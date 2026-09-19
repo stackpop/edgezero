@@ -38,6 +38,8 @@ async fn handle(req: Request) -> anyhow::Result<edgezero_adapter_spin::SpinRespo
 `run_app` reads the portable store metadata baked into `App` by the `app!`
 macro plus `EDGEZERO__*` environment variables; it does not require an
 `edgezero.toml` to be present at runtime.
+If `Hooks::configure` fails, `run_app` returns the source-preserving
+`application configuration failed` error before converting or dispatching the request.
 
 ## Building
 

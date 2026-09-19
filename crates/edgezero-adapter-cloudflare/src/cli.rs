@@ -139,6 +139,7 @@ impl Adapter for CloudflareCliAdapter {
         match capability {
             Capability::ConfigReadDeadlines
             | Capability::InboundReadDeadlines
+            | Capability::IngressAdmissionAbort
             | Capability::OutboundAuthorityOverride
             | Capability::OutboundBatchCancellation
             | Capability::OutboundHeaderFidelity
@@ -1249,6 +1250,10 @@ mod tests {
                 CapabilitySupport::BestEffort,
             ),
             (Capability::IngressAdmission, CapabilitySupport::Native),
+            (
+                Capability::IngressAdmissionAbort,
+                CapabilitySupport::BestEffort,
+            ),
             (
                 Capability::RawIngressFramingValidation,
                 CapabilitySupport::Unsupported,

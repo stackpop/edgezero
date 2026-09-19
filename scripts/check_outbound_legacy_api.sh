@@ -58,4 +58,21 @@ scan \
   'stream_to_client|send_to_client|send_with_registries' \
   crates/edgezero-adapter-fastly/src/templates examples/app-demo/crates/app-demo-adapter-fastly || failed=1
 
+# Application assembly and ingress response ownership are hard-cut contracts.
+# Configuration must be fallible, every response-producing admission variant
+# uses named fields, and response completion never travels through HTTP
+# extensions or an envelope escape hatch.
+scan \
+  'fn configure(_app)?\([^)]*&mut (EdgeZeroApp|edgezero_core::app::App|App)[^)]*\)[[:space:]]*\{' \
+  crates examples/app-demo docs/guide README.md || failed=1
+
+scan \
+  'fn build_app\(\)[[:space:]]*->[[:space:]]*App|AdmissionDecision::Refuse[[:space:]]*\(|ResponseEgressEnvelope[^[:space:]]*\.into_response|envelope\.into_response\(\)' \
+  crates examples/app-demo docs/guide README.md || failed=1
+
+scan \
+  '(extensions(_mut)?\(\)|extensions)\.insert\(ResponseEgressCompletion' \
+  crates examples/app-demo docs/guide README.md \
+  ':(exclude)crates/edgezero-core/src/response_egress.rs' || failed=1
+
 exit "$failed"

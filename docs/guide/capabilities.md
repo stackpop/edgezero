@@ -34,6 +34,7 @@ Support levels mean:
 | Capability                       | Axum        | Cloudflare  | Fastly      | Spin        |
 | -------------------------------- | ----------- | ----------- | ----------- | ----------- |
 | `ingress-admission`              | Native      | Native      | Native      | Native      |
+| `ingress-admission-abort`        | Native      | BestEffort  | BestEffort  | BestEffort  |
 | `inbound-read-deadlines`         | Native      | BestEffort  | BestEffort  | BestEffort  |
 | `raw-ingress-head-limits`        | Unsupported | Unsupported | Unsupported | Unsupported |
 | `raw-ingress-framing-validation` | Unsupported | Unsupported | Unsupported | Unsupported |
@@ -44,6 +45,13 @@ Cloudflare and Spin race pending reads against platform timers and enforce absol
 around ready results; both require deployed probes before host-side teardown latency can be
 bounded. Fastly cannot preempt a synchronous host body read. Those limitations keep the three
 deadline cells at `BestEffort`.
+
+`AdmissionDecision::Abort` is a non-response outcome: it polls no body, invokes no middleware or
+handler, starts no response-egress lifecycle, and emits no HTTP response. Axum owns the HTTP/1
+connection and closes or resets it at that boundary, so its abort capability is `Native`.
+Cloudflare, Fastly, and Spin convert the outcome to a fixed provider error before response
+delivery; their hosts decide the transport effect, so those cells remain `BestEffort` pending
+deployed proof of a reset or close.
 
 All current adapters expose `IngressHeadAccounting::HostManaged` and
 `IngressFraming::HostManaged`. They perform defensive checks on the normalized request
@@ -84,6 +92,10 @@ proved cancellable within a finite wall-clock interval, so every adapter reports
 for `config-read-deadlines`. The
 [configuration design](https://github.com/stackpop/edgezero/blob/main/docs/superpowers/specs/2026-06-16-blob-app-config.md#632-bounded-cancellable-extraction-reads)
 defines the normative accounting, cancellation, error, and promotion requirements.
+
+Application assembly is fallible. `Hooks::configure(&mut App) -> Result<(), EdgeError>` runs before
+EdgeZero request conversion, body polling, or dispatch, and `Hooks::build_app()` propagates that
+result. Axum also completes assembly before binding its listener.
 
 ## Response Egress Matrix
 

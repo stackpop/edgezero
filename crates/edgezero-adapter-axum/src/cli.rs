@@ -143,6 +143,7 @@ impl Adapter for AxumCliAdapter {
             | Capability::ResponseWriteDeadlines => CapabilitySupport::BestEffort,
             Capability::InboundReadDeadlines
             | Capability::IngressAdmission
+            | Capability::IngressAdmissionAbort
             | Capability::OutboundAuthorityOverride
             | Capability::OutboundBatchCancellation
             | Capability::OutboundBatchCompletionOrder
@@ -783,6 +784,7 @@ mod tests {
             ),
             (Capability::InboundReadDeadlines, CapabilitySupport::Native),
             (Capability::IngressAdmission, CapabilitySupport::Native),
+            (Capability::IngressAdmissionAbort, CapabilitySupport::Native),
             (
                 Capability::RawIngressFramingValidation,
                 CapabilitySupport::Unsupported,

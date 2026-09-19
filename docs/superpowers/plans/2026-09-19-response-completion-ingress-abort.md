@@ -80,7 +80,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 - Modify: `crates/edgezero-adapter-{cloudflare,fastly,spin}/src/response.rs`
 - Test: colocated tests in `crates/edgezero-core/src/response_egress.rs`
 
-- [ ] **Step 1: Write red completion-order and exactly-once tests**
+- [x] **Step 1: Write red completion-order and exactly-once tests**
 
   Add tests proving normal completion, source/transport failure, fallback completion, guard drop,
   and competing terminal signals invoke the response completion exactly once before the global
@@ -93,7 +93,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   vec!["completion:completed", "observer:completed"]
   ```
 
-- [ ] **Step 2: Run the focused tests and verify the missing API fails**
+- [x] **Step 2: Run the focused tests and verify the missing API fails**
 
   Run:
 
@@ -104,7 +104,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   Expected: compile failure because `ResponseEgressCompletion` and the completion constructor
   parameter do not exist.
 
-- [ ] **Step 3: Implement direct completion ownership**
+- [x] **Step 3: Implement direct completion ownership**
 
   Add the public non-clone owner:
 
@@ -128,7 +128,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   completion. Do not defer those call sites to later tasks: Task 1 must leave the workspace
   compilable. Re-export the type from `edgezero_core`.
 
-- [ ] **Step 4: Remove the response extraction bypass**
+- [x] **Step 4: Remove the response extraction bypass**
 
   Delete `ResponseEgressEnvelope::into_response()`. Replace core test inspection with a test-only
   helper that calls `begin()`, begins writing, terminally settles the attempt, and only then obtains
@@ -136,7 +136,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   so the workspace-wide all-targets check remains compilable. Add `compile_fail` rustdoc examples
   proving the completion cannot be cloned or inserted into `http::Extensions`.
 
-- [ ] **Step 5: Run the core lifecycle suite**
+- [x] **Step 5: Run the core lifecycle suite**
 
   Run:
 
@@ -151,7 +151,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: all response-egress unit tests and compile-fail doctests pass.
 
-- [ ] **Step 6: Commit the core completion primitive**
+- [x] **Step 6: Commit the core completion primitive**
 
   ```bash
   git add crates/edgezero-core/src/response_egress.rs crates/edgezero-core/src/app.rs \
@@ -170,20 +170,20 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 - Modify: `crates/edgezero-core/src/lib.rs`
 - Test: colocated tests in those files
 
-- [ ] **Step 1: Write red admission ownership tests**
+- [x] **Step 1: Write red admission ownership tests**
 
   Add table-driven tests for `Admit`, `ReadBodyBeforeFallback`, `Refuse`, and `Abort`. Prove the
   exact completion reaches normal handler success, handler error, canonical 404/405, exact-cap
   fallback, overflow, timeout, admitted conversion error, and detached refusal. Prove a dropped
   pre-begin envelope releases the captured resource without invoking its callback.
 
-- [ ] **Step 2: Write red abort tests at the core boundary**
+- [x] **Step 2: Write red abort tests at the core boundary**
 
   Assert `Abort` yields `IngressAdmissionOutcome::Aborted`, then
   `IngressBeginOutcome::Aborted`, and finally `IngressDispatchOutcome::Aborted`; body, middleware,
   handler, completion, observer, and response counters must remain zero.
 
-- [ ] **Step 3: Run focused tests and verify the variants fail to compile**
+- [x] **Step 3: Run focused tests and verify the variants fail to compile**
 
   Run:
 
@@ -194,7 +194,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: compile failures for the new completion fields and abort/result variants.
 
-- [ ] **Step 4: Hard-cut the admission API**
+- [x] **Step 4: Hard-cut the admission API**
 
   Implement these shapes without compatibility constructors:
 
@@ -242,7 +242,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   Add `Aborted` to the begin outcome. The default policy supplies
   `ResponseEgressCompletion::empty()`.
 
-- [ ] **Step 5: Retain completion across response replacement**
+- [x] **Step 5: Retain completion across response replacement**
 
   Add `IngressDispatchOutcome::{Response, Aborted}`. Change `App::dispatch_ingress` to return it.
   In `dispatch_admitted`, split the completion from `PreparedIngress` before awaiting router
@@ -250,14 +250,14 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   envelope regardless of the selected response. Make refusal egress use detached policy/no-op
   observer plus the refusal completion; pre-admission errors use an empty completion.
 
-- [ ] **Step 6: Migrate all core admission constructors and response-inspection tests**
+- [x] **Step 6: Migrate all core admission constructors and response-inspection tests**
 
   Update core/router tests to provide explicit empty completions where no resource is under test.
   Replace every envelope `into_response()` use with a begin-and-settle helper. Keep
   `PreparedResponseEgress::into_response()` because the attempt already owns completion at that
   point.
 
-- [ ] **Step 7: Run all core tests**
+- [x] **Step 7: Run all core tests**
 
   Run:
 
@@ -267,7 +267,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: all core tests pass, including exact completion and abort counters.
 
-- [ ] **Step 8: Commit the ingress ownership cut**
+- [x] **Step 8: Commit the ingress ownership cut**
 
   ```bash
   git add crates/edgezero-core/src/app.rs crates/edgezero-core/src/ingress.rs \
@@ -283,13 +283,13 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 - Test: colocated tests in both files
 - Test: `crates/edgezero-adapter-axum/tests/contract.rs`
 
-- [ ] **Step 1: Write a red raw-socket abort test**
+- [x] **Step 1: Write a red raw-socket abort test**
 
   Configure admission to return `Abort`, send a request with a body over a real loopback HTTP/1
   socket, and assert EOF/reset with zero response bytes. Counters must prove no body poll,
   middleware/handler call, completion, or observer invocation.
 
-- [ ] **Step 2: Run the focused Axum tests and verify the request currently becomes a response**
+- [x] **Step 2: Run the focused Axum tests and verify the request currently becomes a response**
 
   Run:
 
@@ -299,7 +299,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: failure because the service has no abort error path.
 
-- [ ] **Step 3: Implement a private Hyper service abort error**
+- [x] **Step 3: Implement a private Hyper service abort error**
 
   Change `dispatch_request` and `AxumConnectionService::call` to return
   `Result<Response<AxumEgressBody>, AxumIngressAbort>`. Map only
@@ -308,12 +308,12 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   downcasting the Hyper error chain, then drop the connection without constructing response head
   or body.
 
-- [ ] **Step 4: Migrate Axum tests away from envelope extraction**
+- [x] **Step 4: Migrate Axum tests away from envelope extraction**
 
   Update service/contract fixtures for mandatory completion fields and begin-and-settle any
   response envelope they inspect.
 
-- [ ] **Step 5: Run the Axum suite**
+- [x] **Step 5: Run the Axum suite**
 
   Run:
 
@@ -323,7 +323,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: all Axum unit, contract, and raw-socket tests pass.
 
-- [ ] **Step 6: Commit the Axum abort boundary**
+- [x] **Step 6: Commit the Axum abort boundary**
 
   ```bash
   git add crates/edgezero-adapter-axum/src/service.rs \
@@ -342,14 +342,14 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 - Test: `crates/edgezero-adapter-fastly/tests/contract.rs`
 - Test: `crates/edgezero-adapter-spin/tests/contract.rs`
 
-- [ ] **Step 1: Write red adapter abort contract tests**
+- [x] **Step 1: Write red adapter abort contract tests**
 
   Reuse each adapter's injected source/delivery seam. For an aborting app, assert source
   construction and delivery closures are never called, no envelope exists, and the adapter returns
   a fixed category-only platform error. Keep Cloudflare/Fastly/Spin transport reset claims out of
   local tests.
 
-- [ ] **Step 2: Run the three focused suites and verify they fail**
+- [x] **Step 2: Run the three focused suites and verify they fail**
 
   Run:
 
@@ -368,7 +368,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   Expected: failures because unknown begin outcomes are currently rendered as detached internal
   responses.
 
-- [ ] **Step 3: Implement non-response abort propagation**
+- [x] **Step 3: Implement non-response abort propagation**
 
   Cloudflare and Spin return their fixed host error directly before `make_source` or `deliver`.
   Fastly adds an abort branch to its private `DispatchOutcome` and returns a fixed
@@ -376,13 +376,13 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   the known abort variant into an internal HTTP response; retain a future-unknown fail-closed arm
   only where `#[non_exhaustive]` requires it.
 
-- [ ] **Step 4: Migrate contract fixtures to completion ownership**
+- [x] **Step 4: Migrate contract fixtures to completion ownership**
 
   Add explicit empty completions to ordinary decisions and replace every
   `ResponseEgressEnvelope::into_response()` call with begin-and-settle test helpers. Add one
   response-producing test per adapter proving a refusal completion reaches terminal egress once.
 
-- [ ] **Step 5: Run adapter host and target checks**
+- [x] **Step 5: Run adapter host and target checks**
 
   Run:
 
@@ -404,7 +404,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: all supported host tests and WASM checks pass.
 
-- [ ] **Step 6: Commit provider abort propagation**
+- [x] **Step 6: Commit provider abort propagation**
 
   ```bash
   git add crates/edgezero-adapter-cloudflare crates/edgezero-adapter-fastly \
@@ -424,13 +424,13 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 - Modify: `crates/edgezero-adapter-spin/src/lib.rs`
 - Test: adapter-local host-testable build seams plus target contract tests
 
-- [ ] **Step 1: Write red core and macro propagation tests**
+- [x] **Step 1: Write red core and macro propagation tests**
 
   Add a failing configure callback returning a typed `EdgeError`. Assert both hand-written Hooks
   and macro-generated Hooks return the same error from `build_app()` and never expose a partially
   configured `App`.
 
-- [ ] **Step 2: Run core/macro tests and verify callback results are currently discarded**
+- [x] **Step 2: Run core/macro tests and verify callback results are currently discarded**
 
   Run:
 
@@ -441,7 +441,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: compile failure because `configure` and `build_app` are infallible.
 
-- [ ] **Step 3: Implement the fallible trait and macro signatures**
+- [x] **Step 3: Implement the fallible trait and macro signatures**
 
   Hard-cut to:
 
@@ -462,7 +462,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   Make `app!` emit the same explicit methods and return the configured callback result. Do not add
   `build_app_unchecked`, callback coercion, or panic fallback.
 
-- [ ] **Step 4: Write red adapter-boundary tests**
+- [x] **Step 4: Write red adapter-boundary tests**
 
   Add one small adapter-local `build_app_for_dispatch<A>()` seam used by the production entrypoint
   before any platform request work. Use a `FailingHooks` implementation and a dispatch/bind/receive
@@ -471,7 +471,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   target contract tests. Cloudflare logs only `EdgeError::kind()` and returns exactly
   `worker::Error::RustError("application configuration failed")`.
 
-- [ ] **Step 5: Propagate build failure at each entrypoint**
+- [x] **Step 5: Propagate build failure at each entrypoint**
 
   Axum and Spin retain the `EdgeError` source under fixed `anyhow` context. Cloudflare maps through
   a private helper that logs stable kind only and emits the fixed public worker error. Fastly
@@ -479,7 +479,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   retains the `EdgeError` source under fixed `"application configuration failed"` context. Build
   before the boundary specified in the source specs.
 
-- [ ] **Step 6: Run core, macro, and adapter entrypoint tests**
+- [x] **Step 6: Run core, macro, and adapter entrypoint tests**
 
   Run:
 
@@ -503,7 +503,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: all package tests pass with no infallible build call sites.
 
-- [ ] **Step 7: Commit fallible application assembly**
+- [x] **Step 7: Commit fallible application assembly**
 
   ```bash
   git add crates/edgezero-core/src/app.rs crates/edgezero-macros \
@@ -531,13 +531,13 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 - Modify: `scripts/check_outbound_legacy_api.sh`
 - Test: colocated manifest, CLI capability, generator, demo lifecycle, and docs-contract tests
 
-- [ ] **Step 1: Write red capability and generator assertions**
+- [x] **Step 1: Write red capability and generator assertions**
 
   Add `Capability::IngressAdmissionAbort` with the string `ingress-admission-abort`. Assert Axum is
   `Native`; Cloudflare, Fastly, and Spin are `BestEffort`. Add generator assertions for fallible
   `configure_app`, explicit empty completions, fallible `build_app`, and the Fastly return type.
 
-- [ ] **Step 2: Run the focused tests and verify stale artifacts fail**
+- [x] **Step 2: Run the focused tests and verify stale artifacts fail**
 
   Run:
 
@@ -549,19 +549,19 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: failures until capability matrices, generated code, and docs are aligned.
 
-- [ ] **Step 3: Migrate the demo and core template**
+- [x] **Step 3: Migrate the demo and core template**
 
   Make `configure_app` return `Result<(), EdgeError>`, add `Ok(())`, and give every decision an
   explicit `ResponseEgressCompletion`. Demonstrate a response-owned permit/drop probe without a
   global response-id map. Update every demo/template `build_app()` call to handle `Result`.
 
-- [ ] **Step 4: Migrate adapter templates and generated fixtures**
+- [x] **Step 4: Migrate adapter templates and generated fixtures**
 
   Update Fastly's template/demo main if its runner now returns `anyhow::Result<()>`; update other
   adapter templates only where signatures changed. Regenerate or update snapshots/assertions and
   prove a newly generated project contains no removed API.
 
-- [ ] **Step 5: Publish and enforce the capability contract**
+- [x] **Step 5: Publish and enforce the capability contract**
 
   Add the abort capability row to the public guide and checker. Document that Axum's owned HTTP/1
   close is Native while the provider adapters remain BestEffort pending deployed evidence. Update
@@ -569,7 +569,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   scan to reject infallible configure/build signatures, `ResponseEgressEnvelope::into_response`,
   and any completion-in-response-extension carrier.
 
-- [ ] **Step 6: Run demo, generator, docs, and capability suites**
+- [x] **Step 6: Run demo, generator, docs, and capability suites**
 
   Run:
 
@@ -587,7 +587,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: all generated/demo code and documentation checks pass.
 
-- [ ] **Step 7: Commit the consumer migration**
+- [x] **Step 7: Commit the consumer migration**
 
   ```bash
   git add crates/edgezero-core/src/manifest.rs crates/edgezero-adapter-*/src/cli.rs \
