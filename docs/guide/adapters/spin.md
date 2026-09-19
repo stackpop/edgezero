@@ -9,10 +9,13 @@ component-scoped KV / variable stores.
 - Rust toolchain with `wasm32-wasip2` target (`rustup target add wasm32-wasip2`)
 - Spin CLI **4.1 or newer** ([install](https://spinframework.dev/install)).
   The workspace's `spin-sdk` imports `wasi:http/types@0.3.0`, which Spin
-  4.0.x does not provide — on an older runtime the component builds and
-  its tests pass, then `spin up` fails with `component imports instance
-'wasi:http/types@0.3.0', but a matching implementation was not found in
-the linker`.
+  4.0.x does not provide. On an older runtime the component builds and its
+  tests pass, and only `spin up` fails:
+
+  ```
+  Error: component imports instance `wasi:http/types@0.3.0`, but a
+  matching implementation was not found in the linker
+  ```
 
 ## Project Setup
 

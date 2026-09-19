@@ -42,7 +42,10 @@ macro_rules! config_store_contract_tests {
             use super::*;
             use $crate::config_store::ConfigStore;
 
-            fn run<Fut>(future: Fut) -> Fut::Output where Fut: ::std::future::Future {
+            fn run<Fut>(future: Fut) -> Fut::Output
+            where
+                Fut: ::std::future::Future,
+            {
                 ::futures::executor::block_on(future)
             }
 

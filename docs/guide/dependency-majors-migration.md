@@ -58,6 +58,21 @@ The workspace builds on Rust 1.98.1. If your application pins a
 toolchain in `.tool-versions`, move it up with the dependencies; the
 `edition = "2024"` crates in EdgeZero need 1.85 or newer regardless.
 
+A scaffolded app's `.tool-versions` also pins the provider CLIs, and
+those moved too:
+
+| Tool      | Old     | New         | Applies to                  |
+| --------- | ------- | ----------- | --------------------------- |
+| `rust`    | 1.95.0  | **1.98.1**  | every app                   |
+| `fastly`  | 15.1.0  | **16.0.0**  | Fastly adapter              |
+| `viceroy` | 0.17.0  | **0.21.0**  | Fastly local testing        |
+| `nodejs`  | 24.12.0 | **24.20.0** | Cloudflare (wrangler), docs |
+
+The `fastly` line is operational rather than cosmetic: the deploy
+action's `install-fastly.sh` fails closed when `.tool-versions` and its
+own `versions.json` disagree, so an app that moves the Rust pin and
+leaves the Fastly one behind gets a red deploy rather than a warning.
+
 ## Verifying
 
 The mismatch this page describes is a compile error, so a clean build

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Spin CLI floor check, shared with the other smoke tests.
-# shellcheck source=scripts/spin_version_guard.sh
+# shellcheck source-path=SCRIPTDIR
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/spin_version_guard.sh"
 
 # Smoke-test the secret-store demo handlers by starting an adapter, running

@@ -37,7 +37,16 @@ spin_meets_floor() {
   # MAJOR.MINOR only; a pre-release suffix on the patch is ignored.
   encoded=$(printf '%s' "$version" | awk -F'.' '{printf "%d%02d", $1, $2}')
 
-  if [ -n "$encoded" ] && [ "$encoded" -lt "$SPIN_MIN_ENCODED" ]; then
+  # Fail closed on an unreadable version. Reporting "new enough" for a CLI
+  # whose version could not be determined hands the caller straight to the
+  # linker error this guard exists to pre-empt.
+  if ! printf '%s' "$encoded" | grep -qE '^[0-9]+$'; then
+    echo "Could not read a Spin CLI version from \`spin --version\` (got: ${version:-<empty>})." >&2
+    echo "spin-sdk 7 needs >= ${SPIN_MIN_DISPLAY}; install from ${SPIN_INSTALL_URL} or set SKIP_SPIN=1." >&2
+    return 1
+  fi
+
+  if [ "$encoded" -lt "$SPIN_MIN_ENCODED" ]; then
     echo "Spin CLI ${version} is too old: spin-sdk 7 needs >= ${SPIN_MIN_DISPLAY} for wasi:http/types@0.3.0." >&2
     echo "Install a newer CLI from ${SPIN_INSTALL_URL} and re-run." >&2
     return 1

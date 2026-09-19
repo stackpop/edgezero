@@ -883,7 +883,7 @@ mod tests {
         // shared crates are checked against the root manifest here.
         let root_manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"));
         let seeds = seed_workspace_dependencies();
-        for crate_name in ["validator", "axum", "fastly", "worker"] {
+        for crate_name in ["validator", "axum", "fastly", "worker", "simple_logger"] {
             let want = root_manifest
                 .lines()
                 .find(|line| line.starts_with(&format!("{crate_name} = ")))

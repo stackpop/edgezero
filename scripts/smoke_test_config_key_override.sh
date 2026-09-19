@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Spin CLI floor check, shared with the other smoke tests.
-# shellcheck source=scripts/spin_version_guard.sh
+# shellcheck source-path=SCRIPTDIR
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/spin_version_guard.sh"
 
 # 12.7 + 9.3 + 8.3 multi-adapter smoke:
