@@ -1,0 +1,37 @@
+name: EdgeZero setup Rust build cache
+description: Cache Cargo dependency sources and Rust compiler outputs for later build steps in the job.
+
+inputs:
+  working-directory:
+    description: Rust workspace directory, relative to github.workspace, containing the Cargo.lock used for the cache key.
+    required: false
+    default: .
+
+runs:
+  using: composite
+  steps:
+    - name: Validate Rust workspace and enable compiler caching
+      id: prepare
+      shell: bash
+      env:
+        EDGEZERO__RUST_CACHE__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
+        BASH_ENV: ""
+        ENV: ""
+      run: exec "$GITHUB_ACTION_PATH/scripts/prepare.sh"
+
+    - name: Restore Cargo dependency sources
+      id: cargo-sources
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: edgezero-rust-sources-${{ runner.os }}-${{ runner.arch }}-${{ steps.prepare.outputs['cargo-lock-sha256'] }}
+        restore-keys: |
+          edgezero-rust-sources-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Set up Rust compiler cache
+      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      with:
+        version: v0.16.0

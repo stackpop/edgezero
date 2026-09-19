@@ -21,6 +21,24 @@ release supplies a byte-identical application CLI, Fastly package,
 and staging. Different applications or later releases can have different
 manifests. A deployer or runtime environment cannot replace them.
 
+### Optional Rust build caching
+
+Call the provider-neutral cache action once after checking out the application
+and before its Rust build steps:
+
+```yaml
+- name: Set up Rust build cache
+  uses: stackpop/edgezero/.github/actions/setup-rust-build-cache@<ref>
+  with:
+    working-directory: application
+```
+
+`working-directory` identifies the Cargo workspace containing the committed
+`Cargo.lock`. The action restores Cargo registry and Git dependency sources,
+installs a pinned `sccache`, and enables compiler caching for every later native
+or WASM Rust build in the job. It does not cache a Cargo `target` directory or
+change any build, package, release, adapter, or deployment command.
+
 Use the release packager after the application CLI and Fastly package have been
 built in the credential-free producer job:
 

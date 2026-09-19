@@ -87,6 +87,7 @@ jobs:
             .github/workflows/deploy-action.yml \
             .github/workflows/fastly-installer-check.yml \
             .github/actions/build-app-cli/action.yml \
+            .github/actions/setup-rust-build-cache/action.yml \
             .github/actions/deploy-fastly/action.yml \
             .github/actions/healthcheck-fastly/action.yml \
             .github/actions/rollback-fastly/action.yml \
@@ -105,6 +106,9 @@ jobs:
 
       - name: Bash contract tests
         run: .github/actions/deploy-core/tests/run.sh
+
+      - name: Rust build-cache action tests
+        run: .github/actions/setup-rust-build-cache/tests/run.sh
 
       - name: Validate docs
         run: |
@@ -129,6 +133,11 @@ jobs:
 
       - name: Create the store-aware fixture application
         run: .github/actions/deploy-fastly/tests/make-smoke-fixture.sh source store-aware
+
+      - name: Set up Rust build cache
+        uses: ./.github/actions/setup-rust-build-cache
+        with:
+          working-directory: fixture-app
 
       - name: Build the application-owned CLI once
         uses: ./.github/actions/build-app-cli
@@ -173,6 +182,11 @@ jobs:
 
       - name: Create the store-free fixture application
         run: .github/actions/deploy-fastly/tests/make-smoke-fixture.sh source store-free
+
+      - name: Set up Rust build cache
+        uses: ./.github/actions/setup-rust-build-cache
+        with:
+          working-directory: fixture-app
 
       - name: Build the store-free application CLI once
         uses: ./.github/actions/build-app-cli
