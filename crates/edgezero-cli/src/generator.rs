@@ -1538,7 +1538,7 @@ mod tests {
         );
     }
 
-    fn assert_generated_sources_are_lint_clean(project_dir: &Path) {
+    fn assert_generated_core_lifecycle(project_dir: &Path) {
         let core_lib = fs::read_to_string(project_dir.join("crates/demo-app-core/src/lib.rs"))
             .expect("read core lib.rs");
         assert!(
@@ -1571,7 +1571,9 @@ mod tests {
             "generated tests must handle fallible application assembly",
         );
         assert_generated_fallback_policy(&core_lib);
+    }
 
+    fn assert_generated_outbound_handler(project_dir: &Path) {
         let handlers = fs::read_to_string(project_dir.join("crates/demo-app-core/src/handlers.rs"))
             .expect("read handlers.rs");
         assert!(
@@ -1626,7 +1628,9 @@ mod tests {
             !handlers.contains(".send_all("),
             "generated outbound example must not retain the removed send_all API",
         );
+    }
 
+    fn assert_generated_route_and_provider_manifests(project_dir: &Path) {
         let manifest =
             fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
         assert!(
@@ -1646,6 +1650,12 @@ mod tests {
             spin_manifest.contains("allowed_outbound_hosts = [\"https://*:*\"]"),
             "generated Spin hosts must default to HTTPS only",
         );
+    }
+
+    fn assert_generated_sources_are_lint_clean(project_dir: &Path) {
+        assert_generated_core_lifecycle(project_dir);
+        assert_generated_outbound_handler(project_dir);
+        assert_generated_route_and_provider_manifests(project_dir);
         assert_generated_axum_entrypoint(project_dir);
         assert_generated_cloudflare_entrypoint(project_dir);
         assert_generated_fastly_entrypoint(project_dir);

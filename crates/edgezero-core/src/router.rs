@@ -773,6 +773,7 @@ mod tests {
     };
     use crate::params::PathParams;
     use crate::response::response_with_body;
+    use crate::response_egress::ResponseEgressCompletion;
     use crate::time::{Deadline, MonotonicInstant};
     use futures::executor::block_on;
     use futures::task::noop_waker_ref;
@@ -876,7 +877,7 @@ mod tests {
         );
         let mut app = App::new(router.clone());
         app.set_ingress_admission_policy(|_| AdmissionDecision::Admit {
-            completion: crate::response_egress::ResponseEgressCompletion::empty(),
+            completion: ResponseEgressCompletion::empty(),
             grant: IngressGrant::new(String::from("lease")),
             read_deadline: Deadline::after(Duration::from_secs(1)),
         });

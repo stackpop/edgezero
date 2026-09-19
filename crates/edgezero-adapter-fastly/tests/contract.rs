@@ -192,10 +192,11 @@ mod tests {
         let app = build_test_app();
         let req = fastly_request(FastlyMethod::GET, "/uri", None);
 
-        let response = FastlyService::new(&app)
-            .capture_egress_for_test(req)
-            .expect("egress envelope")
-            .into_response();
+        let response = complete_envelope(
+            FastlyService::new(&app)
+                .capture_egress_for_test(req)
+                .expect("egress envelope"),
+        );
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -210,10 +211,11 @@ mod tests {
         let app = build_test_app();
         let req = fastly_request(FastlyMethod::GET, "/stream", None);
 
-        let response = FastlyService::new(&app)
-            .capture_egress_for_test(req)
-            .expect("egress envelope")
-            .into_response();
+        let response = complete_envelope(
+            FastlyService::new(&app)
+                .capture_egress_for_test(req)
+                .expect("egress envelope"),
+        );
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -334,10 +336,11 @@ mod tests {
         let app = build_test_app();
         let req = fastly_request(FastlyMethod::POST, "/mirror", Some(b"echo"));
 
-        let response = FastlyService::new(&app)
-            .capture_egress_for_test(req)
-            .expect("egress envelope")
-            .into_response();
+        let response = complete_envelope(
+            FastlyService::new(&app)
+                .capture_egress_for_test(req)
+                .expect("egress envelope"),
+        );
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -353,11 +356,12 @@ mod tests {
         let req = fastly_request(FastlyMethod::GET, "/config", None);
         let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("hello from fastly test")));
 
-        let response = FastlyService::new(&app)
-            .with_config_handle(handle)
-            .capture_egress_for_test(req)
-            .expect("egress envelope")
-            .into_response();
+        let response = complete_envelope(
+            FastlyService::new(&app)
+                .with_config_handle(handle)
+                .capture_egress_for_test(req)
+                .expect("egress envelope"),
+        );
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -718,14 +722,15 @@ mod tests {
                     None,
                 );
 
-                let response = dispatch_ingress_reader_for_test(
-                    &app,
-                    Method::POST,
-                    path.parse().expect("URI"),
-                    reader,
-                )
-                .expect("egress envelope")
-                .into_response();
+                let response = complete_response(
+                    dispatch_ingress_reader_for_test(
+                        &app,
+                        Method::POST,
+                        path.parse().expect("URI"),
+                        reader,
+                    )
+                    .expect("egress envelope"),
+                );
 
                 assert_eq!(response.status(), expected_status);
                 assert_eq!(body_reads.load(Ordering::SeqCst), 3);
@@ -751,14 +756,15 @@ mod tests {
                     None,
                 );
 
-                let response = dispatch_ingress_reader_for_test(
-                    &app,
-                    Method::POST,
-                    path.parse().expect("URI"),
-                    reader,
-                )
-                .expect("egress envelope")
-                .into_response();
+                let response = complete_response(
+                    dispatch_ingress_reader_for_test(
+                        &app,
+                        Method::POST,
+                        path.parse().expect("URI"),
+                        reader,
+                    )
+                    .expect("egress envelope"),
+                );
 
                 assert_terminal_response(
                     response,
@@ -780,10 +786,11 @@ mod tests {
                 fallback_app(4, Duration::from_secs(30), &grant_drops);
             let request = fastly_request(FastlyMethod::POST, "/missing", Some(b"abcde"));
 
-            let response = FastlyService::new(&app)
-                .capture_egress_for_test(request)
-                .expect("egress envelope")
-                .into_response();
+            let response = complete_response(
+                FastlyService::new(&app)
+                    .capture_egress_for_test(request)
+                    .expect("egress envelope"),
+            );
 
             assert_terminal_response(
                 response,
@@ -813,14 +820,15 @@ mod tests {
                     None,
                 );
 
-                let response = dispatch_ingress_reader_for_test(
-                    &app,
-                    Method::POST,
-                    path.parse().expect("URI"),
-                    reader,
-                )
-                .expect("egress envelope")
-                .into_response();
+                let response = complete_response(
+                    dispatch_ingress_reader_for_test(
+                        &app,
+                        Method::POST,
+                        path.parse().expect("URI"),
+                        reader,
+                    )
+                    .expect("egress envelope"),
+                );
 
                 assert_terminal_response(
                     response,
@@ -858,14 +866,15 @@ mod tests {
                     Some((now, deadline)),
                 );
 
-                let response = dispatch_ingress_reader_for_test(
-                    &app,
-                    Method::POST,
-                    path.parse().expect("URI"),
-                    reader,
-                )
-                .expect("egress envelope")
-                .into_response();
+                let response = complete_response(
+                    dispatch_ingress_reader_for_test(
+                        &app,
+                        Method::POST,
+                        path.parse().expect("URI"),
+                        reader,
+                    )
+                    .expect("egress envelope"),
+                );
 
                 assert_terminal_response(
                     response,
@@ -916,14 +925,15 @@ mod tests {
                     None,
                 );
 
-                let response = dispatch_ingress_reader_for_test(
-                    &app,
-                    Method::POST,
-                    path.parse().expect("URI"),
-                    reader,
-                )
-                .expect("egress envelope")
-                .into_response();
+                let response = complete_response(
+                    dispatch_ingress_reader_for_test(
+                        &app,
+                        Method::POST,
+                        path.parse().expect("URI"),
+                        reader,
+                    )
+                    .expect("egress envelope"),
+                );
 
                 let mut expected_headers = HeaderMap::new();
                 expected_headers.insert("x-ingress-refusal", HeaderValue::from_static("saturated"));
@@ -953,14 +963,15 @@ mod tests {
                 fallback_app(4, Duration::from_secs(30), &grant_drops);
             let reader = error_reader(&grant_drops, &source_drops, &body_reads);
 
-            let response = dispatch_ingress_reader_for_test(
-                &app,
-                Method::POST,
-                "/missing".parse().expect("URI"),
-                reader,
-            )
-            .expect("egress envelope")
-            .into_response();
+            let response = complete_response(
+                dispatch_ingress_reader_for_test(
+                    &app,
+                    Method::POST,
+                    "/missing".parse().expect("URI"),
+                    reader,
+                )
+                .expect("egress envelope"),
+            );
 
             assert_terminal_response(
                 response,

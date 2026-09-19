@@ -601,7 +601,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 - Review: all files changed by Tasks 1-6
 - Modify if needed: PR #275 description
 
-- [ ] **Step 1: Audit for stale and bypassing APIs**
+- [x] **Step 1: Audit for stale and bypassing APIs**
 
   Run:
 
@@ -613,7 +613,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   Inspect every result. The only response-extension lifecycle value may be
   `ResponseEgressDeadline`; completion must follow direct ownership.
 
-- [ ] **Step 2: Run formatting and full native CI gates**
+- [x] **Step 2: Run formatting and full native CI gates**
 
   Run:
 
@@ -626,7 +626,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: zero warnings and zero failures.
 
-- [ ] **Step 3: Run all WASM and excluded-workspace gates**
+- [x] **Step 3: Run all WASM and excluded-workspace gates**
 
   Run:
 
@@ -640,7 +640,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: all target and demo gates pass.
 
-- [ ] **Step 4: Re-run docs and repository contract gates**
+- [x] **Step 4: Re-run docs and repository contract gates**
 
   Run:
 
@@ -654,7 +654,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Expected: all commands exit zero.
 
-- [ ] **Step 5: Perform a final code-review pass**
+- [x] **Step 5: Perform a final code-review pass**
 
   Review ownership/drop paths, callback panic ordering, abort zero-read behavior, fixed public error
   messages, adapter capability claims, generated code, and every `build_app()` call. Remove dead

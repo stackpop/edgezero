@@ -15,7 +15,7 @@ use crate::response::IntoResponse as _;
 use crate::response_egress::{
     ResponseEgressCompletion, ResponseEgressEnvelope, ResponseEgressHead, ResponseEgressObserver,
     ResponseEgressObserverHandle, ResponseEgressPolicy, ResponseEgressPolicyCallback,
-    default_response_egress_policy,
+    ResponseEgressRequestMetadata, default_response_egress_policy,
 };
 use crate::router::{RouteMetadata, RouterService};
 use crate::time::{MonotonicClock, MonotonicInstant};
@@ -226,10 +226,10 @@ impl App {
         let head_parts = IngressHeadParts::from_request(&request, head_accounting, framing);
         match self.begin_ingress(head_parts, request_start)? {
             IngressBeginOutcome::Admitted(prepared) => Ok(IngressDispatchOutcome::Response(
-                self.dispatch_admitted(prepared, request).await,
+                Box::new(self.dispatch_admitted(prepared, request).await),
             )),
             IngressBeginOutcome::Refused(response) => {
-                Ok(IngressDispatchOutcome::Response(response))
+                Ok(IngressDispatchOutcome::Response(Box::new(response)))
             }
             IngressBeginOutcome::Aborted => Ok(IngressDispatchOutcome::Aborted),
         }
@@ -286,9 +286,7 @@ impl App {
     ) -> ResponseEgressEnvelope {
         ResponseEgressEnvelope::new(
             response,
-            request_start,
-            route,
-            request_method,
+            ResponseEgressRequestMetadata::new(request_method, request_start, route),
             completion,
             self.response_egress_policy(),
             self.response_egress_observer(),
@@ -732,7 +730,7 @@ mod tests {
         let IngressDispatchOutcome::Response(envelope) = outcome else {
             panic!("expected response");
         };
-        complete_envelope(envelope)
+        complete_envelope(*envelope)
     }
 
     fn counted_completion(calls: &Arc<AtomicUsize>) -> ResponseEgressCompletion {
@@ -1083,7 +1081,7 @@ mod tests {
         let IngressDispatchOutcome::Response(envelope) = outcome else {
             panic!("expected response");
         };
-        assert_eq!(complete_envelope(envelope).status(), StatusCode::OK);
+        assert_eq!(complete_envelope(*envelope).status(), StatusCode::OK);
         assert_eq!(completions.load(Ordering::SeqCst), 1);
     }
 
@@ -1151,7 +1149,7 @@ mod tests {
             panic!("expected response");
         };
         assert_eq!(
-            complete_envelope(envelope).status(),
+            complete_envelope(*envelope).status(),
             StatusCode::PAYLOAD_TOO_LARGE
         );
         assert_eq!(completions.load(Ordering::SeqCst), 1);

@@ -32,7 +32,9 @@ mod tests {
     use edgezero_adapter_spin::context::SpinRequestContext;
     #[cfg(feature = "test-utils")]
     use edgezero_adapter_spin::request::deadline_body_releases_source_for_test;
-    use edgezero_core::app::{App, Hooks};
+    use edgezero_core::app::App;
+    #[cfg(feature = "test-utils")]
+    use edgezero_core::app::Hooks;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
@@ -50,8 +52,10 @@ mod tests {
     use std::time::Duration;
 
     /// Config store that returns a value only for the expected key.
+    #[cfg(feature = "test-utils")]
     struct FailingConfiguration;
 
+    #[cfg(feature = "test-utils")]
     #[expect(
         clippy::missing_trait_methods,
         reason = "test hook exercises only adapter startup failure"
@@ -69,9 +73,9 @@ mod tests {
     #[cfg(feature = "test-utils")]
     #[test]
     fn failing_configuration() {
-        let Err(error) = build_app_for_test::<FailingConfiguration>() else {
-            panic!("configuration must fail before request dispatch");
-        };
+        let result = build_app_for_test::<FailingConfiguration>();
+        assert!(result.is_err());
+        let error = result.err().expect("configuration must fail");
         assert_eq!(error.to_string(), "application configuration failed");
         assert!(format!("{error:#}").contains("configuration unavailable"));
     }
@@ -550,7 +554,7 @@ mod tests {
                 "/missing".parse().expect("URI"),
                 move || {
                     observed_source_calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(futures::stream::empty::<Result<Bytes, io::Error>>())
+                    Ok(stream::empty::<Result<Bytes, io::Error>>())
                 },
                 move |_response| {
                     observed_delivery_calls.fetch_add(1, Ordering::SeqCst);
