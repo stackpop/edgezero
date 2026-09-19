@@ -68,12 +68,7 @@ jobs:
 
       - name: Run workspace tests
         if: matrix.suite == 'workspace'
-        run: >-
-          cargo test
-          --workspace
-          --all-targets
-          --exclude edgezero-cli
-          --exclude edgezero-adapter-axum
+        run: cargo test --workspace --all-targets
 
       - name: Run EdgeZero CLI tests
         if: matrix.suite == 'cli'
