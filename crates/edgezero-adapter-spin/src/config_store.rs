@@ -7,8 +7,11 @@
 //! by [`crate::request::build_config_registry`], which resolves it
 //! through `EDGEZERO__STORES__CONFIG__<ID>__NAME`.
 
+use std::future::Future;
+
 use async_trait::async_trait;
-use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
+use edgezero_core::config_store::{BoundedStoreRead, ConfigStore, ConfigStoreError};
+use edgezero_core::time::{Deadline, MonotonicClock};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use spin_sdk::key_value::Store as SpinSdkKvStore;
 #[cfg(test)]
@@ -27,9 +30,6 @@ enum SpinConfigBackend {
         label: String,
         store: SpinSdkKvStore,
     },
-    /// Never constructed; keeps the enum inhabited outside production Spin and tests.
-    #[cfg(not(any(all(feature = "spin", target_arch = "wasm32"), test)))]
-    _Uninhabited(std::convert::Infallible),
 }
 
 impl SpinConfigStore {
@@ -100,18 +100,74 @@ impl ConfigStore for SpinConfigStore {
                     "store `{label}`: {err}"
                 ))),
             },
-            #[cfg(not(any(all(feature = "spin", target_arch = "wasm32"), test)))]
-            SpinConfigBackend::_Uninhabited(never) => {
-                let _: &str = key;
-                match *never {}
-            }
         }
     }
+
+    #[inline]
+    async fn get_bounded(
+        &self,
+        key: &str,
+        clock: &MonotonicClock,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        bounded_config_read(
+            self.get(key),
+            clock,
+            deadline,
+            max_backend_bytes,
+            max_value_bytes,
+        )
+        .await
+    }
+}
+
+// Spin KV returns a complete value, so these bounds are cooperative and
+// apply immediately after host materialization rather than during allocation.
+async fn bounded_config_read<F>(
+    read: F,
+    clock: &MonotonicClock,
+    deadline: Deadline,
+    max_backend_bytes: u64,
+    max_value_bytes: u64,
+) -> Result<BoundedStoreRead<String>, ConfigStoreError>
+where
+    F: Future<Output = Result<Option<String>, ConfigStoreError>>,
+{
+    if deadline.is_expired_at(clock.now()) {
+        return Err(ConfigStoreError::DeadlineExceeded);
+    }
+
+    let result = read.await;
+    if deadline.is_expired_at(clock.now()) {
+        drop(result);
+        return Err(ConfigStoreError::DeadlineExceeded);
+    }
+    let value = result?;
+
+    let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+        u64::try_from(stored_value.len()).map_err(|_length_error| ConfigStoreError::ValueTooLarge)
+    })?;
+    if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+        drop(value);
+        return Err(ConfigStoreError::ValueTooLarge);
+    }
+
+    Ok(BoundedStoreRead {
+        backend_bytes,
+        value,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
     use futures::executor::block_on;
 
     // Contract tests exercise the InMemory backend with bytes-backed values.
@@ -182,5 +238,131 @@ mod tests {
     fn missing_key_returns_none() {
         let store = SpinConfigStore::from_entries([]);
         assert_eq!(block_on(store.get("absent")).expect("ok"), None);
+    }
+
+    #[test]
+    fn bounded_read_reports_exact_bytes_and_accepts_exact_caps() {
+        let clock = MonotonicClock::default();
+        let result = block_on(bounded_config_read(
+            async { Ok(Some("value".to_owned())) },
+            &clock,
+            Deadline::after(Duration::from_secs(1)),
+            5,
+            5,
+        ))
+        .expect("exact caps must succeed");
+
+        assert_eq!(result.backend_bytes, 5);
+        assert_eq!(result.value.as_deref(), Some("value"));
+    }
+
+    #[test]
+    fn bounded_read_rejects_either_exceeded_cap() {
+        for (max_backend_bytes, max_value_bytes) in [(4, 5), (5, 4)] {
+            let clock = MonotonicClock::default();
+            let error = block_on(bounded_config_read(
+                async { Ok(Some("value".to_owned())) },
+                &clock,
+                Deadline::after(Duration::from_secs(1)),
+                max_backend_bytes,
+                max_value_bytes,
+            ))
+            .expect_err("an exceeded cap must fail");
+
+            assert!(matches!(error, ConfigStoreError::ValueTooLarge));
+        }
+    }
+
+    #[test]
+    fn bounded_read_checks_deadline_before_polling_host_call() {
+        let polled = Cell::new(false);
+        let clock = MonotonicClock::default();
+        let error = block_on(bounded_config_read(
+            async {
+                polled.set(true);
+                Ok(None)
+            },
+            &clock,
+            Deadline::after(Duration::ZERO),
+            1,
+            1,
+        ))
+        .expect_err("expired deadline must fail");
+
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+        assert!(!polled.get(), "expired reads must not poll the host call");
+    }
+
+    #[test]
+    fn bounded_read_checks_deadline_after_host_call() {
+        let start = MonotonicInstant::now();
+        let terminal = start
+            .checked_add(Duration::from_secs(1))
+            .expect("terminal instant");
+        let now = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&now);
+        let clock = MonotonicClock::new(move || *clock_now.lock().expect("clock lock"));
+        let error = block_on(bounded_config_read(
+            async {
+                *now.lock().expect("clock lock") = terminal;
+                Ok(None)
+            },
+            &clock,
+            Deadline::at_instant(terminal),
+            1,
+            1,
+        ))
+        .expect_err("a host call completing after the deadline must fail");
+
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+    }
+
+    #[test]
+    fn bounded_read_deadline_wins_over_late_host_error() {
+        let start = MonotonicInstant::now();
+        let terminal = start
+            .checked_add(Duration::from_secs(1))
+            .expect("terminal instant");
+        let now = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&now);
+        let clock = MonotonicClock::new(move || *clock_now.lock().expect("clock lock"));
+        let error = block_on(bounded_config_read(
+            async {
+                *now.lock().expect("clock lock") = terminal;
+                Err(ConfigStoreError::unavailable("late host error"))
+            },
+            &clock,
+            Deadline::at_instant(terminal),
+            1,
+            1,
+        ))
+        .expect_err("the post-call deadline check must run after host errors");
+
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+    }
+
+    #[test]
+    fn bounded_config_read_uses_injected_clock() {
+        let process_now = MonotonicInstant::now();
+        let injected_now = process_now
+            .checked_sub(Duration::from_mins(1))
+            .expect("injected instant");
+        let clock = MonotonicClock::new(move || injected_now);
+        let deadline = Deadline::at_instant(
+            injected_now
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+
+        let result = block_on(bounded_config_read(
+            async { Ok(Some("value".to_owned())) },
+            &clock,
+            deadline,
+            5,
+            5,
+        ))
+        .expect("the application clock is still before its deadline");
+
+        assert_eq!(result.value.as_deref(), Some("value"));
     }
 }

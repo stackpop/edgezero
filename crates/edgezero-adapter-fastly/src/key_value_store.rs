@@ -6,26 +6,19 @@
 //!
 //! This module is only compiled when the `fastly` feature is enabled.
 
-#[cfg(feature = "fastly")]
 use async_trait::async_trait;
-#[cfg(feature = "fastly")]
 use bytes::Bytes;
-#[cfg(feature = "fastly")]
 use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
-#[cfg(feature = "fastly")]
 use fastly::kv_store::{KVStore, KVStoreError};
-#[cfg(feature = "fastly")]
 use std::time::Duration;
 
 /// KV store backed by Fastly's KV Store API.
 ///
 /// Wraps a `fastly::kv_store::KVStore` handle obtained via `KVStore::open(name)`.
-#[cfg(feature = "fastly")]
 pub struct FastlyKvStore {
     store: KVStore,
 }
 
-#[cfg(feature = "fastly")]
 impl FastlyKvStore {
     /// Open a Fastly KV Store by name.
     ///
@@ -42,7 +35,6 @@ impl FastlyKvStore {
     }
 }
 
-#[cfg(feature = "fastly")]
 #[async_trait(?Send)]
 impl KvStore for FastlyKvStore {
     #[inline]

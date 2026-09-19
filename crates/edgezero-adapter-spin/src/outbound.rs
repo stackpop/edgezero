@@ -1,0 +1,1676 @@
+#![cfg_attr(
+    any(test, all(feature = "spin", target_arch = "wasm32")),
+    expect(
+        clippy::arbitrary_source_item_ordering,
+        reason = "target and test helper modules stay adjacent to the imports that define their boundaries"
+    )
+)]
+#![cfg_attr(
+    all(feature = "spin", target_arch = "wasm32"),
+    expect(
+        clippy::pub_use,
+        reason = "the target-gated implementation keeps Spin SDK imports out of native builds"
+    )
+)]
+
+use edgezero_core::error::EdgeError;
+#[cfg(any(feature = "test-utils", all(feature = "spin", target_arch = "wasm32")))]
+use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
+
+#[cfg(all(feature = "spin", any(feature = "test-utils", target_arch = "wasm32")))]
+use edgezero_core::error::{BadGatewayReason, BudgetSource};
+#[cfg(all(feature = "spin", any(feature = "test-utils", target_arch = "wasm32")))]
+use edgezero_core::time::Deadline;
+#[cfg(all(feature = "spin", any(feature = "test-utils", target_arch = "wasm32")))]
+use spin_sdk::wasip3::http::types::ErrorCode;
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+mod exchange {
+    use std::future::{Future, IntoFuture};
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use async_stream::stream;
+    use edgezero_core::body::BodyStream;
+    use edgezero_core::error::EdgeError;
+    use futures_util::{StreamExt as _, future::poll_fn};
+
+    pub(super) const READY_ITEM_YIELD_QUOTA: usize = 64;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum UploadCompletion {
+        Complete,
+        ReaderGone,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct RequestTimeouts {
+        between_bytes: u64,
+        connect: u64,
+        first_byte: u64,
+    }
+
+    impl RequestTimeouts {
+        pub(super) fn between_bytes(self) -> u64 {
+            self.between_bytes
+        }
+
+        pub(super) fn connect(self) -> u64 {
+            self.connect
+        }
+
+        pub(super) fn first_byte(self) -> u64 {
+            self.first_byte
+        }
+    }
+
+    pub(super) fn request_timeouts(remaining: Duration) -> RequestTimeouts {
+        let full_remaining = duration_nanos(remaining);
+        RequestTimeouts {
+            between_bytes: full_remaining,
+            connect: full_remaining,
+            first_byte: full_remaining,
+        }
+    }
+
+    pub(super) fn should_emit_response_chunk(length: usize) -> bool {
+        length != 0
+    }
+
+    pub(super) fn duration_nanos(duration: Duration) -> u64 {
+        u64::try_from(duration.as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+
+    pub(super) async fn cooperative_yield_once() {
+        let mut yielded = false;
+        poll_fn(move |context| {
+            if yielded {
+                Poll::Ready(())
+            } else {
+                yielded = true;
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+
+    pub(super) async fn cooperate_after_response_read(ready_reads: &mut usize) {
+        *ready_reads = ready_reads.saturating_add(1);
+        if *ready_reads >= READY_ITEM_YIELD_QUOTA {
+            *ready_reads = 0;
+            cooperative_yield_once().await;
+        }
+    }
+
+    pub(super) fn cooperative_stream(mut source: BodyStream) -> BodyStream {
+        stream! {
+            let mut ready_items = 0_usize;
+            while let Some(item) = source.next().await {
+                let terminal = item.is_err();
+                yield item;
+                if terminal {
+                    return;
+                }
+                ready_items = ready_items.saturating_add(1);
+                if ready_items >= READY_ITEM_YIELD_QUOTA {
+                    cooperative_yield_once().await;
+                    ready_items = 0;
+                }
+            }
+        }
+        .boxed_local()
+    }
+
+    pub(super) async fn settle_reset_content(
+        mut source: BodyStream,
+        declared_body: bool,
+    ) -> Result<(), EdgeError> {
+        if !declared_body && let Some(item) = source.next().await {
+            item?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn run_exchange<Send, Pump, RequestDone, Output, HostError, MapError>(
+        send_future: Send,
+        pump_future: Pump,
+        request_done_reader: RequestDone,
+        map_error: MapError,
+    ) -> Result<Output, EdgeError>
+    where
+        Send: Future<Output = Result<Output, HostError>>,
+        Pump: Future<Output = Result<UploadCompletion, EdgeError>>,
+        RequestDone: IntoFuture<Output = Result<(), HostError>>,
+        MapError: Fn(&HostError) -> EdgeError,
+    {
+        #[derive(Clone, Copy)]
+        enum State {
+            AwaitingRequestDone,
+            ReaderGone,
+            RequestComplete,
+            Uploading,
+        }
+
+        enum Outcome<Output, HostError> {
+            PumpError(EdgeError),
+            RequestDoneError(HostError),
+            Send(Result<Output, HostError>),
+        }
+
+        let mut state = State::Uploading;
+        let mut retained_send = None;
+        let mut send = Box::pin(send_future);
+        let mut pump = Box::pin(pump_future);
+        let mut request_done = Box::pin(request_done_reader.into_future());
+
+        let outcome = poll_fn(|context| {
+            loop {
+                match state {
+                    State::Uploading => match pump.as_mut().poll(context) {
+                        Poll::Ready(Err(error)) => return Poll::Ready(Outcome::PumpError(error)),
+                        Poll::Ready(Ok(UploadCompletion::Complete)) => {
+                            state = State::AwaitingRequestDone;
+                        }
+                        Poll::Ready(Ok(UploadCompletion::ReaderGone)) => {
+                            state = State::ReaderGone;
+                        }
+                        Poll::Pending => match send.as_mut().poll(context) {
+                            Poll::Ready(result) => return Poll::Ready(Outcome::Send(result)),
+                            Poll::Pending => return Poll::Pending,
+                        },
+                    },
+                    State::AwaitingRequestDone => match request_done.as_mut().poll(context) {
+                        Poll::Ready(Err(error)) => {
+                            return Poll::Ready(Outcome::RequestDoneError(error));
+                        }
+                        Poll::Ready(Ok(())) => state = State::RequestComplete,
+                        Poll::Pending => {
+                            if retained_send.is_none()
+                                && let Poll::Ready(result) = send.as_mut().poll(context)
+                            {
+                                retained_send = Some(result);
+                            }
+                            return Poll::Pending;
+                        }
+                    },
+                    State::ReaderGone | State::RequestComplete => {
+                        if let Some(result) = retained_send.take() {
+                            return Poll::Ready(Outcome::Send(result));
+                        }
+                        match send.as_mut().poll(context) {
+                            Poll::Ready(result) => return Poll::Ready(Outcome::Send(result)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+        drop(request_done);
+        drop(pump);
+        drop(send);
+        match outcome {
+            Outcome::PumpError(error) => Err(error),
+            Outcome::RequestDoneError(error) | Outcome::Send(Err(error)) => Err(map_error(&error)),
+            Outcome::Send(Ok(output)) => Ok(output),
+        }
+    }
+}
+
+#[cfg(any(
+    test,
+    all(feature = "spin", target_arch = "wasm32", feature = "test-utils")
+))]
+use exchange::READY_ITEM_YIELD_QUOTA;
+#[cfg(test)]
+use exchange::duration_nanos;
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+use exchange::{
+    UploadCompletion, cooperate_after_response_read, cooperative_stream, cooperative_yield_once,
+    request_timeouts, run_exchange, settle_reset_content, should_emit_response_chunk,
+};
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+mod spin_impl {
+    use std::num::NonZeroU64;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use async_stream::stream;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use edgezero_core::body::{Body, BodyStream};
+    use edgezero_core::compression::{
+        ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_gzip_stream,
+    };
+    use edgezero_core::error::{BadGatewayReason, EdgeError};
+    use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH};
+    use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
+    use edgezero_core::outbound::{
+        OutboundBatch, OutboundBatchDriverEvent, OutboundHttpClient, OutboundRequest,
+        OutboundRequestParts, OutboundResponse, ResponseBodyDisposition, ResponseHeaderLimiter,
+        ResponseMode, collect_response_stream, enforce_payload_content_length, finish_batch_item,
+        insert_proxy_header, limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
+        normalize_response_headers, rechunk_stream,
+    };
+    use edgezero_core::time::{
+        Deadline, DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget,
+    };
+    use futures_util::StreamExt as _;
+    use futures_util::future::{Either, FutureExt as _, LocalBoxFuture, poll_fn, select};
+    use futures_util::stream::{FuturesUnordered, once};
+    use spin_sdk::time::sleep;
+    use spin_sdk::wasip3::http::client;
+    use spin_sdk::wasip3::http::types::{
+        ErrorCode, Fields, Method as WasiMethod, Request, RequestOptions, RequestOptionsError,
+        Response, Scheme,
+    };
+    use spin_sdk::wasip3::http_compat::BodyWriter;
+    use spin_sdk::wasip3::wit_bindgen::{FutureWriter, StreamResult};
+    use spin_sdk::wasip3::wit_future;
+
+    use super::{
+        UploadCompletion, cooperate_after_response_read, cooperative_yield_once,
+        map_spin_send_error, run_exchange, settle_reset_content, should_emit_response_chunk,
+        timeout_error,
+    };
+
+    const RESPONSE_READ_BYTES: usize = 16 * 1024;
+
+    /// Native outbound HTTP implementation for Spin's WASI HTTP 0.3 host.
+    #[derive(Clone)]
+    pub struct SpinOutboundClient {
+        clock: MonotonicClock,
+    }
+
+    struct PreparedRequest {
+        budget: DispatchBudget,
+        parts: OutboundRequestParts,
+    }
+
+    impl SpinOutboundClient {
+        /// Builds a client using the process-default monotonic clock.
+        #[must_use]
+        #[inline]
+        pub fn new() -> Self {
+            Self::with_clock(MonotonicClock::default())
+        }
+
+        /// Builds a client that evaluates every outbound lifetime against `clock`.
+        #[must_use]
+        #[inline]
+        pub fn with_clock(clock: MonotonicClock) -> Self {
+            Self { clock }
+        }
+
+        fn prepare(
+            request: OutboundRequest,
+            started_at: MonotonicInstant,
+        ) -> Result<PreparedRequest, EdgeError> {
+            super::validate_request(&request)?;
+            Self::prepare_validated(request, started_at, None)
+        }
+
+        fn prepare_batch(
+            request: OutboundRequest,
+            started_at: MonotonicInstant,
+            cutoff: Deadline,
+        ) -> Result<PreparedRequest, EdgeError> {
+            super::validate_batch_request(&request)?;
+            Self::prepare_validated(request, started_at, Some(cutoff))
+        }
+
+        fn prepare_validated(
+            mut request: OutboundRequest,
+            started_at: MonotonicInstant,
+            batch_cutoff: Option<Deadline>,
+        ) -> Result<PreparedRequest, EdgeError> {
+            let budget = dispatch_budget(&request, started_at, batch_cutoff)?;
+            normalize_for_dispatch(&mut request)?;
+            Ok(PreparedRequest {
+                budget,
+                parts: request.into_parts(),
+            })
+        }
+
+        async fn execute(&self, prepared: PreparedRequest) -> Result<OutboundResponse, EdgeError> {
+            let PreparedRequest { budget, parts } = prepared;
+            let OutboundRequestParts {
+                body,
+                mut headers,
+                max_brotli_decoder_bytes,
+                max_brotli_window_bits,
+                max_chunk_bytes,
+                max_decoded_response_bytes,
+                max_encoded_response_bytes,
+                max_request_body_bytes,
+                max_response_header_bytes,
+                max_response_header_count,
+                method,
+                response_mode,
+                uri,
+                ..
+            } = parts;
+
+            if !headers.contains_key(ACCEPT_ENCODING) {
+                headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+            }
+
+            let fields = request_fields(&headers)?;
+            let options = request_options(budget, &self.clock)?;
+            let (writer, contents, trailers) = BodyWriter::new();
+            let (request, request_done) =
+                Request::new(fields, Some(contents), trailers, Some(options));
+            set_request_target(&request, &method, &uri)?;
+            let exchange = async move {
+                let upload = pump_request_body(
+                    body,
+                    max_request_body_bytes,
+                    writer,
+                    budget,
+                    self.clock.clone(),
+                );
+                let send = client::send(request);
+                run_exchange(send, upload, request_done, |error| {
+                    map_spin_send_error(error, budget.deadline, budget.cause, self.clock.now())
+                })
+                .await
+            };
+            let response = race_deadline(exchange, budget, &self.clock).await??;
+
+            process_response(
+                response,
+                method,
+                response_mode,
+                budget,
+                max_brotli_decoder_bytes,
+                max_brotli_window_bits,
+                max_chunk_bytes,
+                max_decoded_response_bytes,
+                max_encoded_response_bytes,
+                max_response_header_bytes,
+                max_response_header_count,
+                self.clock.clone(),
+            )
+            .await
+        }
+    }
+
+    impl Default for SpinOutboundClient {
+        #[inline]
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl OutboundHttpClient for SpinOutboundClient {
+        #[inline]
+        async fn send(&self, request: OutboundRequest) -> Result<OutboundResponse, EdgeError> {
+            let started_at = self.clock.now();
+            let prepared = Self::prepare(request, started_at)?;
+            self.execute(prepared).await
+        }
+
+        #[inline]
+        fn start_batch_until(
+            &self,
+            requests: Vec<OutboundRequest>,
+            cutoff: Deadline,
+        ) -> OutboundBatch {
+            let batch_started_at = self.clock.now();
+            let slot_count = requests.len();
+            if cutoff.is_expired_at(batch_started_at) {
+                return OutboundBatch::cutoff(slot_count);
+            }
+
+            let mut completed = Vec::new();
+            let pending_slots = FuturesUnordered::<LocalBoxFuture<'static, _>>::new();
+            for (index, request) in requests.into_iter().enumerate() {
+                match Self::prepare_batch(request, batch_started_at, cutoff) {
+                    Ok(prepared) => {
+                        let client = self.clone();
+                        pending_slots.push(
+                            async move {
+                                let outcome = client.execute(prepared).await;
+                                (index, client.clock.now(), outcome)
+                            }
+                            .boxed_local(),
+                        );
+                    }
+                    Err(error) => completed.push((index, self.clock.now(), Err(error))),
+                }
+            }
+
+            let completions = stream! {
+                let mut pending = pending_slots;
+                poll_fn(|context| {
+                    loop {
+                        match pending.poll_next_unpin(context) {
+                            Poll::Ready(Some(item)) => completed.push(item),
+                            Poll::Ready(None) | Poll::Pending => {
+                                return Poll::Ready(());
+                            }
+                        }
+                    }
+                }).await;
+
+                for (index, completed_at, outcome) in completed {
+                    let Some(item) = finish_batch_item(
+                        index,
+                        batch_started_at,
+                        completed_at,
+                        cutoff,
+                        outcome,
+                    ) else {
+                        yield OutboundBatchDriverEvent::Cutoff;
+                        return;
+                    };
+                    yield OutboundBatchDriverEvent::Item(item);
+                }
+
+                while let Some((index, completed_at, outcome)) = pending.next().await {
+                    let Some(item) = finish_batch_item(
+                        index,
+                        batch_started_at,
+                        completed_at,
+                        cutoff,
+                        outcome,
+                    ) else {
+                        yield OutboundBatchDriverEvent::Cutoff;
+                        return;
+                    };
+                    yield OutboundBatchDriverEvent::Item(item);
+                }
+            };
+            OutboundBatch::from_driver(slot_count, completions)
+        }
+    }
+
+    fn request_fields(headers: &HeaderMap) -> Result<Fields, EdgeError> {
+        let fields = Fields::new();
+        for (name, value) in headers {
+            fields
+                .append(name.as_str(), value.as_bytes())
+                .map_err(|_error| {
+                    EdgeError::bad_request("Spin rejected an outbound request header")
+                })?;
+        }
+        Ok(fields)
+    }
+
+    fn request_options(
+        budget: DispatchBudget,
+        clock: &MonotonicClock,
+    ) -> Result<RequestOptions, EdgeError> {
+        let options = RequestOptions::new();
+        let remaining = budget_remaining(budget, clock)?;
+        let timeouts = super::request_timeouts(remaining);
+        set_timeout_option(
+            "connect",
+            &options.set_connect_timeout(Some(timeouts.connect())),
+        )?;
+        set_timeout_option(
+            "first-byte",
+            &options.set_first_byte_timeout(Some(timeouts.first_byte())),
+        )?;
+        set_timeout_option(
+            "between-bytes",
+            &options.set_between_bytes_timeout(Some(timeouts.between_bytes())),
+        )?;
+        Ok(options)
+    }
+
+    fn set_timeout_option(
+        name: &str,
+        outcome: &Result<(), RequestOptionsError>,
+    ) -> Result<(), EdgeError> {
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(RequestOptionsError::NotSupported) => {
+                log::debug!("Spin host does not support the outbound {name} timeout option");
+                Ok(())
+            }
+            Err(RequestOptionsError::Immutable) => Err(EdgeError::internal(anyhow::anyhow!(
+                "Spin outbound {name} timeout option is immutable"
+            ))),
+            Err(RequestOptionsError::Other(_)) => Err(EdgeError::internal(anyhow::anyhow!(
+                "Spin host rejected the outbound {name} timeout option"
+            ))),
+        }
+    }
+
+    fn set_request_target(request: &Request, method: &Method, uri: &Uri) -> Result<(), EdgeError> {
+        request
+            .set_method(&wasi_method(method))
+            .map_err(|()| EdgeError::bad_request("Spin rejected the outbound request method"))?;
+        let scheme = match uri.scheme_str() {
+            Some("http") => Scheme::Http,
+            Some("https") => Scheme::Https,
+            Some(other) => Scheme::Other(other.to_owned()),
+            None => return Err(EdgeError::bad_request("outbound request URI has no scheme")),
+        };
+        request
+            .set_scheme(Some(&scheme))
+            .map_err(|()| EdgeError::bad_request("Spin rejected the outbound request scheme"))?;
+        let authority = uri
+            .authority()
+            .ok_or_else(|| EdgeError::bad_request("outbound request URI has no authority"))?;
+        request
+            .set_authority(Some(authority.as_str()))
+            .map_err(|()| EdgeError::bad_request("Spin rejected the outbound request authority"))?;
+        request
+            .set_path_with_query(Some(
+                uri.path_and_query()
+                    .map_or("/", |path_and_query| path_and_query.as_str()),
+            ))
+            .map_err(|()| EdgeError::bad_request("Spin rejected the outbound request path"))?;
+        Ok(())
+    }
+
+    fn wasi_method(method: &Method) -> WasiMethod {
+        match *method {
+            Method::GET => WasiMethod::Get,
+            Method::HEAD => WasiMethod::Head,
+            Method::POST => WasiMethod::Post,
+            Method::PUT => WasiMethod::Put,
+            Method::DELETE => WasiMethod::Delete,
+            Method::CONNECT => WasiMethod::Connect,
+            Method::OPTIONS => WasiMethod::Options,
+            Method::TRACE => WasiMethod::Trace,
+            Method::PATCH => WasiMethod::Patch,
+            _ => WasiMethod::Other(method.as_str().to_owned()),
+        }
+    }
+
+    async fn pump_request_body(
+        body: Body,
+        maximum: u64,
+        writer: BodyWriter,
+        budget: DispatchBudget,
+        clock: MonotonicClock,
+    ) -> Result<UploadCompletion, EdgeError> {
+        let BodyWriter {
+            mut stream_writer,
+            result_writer,
+            ..
+        } = writer;
+        let mut total = 0_u64;
+        let mut source = match body {
+            Body::Once(bytes) => once(async move { Ok(bytes) }).boxed_local(),
+            Body::Stream(source) => source,
+        };
+
+        // `BodyWriter` configures `result_writer` to publish a typed host error on drop.
+        // Deadline returns can therefore signal failure without awaiting after budget expiry.
+        while let Some(item) = source.next().await {
+            budget_remaining(budget, &clock)?;
+            let bytes = match item {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    drop(stream_writer);
+                    signal_upload_failure(result_writer, ErrorCode::InternalError(None)).await;
+                    return Err(error);
+                }
+            };
+            let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            let Some(next_total) = total.checked_add(length) else {
+                drop(stream_writer);
+                signal_upload_failure(result_writer, ErrorCode::HttpRequestBodySize(None)).await;
+                return Err(EdgeError::bad_request(
+                    "outbound request body size accounting overflow",
+                ));
+            };
+            if next_total > maximum {
+                drop(stream_writer);
+                signal_upload_failure(
+                    result_writer,
+                    ErrorCode::HttpRequestBodySize(Some(next_total)),
+                )
+                .await;
+                return Err(EdgeError::bad_request(
+                    "outbound request body exceeded configured limit",
+                ));
+            }
+            let unwritten = stream_writer.write_all(bytes.to_vec()).await;
+            budget_remaining(budget, &clock)?;
+            if !unwritten.is_empty() {
+                drop(stream_writer);
+                drop(result_writer.write(Ok(None)).await);
+                return Ok(UploadCompletion::ReaderGone);
+            }
+            total = next_total;
+            cooperative_yield_once().await;
+        }
+
+        drop(stream_writer);
+        if result_writer.write(Ok(None)).await.is_err() {
+            return Ok(UploadCompletion::ReaderGone);
+        }
+        Ok(UploadCompletion::Complete)
+    }
+
+    async fn signal_upload_failure(
+        writer: FutureWriter<Result<Option<Fields>, ErrorCode>>,
+        error: ErrorCode,
+    ) {
+        match writer.write(Err(error)).await {
+            Ok(()) | Err(_) => {}
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the adapter consumes independent response-policy fields"
+    )]
+    async fn process_response(
+        response: Response,
+        request_method: Method,
+        response_mode: ResponseMode,
+        budget: DispatchBudget,
+        max_brotli_decoder_bytes: u64,
+        max_brotli_window_bits: u8,
+        max_chunk_bytes: Option<NonZeroU64>,
+        max_decoded_response_bytes: Option<u64>,
+        max_encoded_response_bytes: Option<u64>,
+        max_response_header_bytes: Option<u64>,
+        max_response_header_count: Option<u64>,
+        clock: MonotonicClock,
+    ) -> Result<OutboundResponse, EdgeError> {
+        budget_remaining(budget, &clock)?;
+        let response_clock = clock.clone();
+        let status = StatusCode::from_u16(response.get_status_code()).map_err(|_error| {
+            EdgeError::bad_gateway_with_reason(
+                "Spin returned an invalid upstream status code",
+                BadGatewayReason::Protocol,
+            )
+        })?;
+        let mut headers = response_headers(&response)?;
+        let mut header_limiter =
+            ResponseHeaderLimiter::new(max_response_header_bytes, max_response_header_count);
+        header_limiter.observe(&headers)?;
+        let disposition = normalize_response_headers(&request_method, status, &mut headers)?;
+        insert_proxy_header(
+            &mut headers,
+            &mut header_limiter,
+            HeaderValue::from_static("spin"),
+        )?;
+
+        let native = response_stream(response, budget, clock.clone());
+        if disposition == ResponseBodyDisposition::FramingBodyless {
+            return Ok(OutboundResponse::new_with_monotonic_clock(
+                request_method,
+                status,
+                headers,
+                Body::empty(),
+                response_clock,
+            ));
+        }
+
+        let declared_reset_body = matches!(
+            disposition,
+            ResponseBodyDisposition::ResetContent {
+                declared_body: true
+            }
+        );
+        if matches!(disposition, ResponseBodyDisposition::ResetContent { .. }) {
+            settle_reset_content(native, declared_reset_body).await?;
+            return Ok(OutboundResponse::new_with_monotonic_clock(
+                request_method,
+                status,
+                headers,
+                Body::empty(),
+                response_clock,
+            ));
+        }
+
+        let encoding = classify_content_encoding(&headers);
+        let max_buffered = match response_mode {
+            ResponseMode::Buffered { max_bytes } => Some(max_bytes),
+            ResponseMode::Streamed => None,
+        };
+        enforce_payload_content_length(
+            &headers,
+            encoding,
+            max_buffered,
+            max_decoded_response_bytes,
+            max_encoded_response_bytes,
+        )?;
+        let encoded = limit_encoded_stream(native, max_encoded_response_bytes);
+        let decoded = match encoding {
+            ContentEncoding::Brotli => {
+                decode_brotli_stream(encoded, max_brotli_window_bits, max_brotli_decoder_bytes)
+            }
+            ContentEncoding::Gzip => decode_gzip_stream(encoded),
+            ContentEncoding::Identity | ContentEncoding::Passthrough => encoded,
+        };
+        if matches!(encoding, ContentEncoding::Brotli | ContentEncoding::Gzip) {
+            headers.remove(CONTENT_ENCODING);
+            headers.remove(CONTENT_LENGTH);
+        }
+        let output = match encoding {
+            ContentEncoding::Brotli | ContentEncoding::Gzip | ContentEncoding::Identity => {
+                limit_decoded_stream(decoded, max_decoded_response_bytes)
+            }
+            ContentEncoding::Passthrough => decoded,
+        };
+        let shaped = rechunk_stream(output, max_chunk_bytes);
+        let deadline_bound = deadline_stream(super::cooperative_stream(shaped), budget, clock);
+        let body = match response_mode {
+            ResponseMode::Buffered { max_bytes } => {
+                Body::from(collect_response_stream(deadline_bound, max_bytes).await?)
+            }
+            ResponseMode::Streamed => Body::from_stream(deadline_bound),
+        };
+        Ok(OutboundResponse::new_with_monotonic_clock(
+            request_method,
+            status,
+            headers,
+            body,
+            response_clock,
+        ))
+    }
+
+    fn response_headers(response: &Response) -> Result<HeaderMap, EdgeError> {
+        let fields = response.get_headers();
+        let mut headers = HeaderMap::new();
+        for (raw_name, raw_value) in fields.copy_all() {
+            let header_name = HeaderName::from_bytes(raw_name.as_bytes()).map_err(|_error| {
+                EdgeError::bad_gateway_with_reason(
+                    "Spin returned an invalid upstream header name",
+                    BadGatewayReason::Protocol,
+                )
+            })?;
+            let header_value = HeaderValue::from_bytes(&raw_value).map_err(|_error| {
+                EdgeError::bad_gateway_with_reason(
+                    "Spin returned an invalid upstream header value",
+                    BadGatewayReason::Protocol,
+                )
+            })?;
+            headers.append(header_name, header_value);
+        }
+        Ok(headers)
+    }
+
+    fn default_response_result() -> Result<(), ErrorCode> {
+        Err(ErrorCode::InternalError(Some(
+            "response body consumer dropped before completion".to_owned(),
+        )))
+    }
+
+    fn response_stream(
+        response: Response,
+        budget: DispatchBudget,
+        clock: MonotonicClock,
+    ) -> BodyStream {
+        let (completion_writer, result_reader) = wit_future::new(default_response_result);
+        let (mut body_reader, trailer_reader) = Response::consume_body(response, result_reader);
+        stream! {
+            let mut ready_reads = 0_usize;
+            loop {
+                let read = body_reader.read(Vec::with_capacity(RESPONSE_READ_BYTES));
+                let (result, chunk) = match race_deadline(read, budget, &clock).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+                match result {
+                    StreamResult::Complete(length) => {
+                        if should_emit_response_chunk(length) {
+                            yield Ok(Bytes::from(chunk));
+                        }
+                        cooperate_after_response_read(&mut ready_reads).await;
+                    }
+                    StreamResult::Dropped => {
+                        let trailer_result = race_deadline(
+                            async move { trailer_reader.await },
+                            budget,
+                            &clock,
+                        )
+                        .await;
+                        match trailer_result {
+                            Ok(Ok(_trailers)) => {}
+                            Ok(Err(error)) => {
+                                yield Err(map_spin_send_error(
+                                    &error,
+                                    budget.deadline,
+                                    budget.cause,
+                                    clock.now(),
+                                ));
+                                return;
+                            }
+                            Err(error) => {
+                                yield Err(error);
+                                return;
+                            }
+                        }
+                        let completion = completion_writer.write(Ok(()));
+                        match race_deadline(completion, budget, &clock).await {
+                            Ok(Ok(())) => return,
+                            Ok(Err(_closed)) => {
+                                yield Err(EdgeError::bad_gateway_with_reason(
+                                    "Spin response completion reader closed",
+                                    BadGatewayReason::Protocol,
+                                ));
+                                return;
+                            }
+                            Err(error) => {
+                                yield Err(error);
+                                return;
+                            }
+                        }
+                    }
+                    StreamResult::Cancelled => {
+                        yield Err(EdgeError::bad_gateway_with_reason(
+                            "Spin cancelled the upstream response body read",
+                            BadGatewayReason::Transport,
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        .boxed_local()
+    }
+
+    fn deadline_stream(
+        mut source: BodyStream,
+        budget: DispatchBudget,
+        clock: MonotonicClock,
+    ) -> BodyStream {
+        stream! {
+            loop {
+                let next_item = match race_deadline(source.next(), budget, &clock).await {
+                    Ok(item) => item,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
+                match next_item {
+                    Some(Ok(bytes)) => yield Ok(bytes),
+                    Some(Err(error)) => {
+                        yield Err(error);
+                        return;
+                    }
+                    None => return,
+                }
+            }
+        }
+        .boxed_local()
+    }
+
+    async fn race_deadline<Output>(
+        future: impl Future<Output = Output>,
+        budget: DispatchBudget,
+        clock: &MonotonicClock,
+    ) -> Result<Output, EdgeError> {
+        let remaining = budget_remaining(budget, clock)?;
+        let timer = sleep(remaining);
+        futures_util::pin_mut!(future, timer);
+        let output = match select(future, timer).await {
+            Either::Left((output, _timer)) => output,
+            Either::Right(((), _future)) => return Err(timeout_error(budget.cause)),
+        };
+        budget_remaining(budget, clock)?;
+        Ok(output)
+    }
+
+    fn budget_remaining(
+        budget: DispatchBudget,
+        clock: &MonotonicClock,
+    ) -> Result<Duration, EdgeError> {
+        budget
+            .deadline
+            .remaining_at(clock.now())
+            .map(|remaining| remaining.min(budget.duration))
+            .ok_or_else(|| timeout_error(budget.cause))
+    }
+
+    /// Runs request-option, response-clock, and fairness checks in the hosted contract binary.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    #[inline]
+    pub async fn deferred_clock_paths_hold_for_test() -> bool {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let start = MonotonicInstant::now();
+        let Ok(request) = OutboundRequest::get("https://example.com/") else {
+            return false;
+        };
+        let Ok(budget) = dispatch_budget(&request.timeout(Duration::from_millis(10)), start, None)
+        else {
+            return false;
+        };
+        let observed = start.checked_add(Duration::from_millis(3)).unwrap_or(start);
+        let option_observations = Arc::new(AtomicUsize::new(0));
+        let observed_options = Arc::clone(&option_observations);
+        let option_clock = MonotonicClock::new(move || {
+            observed_options.fetch_add(1, Ordering::SeqCst);
+            observed
+        });
+        if request_options(budget, &option_clock).is_err()
+            || option_observations.load(Ordering::SeqCst) != 1
+        {
+            return false;
+        }
+
+        let mut ready_reads = 0_usize;
+        for _ in 0..super::READY_ITEM_YIELD_QUOTA {
+            cooperate_after_response_read(&mut ready_reads).await;
+        }
+        if ready_reads != 0 {
+            return false;
+        }
+
+        let stream_observations = Arc::new(AtomicUsize::new(0));
+        let observed_stream = Arc::clone(&stream_observations);
+        let deadline = budget.deadline.instant();
+        let stream_clock = MonotonicClock::new(move || {
+            if observed_stream.fetch_add(1, Ordering::SeqCst) == 0 {
+                start
+            } else {
+                deadline
+            }
+        });
+        let source = once(async { Ok(Bytes::from_static(b"body")) }).boxed_local();
+        let mut body = deadline_stream(source, budget, stream_clock);
+
+        matches!(
+            body.next().await,
+            Some(Err(EdgeError::GatewayTimeout { .. }))
+        )
+    }
+
+    #[cfg(test)]
+    mod clock_tests {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        use edgezero_core::error::BudgetSource;
+        use edgezero_core::time::Deadline;
+        use futures::executor::block_on;
+        use futures_util::stream;
+
+        use super::*;
+
+        fn scripted_clock(script: Vec<MonotonicInstant>) -> MonotonicClock {
+            let observations = Arc::new(Mutex::new(VecDeque::from(script)));
+            MonotonicClock::new(move || {
+                observations
+                    .lock()
+                    .expect("clock observations")
+                    .pop_front()
+                    .expect("clock observation")
+            })
+        }
+
+        fn test_budget(start: MonotonicInstant, duration: Duration) -> DispatchBudget {
+            DispatchBudget {
+                cause: BudgetSource::PerCallTimeout,
+                deadline: Deadline::at_instant(start.checked_add(duration).expect("deadline")),
+                duration,
+            }
+        }
+
+        #[test]
+        fn method_entry_and_preflight_elapsed_use_the_injected_clock() {
+            let start = MonotonicInstant::now();
+            let completed = start
+                .checked_add(Duration::from_millis(9))
+                .expect("completed instant");
+            let client = SpinOutboundClient::with_clock(scripted_clock(vec![start, completed]));
+            let request = OutboundRequest::get("https://example.com/")
+                .expect("request")
+                .stream_response();
+
+            let results = block_on(
+                client
+                    .start_batch_until(
+                        vec![request],
+                        Deadline::at_instant(
+                            start
+                                .checked_add(Duration::from_secs(1))
+                                .expect("cutoff instant"),
+                        ),
+                    )
+                    .collect(),
+            )
+            .expect("valid batch driver");
+
+            let slot = results.slots[0].as_ref().expect("resolved slot");
+            assert_eq!(slot.elapsed, Duration::from_millis(9));
+            assert!(matches!(slot.outcome, Err(EdgeError::BadRequest { .. })));
+        }
+
+        #[test]
+        fn backwards_clock_fails_slot_without_invalid_elapsed() {
+            let start = MonotonicInstant::now();
+            let earlier = start
+                .checked_sub(Duration::from_millis(1))
+                .expect("earlier instant");
+            let client = SpinOutboundClient::with_clock(scripted_clock(vec![start, earlier]));
+            let request = OutboundRequest::get("https://example.com/")
+                .expect("request")
+                .stream_response();
+
+            let results = block_on(
+                client
+                    .start_batch_until(
+                        vec![request],
+                        Deadline::at_instant(
+                            start
+                                .checked_add(Duration::from_secs(1))
+                                .expect("cutoff instant"),
+                        ),
+                    )
+                    .collect(),
+            )
+            .expect("valid batch driver");
+
+            let slot = results.slots[0].as_ref().expect("resolved slot");
+            assert_eq!(slot.elapsed, Duration::ZERO);
+            assert!(matches!(slot.outcome, Err(EdgeError::Internal { .. })));
+        }
+
+        #[test]
+        fn backwards_clock_cannot_expand_the_selected_budget() {
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_millis(10));
+            let earlier = start
+                .checked_sub(Duration::from_millis(5))
+                .expect("earlier instant");
+            let clock = scripted_clock(vec![earlier]);
+
+            assert_eq!(
+                budget_remaining(budget, &clock).expect("remaining budget"),
+                budget.duration
+            );
+        }
+
+        #[test]
+        fn request_option_preparation_consumes_injected_budget() {
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_millis(10));
+            let observed = start
+                .checked_add(Duration::from_millis(3))
+                .expect("observed instant");
+            let observations = Arc::new(Mutex::new(VecDeque::from([observed])));
+            let clock_observations = Arc::clone(&observations);
+            let clock = MonotonicClock::new(move || {
+                clock_observations
+                    .lock()
+                    .expect("clock observations")
+                    .pop_front()
+                    .expect("clock observation")
+            });
+
+            let _options = request_options(budget, &clock).expect("request options");
+
+            assert!(observations.lock().expect("clock observations").is_empty());
+        }
+
+        #[test]
+        fn response_stream_retains_clock_for_post_ready_expiry() {
+            let start = MonotonicInstant::now();
+            let budget = test_budget(start, Duration::from_millis(10));
+            let clock = scripted_clock(vec![start, budget.deadline.instant()]);
+            let source = stream::once(async { Ok(Bytes::from_static(b"body")) }).boxed_local();
+            let mut body = deadline_stream(source, budget, clock);
+
+            let error = block_on(body.next())
+                .expect("terminal item")
+                .expect_err("post-ready expiry");
+
+            assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+        }
+    }
+}
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub use spin_impl::SpinOutboundClient;
+#[cfg(all(feature = "spin", target_arch = "wasm32", feature = "test-utils"))]
+pub use spin_impl::deferred_clock_paths_hold_for_test;
+
+#[cfg(all(feature = "spin", any(feature = "test-utils", target_arch = "wasm32")))]
+fn map_spin_send_error(
+    error: &ErrorCode,
+    deadline: Deadline,
+    cause: BudgetSource,
+    observed_at: edgezero_core::MonotonicInstant,
+) -> EdgeError {
+    if deadline.is_expired_at(observed_at) {
+        return timeout_error(cause);
+    }
+
+    match error {
+        ErrorCode::DnsTimeout
+        | ErrorCode::ConnectionTimeout
+        | ErrorCode::ConnectionReadTimeout
+        | ErrorCode::ConnectionWriteTimeout
+        | ErrorCode::HttpResponseTimeout => timeout_error(BudgetSource::Unspecified),
+        ErrorCode::HttpRequestDenied
+        | ErrorCode::HttpRequestBodySize(_)
+        | ErrorCode::HttpRequestUriTooLong
+        | ErrorCode::HttpRequestHeaderSectionSize(_)
+        | ErrorCode::HttpRequestHeaderSize(_) => {
+            EdgeError::bad_request("outbound request was rejected by the Spin HTTP host")
+        }
+        ErrorCode::HttpRequestLengthRequired
+        | ErrorCode::HttpRequestMethodInvalid
+        | ErrorCode::HttpRequestUriInvalid
+        | ErrorCode::HttpRequestTrailerSectionSize(_)
+        | ErrorCode::HttpRequestTrailerSize(_)
+        | ErrorCode::ConfigurationError => EdgeError::internal(anyhow::anyhow!(
+            "Spin rejected an adapter-owned outbound request invariant"
+        )),
+        ErrorCode::DnsError(_)
+        | ErrorCode::DestinationNotFound
+        | ErrorCode::DestinationUnavailable
+        | ErrorCode::DestinationIpProhibited
+        | ErrorCode::DestinationIpUnroutable
+        | ErrorCode::ConnectionRefused
+        | ErrorCode::ConnectionLimitReached
+        | ErrorCode::TlsProtocolError
+        | ErrorCode::TlsCertificateError
+        | ErrorCode::TlsAlertReceived(_) => EdgeError::bad_gateway_with_reason(
+            "outbound destination could not be reached",
+            BadGatewayReason::Unreachable,
+        ),
+        ErrorCode::ConnectionTerminated => EdgeError::bad_gateway_with_reason(
+            "outbound connection failed after dispatch",
+            BadGatewayReason::Transport,
+        ),
+        ErrorCode::HttpResponseIncomplete
+        | ErrorCode::HttpResponseHeaderSectionSize(_)
+        | ErrorCode::HttpResponseHeaderSize(_)
+        | ErrorCode::HttpResponseBodySize(_)
+        | ErrorCode::HttpResponseTrailerSectionSize(_)
+        | ErrorCode::HttpResponseTrailerSize(_)
+        | ErrorCode::HttpResponseTransferCoding(_)
+        | ErrorCode::HttpResponseContentCoding(_)
+        | ErrorCode::HttpUpgradeFailed
+        | ErrorCode::HttpProtocolError
+        | ErrorCode::LoopDetected => EdgeError::bad_gateway_with_reason(
+            "upstream response violated the HTTP protocol",
+            BadGatewayReason::Protocol,
+        ),
+        ErrorCode::InternalError(_) => EdgeError::bad_gateway_with_reason(
+            "Spin outbound HTTP host failed",
+            BadGatewayReason::Unspecified,
+        ),
+    }
+}
+
+#[cfg(all(feature = "spin", any(feature = "test-utils", target_arch = "wasm32")))]
+fn timeout_error(cause: BudgetSource) -> EdgeError {
+    EdgeError::gateway_timeout_caused("outbound request deadline expired", cause)
+}
+
+#[cfg(any(feature = "test-utils", all(feature = "spin", target_arch = "wasm32")))]
+fn validate_batch_request(request: &OutboundRequest) -> Result<(), EdgeError> {
+    validate_request(request)?;
+    if request.is_stream_body() {
+        return Err(EdgeError::bad_request(
+            "outbound batches require buffered request bodies; use send for a streamed upload",
+        ));
+    }
+    if request.is_stream_response() {
+        return Err(EdgeError::bad_request(
+            "outbound batches require buffered responses; use send for a streamed response",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "test-utils", all(feature = "spin", target_arch = "wasm32")))]
+fn validate_request(request: &OutboundRequest) -> Result<(), EdgeError> {
+    validate_for_dispatch(request)?;
+    if request.has_host_authority_override() {
+        return Err(EdgeError::bad_request(
+            "Spin cannot separate the outbound Host authority from the connection target",
+        ));
+    }
+    Ok(())
+}
+
+/// Runs the target-neutral Spin batch preflight contract in native tests.
+///
+/// # Errors
+/// Returns the same portable validation or batch-shape error as production dispatch.
+#[cfg(feature = "test-utils")]
+#[inline]
+pub fn validate_batch_request_for_test(request: &OutboundRequest) -> Result<(), EdgeError> {
+    validate_batch_request(request)
+}
+
+/// Runs the target-neutral Spin request policy before any provider dispatch.
+///
+/// # Errors
+/// Returns the same portable validation or unsupported-authority error as production dispatch.
+#[cfg(feature = "test-utils")]
+#[inline]
+pub fn validate_request_for_test(request: &OutboundRequest) -> Result<(), EdgeError> {
+    validate_request(request)
+}
+
+/// Exposes the real pinned SDK classifier to WASI resource contract tests.
+#[cfg(all(feature = "spin", feature = "test-utils"))]
+#[must_use]
+#[inline]
+pub fn map_spin_send_error_for_test(
+    error: &ErrorCode,
+    deadline: Deadline,
+    cause: BudgetSource,
+    observed_at: edgezero_core::MonotonicInstant,
+) -> EdgeError {
+    map_spin_send_error(error, deadline, cause, observed_at)
+}
+
+#[cfg(test)]
+mod exchange_tests {
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use futures::executor::block_on;
+
+    use super::{
+        EdgeError, READY_ITEM_YIELD_QUOTA, UploadCompletion, cooperate_after_response_read,
+        cooperative_stream, cooperative_yield_once, duration_nanos, request_timeouts, run_exchange,
+        settle_reset_content, should_emit_response_chunk,
+    };
+
+    struct ScriptedFuture<Output> {
+        drops: Rc<Cell<u32>>,
+        polls: Rc<Cell<u32>>,
+        steps: VecDeque<Poll<Output>>,
+    }
+
+    impl<Output> Unpin for ScriptedFuture<Output> {}
+
+    impl<Output> ScriptedFuture<Output> {
+        fn new(
+            steps: impl IntoIterator<Item = Poll<Output>>,
+            polls: Rc<Cell<u32>>,
+            drops: Rc<Cell<u32>>,
+        ) -> Self {
+            Self {
+                drops,
+                polls,
+                steps: steps.into_iter().collect(),
+            }
+        }
+    }
+
+    impl<Output> Future for ScriptedFuture<Output> {
+        type Output = Output;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.set(self.polls.get().saturating_add(1));
+            let step = self.steps.pop_front().expect("scripted future exhausted");
+            if step.is_pending() {
+                cx.waker().wake_by_ref();
+            }
+            step
+        }
+    }
+
+    impl<Output> Drop for ScriptedFuture<Output> {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get().saturating_add(1));
+        }
+    }
+
+    fn counters() -> (Rc<Cell<u32>>, Rc<Cell<u32>>) {
+        (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)))
+    }
+
+    fn map_host_error(_error: &&'static str) -> EdgeError {
+        EdgeError::bad_gateway("scripted host failure")
+    }
+
+    #[test]
+    fn continuously_ready_chunks_yield_after_each_item() {
+        use futures_util::StreamExt as _;
+        use futures_util::stream;
+        use futures_util::task::noop_waker;
+
+        let processed = Rc::new(Cell::new(0_u32));
+        let observed = Rc::clone(&processed);
+        let mut source = stream::iter([(), (), ()]);
+        let mut pump = Box::pin(async move {
+            while source.next().await.is_some() {
+                observed.set(observed.get().saturating_add(1));
+                cooperative_yield_once().await;
+            }
+        });
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(pump.as_mut().poll(&mut context).is_pending());
+        assert_eq!(processed.get(), 1);
+        assert!(pump.as_mut().poll(&mut context).is_pending());
+        assert_eq!(processed.get(), 2);
+        assert!(pump.as_mut().poll(&mut context).is_pending());
+        assert_eq!(processed.get(), 3);
+        assert!(pump.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn request_timeouts_use_full_remaining_budget_for_every_phase() {
+        let timeouts = request_timeouts(Duration::from_millis(40));
+        assert_eq!(timeouts.connect(), 40_000_000);
+        assert_eq!(timeouts.first_byte(), 40_000_000);
+        assert_eq!(timeouts.between_bytes(), 40_000_000);
+    }
+
+    #[test]
+    fn duration_nanos_floors_and_saturates_without_wrapping() {
+        assert_eq!(duration_nanos(Duration::ZERO), 1);
+        assert_eq!(duration_nanos(Duration::from_nanos(1)), 1);
+        assert_eq!(duration_nanos(Duration::from_nanos(999)), 999);
+        assert_eq!(duration_nanos(Duration::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn cooperative_stream_stops_after_the_first_error() {
+        use bytes::Bytes;
+        use futures_util::StreamExt as _;
+        use futures_util::stream;
+
+        let source = stream::iter([
+            Err(EdgeError::bad_gateway("terminal")),
+            Ok(Bytes::from_static(b"must not escape")),
+        ])
+        .boxed_local();
+        let mut cooperative = cooperative_stream(source);
+
+        assert!(matches!(
+            block_on(cooperative.next()),
+            Some(Err(EdgeError::BadGateway { .. }))
+        ));
+        assert!(block_on(cooperative.next()).is_none());
+    }
+
+    #[test]
+    fn zero_length_complete_does_not_emit_an_empty_response_chunk() {
+        assert!(!should_emit_response_chunk(0));
+        assert!(should_emit_response_chunk(1));
+    }
+
+    #[test]
+    fn reset_content_settlement_is_bounded_and_releases_source() {
+        use bytes::Bytes;
+        use futures_util::StreamExt as _;
+        use futures_util::stream::poll_fn;
+
+        struct DropSignal(Rc<Cell<u32>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.set(self.0.get().saturating_add(1));
+            }
+        }
+
+        let polls = Rc::new(Cell::new(0_u32));
+        let drops = Rc::new(Cell::new(0_u32));
+        let observed_polls = Rc::clone(&polls);
+        let signal = DropSignal(Rc::clone(&drops));
+        let source = poll_fn(move |_context| {
+            let _keep_signal_alive = &signal;
+            observed_polls.set(observed_polls.get().saturating_add(1));
+            Poll::Ready(Some(Ok(Bytes::from_static(b"illegal"))))
+        })
+        .boxed_local();
+
+        block_on(settle_reset_content(source, false)).expect("205 settlement");
+
+        assert_eq!(polls.get(), 1);
+        assert_eq!(drops.get(), 1);
+
+        let declared_polls = Rc::new(Cell::new(0_u32));
+        let declared_drops = Rc::new(Cell::new(0_u32));
+        let observed_declared_polls = Rc::clone(&declared_polls);
+        let declared_signal = DropSignal(Rc::clone(&declared_drops));
+        let declared_source = poll_fn(move |_context| {
+            let _keep_signal_alive = &declared_signal;
+            observed_declared_polls.set(observed_declared_polls.get().saturating_add(1));
+            Poll::Pending::<Option<Result<Bytes, EdgeError>>>
+        })
+        .boxed_local();
+
+        block_on(settle_reset_content(declared_source, true)).expect("declared 205 settlement");
+
+        assert_eq!(declared_polls.get(), 0);
+        assert_eq!(declared_drops.get(), 1);
+
+        let error_drops = Rc::new(Cell::new(0_u32));
+        let error_signal = DropSignal(Rc::clone(&error_drops));
+        let error_source = poll_fn(move |_context| {
+            let _keep_signal_alive = &error_signal;
+            Poll::Ready(Some(Err(EdgeError::bad_gateway("205 source failed"))))
+        })
+        .boxed_local();
+
+        block_on(settle_reset_content(error_source, false)).expect_err("205 source error");
+
+        assert_eq!(error_drops.get(), 1);
+    }
+
+    #[test]
+    fn zero_length_response_reads_force_a_pending_boundary_at_the_quota() {
+        use futures_util::task::noop_waker;
+
+        let processed = Rc::new(Cell::new(0_usize));
+        let observed = Rc::clone(&processed);
+        let mut task = Box::pin(async move {
+            let mut ready_reads = 0_usize;
+            for _ in 0..READY_ITEM_YIELD_QUOTA.saturating_add(1) {
+                observed.set(observed.get().saturating_add(1));
+                cooperate_after_response_read(&mut ready_reads).await;
+            }
+        });
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(task.as_mut().poll(&mut context).is_pending());
+        assert_eq!(processed.get(), READY_ITEM_YIELD_QUOTA);
+        assert!(task.as_mut().poll(&mut context).is_ready());
+        assert_eq!(processed.get(), READY_ITEM_YIELD_QUOTA.saturating_add(1));
+    }
+
+    #[test]
+    fn cooperative_stream_forces_a_pending_boundary_at_its_quota() {
+        use std::iter::repeat_with;
+
+        use bytes::Bytes;
+        use futures_util::StreamExt as _;
+        use futures_util::stream;
+        use futures_util::task::noop_waker;
+
+        let mut source = cooperative_stream(
+            stream::iter(
+                repeat_with(|| Ok::<Bytes, EdgeError>(Bytes::new()))
+                    .take(READY_ITEM_YIELD_QUOTA.saturating_add(1)),
+            )
+            .boxed_local(),
+        );
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+
+        for _ in 0..READY_ITEM_YIELD_QUOTA {
+            assert!(matches!(
+                source.as_mut().poll_next(&mut context),
+                Poll::Ready(Some(Ok(_)))
+            ));
+        }
+        assert!(source.as_mut().poll_next(&mut context).is_pending());
+        assert!(matches!(
+            source.as_mut().poll_next(&mut context),
+            Poll::Ready(Some(Ok(_)))
+        ));
+    }
+
+    #[test]
+    fn upload_failure_wins_over_simultaneously_ready_send() {
+        let (send_polls, send_drops) = counters();
+        let (pump_polls, pump_drops) = counters();
+        let (done_polls, done_drops) = counters();
+        let send = ScriptedFuture::new(
+            [Poll::Ready(Ok(7_u8))],
+            Rc::clone(&send_polls),
+            Rc::clone(&send_drops),
+        );
+        let pump = ScriptedFuture::new(
+            [Poll::Ready(Err(EdgeError::bad_request("upload failed")))],
+            Rc::clone(&pump_polls),
+            Rc::clone(&pump_drops),
+        );
+        let done = ScriptedFuture::new(
+            [Poll::Ready(Ok(()))],
+            Rc::clone(&done_polls),
+            Rc::clone(&done_drops),
+        );
+
+        let outcome = block_on(run_exchange(send, pump, done, map_host_error));
+
+        assert!(matches!(outcome, Err(EdgeError::BadRequest { .. })));
+        assert_eq!(pump_polls.get(), 1);
+        assert_eq!(send_polls.get(), 0);
+        assert_eq!(done_polls.get(), 0);
+        assert_eq!(send_drops.get(), 1);
+        assert_eq!(pump_drops.get(), 1);
+        assert_eq!(done_drops.get(), 1);
+    }
+
+    #[test]
+    fn ready_send_after_pending_upload_is_authoritative() {
+        let (send_polls, send_drops) = counters();
+        let (pump_polls, pump_drops) = counters();
+        let (done_polls, done_drops) = counters();
+        let send = ScriptedFuture::new(
+            [Poll::Ready(Ok(7_u8))],
+            Rc::clone(&send_polls),
+            Rc::clone(&send_drops),
+        );
+        let pump = ScriptedFuture::new(
+            [
+                Poll::Pending,
+                Poll::Ready(Err(EdgeError::bad_request("late upload failure"))),
+            ],
+            Rc::clone(&pump_polls),
+            Rc::clone(&pump_drops),
+        );
+        let done = ScriptedFuture::new(
+            [Poll::Ready(Ok(()))],
+            Rc::clone(&done_polls),
+            Rc::clone(&done_drops),
+        );
+
+        let outcome = block_on(run_exchange(send, pump, done, map_host_error));
+
+        assert_eq!(outcome.expect("send result"), 7);
+        assert_eq!(pump_polls.get(), 1);
+        assert_eq!(send_polls.get(), 1);
+        assert_eq!(done_polls.get(), 0);
+        assert_eq!(send_drops.get(), 1);
+        assert_eq!(pump_drops.get(), 1);
+        assert_eq!(done_drops.get(), 1);
+    }
+
+    #[test]
+    fn request_done_error_wins_over_retained_send() {
+        let (send_polls, send_drops) = counters();
+        let (pump_polls, pump_drops) = counters();
+        let (done_polls, done_drops) = counters();
+        let send = ScriptedFuture::new(
+            [Poll::Ready(Ok(7_u8))],
+            Rc::clone(&send_polls),
+            Rc::clone(&send_drops),
+        );
+        let pump = ScriptedFuture::new(
+            [Poll::Ready(Ok(UploadCompletion::Complete))],
+            pump_polls,
+            Rc::clone(&pump_drops),
+        );
+        let done = ScriptedFuture::new(
+            [Poll::Pending, Poll::Ready(Err("request completion failed"))],
+            Rc::clone(&done_polls),
+            Rc::clone(&done_drops),
+        );
+
+        let observed_send_drops = Rc::clone(&send_drops);
+        let observed_pump_drops = Rc::clone(&pump_drops);
+        let observed_done_drops = Rc::clone(&done_drops);
+        let outcome = block_on(run_exchange(send, pump, done, move |_error| {
+            assert_eq!(observed_send_drops.get(), 1);
+            assert_eq!(observed_pump_drops.get(), 1);
+            assert_eq!(observed_done_drops.get(), 1);
+            EdgeError::bad_gateway("scripted host failure")
+        }));
+
+        assert!(matches!(outcome, Err(EdgeError::BadGateway { .. })));
+        assert_eq!(send_polls.get(), 1);
+        assert_eq!(done_polls.get(), 2);
+    }
+
+    #[test]
+    fn request_done_success_releases_retained_send_without_repolling_it() {
+        let (send_polls, send_drops) = counters();
+        let (pump_polls, pump_drops) = counters();
+        let (done_polls, done_drops) = counters();
+        let send = ScriptedFuture::new([Poll::Ready(Ok(7_u8))], Rc::clone(&send_polls), send_drops);
+        let pump = ScriptedFuture::new(
+            [Poll::Ready(Ok(UploadCompletion::Complete))],
+            pump_polls,
+            pump_drops,
+        );
+        let done = ScriptedFuture::new(
+            [Poll::Pending, Poll::Ready(Ok(()))],
+            Rc::clone(&done_polls),
+            done_drops,
+        );
+
+        let outcome = block_on(run_exchange(send, pump, done, map_host_error));
+
+        assert_eq!(outcome.expect("retained send result"), 7);
+        assert_eq!(send_polls.get(), 1);
+        assert_eq!(done_polls.get(), 2);
+    }
+
+    #[test]
+    fn reader_gone_never_polls_request_done() {
+        let (send_polls, send_drops) = counters();
+        let (pump_polls, pump_drops) = counters();
+        let (done_polls, done_drops) = counters();
+        let send = ScriptedFuture::new(
+            [Poll::Pending, Poll::Ready(Ok(7_u8))],
+            Rc::clone(&send_polls),
+            send_drops,
+        );
+        let pump = ScriptedFuture::new(
+            [Poll::Ready(Ok(UploadCompletion::ReaderGone))],
+            pump_polls,
+            pump_drops,
+        );
+        let done = ScriptedFuture::new([Poll::Ready(Ok(()))], Rc::clone(&done_polls), done_drops);
+
+        let outcome = block_on(run_exchange(send, pump, done, map_host_error));
+
+        assert_eq!(outcome.expect("early response"), 7);
+        assert_eq!(send_polls.get(), 2);
+        assert_eq!(done_polls.get(), 0);
+    }
+}

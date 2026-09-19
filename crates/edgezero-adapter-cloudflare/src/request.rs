@@ -1,28 +1,51 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+#[cfg(feature = "test-utils")]
+use std::{
+    io,
+    sync::atomic::{AtomicUsize, Ordering},
+    task::Poll,
+};
 
+#[cfg(feature = "test-utils")]
+use bytes::Bytes;
 use edgezero_core::app::{App, StoreMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Method as CoreMethod, Request, Uri, request_builder};
+use edgezero_core::ingress::{
+    IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts, PreparedIngress,
+};
 use edgezero_core::key_value_store::KvHandle;
-use edgezero_core::proxy::ProxyHandle;
+use edgezero_core::outbound::HttpClient;
+use edgezero_core::response_egress::ResponseEgressEnvelope;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
+use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
+#[cfg(feature = "test-utils")]
+use futures::executor::block_on;
+use futures_util::future::{Either, select};
+#[cfg(feature = "test-utils")]
+use futures_util::stream::Empty;
+#[cfg(feature = "test-utils")]
+use futures_util::stream::poll_fn;
+use futures_util::stream::{LocalBoxStream, once, unfold};
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use worker::{
-    Context, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
+    Context, Delay, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
 };
 
 use crate::config_store::CloudflareConfigStore;
 use crate::context::CloudflareRequestContext;
 use crate::key_value_store::CloudflareKvStore;
-use crate::proxy::CloudflareProxyClient;
-use crate::response::from_core_response;
+use crate::outbound::CloudflareOutboundClient;
+use crate::response::{CloudflareEgressRuntime, from_egress_response};
 use crate::secret_store::CloudflareSecretStore;
 
 /// Groups the optional per-request store handles injected at dispatch time.
@@ -106,6 +129,7 @@ impl<'app> CloudflareService<'app> {
         env: Env,
         ctx: Context,
     ) -> Result<CfResponse, WorkerError> {
+        let request_start = self.app.monotonic_now();
         let config_store = match self.config {
             ConfigSource::Binding(binding) => open_config_or_warn(&env, &binding),
             ConfigSource::Handle(handle) => Some(handle),
@@ -134,6 +158,7 @@ impl<'app> CloudflareService<'app> {
                 secrets,
                 ..Default::default()
             },
+            request_start,
         )
         .await
     }
@@ -233,6 +258,16 @@ pub(crate) struct RegistryInputs<'env> {
     pub secret_meta: Option<StoreMetadata>,
 }
 
+#[cfg(feature = "test-utils")]
+struct DropSignal(Arc<AtomicUsize>);
+
+#[cfg(feature = "test-utils")]
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// Convert a Cloudflare Worker request into an `EdgeZero` core request.
 ///
 /// # Errors
@@ -240,10 +275,24 @@ pub(crate) struct RegistryInputs<'env> {
 /// and [`EdgeError::internal`] if the body cannot be read or the core
 /// request cannot be built.
 #[inline]
+#[expect(
+    clippy::unused_async,
+    reason = "the public converter retains its established async API while request bodies remain lazy"
+)]
 pub async fn into_core_request(
-    mut req: CfRequest,
+    req: CfRequest,
     env: Env,
     ctx: Context,
+) -> Result<Request, EdgeError> {
+    let request = into_core_request_head(&req, env, ctx, MonotonicClock::default())?;
+    attach_core_body(req, request, None)
+}
+
+fn into_core_request_head(
+    req: &CfRequest,
+    env: Env,
+    ctx: Context,
+    outbound_clock: MonotonicClock,
 ) -> Result<Request, EdgeError> {
     let method = into_core_method(&req.method());
     let url = req
@@ -260,17 +309,236 @@ pub async fn into_core_request(
         builder = builder.header(name.as_str(), value);
     }
 
-    let bytes = req.bytes().await.map_err(EdgeError::internal)?;
-
-    let mut request = builder
-        .body(Body::from(bytes))
-        .map_err(EdgeError::internal)?;
+    let mut request = builder.body(Body::empty()).map_err(EdgeError::internal)?;
 
     CloudflareRequestContext::insert(&mut request, env, ctx);
     request
         .extensions_mut()
-        .insert(ProxyHandle::with_client(CloudflareProxyClient));
+        .insert(outbound_client(outbound_clock));
     Ok(request)
+}
+
+fn outbound_client(clock: MonotonicClock) -> HttpClient {
+    HttpClient::with_client(CloudflareOutboundClient::with_clock(clock))
+}
+
+fn attach_core_body(
+    req: CfRequest,
+    mut request: Request,
+    read_lifetime: Option<(Deadline, MonotonicClock)>,
+) -> Result<Request, EdgeError> {
+    let stream = cloudflare_body_stream(req)?;
+    *request.body_mut() = match read_lifetime {
+        Some((deadline, monotonic_clock)) => {
+            cloudflare_deadline_body(stream, deadline, monotonic_clock)
+        }
+        None => Body::from_external_stream(stream),
+    };
+    Ok(request)
+}
+
+fn cloudflare_body_stream(
+    mut req: CfRequest,
+) -> Result<LocalBoxStream<'static, Result<bytes::Bytes, WorkerError>>, EdgeError> {
+    if req.inner().body().is_some() {
+        return Ok(req
+            .stream()
+            .map_err(EdgeError::internal)?
+            .map_ok(bytes::Bytes::from)
+            .boxed_local());
+    }
+
+    // The Workers test runtime and some host-created requests expose an
+    // ArrayBuffer but no ReadableStream. Keep the fallback read lazy so
+    // admission still runs before the first body byte is requested.
+    Ok(once(async move { req.bytes().await.map(bytes::Bytes::from) }).boxed_local())
+}
+
+fn cloudflare_deadline_body<Source, SourceError>(
+    source: Source,
+    deadline: Deadline,
+    monotonic_clock: MonotonicClock,
+) -> Body
+where
+    Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+{
+    let boxed_stream = source.map_err(Into::into).boxed_local();
+    let stream = unfold(Some(boxed_stream), move |stream_state| {
+        let clock = monotonic_clock.clone();
+        async move {
+            let mut body_stream = stream_state?;
+            if deadline.is_expired_at(clock.now()) {
+                return Some((
+                    Err(EdgeError::request_timeout(
+                        "inbound body read deadline exceeded",
+                    )),
+                    None,
+                ));
+            }
+
+            Delay::from(Duration::ZERO).await;
+
+            let item = {
+                let Some(remaining) = deadline.remaining_at(clock.now()) else {
+                    return Some((
+                        Err(EdgeError::request_timeout(
+                            "inbound body read deadline exceeded",
+                        )),
+                        None,
+                    ));
+                };
+                let timer = Delay::from(remaining);
+                let next = body_stream.next();
+                match select(timer, next).await {
+                    Either::Left(((), _)) => {
+                        return Some((
+                            Err(EdgeError::request_timeout(
+                                "inbound body read deadline exceeded",
+                            )),
+                            None,
+                        ));
+                    }
+                    Either::Right((item, _)) => item,
+                }
+            };
+            if deadline.is_expired_at(clock.now()) {
+                return Some((
+                    Err(EdgeError::request_timeout(
+                        "inbound body read deadline exceeded",
+                    )),
+                    None,
+                ));
+            }
+            match item {
+                Some(Ok(bytes)) => Some((Ok(bytes), Some(body_stream))),
+                Some(Err(error)) => Some((Err(EdgeError::internal(error)), None)),
+                None => None,
+            }
+        }
+    });
+    Body::from_stream(stream)
+}
+
+/// Runs the terminal source-release probe used by the WASM contract suite.
+#[cfg(feature = "test-utils")]
+#[must_use]
+#[inline]
+pub fn deadline_body_releases_source_for_test() -> bool {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let signal = DropSignal(Arc::clone(&dropped));
+    let source = poll_fn(move |_cx| {
+        let _keep_alive = &signal;
+        Poll::<Option<Result<Bytes, io::Error>>>::Pending
+    });
+    let start = MonotonicInstant::now();
+    let clock = MonotonicClock::new(move || start);
+    let body = cloudflare_deadline_body(source, Deadline::at_instant(start), clock);
+    let Some(mut body_stream) = body.into_stream() else {
+        return false;
+    };
+    let Some(Err(error)) = block_on(body_stream.next()) else {
+        return false;
+    };
+    matches!(error, EdgeError::RequestTimeout { .. }) && dropped.load(Ordering::SeqCst) == 1
+}
+
+/// Dispatches an observable source through the production ingress body wrapper.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn dispatch_ingress_stream_for_test<Source, SourceError>(
+    app: &App,
+    method: CoreMethod,
+    uri: Uri,
+    source: Source,
+) -> Result<ResponseEgressEnvelope, WorkerError>
+where
+    Source: futures_util::Stream<Item = Result<Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+{
+    let request_start = app.monotonic_now();
+    let mut core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(|error| edge_error_to_worker(&EdgeError::internal(error)))?;
+    core_request
+        .extensions_mut()
+        .insert(outbound_client(app.monotonic_clock()));
+    dispatch_ingress_stream_and(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        move || Ok(source),
+        Ok,
+    )
+    .await
+}
+
+/// Exercises admission ordering with observable source construction and delivery closures.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn dispatch_ingress_with_for_test<Source, SourceError, MakeSource, Output, Deliver>(
+    app: &App,
+    method: CoreMethod,
+    uri: Uri,
+    make_source: MakeSource,
+    deliver: Deliver,
+) -> Result<Output, WorkerError>
+where
+    Source: futures_util::Stream<Item = Result<Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+    MakeSource: FnOnce() -> Result<Source, EdgeError>,
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
+{
+    let request_start = app.monotonic_now();
+    let core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(|error| edge_error_to_worker(&EdgeError::internal(error)))?;
+    dispatch_ingress_stream_and(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        make_source,
+        deliver,
+    )
+    .await
+}
+
+/// Exercises a source-construction failure after admission through the production seam.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn dispatch_ingress_source_error_for_test(
+    app: &App,
+    method: CoreMethod,
+    uri: Uri,
+) -> Result<ResponseEgressEnvelope, WorkerError> {
+    let request_start = app.monotonic_now();
+    let core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(|error| edge_error_to_worker(&EdgeError::internal(error)))?;
+    dispatch_ingress_stream_and(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        || -> Result<Empty<Result<Bytes, io::Error>>, EdgeError> {
+            Err(EdgeError::internal(anyhow::anyhow!(
+                "cloudflare source construction failed"
+            )))
+        },
+        Ok,
+    )
+    .await
 }
 
 pub(crate) async fn dispatch_with_handles(
@@ -279,11 +547,95 @@ pub(crate) async fn dispatch_with_handles(
     env: Env,
     ctx: Context,
     stores: Stores,
+    request_start: MonotonicInstant,
 ) -> Result<CfResponse, WorkerError> {
-    let core_request = into_core_request(req, env, ctx)
-        .await
-        .map_err(|err| edge_error_to_worker(&err))?;
-    dispatch_core_request(app, core_request, stores).await
+    let signal = req.inner().signal();
+    let head_request = into_core_request_head(&req, env, ctx, app.monotonic_clock())
+        .map_err(|error| edge_error_to_worker(&error))?;
+    let context = CloudflareRequestContext::get(&head_request)
+        .map(CloudflareRequestContext::context_handle)
+        .ok_or_else(|| WorkerError::RustError("missing Cloudflare request context".to_owned()))?;
+    let runtime = CloudflareEgressRuntime::new(signal, context);
+    dispatch_ingress_stream_and(
+        app,
+        head_request,
+        stores,
+        request_start,
+        move || cloudflare_body_stream(req),
+        move |egress| from_egress_response(egress, runtime),
+    )
+    .await
+}
+
+async fn dispatch_ingress_stream_and<Source, SourceError, MakeSource, Output, Deliver>(
+    app: &App,
+    mut head_request: Request,
+    stores: Stores,
+    request_start: MonotonicInstant,
+    make_source: MakeSource,
+    deliver: Deliver,
+) -> Result<Output, WorkerError>
+where
+    Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+    MakeSource: FnOnce() -> Result<Source, EdgeError>,
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
+{
+    let request_method = head_request.method().clone();
+    let head_parts = IngressHeadParts::from_request(
+        &head_request,
+        IngressHeadAccounting::HostManaged,
+        IngressFraming::HostManaged,
+    );
+    if let Err(validation_error) = head_parts.validate_normalized(app.ingress_head_limits()) {
+        return deliver(app.detached_ingress_error_egress(
+            validation_error,
+            request_method,
+            request_start,
+        ))
+        .map_err(|delivery_error| edge_error_to_worker(&delivery_error));
+    }
+    let prepared = match app.begin_ingress(head_parts, request_start) {
+        Ok(outcome) => match outcome {
+            IngressBeginOutcome::Admitted(prepared) => prepared,
+            IngressBeginOutcome::Refused(response) => {
+                return deliver(response).map_err(|error| edge_error_to_worker(&error));
+            }
+            IngressBeginOutcome::Aborted => {
+                return Err(WorkerError::RustError(
+                    "ingress admission aborted".to_owned(),
+                ));
+            }
+            _ => {
+                let admission_error =
+                    EdgeError::internal(anyhow::anyhow!("unsupported ingress admission outcome"));
+                return deliver(app.detached_ingress_error_egress(
+                    admission_error,
+                    request_method,
+                    request_start,
+                ))
+                .map_err(|delivery_error| edge_error_to_worker(&delivery_error));
+            }
+        },
+        Err(admission_error) => {
+            return deliver(app.detached_ingress_error_egress(
+                admission_error,
+                request_method,
+                request_start,
+            ))
+            .map_err(|delivery_error| edge_error_to_worker(&delivery_error));
+        }
+    };
+    let source = match make_source() {
+        Ok(source) => source,
+        Err(source_error) => {
+            return deliver(app.admitted_error_egress(prepared, source_error))
+                .map_err(|delivery_error| edge_error_to_worker(&delivery_error));
+        }
+    };
+    *head_request.body_mut() =
+        cloudflare_deadline_body(source, prepared.read_deadline(), prepared.monotonic_clock());
+    dispatch_core_request(app, head_request, stores, prepared, deliver).await
 }
 
 /// Dispatch with per-id store registries built from baked metadata.
@@ -302,6 +654,7 @@ pub(crate) async fn dispatch_with_registries(
     ctx: Context,
     inputs: RegistryInputs<'_>,
 ) -> Result<CfResponse, WorkerError> {
+    let request_start = app.monotonic_now();
     let kv_registry = build_kv_registry(&env, inputs.kv_meta, inputs.env_config)?;
     let config_registry = build_config_registry(&env, inputs.config_meta, inputs.env_config);
     let secret_registry = build_secret_registry(&env, inputs.secret_meta, inputs.env_config);
@@ -316,6 +669,7 @@ pub(crate) async fn dispatch_with_registries(
             secret_registry,
             ..Default::default()
         },
+        request_start,
     )
     .await
 }
@@ -438,11 +792,16 @@ fn build_secret_registry(
     StoreRegistry::from_parts(by_id, meta.default.to_owned())
 }
 
-async fn dispatch_core_request(
+async fn dispatch_core_request<Output, Deliver>(
     app: &App,
     mut core_request: Request,
     stores: Stores,
-) -> Result<CfResponse, WorkerError> {
+    prepared: PreparedIngress,
+    deliver: Deliver,
+) -> Result<Output, WorkerError>
+where
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
+{
     // Hard-cutoff: see fastly's `dispatch_core_request`
     // for the rationale. Only registries go into extensions —
     // legacy bare handles are synthesised into a one-id registry
@@ -457,12 +816,8 @@ async fn dispatch_core_request(
     if let Some(registry) = secret_registry {
         core_request.extensions_mut().insert(registry);
     }
-    let svc = app.router().clone();
-    let response = svc
-        .oneshot(core_request)
-        .await
-        .map_err(|err| edge_error_to_worker(&err))?;
-    from_core_response(response).map_err(|err| edge_error_to_worker(&err))
+    let response = app.dispatch_admitted(prepared, core_request).await;
+    deliver(response).map_err(|err| edge_error_to_worker(&err))
 }
 
 fn edge_error_to_worker(err: &EdgeError) -> WorkerError {
@@ -570,8 +925,19 @@ fn warn_missing_kv_binding_once(kv_binding: &str, error: &impl Display) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
     use super::*;
+    use edgezero_core::context::RequestContext;
+    use edgezero_core::http::{Response, StatusCode, response_builder};
+    use edgezero_core::outbound::OutboundRequest;
+    use edgezero_core::router::RouterService;
     use wasm_bindgen_test::wasm_bindgen_test;
+    use worker::js_sys::Object;
+    use worker::wasm_bindgen::JsCast as _;
+    use worker::worker_sys::Context as WorkerSysContext;
 
     #[wasm_bindgen_test]
     fn into_http_method_defaults_unknown_to_get() {
@@ -585,6 +951,73 @@ mod tests {
         assert_eq!(into_core_method(&Method::Post), CoreMethod::POST);
         assert_eq!(into_core_method(&Method::Put), CoreMethod::PUT);
         assert_eq!(into_core_method(&Method::Delete), CoreMethod::DELETE);
+    }
+
+    #[wasm_bindgen_test]
+    async fn standard_service_installs_the_exact_application_outbound_clock() {
+        async fn elapsed(ctx: RequestContext) -> Result<Response, EdgeError> {
+            let client = ctx
+                .http_client()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing HTTP client")))?;
+            let request =
+                OutboundRequest::get("https://example.com/")?.body(Body::from("invalid GET body"));
+            let results = client
+                .send_all_until(vec![request], Deadline::after(Duration::from_secs(1)))
+                .await?;
+            let result = results
+                .slots
+                .first()
+                .and_then(Option::as_ref)
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("missing outbound result")))?;
+            if !matches!(&result.outcome, Err(EdgeError::BadRequest { .. })) {
+                return Err(EdgeError::internal(anyhow::anyhow!(
+                    "clock probe did not fail during batch preflight"
+                )));
+            }
+            response_builder()
+                .status(StatusCode::NO_CONTENT)
+                .header(
+                    "x-edgezero-elapsed-ms",
+                    result.elapsed.as_millis().to_string(),
+                )
+                .body(Body::empty())
+                .map_err(EdgeError::internal)
+        }
+
+        let start = MonotonicInstant::now();
+        let completed = start
+            .checked_add(Duration::from_millis(7))
+            .expect("completed instant");
+        let observations = Arc::new(AtomicUsize::new(0));
+        let clock_observations = Arc::clone(&observations);
+        let mut app = App::new(RouterService::builder().get("/clock", elapsed).build());
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            if clock_observations.fetch_add(1, Ordering::SeqCst) < 2 {
+                start
+            } else {
+                completed
+            }
+        }));
+        let init = worker::RequestInit::new();
+        let request = CfRequest::new_with_init("https://example.com/clock", &init)
+            .expect("Cloudflare request");
+        let env = Object::new().unchecked_into::<Env>();
+        let js_context = Object::new().unchecked_into::<WorkerSysContext>();
+
+        let response = CloudflareService::new(&app)
+            .dispatch(request, env, Context::new(js_context))
+            .await
+            .expect("Cloudflare response");
+
+        assert_eq!(response.status_code(), StatusCode::NO_CONTENT.as_u16());
+        assert_eq!(
+            response
+                .headers()
+                .get("x-edgezero-elapsed-ms")
+                .expect("elapsed header"),
+            Some("7".to_owned())
+        );
+        assert!(observations.load(Ordering::SeqCst) >= 3);
     }
 }
 
@@ -601,6 +1034,10 @@ mod synthesis_tests {
 
     struct StubConfig;
     #[async_trait::async_trait(?Send)]
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the test provider intentionally exercises the bounded-read compatibility default"
+    )]
     impl ConfigStore for StubConfig {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(None)

@@ -6,11 +6,8 @@
 #[cfg(target_arch = "wasm32")]
 use app_demo_core::App;
 #[cfg(target_arch = "wasm32")]
-use fastly::{Error, Request, Response};
-#[cfg(target_arch = "wasm32")]
-#[fastly::main]
-pub fn main(req: Request) -> Result<Response, Error> {
-    edgezero_adapter_fastly::run_app::<App>(req)
+pub fn main() -> Result<(), fastly::Error> {
+    edgezero_adapter_fastly::run_app::<App>()
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -34,7 +34,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up rust toolchain
@@ -76,7 +76,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   adapter-wasm-clippy:
-    name: ${{ matrix.adapter }} wasm clippy
+    name: ${{ matrix.adapter }} wasm clippy (${{ matrix.features }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -85,6 +85,9 @@ jobs:
           - adapter: cloudflare
             target: wasm32-unknown-unknown
             features: cloudflare
+          - adapter: cloudflare
+            target: wasm32-unknown-unknown
+            features: cloudflare test-utils
           - adapter: fastly
             target: wasm32-wasip1
             features: fastly
@@ -94,9 +97,18 @@ jobs:
           - adapter: fastly
             target: wasm32-wasip1
             features: fastly cli
+          - adapter: fastly
+            target: wasm32-wasip1
+            features: fastly test-utils
+          - adapter: fastly
+            target: wasm32-wasip1
+            features: fastly cli test-utils
           - adapter: spin
             target: wasm32-wasip2
             features: spin
+          - adapter: spin
+            target: wasm32-wasip2
+            features: spin test-utils
     steps:
       - uses: actions/checkout@v6
 
@@ -114,7 +126,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust tool chain
@@ -144,7 +156,7 @@ jobs:
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
@@ -162,3 +174,10 @@ jobs:
 
       - name: Run Prettier (check)
         run: npm run format
+
+      - name: Check outbound documentation contract
+        working-directory: .
+        run: node scripts/check_outbound_docs_contract.mjs
+
+      - name: Build documentation
+        run: npm run build

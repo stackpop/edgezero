@@ -62,6 +62,29 @@ Each item must be:
 - Either a unit struct or zero-argument constructor
 - Implementing `edgezero_core::middleware::Middleware`
 
+## Capabilities Section
+
+Use `[capabilities]` to declare portable runtime behavior that the application requires or
+explicitly treats as optional:
+
+```toml
+[capabilities]
+required = ["outbound-deadlines"]
+optional = ["outbound-http"]
+
+[capabilities.outbound]
+hosts = ["https://api.example.com", "https://*.example.net:*"]
+```
+
+Required capabilities accept `Native` or `BoundedCooperative` support and fail before adapter
+execution for `BestEffort` or `Unsupported`. Optional capabilities log degradation and proceed.
+Unknown names, duplicates, and required/optional overlap are validation errors.
+
+Outbound hosts configure adapter plumbing rather than application authorization. Omitting
+`hosts` defaults to `https://*:*`; `hosts = ["*"]` is an explicit grant for both HTTP and HTTPS.
+See [Capabilities](/guide/capabilities) for the exact grammar, support matrix, and platform
+limitations.
+
 ## HTTP Triggers
 
 The `[[triggers.http]]` array defines routes:
@@ -75,6 +98,7 @@ handler = "my_app_core::handlers::root"
 
 [[triggers.http]]
 id = "echo"
+class = "interactive"
 path = "/echo/{name}"
 methods = ["GET", "POST"]
 handler = "my_app_core::handlers::echo"
@@ -91,6 +115,11 @@ body-mode = "buffered"
 | `adapters`    | No       | Intended adapter filter (metadata; `app!` currently ignores) |
 | `description` | No       | Human-readable description for docs or tooling               |
 | `body-mode`   | No       | `buffered` or `stream`                                       |
+| `class`       | No       | Opaque route class exposed to ingress admission policy       |
+
+`class` is application-defined metadata. It is available on matched and
+method-not-allowed route metadata, but it is not interpreted by EdgeZero and does not change the
+route's stable method-plus-pattern identity.
 
 ::: tip Adapter filters
 The `adapters` field is currently metadata for tooling; `app!` wires all triggers regardless of adapter.
@@ -504,6 +533,12 @@ middleware = [
   "my_app_core::middleware::Cors"
 ]
 
+[capabilities]
+optional = ["outbound-http"]
+
+[capabilities.outbound]
+hosts = ["https://api.example.com"]
+
 [[triggers.http]]
 id = "root"
 path = "/"
@@ -621,7 +656,7 @@ The macro:
 - Generates route registration
 - Wires middleware from the manifest
 - Bakes portable store metadata (`Hooks::stores()`) from `[stores.kv]`, `[stores.config]`, and `[stores.secrets]` when present
-- Creates the `App` struct that implements `Hooks` (use `App::build_app()`)
+- Creates the `App` struct that implements `Hooks` (use the fallible `App::build_app()`)
 
 ### ManifestLoader
 

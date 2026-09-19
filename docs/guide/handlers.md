@@ -202,17 +202,17 @@ async fn inspect(ctx: RequestContext) -> Result<Text<String>, EdgeError> {
 
 `RequestContext` provides these methods:
 
-| Method           | Returns                                    |
-| ---------------- | ------------------------------------------ |
-| `request()`      | `&Request` - full HTTP request             |
-| `path_params()`  | `&PathParams` - raw path parameters        |
-| `path::<T>()`    | Deserialize path params to `T`             |
-| `query::<T>()`   | Deserialize query string to `T`            |
-| `json::<T>()`    | Deserialize JSON body to `T`               |
-| `form::<T>()`    | Deserialize form body to `T`               |
-| `body()`         | `&Body` - raw request body                 |
-| `into_request()` | `Request` - consume context, take request  |
-| `proxy_handle()` | `Option<ProxyHandle>` - adapter proxy hook |
+| Method           | Returns                                             |
+| ---------------- | --------------------------------------------------- |
+| `request()`      | `&Request` - full HTTP request                      |
+| `path_params()`  | `&PathParams` - raw path parameters                 |
+| `path::<T>()`    | Deserialize path params to `T`                      |
+| `query::<T>()`   | Deserialize query string to `T`                     |
+| `json::<T>()`    | Deserialize JSON body to `T`                        |
+| `form::<T>()`    | Deserialize form body to `T`                        |
+| `body()`         | `&Body` - raw request body                          |
+| `into_request()` | `Request` - consume context, take request           |
+| `http_client()`  | `Option<HttpClient>` - adapter outbound HTTP client |
 
 ## Sharing app state
 
@@ -300,6 +300,46 @@ app-state struct and register that.
 > So the `state` expression runs on that cadence: build heavy state **once** and
 > hand out clones (e.g. a `OnceLock<Arc<AppState>>` as above, or a `static`), and
 > let `T = Arc<AppState>` so each call is just a refcount bump. Do **not** `Arc::new(HeavyThing::build())` directly in the `state` expression.
+
+### Configuring the application lifecycle
+
+Macro-driven apps can customize the generated `App` through the existing
+`Hooks::configure` seam without replacing manifest-driven routing:
+
+```rust
+use edgezero_core::{
+    AdmissionDecision, EdgeError, IngressGrant, ResponseEgressCompletion,
+};
+use std::time::Duration;
+
+fn configure_app(app: &mut edgezero_core::app::App) -> Result<(), EdgeError> {
+    app.set_ingress_admission_policy(|head| AdmissionDecision::Admit {
+        completion: ResponseEgressCompletion::empty(),
+        grant: IngressGrant::empty(),
+        read_deadline: head.read_deadline_after(Duration::from_secs(30)),
+    });
+    Ok(())
+}
+
+edgezero_core::app!("edgezero.toml", configure = crate::configure_app);
+```
+
+`configure = <expr>` must evaluate to a callable that accepts `&mut App` and returns
+`Result<(), EdgeError>`. It is
+invoked after the manifest router is built and before the app begins serving, so
+it can install ingress admission, request-head limits, config extraction limits,
+the monotonic clock, and response-egress policy or observation hooks. Keep the
+callback cheap for the same adapter-lifecycle reasons as `state = <expr>` above. A configuration
+error prevents EdgeZero request conversion, body polling, and dispatch; Axum also fails before
+binding its listener.
+
+Every response-producing admission decision owns one explicit `ResponseEgressCompletion`. Use
+`ResponseEgressCompletion::empty()` when there is no response-scoped resource. To hold a permit
+through terminal egress, move it directly into `ResponseEgressCompletion::new(move |report| ... )`.
+The completion is non-clone and never belongs in response extensions. It follows admitted,
+refused, fallback, handler-error, and middleware-error responses into the adapter's exactly-once
+egress attempt. `AdmissionDecision::Abort` is different: it returns no response and therefore owns
+no completion.
 
 ## Response Types
 

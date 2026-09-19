@@ -1,6 +1,6 @@
 //! Adapter helpers for Cloudflare Workers.
 
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub mod cli;
 
 // `config_store` compiles on host for its `InMemory` test backend; the
@@ -11,21 +11,41 @@ pub mod config_store;
 pub mod context;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod key_value_store;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub mod proxy;
+#[cfg(any(
+    test,
+    feature = "test-utils",
+    all(feature = "cloudflare", target_arch = "wasm32")
+))]
+pub mod outbound;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod request;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
 pub mod response;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod secret_store;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-use edgezero_core::app::{Hooks, StoresMetadata};
+use edgezero_core::app::{App, Hooks, StoresMetadata};
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use worker::{Context, Env, Error as WorkerError, Request, Response};
+
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+fn build_app_for_dispatch<A: Hooks>() -> Result<App, WorkerError> {
+    A::build_app().map_err(|error| {
+        log::error!("application configuration failed: {}", error.kind());
+        WorkerError::RustError("application configuration failed".to_owned())
+    })
+}
+
+/// Test seam for the production application-assembly error mapping.
+#[cfg(all(feature = "test-utils", feature = "cloudflare", target_arch = "wasm32"))]
+#[doc(hidden)]
+#[inline]
+pub fn build_app_for_test<A: Hooks>() -> Result<App, WorkerError> {
+    build_app_for_dispatch::<A>()
+}
 
 /// # Errors
 /// Never; this is currently a no-op on Cloudflare Workers (Workers manages
@@ -100,6 +120,7 @@ pub async fn run_app<A: Hooks>(
     env: Env,
     ctx: Context,
 ) -> Result<Response, WorkerError> {
+    let app = build_app_for_dispatch::<A>()?;
     // Best-effort: if a logger is already installed, ignore the error rather
     // than panicking — every Worker request re-enters this function. Skipped
     // entirely when the app owns logging.
@@ -108,7 +129,6 @@ pub async fn run_app<A: Hooks>(
     }
     let stores = A::stores();
     let env_config = env_config_from_worker(&env, stores);
-    let app = A::build_app();
     request::dispatch_with_registries(
         &app,
         req,

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, PoisonError, RwLock};
+
+use edgezero_core::{Capability, CapabilitySupport};
 
 static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -39,6 +41,53 @@ pub enum AdapterAction {
     /// adapters return "unsupported".
     Rollback,
     Serve,
+}
+
+/// Canonical application target selected by the CLI before adapter dispatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct AdapterExecutionTarget {
+    app_root: PathBuf,
+    component: Option<String>,
+    platform_manifest: Option<PathBuf>,
+}
+
+impl AdapterExecutionTarget {
+    /// Canonical application root used for this action.
+    #[must_use]
+    #[inline]
+    pub fn app_root(&self) -> &Path {
+        &self.app_root
+    }
+
+    /// Optional platform component selected by the manifest.
+    #[must_use]
+    #[inline]
+    pub fn component(&self) -> Option<&str> {
+        self.component.as_deref()
+    }
+
+    /// Construct a target after the caller has canonicalized and validated it.
+    #[must_use]
+    #[inline]
+    pub fn new(
+        app_root: PathBuf,
+        component: Option<String>,
+        platform_manifest: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            app_root,
+            component,
+            platform_manifest,
+        }
+    }
+
+    /// Canonical platform manifest selected for this action, when applicable.
+    #[must_use]
+    #[inline]
+    pub fn platform_manifest(&self) -> Option<&Path> {
+        self.platform_manifest.as_deref()
+    }
 }
 
 /// A single declared store id, paired with the platform name the
@@ -269,11 +318,18 @@ pub enum ReadConfigEntry {
 /// Interface implemented by adapter crates to integrate with the `EdgeZero` CLI.
 ///
 /// The non-`execute` methods carry the adapter's `config validate`
-/// rules. They take primitive parameters (no `Manifest` /
-/// `SecretField` from `edgezero-core`) so this crate stays dep-free
-/// of `edgezero-core`. Defaults are no-ops; adapters override what
-/// they actually need.
+/// rules. Defaults are no-ops; adapters override what they actually need.
 pub trait Adapter: Sync + Send {
+    /// Report this adapter's support for an application capability.
+    ///
+    /// The fail-closed default prevents an adapter from accidentally claiming
+    /// support merely because a new capability was added to core.
+    #[must_use]
+    #[inline]
+    fn capability(&self, _capability: Capability) -> CapabilitySupport {
+        CapabilitySupport::Unsupported
+    }
+
     /// Execute the requested action with optional adapter-specific args.
     ///
     /// `args` is a stringly-typed pass-through for arguments meant
@@ -289,6 +345,27 @@ pub trait Adapter: Sync + Send {
     /// # Errors
     /// Returns an error string if the requested adapter action fails.
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
+
+    /// Execute against a target already selected and validated by the CLI.
+    ///
+    /// The default refuses rather than falling back to [`Self::execute`], which
+    /// could rediscover a different project from the process working directory.
+    ///
+    /// # Errors
+    /// Returns an explicit unsupported error unless the adapter implements
+    /// pinned-target dispatch.
+    #[inline]
+    fn execute_target(
+        &self,
+        _action: AdapterAction,
+        _target: &AdapterExecutionTarget,
+        _args: &[String],
+    ) -> Result<(), String> {
+        Err(format!(
+            "adapter `{}` does not support pinned execution targets",
+            self.name()
+        ))
+    }
 
     /// Reclaim chunk entries that no LIVE config pointer references.
     ///
@@ -666,6 +743,35 @@ mod tests {
         name: &'static str,
     }
 
+    struct CapabilityAdapter;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "fixture overrides only the behavior under test"
+    )]
+    impl Adapter for CapabilityAdapter {
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "Capability is non-exhaustive and this fixture defaults all untested capabilities to unsupported"
+        )]
+        fn capability(&self, capability: Capability) -> CapabilitySupport {
+            match capability {
+                Capability::LazyStreamedResponsePassthrough => CapabilitySupport::BestEffort,
+                Capability::OutboundDeadlines => CapabilitySupport::BoundedCooperative,
+                Capability::OutboundHttp => CapabilitySupport::Native,
+                _ => CapabilitySupport::Unsupported,
+            }
+        }
+
+        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "capability-fixture"
+        }
+    }
+
     #[expect(
         clippy::missing_trait_methods,
         reason = "TestAdapter only exercises register / get / execute; the validation methods inherit the trait defaults (no-ops)"
@@ -685,6 +791,47 @@ mod tests {
         let mut registry = super::REGISTRY.write().expect("registry lock");
         registry.clear();
         HIT.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn adapter_capability_default_is_unsupported() {
+        assert_eq!(
+            FIRST.capability(Capability::OutboundHttp),
+            CapabilitySupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn adapter_capability_reports_each_support_level() {
+        let adapter = CapabilityAdapter;
+        assert_eq!(
+            adapter.capability(Capability::OutboundHttp),
+            CapabilitySupport::Native
+        );
+        assert_eq!(
+            adapter.capability(Capability::OutboundDeadlines),
+            CapabilitySupport::BoundedCooperative
+        );
+        assert_eq!(
+            adapter.capability(Capability::LazyStreamedResponsePassthrough),
+            CapabilitySupport::BestEffort
+        );
+        assert_eq!(
+            adapter.capability(Capability::OutboundCompleteResourceAccounting),
+            CapabilitySupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn adapter_execute_target_default_refuses_rediscovery() {
+        let _guard = TEST_LOCK.lock().expect("lock");
+        reset();
+        let target = AdapterExecutionTarget::new(PathBuf::from("/tmp"), None, None);
+        let error = FIRST
+            .execute_target(AdapterAction::Build, &target, &[])
+            .expect_err("default target execution must fail closed");
+        assert!(error.contains("pinned execution targets"));
+        assert_eq!(HIT.load(Ordering::SeqCst), 0);
     }
 
     #[test]

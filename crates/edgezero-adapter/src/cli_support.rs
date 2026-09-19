@@ -8,6 +8,10 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(test)]
+use edgezero_core::manifest::ManifestLoader;
+use edgezero_core::manifest::{Manifest, canonicalize_outbound_hosts};
+
 /// Walks up the directory tree looking for `manifest_name` alongside a `Cargo.toml`.
 #[inline]
 #[must_use]
@@ -126,6 +130,112 @@ pub fn read_package_name(manifest: &Path) -> Result<String, String> {
     ))
 }
 
+/// Verifies the selected Spin component's outbound host set against the application contract.
+///
+/// # Errors
+/// Returns an operator-facing error when the Spin manifest/component is invalid or its canonical
+/// `allowed_outbound_hosts` set differs from `[capabilities.outbound].hosts`.
+#[inline]
+pub fn validate_spin_outbound_host_contract(
+    manifest: &Manifest,
+    manifest_path: &Path,
+    spin_manifest_path: &Path,
+    component_selector: Option<&str>,
+) -> Result<(), String> {
+    let raw = fs::read_to_string(spin_manifest_path).map_err(|error| {
+        format!(
+            "failed to read Spin manifest at {}: {error}",
+            spin_manifest_path.display()
+        )
+    })?;
+    let parsed: toml::Value = toml::from_str(&raw).map_err(|error| {
+        format!(
+            "failed to parse {} as TOML: {error}",
+            spin_manifest_path.display()
+        )
+    })?;
+    let components = parsed
+        .get("component")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| {
+            format!(
+                "{}: no [component.*] declarations found",
+                spin_manifest_path.display()
+            )
+        })?;
+    let component = match component_selector {
+        Some(selected) if components.contains_key(selected) => selected.to_owned(),
+        Some(selected) => {
+            return Err(format!(
+                "Spin component {selected:?} is not declared in {}",
+                spin_manifest_path.display()
+            ));
+        }
+        None if components.len() == 1 => components
+            .keys()
+            .next()
+            .cloned()
+            .ok_or_else(|| "Spin component selection failed".to_owned())?,
+        None => {
+            return Err(format!(
+                "{} declares {} components but no Spin component was selected",
+                spin_manifest_path.display(),
+                components.len()
+            ));
+        }
+    };
+    let component_table = components
+        .get(&component)
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| {
+            format!(
+                "[component.{component}] in {} must be a table",
+                spin_manifest_path.display()
+            )
+        })?;
+    let platform_values = component_table
+        .get("allowed_outbound_hosts")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "[component.{component}].allowed_outbound_hosts is missing or not an array in {}",
+                spin_manifest_path.display()
+            )
+        })?;
+    let platform_hosts = platform_values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                format!(
+                    "[component.{component}].allowed_outbound_hosts in {} must contain only strings",
+                    spin_manifest_path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected = canonicalize_outbound_hosts(manifest.capabilities.outbound.hosts.as_deref())
+        .map_err(|error| {
+            format!(
+                "invalid outbound host contract in {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    let actual = canonicalize_outbound_hosts(Some(&platform_hosts)).map_err(|error| {
+        format!(
+            "invalid [component.{component}].allowed_outbound_hosts in {}: {error}",
+            spin_manifest_path.display()
+        )
+    })?;
+    if actual == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "Spin outbound host drift: {} selects component `{component}` in {}; expected canonical allowed_outbound_hosts {expected:?}, found {actual:?}. Update that component field and rerun.",
+        manifest_path.display(),
+        spin_manifest_path.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +351,106 @@ mod tests {
             err.contains("exited with status"),
             "expected the exit-status branch, got: {err}"
         );
+    }
+
+    #[test]
+    fn spin_selected_component_outbound_hosts_are_canonical_and_order_independent() {
+        let dir = tempdir().expect("temp dir");
+        let manifest_path = dir.path().join("edgezero.toml");
+        let spin_path = dir.path().join("spin.toml");
+        fs::write(
+            &manifest_path,
+            "[capabilities.outbound]\nhosts = [\"*\", \"api.example.com\"]\n",
+        )
+        .expect("write app manifest");
+        fs::write(
+            &spin_path,
+            "[component.app]\nallowed_outbound_hosts = [\"https://api.example.com\", \"https://*:*\", \"http://*:*\"]\n",
+        )
+        .expect("write Spin manifest");
+        let loader = ManifestLoader::from_path(&manifest_path).expect("load manifest");
+
+        validate_spin_outbound_host_contract(loader.manifest(), &manifest_path, &spin_path, None)
+            .expect("canonical host sets match");
+    }
+
+    #[test]
+    fn spin_selected_component_outbound_host_drift_fails_closed() {
+        let dir = tempdir().expect("temp dir");
+        let manifest_path = dir.path().join("edgezero.toml");
+        let spin_path = dir.path().join("spin.toml");
+        fs::write(&manifest_path, "").expect("write app manifest");
+        fs::write(
+            &spin_path,
+            "[component.first]\nallowed_outbound_hosts = [\"https://*:*\"]\n[component.second]\nallowed_outbound_hosts = [\"https://api.example.com\"]\n",
+        )
+        .expect("write Spin manifest");
+        let loader = ManifestLoader::from_path(&manifest_path).expect("load manifest");
+
+        let error = validate_spin_outbound_host_contract(
+            loader.manifest(),
+            &manifest_path,
+            &spin_path,
+            Some("second"),
+        )
+        .expect_err("selected component drift");
+
+        assert!(error.contains("component `second`"), "{error}");
+        assert!(error.contains("https://*:*"), "{error}");
+        assert!(error.contains("https://api.example.com"), "{error}");
+    }
+
+    #[test]
+    fn spin_selected_component_applies_default_and_rejects_malformed_platform_hosts() {
+        let dir = tempdir().expect("temp dir");
+        let manifest_path = dir.path().join("edgezero.toml");
+        let spin_path = dir.path().join("spin.toml");
+        fs::write(&manifest_path, "").expect("write app manifest");
+        fs::write(
+            &spin_path,
+            "[component.app]\nallowed_outbound_hosts = [\"https://*:*\"]\n",
+        )
+        .expect("write Spin manifest");
+        let loader = ManifestLoader::from_path(&manifest_path).expect("load manifest");
+        validate_spin_outbound_host_contract(loader.manifest(), &manifest_path, &spin_path, None)
+            .expect("absent app hosts retain the HTTPS-only default");
+
+        fs::write(
+            &spin_path,
+            "[component.app]\nallowed_outbound_hosts = [\"ftp://example.com\"]\n",
+        )
+        .expect("replace Spin manifest");
+        let error = validate_spin_outbound_host_contract(
+            loader.manifest(),
+            &manifest_path,
+            &spin_path,
+            None,
+        )
+        .expect_err("malformed platform host");
+        assert!(error.contains("invalid [component.app]"), "{error}");
+    }
+
+    #[test]
+    fn spin_selected_component_requires_unambiguous_component() {
+        let dir = tempdir().expect("temp dir");
+        let manifest_path = dir.path().join("edgezero.toml");
+        let spin_path = dir.path().join("spin.toml");
+        fs::write(&manifest_path, "").expect("write app manifest");
+        fs::write(
+            &spin_path,
+            "[component.first]\nallowed_outbound_hosts = [\"https://*:*\"]\n[component.second]\nallowed_outbound_hosts = [\"https://*:*\"]\n",
+        )
+        .expect("write Spin manifest");
+        let loader = ManifestLoader::from_path(&manifest_path).expect("load manifest");
+
+        let error = validate_spin_outbound_host_contract(
+            loader.manifest(),
+            &manifest_path,
+            &spin_path,
+            None,
+        )
+        .expect_err("ambiguous component");
+
+        assert!(error.contains("2 components"), "{error}");
     }
 }

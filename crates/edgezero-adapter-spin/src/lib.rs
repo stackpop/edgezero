@@ -1,23 +1,29 @@
 //! Adapter helpers for Spin (Fermyon).
 
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use anyhow::Context as _;
+
+#[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub mod cli;
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 pub mod config_store;
 pub mod context;
-mod decompress;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub mod key_value_store;
 // `kv_pagination` is the pure paging logic for `SpinKvStore::list_keys_page`.
 // It is host-compilable so its tests run under `cargo test`, while the wasm32
 // `SpinKvStore` is the production consumer.
 mod kv_pagination;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub mod proxy;
+#[cfg(any(
+    test,
+    feature = "test-utils",
+    all(feature = "spin", target_arch = "wasm32")
+))]
+pub mod outbound;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub mod request;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[cfg(all(feature = "spin", any(test, target_arch = "wasm32")))]
 pub mod response;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub mod secret_store;
@@ -27,28 +33,25 @@ use core::future::Future;
 use core::pin::Pin;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use bytes::Bytes;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::app::{App, Hooks};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use spin_sdk::http::{FullBody, Request as SpinRequest, Response as SpinResponse};
-
-/// Spin SDK response with a fully-buffered body. Extracted as a type alias
-/// because the full `Response<FullBody<Bytes>>` form appears in multiple
-/// signatures (`AppExt::dispatch`, `request::dispatch*`, `from_core_response`).
+use spin_sdk::http::Request as SpinRequest;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub type SpinFullResponse = SpinResponse<FullBody<Bytes>>;
+use spin_sdk::wasip3::http::types::Response as WasiResponse;
+
+/// Raw `WASIp3` response whose body and transmission lifetime remain owned by `EdgeZero`.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub type SpinResponse = WasiResponse;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub trait AppExt {
-    /// Dispatch a Spin request through the `EdgeZero` router and return a
-    /// fully-buffered Spin response.
+    /// Dispatch a Spin request and return the raw response backed by `EdgeZero`'s owned writer.
     fn dispatch<'app>(
         &'app self,
         req: SpinRequest,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<SpinFullResponse>> + 'app>>;
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<SpinResponse>> + 'app>>;
 }
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -57,9 +60,22 @@ impl AppExt for App {
     fn dispatch<'app>(
         &'app self,
         req: SpinRequest,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<SpinFullResponse>> + 'app>> {
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<SpinResponse>> + 'app>> {
         Box::pin(request::dispatch(self, req))
     }
+}
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
+    A::build_app().context("application configuration failed")
+}
+
+/// Test seam for the production application-assembly error mapping.
+#[cfg(all(feature = "test-utils", feature = "spin", target_arch = "wasm32"))]
+#[doc(hidden)]
+#[inline]
+pub fn build_app_for_test<A: Hooks>() -> anyhow::Result<App> {
+    build_app_for_dispatch::<A>()
 }
 
 /// Initialize the logger for Spin.
@@ -94,21 +110,23 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
 /// use my_core::App;
 ///
 /// #[http_service]
-/// async fn handle(req: spin_sdk::http::Request) -> anyhow::Result<impl spin_sdk::http::IntoResponse> {
+/// async fn handle(
+///     req: spin_sdk::http::Request,
+/// ) -> anyhow::Result<edgezero_adapter_spin::SpinResponse> {
 ///     edgezero_adapter_spin::run_app::<App>(req).await
 /// }
 /// ```
 ///
-/// Returns the concrete [`SpinFullResponse`] (was `impl IntoResponse` up
-/// through 2026-Q2). Source-compatible with the generated scaffold handler
-/// signature because `SpinFullResponse: spin_sdk::http::IntoResponse`.
+/// Returns the concrete raw [`SpinResponse`]. Its body writer and transmission-result observer
+/// remain owned by the adapter's spawned response-egress coordinator.
 ///
 /// # Errors
 /// Returns [`anyhow::Error`] when the inner dispatch fails — transport,
 /// router, store binding, or response translation errors propagate here.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[inline]
-pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinFullResponse> {
+pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinResponse> {
+    let app = build_app_for_dispatch::<A>()?;
     // Best-effort: every Spin `#[http_service]` re-enters this function, so a
     // second `log::set_logger` call returns Err — drop the result instead of
     // `.expect()` to avoid panicking on every subsequent request. Skipped
@@ -118,7 +136,6 @@ pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinFullRespo
     }
     let env = EnvConfig::from_env();
     let stores = A::stores();
-    let app = A::build_app();
     request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)
         .await
 }
