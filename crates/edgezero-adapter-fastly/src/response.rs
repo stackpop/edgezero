@@ -622,7 +622,7 @@ mod tests {
     use edgezero_core::app::App;
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::{Version, request_builder, response_builder};
-    use edgezero_core::ingress::{IngressFraming, IngressHeadAccounting};
+    use edgezero_core::ingress::{IngressDispatchOutcome, IngressFraming, IngressHeadAccounting};
     use edgezero_core::response_egress::{
         ResponseEgressBodyKind, ResponseEgressCompletion, ResponseEgressHead,
         ResponseEgressObserver, ResponseEgressObserverHandle, ResponseEgressReport,
@@ -646,6 +646,13 @@ mod tests {
         fn complete(&self, report: &ResponseEgressReport) {
             self.0.lock().expect("reports lock").push(report.clone());
         }
+    }
+
+    fn response_egress(outcome: IngressDispatchOutcome) -> ResponseEgressEnvelope {
+        let IngressDispatchOutcome::Response(envelope) = outcome else {
+            panic!("expected response egress");
+        };
+        envelope
     }
 
     #[derive(Default)]
@@ -1271,13 +1278,15 @@ mod tests {
             .uri("/")
             .body(Body::empty())
             .expect("request");
-        let egress = executor::block_on(app.dispatch_ingress(
-            request,
-            request_start,
-            IngressHeadAccounting::HostManaged,
-            IngressFraming::HostManaged,
-        ))
-        .expect("egress");
+        let egress = response_egress(
+            executor::block_on(app.dispatch_ingress(
+                request,
+                request_start,
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("egress"),
+        );
         let state = Rc::new(RefCell::new(SinkState::default()));
         let mut committer = MockCommitter::new(Rc::clone(&state));
         assert_eq!(send_egress_with(egress, &mut committer), Ok(()));
@@ -1311,13 +1320,15 @@ mod tests {
             .uri("/")
             .body(Body::empty())
             .expect("request");
-        let egress = executor::block_on(app.dispatch_ingress(
-            request,
-            now,
-            IngressHeadAccounting::HostManaged,
-            IngressFraming::HostManaged,
-        ))
-        .expect("egress");
+        let egress = response_egress(
+            executor::block_on(app.dispatch_ingress(
+                request,
+                now,
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("egress"),
+        );
         let state = Rc::new(RefCell::new(SinkState::default()));
         let mut committer = MockCommitter::new(Rc::clone(&state));
         assert_eq!(send_egress_with(egress, &mut committer), Ok(()));
@@ -1346,13 +1357,15 @@ mod tests {
             .uri("/")
             .body(Body::empty())
             .expect("request");
-        let egress = executor::block_on(app.dispatch_ingress(
-            request,
-            request_start,
-            IngressHeadAccounting::HostManaged,
-            IngressFraming::HostManaged,
-        ))
-        .expect("egress");
+        let egress = response_egress(
+            executor::block_on(app.dispatch_ingress(
+                request,
+                request_start,
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("egress"),
+        );
         let state = Rc::new(RefCell::new(SinkState::default()));
         let mut committer = MockCommitter::new(Rc::clone(&state));
         assert_eq!(send_egress_with(egress, &mut committer), Ok(()));
@@ -1395,13 +1408,15 @@ mod tests {
             .uri("/")
             .body(Body::empty())
             .expect("request");
-        let egress = executor::block_on(app.dispatch_ingress(
-            request,
-            start,
-            IngressHeadAccounting::HostManaged,
-            IngressFraming::HostManaged,
-        ))
-        .expect("egress");
+        let egress = response_egress(
+            executor::block_on(app.dispatch_ingress(
+                request,
+                start,
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("egress"),
+        );
         let state = Rc::new(RefCell::new(SinkState::default()));
         let mut committer = MockCommitter::new(Rc::clone(&state));
         assert_eq!(
@@ -1436,13 +1451,15 @@ mod tests {
                 .uri("/")
                 .body(Body::empty())
                 .expect("request");
-            let egress = executor::block_on(app.dispatch_ingress(
-                request,
-                request_start,
-                IngressHeadAccounting::HostManaged,
-                IngressFraming::HostManaged,
-            ))
-            .expect("egress");
+            let egress = response_egress(
+                executor::block_on(app.dispatch_ingress(
+                    request,
+                    request_start,
+                    IngressHeadAccounting::HostManaged,
+                    IngressFraming::HostManaged,
+                ))
+                .expect("egress"),
+            );
             let state = Rc::new(RefCell::new(SinkState {
                 finish: if finish_error {
                     MockTerminal::Error
@@ -1483,13 +1500,15 @@ mod tests {
             .uri("/")
             .body(Body::empty())
             .expect("request");
-        let egress = executor::block_on(app.dispatch_ingress(
-            request,
-            request_start,
-            IngressHeadAccounting::HostManaged,
-            IngressFraming::HostManaged,
-        ))
-        .expect("egress");
+        let egress = response_egress(
+            executor::block_on(app.dispatch_ingress(
+                request,
+                request_start,
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("egress"),
+        );
         let state = Rc::new(RefCell::new(SinkState::default()));
         let mut committer = MockCommitter {
             commit_plan: VecDeque::new(),

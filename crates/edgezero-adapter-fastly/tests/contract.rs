@@ -31,10 +31,26 @@ mod tests {
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{Method, Response, StatusCode, response_builder};
+    use edgezero_core::response_egress::ResponseEgressEnvelope;
     use edgezero_core::router::{RouteMetadata, RouterService};
     use fastly::Request as FastlyRequest;
     use fastly::http::Method as FastlyMethod;
     use futures::{executor::block_on, stream};
+
+    trait CompleteEnvelope {
+        fn into_response(self) -> Response;
+    }
+
+    impl CompleteEnvelope for ResponseEgressEnvelope {
+        fn into_response(self) -> Response {
+            let Ok((prepared, _, mut attempt, clock)) = self.begin() else {
+                panic!("begin response egress");
+            };
+            assert!(attempt.begin_writing());
+            assert!(attempt.complete(clock.now()));
+            prepared.into_response()
+        }
+    }
 
     struct FixedConfigStore(&'static str);
 
@@ -260,13 +276,12 @@ mod tests {
         use edgezero_core::ingress::AdmissionDecision;
 
         let mut app = build_test_app();
-        app.set_ingress_admission_policy(|_head| {
-            AdmissionDecision::Refuse(
-                response_builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .body(Body::from("refused"))
-                    .expect("refusal"),
-            )
+        app.set_ingress_admission_policy(|_head| AdmissionDecision::Refuse {
+            completion: edgezero_core::ResponseEgressCompletion::empty(),
+            response: response_builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::from("refused"))
+                .expect("refusal"),
         });
         let finalized = Arc::new(AtomicUsize::new(0));
         let finalized_hook = Arc::clone(&finalized);
@@ -341,6 +356,7 @@ mod tests {
 
         use edgezero_adapter_fastly::request::{
             dispatch_ingress_reader_for_test, dispatch_ingress_source_error_for_test,
+            dispatch_ingress_with_for_test,
         };
         use edgezero_core::http::{HeaderMap, HeaderValue};
         use edgezero_core::ingress::{
@@ -348,13 +364,42 @@ mod tests {
         };
         use edgezero_core::middleware::{Middleware, Next};
         use edgezero_core::response_egress::{
-            ResponseEgressEnvelope, ResponseEgressObserver, ResponseEgressOutcome,
-            ResponseEgressReport,
+            ResponseEgressCompletion, ResponseEgressEnvelope, ResponseEgressObserver,
+            ResponseEgressOutcome, ResponseEgressReport,
         };
         use edgezero_core::router::RouteResolution;
         use edgezero_core::time::{MonotonicClock, MonotonicInstant};
 
         use super::*;
+
+        #[test]
+        fn admission_abort() {
+            let source_calls = Arc::new(AtomicUsize::new(0));
+            let observed_source_calls = Arc::clone(&source_calls);
+            let delivery_calls = Arc::new(AtomicUsize::new(0));
+            let observed_delivery_calls = Arc::clone(&delivery_calls);
+            let mut app = App::new(RouterService::builder().build());
+            app.set_ingress_admission_policy(|_| AdmissionDecision::Abort);
+
+            let error = dispatch_ingress_with_for_test(
+                &app,
+                Method::POST,
+                "/missing".parse().expect("URI"),
+                move || {
+                    observed_source_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(Cursor::new(Vec::<u8>::new()))
+                },
+                move |_response| {
+                    observed_delivery_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .expect_err("abort must return a platform error");
+
+            assert!(error.to_string().contains("ingress admission aborted"));
+            assert_eq!(source_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(delivery_calls.load(Ordering::SeqCst), 0);
+        }
 
         struct DropSignal(Arc<AtomicUsize>);
 
@@ -498,6 +543,7 @@ mod tests {
                     RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound
                 ));
                 AdmissionDecision::ReadBodyBeforeFallback {
+                    completion: ResponseEgressCompletion::empty(),
                     grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
                     max_body_bytes,
                     read_deadline: head.read_deadline_after(read_budget),
@@ -592,6 +638,7 @@ mod tests {
                     .build(),
             );
             app.set_ingress_admission_policy(move |head| AdmissionDecision::Admit {
+                completion: ResponseEgressCompletion::empty(),
                 grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
                 read_deadline: head.read_deadline_after(Duration::from_secs(1)),
             });
@@ -819,19 +866,27 @@ mod tests {
                 let grant_drops = Arc::new(AtomicUsize::new(0));
                 let source_drops = Arc::new(AtomicUsize::new(0));
                 let body_reads = Arc::new(AtomicUsize::new(0));
+                let completion_calls = Arc::new(AtomicUsize::new(0));
+                let observed_completion_calls = Arc::clone(&completion_calls);
                 let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
-                app.set_ingress_admission_policy(|head| {
+                app.set_ingress_admission_policy(move |head| {
                     assert!(matches!(
                         head.route_resolution(),
                         RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound
                     ));
-                    AdmissionDecision::Refuse(
-                        response_builder()
+                    AdmissionDecision::Refuse {
+                        completion: {
+                            let calls = Arc::clone(&observed_completion_calls);
+                            ResponseEgressCompletion::new(move |_report| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                            })
+                        },
+                        response: response_builder()
                             .status(StatusCode::SERVICE_UNAVAILABLE)
                             .header("x-ingress-refusal", "saturated")
                             .body(Body::from("fastly unavailable\n"))
                             .expect("refusal response"),
-                    )
+                    }
                 });
                 let reader = tracked_reader(
                     vec![Bytes::from_static(b"body")],
@@ -861,6 +916,7 @@ mod tests {
                 assert_eq!(body_reads.load(Ordering::SeqCst), 0);
                 assert_eq!(grant_drops.load(Ordering::SeqCst), 0);
                 assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(completion_calls.load(Ordering::SeqCst), 1);
                 assert_no_route_dispatch(&handler_calls, &middleware_calls);
             }
         }

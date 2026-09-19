@@ -477,6 +477,40 @@ where
     .await
 }
 
+/// Exercises admission ordering with observable source construction and delivery closures.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn dispatch_ingress_with_for_test<Source, SourceError, MakeSource, Output, Deliver>(
+    app: &App,
+    method: CoreMethod,
+    uri: Uri,
+    make_source: MakeSource,
+    deliver: Deliver,
+) -> Result<Output, WorkerError>
+where
+    Source: futures_util::Stream<Item = Result<Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+    MakeSource: FnOnce() -> Result<Source, EdgeError>,
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
+{
+    let request_start = app.monotonic_now();
+    let core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(|error| edge_error_to_worker(&EdgeError::internal(error)))?;
+    dispatch_ingress_stream_and(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        make_source,
+        deliver,
+    )
+    .await
+}
+
 /// Exercises a source-construction failure after admission through the production seam.
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
@@ -566,6 +600,11 @@ where
             IngressBeginOutcome::Admitted(prepared) => prepared,
             IngressBeginOutcome::Refused(response) => {
                 return deliver(response).map_err(|error| edge_error_to_worker(&error));
+            }
+            IngressBeginOutcome::Aborted => {
+                return Err(WorkerError::RustError(
+                    "ingress admission aborted".to_owned(),
+                ));
             }
             _ => {
                 let admission_error =

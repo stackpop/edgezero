@@ -556,6 +556,7 @@ mod tests {
 
         use edgezero_adapter_cloudflare::request::{
             dispatch_ingress_source_error_for_test, dispatch_ingress_stream_for_test,
+            dispatch_ingress_with_for_test,
         };
         use edgezero_core::http::{HeaderMap, HeaderValue};
         use edgezero_core::ingress::{
@@ -563,8 +564,8 @@ mod tests {
         };
         use edgezero_core::middleware::{Middleware, Next};
         use edgezero_core::response_egress::{
-            ResponseEgressEnvelope, ResponseEgressObserver, ResponseEgressOutcome,
-            ResponseEgressReport,
+            ResponseEgressCompletion, ResponseEgressEnvelope, ResponseEgressObserver,
+            ResponseEgressOutcome, ResponseEgressReport,
         };
         use edgezero_core::router::{RouteMetadata, RouteResolution};
         use futures::future::poll_fn as poll_future;
@@ -572,6 +573,36 @@ mod tests {
         use worker::{Delay, Response as CfResponse};
 
         use super::*;
+
+        #[wasm_bindgen_test]
+        async fn admission_abort() {
+            let source_calls = Arc::new(AtomicUsize::new(0));
+            let observed_source_calls = Arc::clone(&source_calls);
+            let delivery_calls = Arc::new(AtomicUsize::new(0));
+            let observed_delivery_calls = Arc::clone(&delivery_calls);
+            let mut app = App::new(RouterService::builder().build());
+            app.set_ingress_admission_policy(|_| AdmissionDecision::Abort);
+
+            let error = dispatch_ingress_with_for_test(
+                &app,
+                Method::POST,
+                "/missing".parse().expect("URI"),
+                move || {
+                    observed_source_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(futures::stream::empty::<Result<Bytes, io::Error>>())
+                },
+                move |_response| {
+                    observed_delivery_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("abort must return a platform error");
+
+            assert!(error.to_string().contains("ingress admission aborted"));
+            assert_eq!(source_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(delivery_calls.load(Ordering::SeqCst), 0);
+        }
 
         struct DropSignal(Arc<AtomicUsize>);
 
@@ -634,6 +665,7 @@ mod tests {
                     RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound
                 ));
                 AdmissionDecision::ReadBodyBeforeFallback {
+                    completion: ResponseEgressCompletion::empty(),
                     grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
                     max_body_bytes,
                     read_deadline: head.read_deadline_after(read_budget),
@@ -778,6 +810,7 @@ mod tests {
                     .build(),
             );
             app.set_ingress_admission_policy(move |head| AdmissionDecision::Admit {
+                completion: ResponseEgressCompletion::empty(),
                 grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
                 read_deadline: head.read_deadline_after(Duration::from_secs(1)),
             });
@@ -991,19 +1024,27 @@ mod tests {
             for path in ["/missing", "/known"] {
                 let source_drops = Arc::new(AtomicUsize::new(0));
                 let body_polls = Arc::new(AtomicUsize::new(0));
+                let completion_calls = Arc::new(AtomicUsize::new(0));
+                let observed_completion_calls = Arc::clone(&completion_calls);
                 let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
-                app.set_ingress_admission_policy(|head| {
+                app.set_ingress_admission_policy(move |head| {
                     assert!(matches!(
                         head.route_resolution(),
                         RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound
                     ));
-                    AdmissionDecision::Refuse(
-                        response_builder()
+                    AdmissionDecision::Refuse {
+                        completion: {
+                            let calls = Arc::clone(&observed_completion_calls);
+                            ResponseEgressCompletion::new(move |_report| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                            })
+                        },
+                        response: response_builder()
                             .status(StatusCode::SERVICE_UNAVAILABLE)
                             .header("x-ingress-refusal", "saturated")
                             .body(Body::from("cloudflare unavailable\n"))
                             .expect("refusal response"),
-                    )
+                    }
                 });
                 let unobserved_grant = Arc::new(AtomicUsize::new(0));
                 let source = pending_stream(&unobserved_grant, &source_drops, &body_polls);
@@ -1031,6 +1072,7 @@ mod tests {
                 assert_eq!(body_polls.load(Ordering::SeqCst), 0);
                 assert_eq!(unobserved_grant.load(Ordering::SeqCst), 0);
                 assert_eq!(source_drops.load(Ordering::SeqCst), 1);
+                assert_eq!(completion_calls.load(Ordering::SeqCst), 1);
                 assert_no_route_dispatch(&handler_calls, &middleware_calls);
             }
         }

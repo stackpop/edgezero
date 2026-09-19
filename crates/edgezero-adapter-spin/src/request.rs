@@ -254,6 +254,41 @@ where
     .await
 }
 
+/// Exercises admission ordering with observable source construction and delivery closures.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[inline]
+pub async fn dispatch_ingress_with_for_test<Source, SourceError, MakeSource, Output, Deliver>(
+    app: &App,
+    method: Method,
+    uri: Uri,
+    make_source: MakeSource,
+    deliver: Deliver,
+) -> anyhow::Result<Output>
+where
+    Source: futures_util::Stream<Item = Result<bytes::Bytes, SourceError>> + 'static,
+    SourceError: Into<anyhow::Error> + 'static,
+    MakeSource: FnOnce() -> Result<Source, EdgeError>,
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<Output, EdgeError>,
+{
+    let request_start = app.monotonic_now();
+    let core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(EdgeError::internal)?;
+    dispatch_ingress_stream_with_timer_and(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        make_source,
+        |_| pending::<()>(),
+        deliver,
+    )
+    .await
+}
+
 /// Exercises a source-construction failure after admission through the production seam.
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
@@ -500,6 +535,9 @@ where
             IngressBeginOutcome::Admitted(prepared) => prepared,
             IngressBeginOutcome::Refused(response) => {
                 return Ok(deliver(response)?);
+            }
+            IngressBeginOutcome::Aborted => {
+                return Err(anyhow::anyhow!("ingress admission aborted"));
             }
             _ => {
                 return Ok(deliver(app.detached_ingress_error_egress(
