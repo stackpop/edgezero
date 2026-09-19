@@ -40,6 +40,8 @@ variables (see [the migration guide](../manifest-store-migration.md)).
 The portable store metadata baked into `App` by the `app!` macro
 drives which logical stores are exposed; no `edgezero.toml` needs to
 be loaded by the runtime.
+If `Hooks::configure` fails, `run_app` returns the source-preserving
+`application configuration failed` error before binding the listener.
 
 ## Development Server
 
@@ -114,7 +116,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler() {
-        let app = App::build_app();
+        let app = App::build_app().expect("configured app");
         let router = app.router();
 
         let request = Request::builder()

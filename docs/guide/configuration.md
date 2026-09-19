@@ -656,7 +656,7 @@ The macro:
 - Generates route registration
 - Wires middleware from the manifest
 - Bakes portable store metadata (`Hooks::stores()`) from `[stores.kv]`, `[stores.config]`, and `[stores.secrets]` when present
-- Creates the `App` struct that implements `Hooks` (use `App::build_app()`)
+- Creates the `App` struct that implements `Hooks` (use the fallible `App::build_app()`)
 
 ### ManifestLoader
 

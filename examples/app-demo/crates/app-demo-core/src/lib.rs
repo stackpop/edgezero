@@ -13,7 +13,10 @@ use std::time::Duration;
 
 use edgezero_core::app::App as EdgeZeroApp;
 use edgezero_core::http::StatusCode;
-use edgezero_core::{AdmissionDecision, BufferedIngressResponse, IngressGrant, RouteResolution};
+use edgezero_core::{
+    AdmissionDecision, BufferedIngressResponse, ConfigExtractionLimits, EdgeError, IngressGrant,
+    ResponseEgressCompletion, RouteResolution,
+};
 
 const DEFAULT_INGRESS_READ_BUDGET: Duration = Duration::from_secs(30);
 const FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024;
@@ -34,7 +37,8 @@ pub struct DemoState {
 }
 
 /// Installs request-lifecycle policy before any adapter begins polling a body.
-fn configure_app(app: &mut EdgeZeroApp) {
+fn configure_app(app: &mut EdgeZeroApp) -> Result<(), EdgeError> {
+    app.set_config_extraction_limits(ConfigExtractionLimits::default())?;
     app.set_ingress_admission_policy(|head| match head.route_resolution().clone() {
         RouteResolution::Matched(metadata) => {
             let route_class = metadata.class().map(str::to_owned);
@@ -44,12 +48,14 @@ fn configure_app(app: &mut EdgeZeroApp) {
                 DEFAULT_INGRESS_READ_BUDGET
             };
             AdmissionDecision::Admit {
+                completion: response_completion(route_class.clone()),
                 grant: IngressGrant::new(AdmissionLease { route_class }),
                 read_deadline: head.read_deadline_after(read_budget),
             }
         }
         RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound | _ => {
             AdmissionDecision::ReadBodyBeforeFallback {
+                completion: ResponseEgressCompletion::empty(),
                 grant: IngressGrant::new(AdmissionLease { route_class: None }),
                 max_body_bytes: FALLBACK_INGRESS_BODY_BYTES,
                 read_deadline: head.read_deadline_after(FALLBACK_INGRESS_READ_BUDGET),
@@ -64,6 +70,13 @@ fn configure_app(app: &mut EdgeZeroApp) {
             }
         }
     });
+    Ok(())
+}
+
+/// Keeps an application-owned value alive until this response reaches terminal egress.
+fn response_completion(route_class: Option<String>) -> ResponseEgressCompletion {
+    let response_scoped_lease = AdmissionLease { route_class };
+    ResponseEgressCompletion::new(move |_report| drop(response_scoped_lease))
 }
 
 /// Returns the shared app state, referenced by `app!(..., state = crate::app_state())`.
@@ -99,7 +112,8 @@ mod lifecycle_tests {
     use edgezero_core::body::Body;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{request_builder, HeaderMap, Method, Response, StatusCode, Version};
-    use edgezero_core::ingress::{IngressBeginOutcome, IngressHeadParts};
+    use edgezero_core::ingress::{IngressBeginOutcome, IngressDispatchOutcome, IngressHeadParts};
+    use edgezero_core::response_egress::ResponseEgressEnvelope;
     use edgezero_core::router::RouteResolution;
     use edgezero_core::time::MonotonicInstant;
     use futures::executor::block_on;
@@ -117,7 +131,7 @@ mod lifecycle_tests {
 
     #[test]
     fn configured_admission_uses_finite_class_aware_deadlines() {
-        let app = super::App::build_app();
+        let app = super::App::build_app().expect("configured app");
         let start = MonotonicInstant::now();
 
         let outbound = begin_ingress(&app, "/proxy/status/200", start);
@@ -145,7 +159,7 @@ mod lifecycle_tests {
 
     #[test]
     fn admission_handler_consumes_the_typed_grant_once() {
-        let app = super::App::build_app();
+        let app = super::App::build_app().expect("configured app");
         let start = MonotonicInstant::now();
         let prepared = begin_ingress(&app, "/admission", start);
         let request = request_builder()
@@ -154,7 +168,7 @@ mod lifecycle_tests {
             .body(Body::empty())
             .expect("request");
 
-        let response = block_on(app.dispatch_admitted(prepared, request)).into_response();
+        let response = complete_envelope(block_on(app.dispatch_admitted(prepared, request)));
         let payload: serde_json::Value = response.body().to_json().expect("json");
         assert_eq!(payload["route_class"], "diagnostic");
         assert_eq!(payload["grant_consumed_once"], true);
@@ -162,7 +176,7 @@ mod lifecycle_tests {
 
     #[test]
     fn configured_admission_preserves_fallback_status_at_exact_cap() {
-        let app = super::App::build_app();
+        let app = super::App::build_app().expect("configured app");
         for (method, path, expected) in [
             (Method::POST, "/missing", StatusCode::NOT_FOUND),
             (Method::POST, "/", StatusCode::METHOD_NOT_ALLOWED),
@@ -172,21 +186,22 @@ mod lifecycle_tests {
                 .uri(path)
                 .body(Body::stream(iter([Bytes::from(vec![b'a'; 4_096])])))
                 .expect("request");
-            let response = block_on(app.dispatch_ingress(
-                request,
-                MonotonicInstant::now(),
-                edgezero_core::IngressHeadAccounting::HostManaged,
-                edgezero_core::IngressFraming::HostManaged,
-            ))
-            .expect("dispatch")
-            .into_response();
+            let response = complete_dispatch(
+                block_on(app.dispatch_ingress(
+                    request,
+                    MonotonicInstant::now(),
+                    edgezero_core::IngressHeadAccounting::HostManaged,
+                    edgezero_core::IngressFraming::HostManaged,
+                ))
+                .expect("dispatch"),
+            );
             assert_eq!(response.status(), expected);
         }
     }
 
     #[test]
     fn configured_admission_returns_exact_overflow_response_for_both_fallbacks() {
-        let app = super::App::build_app();
+        let app = super::App::build_app().expect("configured app");
         for (method, path) in [(Method::POST, "/missing"), (Method::POST, "/")] {
             let request = request_builder()
                 .method(method)
@@ -196,14 +211,15 @@ mod lifecycle_tests {
                     Bytes::from_static(b"b"),
                 ])))
                 .expect("request");
-            let response = block_on(app.dispatch_ingress(
-                request,
-                MonotonicInstant::now(),
-                edgezero_core::IngressHeadAccounting::HostManaged,
-                edgezero_core::IngressFraming::HostManaged,
-            ))
-            .expect("dispatch")
-            .into_response();
+            let response = complete_dispatch(
+                block_on(app.dispatch_ingress(
+                    request,
+                    MonotonicInstant::now(),
+                    edgezero_core::IngressHeadAccounting::HostManaged,
+                    edgezero_core::IngressFraming::HostManaged,
+                ))
+                .expect("dispatch"),
+            );
 
             assert_plain_text_response(
                 &response,
@@ -215,7 +231,7 @@ mod lifecycle_tests {
 
     #[test]
     fn configured_admission_returns_exact_timeout_response() {
-        let app = super::App::build_app();
+        let app = super::App::build_app().expect("configured app");
         let request = request_builder()
             .method(Method::POST)
             .uri("/missing")
@@ -223,14 +239,15 @@ mod lifecycle_tests {
                 EdgeError::request_timeout("adapter read deadline exceeded"),
             )])))
             .expect("request");
-        let response = block_on(app.dispatch_ingress(
-            request,
-            MonotonicInstant::now(),
-            edgezero_core::IngressHeadAccounting::HostManaged,
-            edgezero_core::IngressFraming::HostManaged,
-        ))
-        .expect("dispatch")
-        .into_response();
+        let response = complete_dispatch(
+            block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                edgezero_core::IngressHeadAccounting::HostManaged,
+                edgezero_core::IngressFraming::HostManaged,
+            ))
+            .expect("dispatch"),
+        );
 
         assert_plain_text_response(&response, StatusCode::REQUEST_TIMEOUT, b"request timeout\n");
     }
@@ -257,6 +274,22 @@ mod lifecycle_tests {
         assert_eq!(response.body().as_bytes().expect("buffered body"), body);
     }
 
+    fn complete_dispatch(outcome: IngressDispatchOutcome) -> Response {
+        let IngressDispatchOutcome::Response(envelope) = outcome else {
+            panic!("expected response");
+        };
+        complete_envelope(envelope)
+    }
+
+    fn complete_envelope(envelope: ResponseEgressEnvelope) -> Response {
+        let Ok((prepared, _, mut attempt, clock)) = envelope.begin() else {
+            panic!("response egress begin");
+        };
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(clock.now()));
+        prepared.into_response()
+    }
+
     fn begin_ingress(
         app: &EdgeZeroApp,
         path: &str,
@@ -271,7 +304,7 @@ mod lifecycle_tests {
         match app.begin_ingress(head, start).expect("begin ingress") {
             IngressBeginOutcome::Admitted(prepared) => prepared,
             IngressBeginOutcome::Refused(_) => panic!("demo policy must admit request"),
-            _ => panic!("unknown admission outcome"),
+            IngressBeginOutcome::Aborted | _ => panic!("unknown admission outcome"),
         }
     }
 }

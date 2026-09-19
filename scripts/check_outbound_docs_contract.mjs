@@ -3,6 +3,7 @@
 import { readFileSync } from 'node:fs'
 
 const capabilityPath = 'docs/guide/capabilities.md'
+const handlersGuidePath = 'docs/guide/handlers.md'
 const proxyGuidePath = 'docs/guide/proxying.md'
 const fastlyGuidePath = 'docs/guide/adapters/fastly.md'
 const scaffoldReadmePath =
@@ -36,6 +37,13 @@ const expectedHeader = [
 ]
 const expectedIngressRows = [
   ['ingress-admission', 'Native', 'Native', 'Native', 'Native'],
+  [
+    'ingress-admission-abort',
+    'Native',
+    'BestEffort',
+    'BestEffort',
+    'BestEffort',
+  ],
   [
     'inbound-read-deadlines',
     'Native',
@@ -366,6 +374,7 @@ for (const [name, expectedRows, actualRows] of matrices) {
 
 const hardCutSurfaces = [
   [capabilityPath, capabilitySource],
+  [handlersGuidePath, readFileSync(handlersGuidePath, 'utf8')],
   [proxyGuidePath, readFileSync(proxyGuidePath, 'utf8')],
   [fastlyGuidePath, readFileSync(fastlyGuidePath, 'utf8')],
   [scaffoldReadmePath, readFileSync(scaffoldReadmePath, 'utf8')],
@@ -392,9 +401,21 @@ for (const staleFragment of [
     )
   }
 }
+const handlersGuideSource = hardCutSurfaces[1][1]
+for (const requiredFragment of [
+  'fn configure_app(app: &mut edgezero_core::app::App) -> Result<(), EdgeError>',
+  'completion: ResponseEgressCompletion::empty()',
+  'ResponseEgressCompletion::new(move |report| ... )',
+  '`AdmissionDecision::Abort`',
+  'never belongs in response extensions',
+]) {
+  if (!handlersGuideSource.includes(requiredFragment)) {
+    fail(`${handlersGuidePath} is missing lifecycle contract: ${requiredFragment}`)
+  }
+}
 if (
-  !hardCutSurfaces[1][1].includes('start_batch_until') ||
-  !hardCutSurfaces[1][1].includes('send_all_until')
+  !hardCutSurfaces[2][1].includes('start_batch_until') ||
+  !hardCutSurfaces[2][1].includes('send_all_until')
 ) {
   fail('outbound guide must document completion-order and ordered batch access')
 }
@@ -406,13 +427,13 @@ for (const requiredFragment of [
   'OutboundBatchFailure',
   'send_all_until(requests, cutoff).await',
 ]) {
-  if (!hardCutSurfaces[1][1].includes(requiredFragment)) {
+  if (!hardCutSurfaces[2][1].includes(requiredFragment)) {
     fail(`${proxyGuidePath} is missing typed batch contract: ${requiredFragment}`)
   }
 }
 if (
-  !hardCutSurfaces[2][1].includes('run_app_with_hooks') ||
-  !hardCutSurfaces[2][1].includes('send_request_with_hooks')
+  !hardCutSurfaces[3][1].includes('run_app_with_hooks') ||
+  !hardCutSurfaces[3][1].includes('send_request_with_hooks')
 ) {
   fail('Fastly guide must document the closed request/response lifecycle APIs')
 }
@@ -515,6 +536,15 @@ if (cloudflareExactDeadlineRecommendation.test(outboundSpecSource)) {
 }
 
 const inboundSpecSource = readFileSync(inboundSpecPath, 'utf8')
+for (const requiredFragment of [
+  '    Abort,',
+  'ResponseEgressCompletion::empty()',
+  'Hooks::configure(&mut App) -> Result<(), EdgeError>',
+]) {
+  if (!inboundSpecSource.includes(requiredFragment)) {
+    fail(`${inboundSpecPath} is missing lifecycle contract: ${requiredFragment}`)
+  }
+}
 for (const staleFragment of [
   'current Tower adapter nevertheless drives',
   'block_in_place` plus a nested runtime `block_on',
@@ -640,6 +670,9 @@ if (
 const responseEgressSpecSource = readFileSync(responseEgressSpecPath, 'utf8')
 for (const requiredFragment of [
   'pub struct ResponseEgressDeadline(Deadline);',
+  'pub struct ResponseEgressCompletion',
+  'ResponseEgressCompletion::empty()',
+  'not attached to a `Response` and never enters `http::Extensions`',
   'ResponseEgressHead::application_deadline()',
   'queue-through-egress',
 ]) {

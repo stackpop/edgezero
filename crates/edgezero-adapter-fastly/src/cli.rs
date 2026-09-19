@@ -398,6 +398,7 @@ impl Adapter for FastlyCliAdapter {
             | Capability::OutboundHeaderFidelity => CapabilitySupport::Native,
             Capability::ConfigReadDeadlines
             | Capability::InboundReadDeadlines
+            | Capability::IngressAdmissionAbort
             | Capability::LazyStreamedResponsePassthrough
             | Capability::OutboundBatchCancellation
             | Capability::OutboundBatchCompletionOrder
@@ -5680,6 +5681,10 @@ mod tests {
                 CapabilitySupport::BestEffort,
             ),
             (Capability::IngressAdmission, CapabilitySupport::Native),
+            (
+                Capability::IngressAdmissionAbort,
+                CapabilitySupport::BestEffort,
+            ),
             (
                 Capability::RawIngressFramingValidation,
                 CapabilitySupport::Unsupported,

@@ -57,6 +57,8 @@ environment variables (see
 per-id `KV` / `Config` / `Secret` registries from the portable store
 metadata baked into `App` by the `app!` macro. No `edgezero.toml` is
 loaded by the runtime.
+If `Hooks::configure` fails, `run_app` returns the source-preserving
+`application configuration failed` error before receiving the client request.
 
 For fully manual wiring, build `FastlyService`, attach stores as needed, and call its send-owning
 `send()` method. Prefer `run_app` for manifest-driven store resolution.

@@ -1425,6 +1425,7 @@ mod tests {
         let fallback = normalize_source_whitespace(fallback_initializer_block(core_lib));
         assert!(
             core_lib.contains("FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024")
+                && fallback.contains("completion: ResponseEgressCompletion::empty()")
                 && fallback
                     .contains("grant: IngressGrant::new(AdmissionLease { route_class: None })")
                 && fallback.contains("max_body_bytes: FALLBACK_INGRESS_BODY_BYTES")
@@ -1449,6 +1450,7 @@ mod tests {
     fn generated_fallback_policy_rejects_swapped_terminal_mappings() {
         assert_generated_fallback_policy(
             r#"AdmissionDecision::ReadBodyBeforeFallback {
+                completion: ResponseEgressCompletion::empty(),
                 grant: IngressGrant::new(AdmissionLease { route_class: None }),
                 max_body_bytes: FALLBACK_INGRESS_BODY_BYTES,
                 on_exceeded: BufferedIngressResponse::text(
@@ -1516,6 +1518,7 @@ mod tests {
             !entrypoint.contains("#[fastly::main]")
                 && !entrypoint.contains("Request")
                 && !entrypoint.contains("Response")
+                && entrypoint.contains("pub fn main() -> Result<(), fastly::Error>")
                 && entrypoint.contains("run_app::<demo_app_core::App>()"),
             "generated Fastly entrypoint must let EdgeZero own request receipt and response delivery",
         );
@@ -1543,12 +1546,29 @@ mod tests {
             "generated app macro must install the lifecycle configuration callback",
         );
         assert!(
+            core_lib.contains("fn configure_app(app: &mut EdgeZeroApp) -> Result<(), EdgeError>")
+                && core_lib.contains("Ok(())"),
+            "generated lifecycle configuration must propagate initialization failures",
+        );
+        assert!(
             core_lib.contains("set_ingress_admission_policy"),
             "generated app must configure ingress admission",
         );
         assert!(
             core_lib.contains("IngressGrant::new"),
             "generated admission policy must issue an app-owned grant",
+        );
+        assert!(
+            core_lib.contains("ResponseEgressCompletion::new")
+                && core_lib.contains("ResponseEgressCompletion::empty()")
+                && core_lib.contains("completion: response_completion(route_class.clone())")
+                && core_lib.contains("drop(response_scoped_lease)")
+                && core_lib.contains("completion:"),
+            "generated admission decisions must own an explicit response completion resource",
+        );
+        assert!(
+            core_lib.contains("super::App::build_app().expect(\"configured app\")"),
+            "generated tests must handle fallible application assembly",
         );
         assert_generated_fallback_policy(&core_lib);
 

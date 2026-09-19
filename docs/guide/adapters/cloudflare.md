@@ -55,6 +55,9 @@ derived from the baked store ids and queried individually). Per-id
 `KV` / `Config` / `Secret` registries are built and injected into
 request extensions automatically. No `edgezero.toml` is loaded by
 the runtime — see [the migration guide](../manifest-store-migration.md).
+If `Hooks::configure` fails, `run_app` logs only the stable EdgeZero error category and returns the
+fixed `application configuration failed` worker error before request conversion. Application or
+provider diagnostics are not exposed on the wire.
 
 The low-level `dispatch()` helper remains available only for fully manual wiring and does not inject
 store metadata. Prefer `run_app` or `dispatch_with_config` for normal use.

@@ -307,24 +307,39 @@ Macro-driven apps can customize the generated `App` through the existing
 `Hooks::configure` seam without replacing manifest-driven routing:
 
 ```rust
-use edgezero_core::{AdmissionDecision, IngressGrant};
+use edgezero_core::{
+    AdmissionDecision, EdgeError, IngressGrant, ResponseEgressCompletion,
+};
 use std::time::Duration;
 
-fn configure_app(app: &mut edgezero_core::app::App) {
+fn configure_app(app: &mut edgezero_core::app::App) -> Result<(), EdgeError> {
     app.set_ingress_admission_policy(|head| AdmissionDecision::Admit {
+        completion: ResponseEgressCompletion::empty(),
         grant: IngressGrant::empty(),
         read_deadline: head.read_deadline_after(Duration::from_secs(30)),
     });
+    Ok(())
 }
 
 edgezero_core::app!("edgezero.toml", configure = crate::configure_app);
 ```
 
-`configure = <expr>` must evaluate to a callable that accepts `&mut App`. It is
+`configure = <expr>` must evaluate to a callable that accepts `&mut App` and returns
+`Result<(), EdgeError>`. It is
 invoked after the manifest router is built and before the app begins serving, so
 it can install ingress admission, request-head limits, config extraction limits,
 the monotonic clock, and response-egress policy or observation hooks. Keep the
-callback cheap for the same adapter-lifecycle reasons as `state = <expr>` above.
+callback cheap for the same adapter-lifecycle reasons as `state = <expr>` above. A configuration
+error prevents EdgeZero request conversion, body polling, and dispatch; Axum also fails before
+binding its listener.
+
+Every response-producing admission decision owns one explicit `ResponseEgressCompletion`. Use
+`ResponseEgressCompletion::empty()` when there is no response-scoped resource. To hold a permit
+through terminal egress, move it directly into `ResponseEgressCompletion::new(move |report| ... )`.
+The completion is non-clone and never belongs in response extensions. It follows admitted,
+refused, fallback, handler-error, and middleware-error responses into the adapter's exactly-once
+egress attempt. `AdmissionDecision::Abort` is different: it returns no response and therefore owns
+no completion.
 
 ## Response Types
 

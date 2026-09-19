@@ -38,19 +38,13 @@ mod tests {
     use fastly::http::Method as FastlyMethod;
     use futures::{executor::block_on, stream};
 
-    trait CompleteEnvelope {
-        fn into_response(self) -> Response;
-    }
-
-    impl CompleteEnvelope for ResponseEgressEnvelope {
-        fn into_response(self) -> Response {
-            let Ok((prepared, _, mut attempt, clock)) = self.begin() else {
-                panic!("begin response egress");
-            };
-            assert!(attempt.begin_writing());
-            assert!(attempt.complete(clock.now()));
-            prepared.into_response()
-        }
+    fn complete_envelope(envelope: ResponseEgressEnvelope) -> Response {
+        let Ok((prepared, _, mut attempt, clock)) = envelope.begin() else {
+            panic!("begin response egress");
+        };
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(clock.now()));
+        prepared.into_response()
     }
 
     struct FixedConfigStore(&'static str);
@@ -273,7 +267,7 @@ mod tests {
                 },
                 move |envelope| {
                     delivery_events.lock().expect("events").push("deliver");
-                    let response = envelope.into_response();
+                    let response = complete_envelope(envelope);
                     assert_eq!(response.status(), StatusCode::CREATED);
                     assert_eq!(
                         response.headers().get("x-finalized"),

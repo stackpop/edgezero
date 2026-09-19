@@ -147,6 +147,7 @@ impl Adapter for SpinCliAdapter {
             | Capability::OutboundHttp => CapabilitySupport::Native,
             Capability::ConfigReadDeadlines
             | Capability::InboundReadDeadlines
+            | Capability::IngressAdmissionAbort
             | Capability::LazyStreamedResponsePassthrough
             | Capability::OutboundBatchCancellation
             | Capability::OutboundDeadlines
@@ -1336,6 +1337,10 @@ mod tests {
                 CapabilitySupport::BestEffort,
             ),
             (Capability::IngressAdmission, CapabilitySupport::Native),
+            (
+                Capability::IngressAdmissionAbort,
+                CapabilitySupport::BestEffort,
+            ),
             (
                 Capability::RawIngressFramingValidation,
                 CapabilitySupport::Unsupported,
