@@ -218,7 +218,7 @@ struct ResolvedTomlLeaf<'raw> {
 #[inline]
 pub fn run_config_validate(args: &ConfigValidateArgs) -> Result<(), String> {
     let ctx = load_validation_context(args)?;
-    run_shared_checks(&ctx)?;
+    run_shared_checks(&ctx, None)?;
     log::info!(
         "[edgezero] config validate (raw): {} OK{}",
         args.manifest.display(),
@@ -237,7 +237,7 @@ where
     C: DeserializeOwned + Validate + AppConfigMeta,
 {
     let ctx = load_validation_context(args)?;
-    run_shared_checks(&ctx)?;
+    run_shared_checks(&ctx, None)?;
 
     // Typed deserialise + validate_excluding_secrets (push,
     // diff, AND typed validate all use deserialize-only +
@@ -255,7 +255,7 @@ where
         .map_err(|err| format!("typed app-config failed validation: {err}"))?;
 
     typed_secret_checks(&typed, &ctx)?;
-    run_adapter_typed_checks::<C>(&ctx)?;
+    run_adapter_typed_checks::<C>(&ctx, None)?;
 
     log::info!(
         "[edgezero] config validate (typed): {} + {} OK{}",
@@ -445,7 +445,7 @@ where
 {
     // Pre-flight: load + validate.
     let ctx = load_push_context(args)?;
-    run_shared_checks(&ctx.validation)?;
+    run_shared_checks(&ctx.validation, Some(&args.adapter))?;
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
     let typed: C = app_config::deserialize_app_config_with_options::<C>(
@@ -457,7 +457,7 @@ where
     app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("typed app-config failed validation: {err}"))?;
     typed_secret_checks(&typed, &ctx.validation)?;
-    run_adapter_typed_checks::<C>(&ctx.validation)?;
+    run_adapter_typed_checks::<C>(&ctx.validation, Some(&args.adapter))?;
 
     // Resolve adapter paths.
     let (manifest_root, adapter_manifest_path, component_selector, push_ctx) =
@@ -611,7 +611,8 @@ where
         strict: false,
     };
     let ctx = load_validation_context(&validate_args)?;
-    run_shared_checks(&ctx)?;
+    ensure_adapter_defined(&args.adapter, Some(&ctx.manifest_loader))?;
+    run_shared_checks(&ctx, Some(&args.adapter))?;
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
     let typed: C = app_config::deserialize_app_config_with_options::<C>(
@@ -623,7 +624,7 @@ where
     app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("local validation failed: {err}"))?;
     typed_secret_checks(&typed, &ctx)?;
-    run_adapter_typed_checks::<C>(&ctx)?;
+    run_adapter_typed_checks::<C>(&ctx, Some(&args.adapter))?;
 
     // Build the local envelope.
     let local_data: serde_json::Value = serde_json::to_value(&typed)
@@ -1334,7 +1335,7 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
     // Push is strict — the synthesized validate args
     // unconditionally request `--strict` so `run_shared_checks`
     // runs the capability-completeness + handler-path checks
-    // alongside the schema and per-adapter shared checks.
+    // alongside the schema and selected-adapter shared checks.
     let validate_args = ConfigValidateArgs {
         app_config: args.app_config.clone(),
         manifest: args.manifest.clone(),
@@ -1526,10 +1527,10 @@ fn resolve_app_config_path(
     )
 }
 
-fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
-    run_adapter_shared_checks(ctx)?;
+fn run_shared_checks(ctx: &ValidationContext, selected: Option<&str>) -> Result<(), String> {
+    run_adapter_shared_checks(ctx, selected)?;
     if ctx.args_strict {
-        strict_capability_completeness(ctx.manifest())?;
+        strict_capability_completeness(ctx.manifest(), selected)?;
         strict_handler_paths(ctx.manifest())?;
     }
     Ok(())
@@ -1541,12 +1542,15 @@ fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
 // -------------------------------------------------------------------
 
 /// Run the adapter-agnostic shared checks: for every adapter
-/// declared in the manifest, look up its `Adapter` impl in the
+/// declared in the manifest (or only the selected push/diff target), look up its `Adapter` impl in the
 /// registry and invoke `validate_app_config_keys` +
 /// `validate_adapter_manifest`. Adapters not in the registry (e.g.
 /// a feature-gated build that omitted some) are silently skipped —
 /// they can't validate what they don't link.
-fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
+fn run_adapter_shared_checks(
+    ctx: &ValidationContext,
+    selected: Option<&str>,
+) -> Result<(), String> {
     let raw_table = ctx
         .raw_config
         .as_table()
@@ -1557,6 +1561,9 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
     let env_config = EnvConfig::from_env();
 
     for (name, adapter_cfg) in &ctx.manifest().adapters {
+        if selected.is_some_and(|target| target != name) {
+            continue;
+        }
         let Some(adapter) = adapter_registry::get_adapter(name) else {
             continue;
         };
@@ -1750,7 +1757,10 @@ fn collect_secret_leaves<'raw>(
 /// runtime store ids, not flat-namespace candidates) so adapters
 /// whose secret store has a flat-namespace constraint (Spin) can
 /// detect within-secrets collisions.
-fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result<(), String> {
+fn run_adapter_typed_checks<C: AppConfigMeta>(
+    ctx: &ValidationContext,
+    selected: Option<&str>,
+) -> Result<(), String> {
     let default_store_id = ctx
         .manifest()
         .stores
@@ -1781,6 +1791,9 @@ fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result
     }
 
     for name in ctx.manifest().adapters.keys() {
+        if selected.is_some_and(|target| target != name) {
+            continue;
+        }
         if let Some(adapter) = adapter_registry::get_adapter(name) {
             adapter.validate_typed_secrets(&entries)?;
         }
@@ -1888,12 +1901,18 @@ fn flatten_keys_into(table: &Table, prefix: &str, out: &mut Vec<String>) {
 // --strict checks
 // -------------------------------------------------------------------
 
-fn strict_capability_completeness(manifest: &Manifest) -> Result<(), String> {
+fn strict_capability_completeness(
+    manifest: &Manifest,
+    selected: Option<&str>,
+) -> Result<(), String> {
     // Capability matrix, driven by each adapter crate's
     // `Adapter::single_store_kinds()` impl. Adapters not in the
     // registry (e.g. a feature-gated build that omitted some) are
     // skipped — we can't speak for what isn't linked.
     for adapter_name in manifest.adapters.keys() {
+        if selected.is_some_and(|target| target != adapter_name) {
+            continue;
+        }
         enforce_single_store_capability(manifest, adapter_name)?;
     }
     Ok(())
@@ -4103,6 +4122,66 @@ timeout_ms = 50
     /// `validate_adapter_manifest`, which fails when the
     /// referenced spin.toml has no `[component.*]` declarations.
     #[test]
+    fn selected_adapter_strict_checks_preserve_portability_validation() {
+        let manifest_text = format!(
+            "{}\n[adapters.spin.adapter]\ncrate = \"unused\"\nmanifest = \"spin.toml\"\n",
+            PUSH_MANIFEST
+                .replace("adapters.axum", "adapters.fastly")
+                .replace(
+                    "ids = [\"default\"]",
+                    "ids = [\"default\", \"extra\"]\ndefault = \"default\""
+                )
+        );
+        let (dir, manifest, _) = setup_project(&manifest_text, FIXTURE_APP_CONFIG);
+        fs::write(dir.path().join("spin.toml"), VALID_SPIN_TOML).unwrap();
+        let mut args = args_for(&manifest);
+        args.strict = true;
+        let ctx = load_validation_context(&args).unwrap();
+        run_shared_checks(&ctx, Some("fastly"))
+            .expect("selected multi-store adapter accepts multiple stores");
+        for selected in [None, Some("spin")] {
+            let err = run_shared_checks(&ctx, selected).unwrap_err();
+            assert!(err.contains("Single") && err.contains("secrets"), "{err}");
+        }
+    }
+
+    #[test]
+    fn selected_adapter_push_and_diff_ignore_unrelated_adapter_constraints() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let manifest_text = format!(
+            "{PUSH_MANIFEST}\n[adapters.spin.adapter]\ncrate = \"unused\"\nmanifest = \"spin.toml\"\n"
+        );
+        for spin_manifest in ["spin_manifest_version = 2\n", VALID_SPIN_TOML] {
+            let app_config = FIXTURE_APP_CONFIG.replace("demo_api_token", "Private-Reference");
+            let (dir, manifest, _) = setup_project(&manifest_text, &app_config);
+            fs::write(dir.path().join("spin.toml"), spin_manifest).unwrap();
+            let mut push = push_args(&manifest, "axum");
+            push.local = true;
+            push.dry_run = true;
+            run_config_push_typed::<FixtureConfig>(&push)
+                .expect("an unrelated adapter must not block a selected-adapter push");
+            let diff = ConfigDiffArgs {
+                adapter: "axum".into(),
+                app_config: None,
+                exit_code: false,
+                format: DiffFormat::Unified,
+                key: None,
+                local: true,
+                manifest: manifest.clone(),
+                no_env: true,
+                runtime_config: None,
+                store: None,
+                staging: false,
+            };
+            run_config_diff_typed::<FixtureConfig>(&diff)
+                .expect("an unrelated adapter must not block a selected-adapter diff");
+            assert!(run_config_validate_typed::<FixtureConfig>(&args_for(&manifest)).is_err());
+            push.adapter = "spin".into();
+            assert!(run_config_push_typed::<FixtureConfig>(&push).is_err());
+        }
+    }
+
+    #[test]
     fn typed_push_runs_spin_adapter_manifest_check_before_push() {
         let _lock = manifest_guard().lock().expect("manifest guard");
         let app_config = r#"
@@ -4187,20 +4266,12 @@ default = "one"
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"a.wasm\"\n",
         )
         .expect("write spin.toml");
-        // Adapter the push targets doesn't matter — the strict
-        // capability check fires per declared adapter set. We
-        // push to axum to keep the rest of the flow simple.
+        // The selected adapter is Single-capable too, so its capability
+        // check must still reject before any push.
         let err = run_config_push_typed::<FixtureConfig>(&push_args(&manifest, "axum"))
             .expect_err("Single-capable adapter with multi-id store must fail preflight");
-        // BTreeMap iteration order on the manifest's adapter set
-        // means the check reports whichever Single-capable
-        // adapter sorts first (axum or spin) — both are
-        // Single-capable for secrets in this fixture. The
-        // contract that matters is "the strict check ran before
-        // the per-adapter push", which the `Single` +
-        // `secrets` substrings prove.
         assert!(
-            err.contains("Single") && err.contains("secrets"),
+            err.contains("axum") && err.contains("Single") && err.contains("secrets"),
             "error must come from --strict capability check: {err}"
         );
     }

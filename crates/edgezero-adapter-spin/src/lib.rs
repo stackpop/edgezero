@@ -29,7 +29,7 @@ use core::pin::Pin;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use bytes::Bytes;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::{App, Hooks, StoresMetadata};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -120,5 +120,32 @@ pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinFullRespo
     let stores = A::stores();
     let app = A::build_app();
     request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)
+        .await
+}
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+/// Dispatch a caller-owned app with explicit store metadata.
+///
+/// Resolves configuration and request resources for this invocation without
+/// building or caching an app or installing logging. Pass metadata matching
+/// the app (normally `MyApp::stores()`). Retain only application-owned values;
+/// native handles and pending work belong to the request. Shared app state
+/// must support overlapping invocations.
+///
+/// Store metadata is a caller precondition: `App` carries no store provenance,
+/// so this function cannot validate the pairing. Mismatched metadata can fail
+/// binding resolution or select unintended bindings. Keep the app and its
+/// construction metadata together; normally both come from the same `Hooks` type.
+///
+/// # Errors
+/// Returns conversion or dispatch errors from the existing adapter boundary.
+#[inline]
+pub async fn dispatch_app(
+    app: &App,
+    stores: StoresMetadata,
+    req: SpinRequest,
+) -> anyhow::Result<SpinFullResponse> {
+    let env = EnvConfig::from_env();
+    request::dispatch_with_registries(app, req, stores.config, stores.kv, stores.secrets, &env)
         .await
 }

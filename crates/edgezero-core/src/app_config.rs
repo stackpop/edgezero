@@ -1585,3 +1585,30 @@ greeting = "hello"
         assert_eq!(array.dotted_path(), "partners[*].api_key");
     }
 }
+
+#[cfg(test)]
+mod retained_guard_tests {
+    use super::{SECRET_FIELDS_DEPTH, SecretFieldsRecursionGuard};
+    use std::panic::catch_unwind;
+
+    #[test]
+    fn recursion_guard_resets_after_scope_and_unwind() {
+        fn nested_scope() {
+            let _outer = SecretFieldsRecursionGuard::enter();
+            let _inner = SecretFieldsRecursionGuard::enter();
+            SECRET_FIELDS_DEPTH.with(|depth| assert_eq!(depth.get(), 2));
+        }
+        nested_scope();
+        SECRET_FIELDS_DEPTH.with(|depth| assert_eq!(depth.get(), 0));
+        assert!(
+            catch_unwind(|| {
+                let _guard = SecretFieldsRecursionGuard::enter();
+                panic!("injected initialization failure");
+            })
+            .is_err()
+        );
+        SECRET_FIELDS_DEPTH.with(|depth| assert_eq!(depth.get(), 0));
+        let _fresh = SecretFieldsRecursionGuard::enter();
+        SECRET_FIELDS_DEPTH.with(|depth| assert_eq!(depth.get(), 1));
+    }
+}

@@ -1,6 +1,14 @@
 //! Utilities for bridging Fastly Compute@Edge requests into the
 //! `edgezero-core` service abstractions.
 
+#![cfg_attr(
+    feature = "fastly",
+    expect(
+        clippy::pub_use,
+        reason = "re-export the SDK serving builder rather than duplicate its API"
+    )
+)]
+
 // Only compiled where it is actually used (the CLI push/GC path and the Fastly
 // runtime resolver). Gating it keeps a `--no-default-features` build dead-code
 // clean instead of dragging in helpers no feature references.
@@ -13,6 +21,7 @@ pub mod config_store;
 pub mod context;
 #[cfg(feature = "fastly")]
 pub mod key_value_store;
+pub mod lifecycle;
 #[cfg(feature = "fastly")]
 pub mod logger;
 #[cfg(feature = "fastly")]
@@ -24,6 +33,8 @@ pub mod response;
 #[cfg(feature = "fastly")]
 pub mod secret_store;
 
+#[cfg(any(feature = "fastly", test))]
+use edgezero_core::app::App;
 #[cfg(feature = "fastly")]
 use edgezero_core::app::Hooks;
 #[cfg(any(feature = "fastly", test))]
@@ -36,6 +47,8 @@ use edgezero_core::http::Extensions;
 use edgezero_core::manifest::ResolvedLoggingConfig;
 #[cfg(feature = "fastly")]
 use fastly::compute_runtime::service_id;
+#[cfg(feature = "fastly")]
+pub use fastly::http::serve::{Serve, ServeSummary};
 
 #[cfg(any(feature = "cli", feature = "fastly", test))]
 const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";
@@ -101,6 +114,35 @@ impl From<&EnvConfig> for FastlyLogging {
             level,
             use_fastly_logger,
         }
+    }
+}
+
+#[cfg(any(feature = "fastly", test))]
+#[derive(Default)]
+struct RetainedApp {
+    app: Option<App>,
+}
+
+#[cfg(any(feature = "fastly", test))]
+impl RetainedApp {
+    fn get_or_init<E>(
+        &mut self,
+        env: &EnvConfig,
+        owns_logging: impl FnOnce() -> bool,
+        install_logger: impl FnOnce(&str, log::LevelFilter, bool) -> Result<(), E>,
+        build: impl FnOnce() -> App,
+    ) -> Result<&App, E> {
+        if self.app.is_none() {
+            let logging = FastlyLogging::from(env);
+            if logging.use_fastly_logger && !owns_logging() {
+                install_logger(
+                    logging.endpoint.as_deref().unwrap_or("stdout"),
+                    logging.level,
+                    logging.echo_stdout,
+                )?;
+            }
+        }
+        Ok(self.app.get_or_insert_with(build))
     }
 }
 
@@ -431,4 +473,164 @@ mod runtime_env_key_tests {
             ]
         );
     }
+}
+
+#[cfg(test)]
+mod retained_app_tests {
+    use super::*;
+    use edgezero_core::app::{App, Hooks};
+    use edgezero_core::router::RouterService;
+    use std::cell::{Cell, RefCell};
+
+    struct CountedApp;
+    thread_local! { static CONFIGURES: Cell<usize> = const { Cell::new(0) }; }
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "exercise default app construction"
+    )]
+    impl Hooks for CountedApp {
+        fn configure(app: &mut App) {
+            CONFIGURES.with(|count| count.set(count.get().checked_add(1).unwrap()));
+            app.set_name("retained");
+        }
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    fn configured_env() -> EnvConfig {
+        EnvConfig::from_vars([
+            ("EDGEZERO__LOGGING__ENDPOINT", "fixture-logs"),
+            ("EDGEZERO__LOGGING__LEVEL", "debug"),
+        ])
+    }
+
+    #[test]
+    fn retained_app_initializes_logging_before_build_once() {
+        let mut retained = RetainedApp::default();
+        let events = RefCell::new(Vec::new());
+        CONFIGURES.with(|count| count.set(0));
+        for _ in 0_usize..2 {
+            let app = retained
+                .get_or_init(
+                    &configured_env(),
+                    || false,
+                    |endpoint, level, echo| {
+                        assert_eq!(endpoint, "fixture-logs");
+                        assert_eq!(level, log::LevelFilter::Debug);
+                        assert!(echo);
+                        events.borrow_mut().push("logger");
+                        Ok::<(), &'static str>(())
+                    },
+                    || {
+                        events.borrow_mut().push("build");
+                        CountedApp::build_app()
+                    },
+                )
+                .unwrap();
+            assert_eq!(app.name(), "retained");
+        }
+        assert_eq!(*events.borrow(), ["logger", "build"]);
+        CONFIGURES.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    #[test]
+    fn retained_app_keeps_first_degraded_snapshot() {
+        let mut retained = RetainedApp::default();
+        let builds = Cell::new(0_usize);
+        for env in [EnvConfig::default(), configured_env()] {
+            retained
+                .get_or_init(
+                    &env,
+                    || false,
+                    |_, _, _| -> Result<(), &'static str> { panic!("must not install later") },
+                    || {
+                        builds.set(builds.get().checked_add(1).unwrap());
+                        CountedApp::build_app()
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    fn retained_app_respects_owned_logging_and_fresh_owners() {
+        let builds = Cell::new(0_usize);
+        for _ in 0_usize..2 {
+            let mut retained = RetainedApp::default();
+            retained
+                .get_or_init(
+                    &configured_env(),
+                    || true,
+                    |_, _, _| -> Result<(), &'static str> { panic!("caller owns logging") },
+                    || {
+                        builds.set(builds.get().checked_add(1).unwrap());
+                        CountedApp::build_app()
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(builds.get(), 2);
+    }
+
+    #[test]
+    fn retained_app_logger_error_prevents_construction() {
+        let mut retained = RetainedApp::default();
+        let result = retained.get_or_init(
+            &configured_env(),
+            || false,
+            |_, _, _| Err("logger failed"),
+            || panic!("must not build"),
+        );
+        assert_eq!(result.err(), Some("logger failed"));
+        assert!(retained.app.is_none());
+    }
+}
+
+#[cfg(feature = "fastly")]
+/// Serve requests with an app initialized once on the first callback.
+///
+/// Opt in using an ordinary `main` and an explicitly bounded [`Serve`]. The
+/// runtime may exit before any configured limit; every request must tolerate
+/// fresh initialization. The standard response conversion buffers core streams.
+/// Inspect the returned summary (whose request count includes failed attempts)
+/// or call its `into_result()` method to propagate terminal callback errors.
+#[must_use = "inspect the serving summary or call into_result() to handle terminal errors"]
+#[inline]
+pub fn serve_app<A: Hooks>(serve: Serve) -> ServeSummary<fastly::Error> {
+    serve_app_with_request_extensions::<A, _>(serve, |_request, _extensions| {})
+}
+
+#[cfg(feature = "fastly")]
+/// Serve a retained app with fresh request extensions and store registries.
+///
+/// Runtime configuration is read on every callback. Logging uses only the first
+/// snapshot, before app construction, unless `Hooks::owns_logging` is true.
+/// An unavailable optional configuration store freezes logging as disabled,
+/// even if later reads recover store selectors. Initialization errors terminate
+/// the SDK loop; construction panics remain sandbox failures.
+///
+/// The callback runs per request, but the closure and its captured state live
+/// for the entire serving loop. Only the supplied extensions are freshly created
+/// for each request; create request-local mutable data inside the callback.
+/// For mutable native requests, manual streaming, response finalization, or
+/// custom initialization, use [`lifecycle::serve_custom`].
+#[must_use = "inspect the serving summary or call into_result() to handle terminal errors"]
+#[inline]
+pub fn serve_app_with_request_extensions<A, F>(
+    serve: Serve,
+    mut extend: F,
+) -> ServeSummary<fastly::Error>
+where
+    A: Hooks,
+    F: FnMut(&fastly::Request, &mut Extensions),
+{
+    let stores = A::stores();
+    let mut retained = RetainedApp::default();
+    serve.run(move |req| -> Result<fastly::Response, fastly::Error> {
+        let env = runtime_env_config(stores);
+        let app = retained.get_or_init(&env, A::owns_logging, init_logger, A::build_app)?;
+        request::dispatch_with_registries(app, req, stores, &env, &mut extend)
+    })
 }

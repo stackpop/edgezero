@@ -296,3 +296,163 @@ Configure the Fastly adapter in `edgezero.toml`. See [Configuration](/guide/conf
 
 - Learn about [Cloudflare Workers](/guide/adapters/cloudflare) as an alternative deployment target
 - Explore [Configuration](/guide/configuration) for manifest details
+
+## Reusing a sandbox and retaining an app
+
+Opt in with an ordinary `main` in place of the single-request `#[fastly::main]`:
+
+```rust
+use edgezero_adapter_fastly::{Serve, serve_app};
+use std::time::Duration;
+
+fn main() -> Result<(), fastly::Error> {
+    serve_app::<MyApp>(
+        Serve::new()
+            .with_max_requests(10)
+            .with_timeout(Duration::from_millis(500)),
+    ).into_result()
+}
+```
+
+`serve_app_with_request_extensions` additionally accepts an `FnMut` callback
+for fresh extensions on every request. The first callback initializes logging
+and builds the app. Each callback reads runtime configuration and constructs new
+store registries. App construction and `configure` execute once per retained
+owner; explicit work elsewhere still executes whenever the application calls it.
+The extension callback and its captures are retained for the whole serving loop;
+only the supplied extensions are fresh. Create request-specific mutable data
+inside the callback or store it in those extensions.
+
+Logging takes the first configuration snapshot, unless the app owns logging.
+An unavailable optional runtime configuration store disables logging for that
+sandbox, even if subsequent reads recover store selectors. It does not silently
+retry or reconfigure logging. The current overlay enables logging when an
+endpoint exists and uses `echo_stdout: true`. Applications requiring another
+initialization policy should use `lifecycle::serve_custom` and `setup_once`.
+The resolved configuration does not distinguish intentionally disabled logging
+from an unavailable first snapshot. Warnings through the log facade may be lost
+before a logger is installed; absence of a warning does not establish a healthy
+configuration read.
+
+SDK 0.12.1 exposes `with_max_requests`, `with_timeout`, `with_max_lifetime`, and
+`with_max_memory`. A value of zero disables the request-count or memory limit;
+it does not request zero callbacks or zero memory use. The lifetime limit is
+measured from `Serve` construction, including time before the first callback.
+Limits do not guarantee reuse; any request may start a fresh sandbox.
+Lifetime and memory checks occur between callbacks and cannot interrupt
+blocked application work. Before using a local memory limit, verify that the
+guest's memory-snapshot call succeeds: an unsupported snapshot conservatively
+ends the SDK loop. CPU clock observations are not reliable cross-run benchmarks.
+
+`ServeSummary::requests()` counts attempted callbacks, including a failed one.
+Record response commitment, guest completion, and client completion separately;
+a crash can prevent a final summary. Ordinary handler errors are rendered by the
+router. Errors escaping conversion, required store setup, stream collection, or
+error rendering retain the SDK's terminal error behavior. Constructor panics
+remain sandbox failures.
+
+### Custom dispatch and streaming
+
+The standard helper collects core response streams into a native response body.
+For progressive client streaming, mutable native requests, response-extension
+finalization, or post-send work, use `lifecycle::serve_custom` with a configured
+`Serve` builder and a callback receiving `&mut lifecycle::Sandbox<T>`. EdgeZero
+owns the retained slot and successful-only initialization; your callback chooses
+the application-owned `T`. Initialize lazily so health checks can bypass expensive
+construction. Use `runtime_env_config` and `request::dispatch_with_registries`
+when standard translation suffices; otherwise retain the existing raw
+`into_core_request` and router dispatch path.
+
+For manual streaming, append every header value, commit once with
+`stream_to_client`, pump and flush chunks, then finish the stream. Handle errors
+after commitment locally: returning an error to the SDK can trigger another
+response attempt. Complete pending backend and post-send operations before the
+callback returns. Do not cache native store handles with the app.
+
+Use `Request::get_client_request_id()` for request correlation. `FASTLY_TRACE_ID`
+describes the sandbox and must not be treated as a unique request ID. If a native
+ID is unavailable, generate a request-local fallback and label its source. Do
+not retain correlation fields in app state or global logger configuration.
+
+### Custom lifecycle compatibility contract
+
+The custom path is a supported interface, not a requirement to use `serve_app`.
+It combines `lifecycle::serve_custom`, public `request::into_core_request`, and
+`App::router().oneshot`. EdgeZero delegates the receive loop and limits to the SDK,
+owns the state slot, attempted-callback count, initialization-attempt count, and
+successful setup guard. The application owns the limit configuration, which state
+survives, initialization and setup closures, error responses, logging policy,
+configuration refresh, response finalization, and explicit sending. Direct SDK
+serving remains available when these helpers do not fit.
+
+`Sandbox::initialize` invokes its builder only while empty. It returns `Result<(), E>`
+without constraining `E`: an error may carry a fallback router for this request.
+Read the retained value afterward using `state()`. `setup_once` has an independent
+success guard, so application retries do not repeat successful logger installation.
+Failed setup must be safe to retry; partial side effects are not rolled back.
+Neither method catches panics. `requests()` includes the current callback and
+early-return probes; `initialization_attempts()` counts only actual builder calls.
+
+For example, inside a callback after its health checks:
+
+```rust,ignore
+sandbox.setup_once(|| install_application_logger())?;
+let fallback = sandbox.initialize(|| build_application()).err();
+// build_application returns Ok(retained_state) or Err(request_local_error_router).
+// Select fallback.as_ref() or sandbox.state(), then dispatch and explicitly send.
+```
+
+Use `lifecycle::run_custom(Request::from_client(), callback)` for the single-request
+branch. It creates fresh state and does not enter `Serve` or call `next_request`.
+Both wrappers complete the SDK `HandlerResult` exactly once. Use an ordinary
+`fn main`, not `#[fastly::main]`, which could attempt another error response when
+an already-completed error propagates. Manually sending callbacks can return `()`
+or `Result<(), E>`; after response commitment, handle failures locally and return
+`() / Ok(())`. The wrappers never convert or collect the callback's response body.
+
+Retain only successfully initialized state. A handled initialization failure
+may send an error response and return `()` (or `Ok(())`) to allow another
+callback to retry. Do not put an error router into the retained slot. Check
+health routes before initialization. Guard successful global logger installation
+separately: retrying application initialization must not reinstall the logger.
+Constructor panics are sandbox failures, not recoverable initialization results.
+The standard helper's terminal error policy is unchanged.
+
+Every callback gets fresh request extensions, metadata, native handles, and
+bodies. Mutable parsing buffers belong to a request or document, even when their
+rewriter is referenced by a retained router. Response extensions produced by
+handlers remain available after direct router dispatch; inspect them before
+sending. Registry-aware `dispatch_with_registries` performs standard response
+conversion and is not a streaming/finalization substitute.
+
+Pin the adapter, core, and SDK to compatible versions. Do not repin merely to
+replace the SDK's `Serve` import with its EdgeZero re-export. When adopting a new
+EdgeZero revision, run the existing compatibility suite against that checkout:
+
+```sh
+./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke --require-runtime
+```
+
+The standalone fixture workspace depends on this checkout by path. Its custom
+entry points use these lifecycle helpers and exercise lazy health bypass, failed initialization followed by
+successful retry and reuse, request-specific response extensions, progressive
+streaming, duplicate cookies, and post-commit error handling. The runner records
+runtime versions and artifact identities. Recovery only passes when all required
+callbacks are observed in the same guest. An unavailable runtime or missing
+reuse is unverified, not a compatibility pass. Run the corresponding adapter
+suites when using Cloudflare, Spin, or Axum; their host lifetimes differ.
+
+Application-specific refresh, key rotation, and workload validation remain the
+application's responsibility. Passing local fixtures does not guarantee reuse
+or establish deployed resource lifetimes.
+
+Warning caches persist too. Their bounded recent-name sets can evict entries,
+so warnings can recur; suppressed warning counts are not failure counts.
+Dynamic-backend capacity is service-wide, and registrations may wait for capacity.
+A sandbox request limit alone does not bound origin diversity or request fan-out.
+
+The local fixtures are in `tests/fixtures/reusable-app`. Local reuse and streaming
+results do not establish deployed eviction frequency, endpoint-handle validity,
+resource accounting, or performance. Named endpoint delivery must be verified
+separately from echoed stdout. Roll back by restoring the original single-request
+entry point and removing retained state, not merely setting a request limit of one.

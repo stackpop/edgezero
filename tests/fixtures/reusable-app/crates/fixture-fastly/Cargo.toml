@@ -1,0 +1,58 @@
+[package]
+name = "fixture-fastly"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+edgezero-core.workspace = true
+edgezero-adapter-fastly.workspace = true
+fixture-core.workspace = true
+fastly.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[[bin]]
+name = "fixture-fastly-single-request"
+path = "src/bin/single_request.rs"
+
+[[bin]]
+name = "fixture-fastly-rebuild-per-request"
+path = "src/bin/rebuild_per_request.rs"
+
+[[bin]]
+name = "fixture-fastly-retained-app"
+path = "src/bin/retained_app.rs"
+
+[[bin]]
+name = "fixture-fastly-custom-single-request"
+path = "src/bin/custom_single_request.rs"
+
+[[bin]]
+name = "fixture-fastly-custom-rebuild-per-request"
+path = "src/bin/custom_rebuild_per_request.rs"
+
+[[bin]]
+name = "fixture-fastly-custom-retained-app"
+path = "src/bin/custom_retained_app.rs"
+
+[[bin]]
+name = "fixture-fastly-logger-negative"
+path = "src/bin/logger_negative.rs"
+
+[[bin]]
+name = "fixture-fastly-limit-requests"
+path = "src/bin/limit_requests.rs"
+
+[[bin]]
+name = "fixture-fastly-limit-lifetime"
+path = "src/bin/limit_lifetime.rs"
+
+[[bin]]
+name = "fixture-fastly-limit-memory"
+path = "src/bin/limit_memory.rs"
+
+[[bin]]
+name = "fixture-fastly-faults"
+path = "src/bin/faults.rs"

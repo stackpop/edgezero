@@ -862,6 +862,145 @@ mod tests {
     }
 
     #[test]
+    fn retained_router_separates_overlapping_requests() {
+        use futures::channel::oneshot;
+        use std::collections::VecDeque;
+        use std::future::Future as _;
+        use std::str::from_utf8;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct Tag(&'static str);
+        #[derive(Clone)]
+        struct RequestToken(&'static str);
+        struct Barrier(Mutex<VecDeque<oneshot::Receiver<()>>>);
+        #[async_trait::async_trait(?Send)]
+        impl Middleware for Barrier {
+            async fn handle(
+                &self,
+                ctx: RequestContext,
+                next: Next<'_>,
+            ) -> Result<Response, EdgeError> {
+                let receiver = self.0.lock().unwrap().pop_front().unwrap();
+                receiver.await.unwrap();
+                next.run(ctx).await
+            }
+        }
+        #[crate::action]
+        async fn probe(ctx: RequestContext) -> Result<String, EdgeError> {
+            let request = ctx.request();
+            let counter = request.extensions().get::<Arc<AtomicUsize>>().unwrap();
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(format!(
+                "{}:{}:{}:{}:{}",
+                ctx.path_params().get("id").unwrap(),
+                request.headers()["x-request-token"].to_str().unwrap(),
+                from_utf8(ctx.body().as_bytes().unwrap()).unwrap(),
+                request.extensions().get::<RequestToken>().unwrap().0,
+                request.extensions().get::<Tag>().unwrap().0
+            ))
+        }
+        let (send1, recv1) = oneshot::channel();
+        let (send2, recv2) = oneshot::channel();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .with_state(Tag("app"))
+            .with_state(Arc::clone(&counter))
+            .middleware(Barrier(Mutex::new([recv1, recv2].into())))
+            .get("/probe/{id}", probe)
+            .build();
+        let make_request = |token: &'static str| {
+            let mut req = request_builder()
+                .uri(format!("/probe/{token}"))
+                .header("x-request-token", token)
+                .body(Body::from(token))
+                .unwrap();
+            req.extensions_mut().insert(RequestToken(token));
+            req.extensions_mut().insert(Tag("request"));
+            req
+        };
+        let mut first = Box::pin(router.oneshot(make_request("first")));
+        let mut second = Box::pin(router.oneshot(make_request("second")));
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        send1.send(()).unwrap();
+        send2.send(()).unwrap();
+        let first_response = block_on(first).unwrap();
+        let second_response = block_on(second).unwrap();
+        assert_eq!(
+            first_response.body().as_bytes().unwrap(),
+            b"first:first:first:first:app"
+        );
+        assert_eq!(
+            second_response.body().as_bytes().unwrap(),
+            b"second:second:second:second:app"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn retained_router_releases_cancelled_request_state() {
+        use std::future::{Future as _, pending};
+
+        #[derive(Clone)]
+        struct RequestResource(Arc<()>);
+
+        #[crate::action]
+        async fn wait(ctx: RequestContext) -> Result<String, EdgeError> {
+            // Keep the request alive across suspension, as an awaiting handler does.
+            pending::<()>().await;
+            Ok(ctx.path_params().get("id").unwrap().to_owned())
+        }
+
+        #[crate::action]
+        async fn probe(ctx: RequestContext) -> Result<String, EdgeError> {
+            assert!(
+                ctx.request()
+                    .extensions()
+                    .get::<RequestResource>()
+                    .is_none()
+            );
+            Ok(ctx.path_params().get("id").unwrap().to_owned())
+        }
+
+        let shared = Arc::new(());
+        let router = RouterService::builder()
+            .with_state(Arc::clone(&shared))
+            .get("/wait/{id}", wait)
+            .get("/probe/{id}", probe)
+            .build();
+        let resource = RequestResource(Arc::new(()));
+        let released = Arc::downgrade(&resource.0);
+        let mut request = request_builder()
+            .uri("/wait/cancelled")
+            .body(Body::from("private request body"))
+            .unwrap();
+        request.extensions_mut().insert(resource);
+        let mut suspended = Box::pin(router.oneshot(request));
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(suspended.as_mut().poll(&mut cx).is_pending());
+        assert!(released.upgrade().is_some());
+        drop(suspended);
+        assert!(released.upgrade().is_none());
+
+        let response = block_on(
+            router.oneshot(
+                request_builder()
+                    .uri("/probe/fresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(response.body().as_bytes().unwrap(), b"fresh");
+        assert_eq!(Arc::strong_count(&shared), 2);
+        drop(router);
+        assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    #[test]
     fn with_state_no_cross_request_bleed() {
         use crate::extractor::{FromRequest as _, State};
         use std::future::Future as _;
