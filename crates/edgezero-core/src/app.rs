@@ -430,21 +430,28 @@ pub struct StoresMetadata {
 /// Trait implemented by application hook adapters.
 pub trait Hooks {
     /// Construct an `App` by wiring the routes and invoking the configuration hook.
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns the typed configuration error without exposing a partially configured app.
     #[inline]
-    fn build_app() -> App
+    fn build_app() -> Result<App, EdgeError>
     where
         Self: Sized,
     {
         let mut app = App::with_name(Self::routes(), Self::name());
-        Self::configure(&mut app);
-        app
+        Self::configure(&mut app)?;
+        Ok(app)
     }
 
     /// Allow implementations to mutate the freshly constructed application before use.
     /// The default implementation performs no changes.
+    ///
+    /// # Errors
+    /// Returns a typed startup-policy error when configuration cannot be completed.
     #[inline]
-    fn configure(_app: &mut App) {}
+    fn configure(_app: &mut App) -> Result<(), EdgeError> {
+        Ok(())
+    }
 
     /// Parsed and finalized manifest contract baked by `app!`.
     ///
@@ -549,6 +556,8 @@ mod tests {
 
     struct DefaultHooks;
 
+    struct FailingHooks;
+
     struct TestHooks;
 
     struct CountingMiddleware(Arc<AtomicUsize>);
@@ -594,11 +603,26 @@ mod tests {
 
     #[expect(
         clippy::missing_trait_methods,
+        reason = "test stub exercises only fallible application configuration"
+    )]
+    impl Hooks for FailingHooks {
+        fn configure(_app: &mut App) -> Result<(), EdgeError> {
+            Err(EdgeError::service_unavailable("configuration unavailable"))
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[expect(
+        clippy::missing_trait_methods,
         reason = "test stub — `build_app` intentionally uses the trait default; other methods are overridden for test coverage"
     )]
     impl Hooks for TestHooks {
-        fn configure(app: &mut App) {
+        fn configure(app: &mut App) -> Result<(), EdgeError> {
             app.set_name("configured");
+            Ok(())
         }
 
         fn name() -> &'static str {
@@ -741,7 +765,7 @@ mod tests {
 
     #[test]
     fn build_app_invokes_hooks_for_routes_and_configuration() {
-        let app = TestHooks::build_app();
+        let app = TestHooks::build_app().expect("configured app");
         assert_eq!(app.name(), "configured");
         let stores = TestHooks::stores();
         let config = stores.config.expect("config store metadata");
@@ -761,6 +785,14 @@ mod tests {
         let response = block_on(app.router().clone().call(request)).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.body().as_bytes().expect("buffered"), b"ok");
+    }
+
+    #[test]
+    fn build_app_propagates_configuration_failure() {
+        let Err(error) = FailingHooks::build_app() else {
+            panic!("configuration failure must stop application assembly");
+        };
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
@@ -1816,7 +1848,7 @@ mod tests {
 
     #[test]
     fn default_hooks_use_default_name_and_into_router() {
-        let app = DefaultHooks::build_app();
+        let app = DefaultHooks::build_app().expect("default app");
         assert_eq!(app.name(), App::default_name());
         assert!(matches!(DefaultHooks::manifest(), BakedManifest::Absent));
         assert_eq!(DefaultHooks::manifest_json(), None);

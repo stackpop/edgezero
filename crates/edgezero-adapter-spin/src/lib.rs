@@ -1,5 +1,8 @@
 //! Adapter helpers for Spin (Fermyon).
 
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use anyhow::Context as _;
+
 #[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub mod cli;
 
@@ -41,6 +44,18 @@ use spin_sdk::wasip3::http::types::Response as WasiResponse;
 /// Raw `WASIp3` response whose body and transmission lifetime remain owned by `EdgeZero`.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub type SpinResponse = WasiResponse;
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
+    A::build_app().context("application configuration failed")
+}
+
+/// Test seam for the production application-assembly error mapping.
+#[cfg(all(feature = "test-utils", feature = "spin", target_arch = "wasm32"))]
+#[doc(hidden)]
+pub fn build_app_for_test<A: Hooks>() -> anyhow::Result<App> {
+    build_app_for_dispatch::<A>()
+}
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub trait AppExt {
@@ -110,6 +125,7 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[inline]
 pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinResponse> {
+    let app = build_app_for_dispatch::<A>()?;
     // Best-effort: every Spin `#[http_service]` re-enters this function, so a
     // second `log::set_logger` call returns Err — drop the result instead of
     // `.expect()` to avoid panicking on every subsequent request. Skipped
@@ -119,7 +135,6 @@ pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinResponse>
     }
     let env = EnvConfig::from_env();
     let stores = A::stores();
-    let app = A::build_app();
     request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)
         .await
 }

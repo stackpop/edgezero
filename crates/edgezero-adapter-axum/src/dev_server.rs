@@ -391,8 +391,13 @@ fn serve_local(
 ///
 /// # Errors
 /// Returns an error if the dev server fails to bind or any required store handle cannot be initialised.
+fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
+    A::build_app().context("application configuration failed")
+}
+
 #[inline]
 pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
+    let app = build_app_for_dispatch::<A>()?;
     let env = EnvConfig::from_env();
     let stores = A::stores();
     let kv_init_requirement = kv_init_requirement(stores);
@@ -411,8 +416,6 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
         log::warn!("{warning}");
     }
     let addr = resolution.addr;
-    let app = A::build_app();
-
     log::info!("[edgezero] starting axum server on http://{addr}");
 
     let runtime = RuntimeBuilder::new_multi_thread()
@@ -581,7 +584,37 @@ pub(crate) fn resolve_addr(env: &EnvConfig) -> addr::BindAddrResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::error::EdgeError;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailingConfiguration;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test hook exercises only adapter startup failure"
+    )]
+    impl Hooks for FailingConfiguration {
+        fn configure(_app: &mut App) -> Result<(), EdgeError> {
+            Err(EdgeError::service_unavailable("configuration unavailable"))
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[test]
+    fn failing_configuration_prevents_listener_boundary() {
+        let bind_calls = AtomicUsize::new(0);
+        let result = build_app_for_dispatch::<FailingConfiguration>().map(|_app| {
+            bind_calls.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let error = result.expect_err("configuration must fail before listener bind");
+        assert_eq!(error.to_string(), "application configuration failed");
+        assert_eq!(bind_calls.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn default_config_uses_expected_address() {

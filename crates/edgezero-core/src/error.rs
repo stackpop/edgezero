@@ -275,7 +275,10 @@ impl EdgeError {
         }
     }
 
-    fn kind_str(&self) -> &'static str {
+    /// Returns the stable public category without provider or application diagnostics.
+    #[must_use]
+    #[inline]
+    pub fn kind(&self) -> &'static str {
         match self {
             EdgeError::BadGateway { .. } => "bad_gateway",
             EdgeError::BadRequest { .. } => "bad_request",
@@ -533,8 +536,8 @@ impl From<ConfigStoreError> for EdgeError {
 impl IntoResponse for EdgeError {
     #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
-        let kind = self.kind_str();
-        let is_config_out_of_date = self.kind_str() == "config_out_of_date";
+        let kind = self.kind();
+        let is_config_out_of_date = self.kind() == "config_out_of_date";
         // `ConfigOutOfDate { field_path: String::new(), .. }` (the missing-blob
         // path) must OMIT the `field_path` JSON key entirely, not emit
         // `"field_path": ""`. Per spec 6.3.1.

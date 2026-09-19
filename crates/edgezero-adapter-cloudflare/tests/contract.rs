@@ -32,6 +32,8 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
+    #[cfg(feature = "test-utils")]
+    use edgezero_adapter_cloudflare::build_app_for_test;
     use edgezero_adapter_cloudflare::context::CloudflareRequestContext;
     use edgezero_adapter_cloudflare::outbound::CloudflareOutboundClient;
     #[cfg(feature = "test-utils")]
@@ -41,7 +43,7 @@ mod tests {
     #[cfg(feature = "test-utils")]
     use edgezero_adapter_cloudflare::request::deadline_body_releases_source_for_test;
     use edgezero_adapter_cloudflare::request::{CloudflareService, into_core_request};
-    use edgezero_core::app::App;
+    use edgezero_core::app::{App, Hooks};
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
@@ -60,6 +62,36 @@ mod tests {
     wasm_bindgen_test_configure!(run_in_browser);
 
     struct FixedConfigStore(&'static str);
+
+    struct FailingConfiguration;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test hook exercises only adapter startup failure"
+    )]
+    impl Hooks for FailingConfiguration {
+        fn configure(_app: &mut App) -> Result<(), EdgeError> {
+            Err(EdgeError::service_unavailable(
+                "private configuration detail",
+            ))
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[wasm_bindgen_test]
+    fn failing_configuration() {
+        let Err(error) = build_app_for_test::<FailingConfiguration>() else {
+            panic!("configuration must fail before request dispatch");
+        };
+        assert!(matches!(
+            error,
+            worker::Error::RustError(message) if message == "application configuration failed"
+        ));
+    }
 
     #[async_trait::async_trait(?Send)]
     #[expect(

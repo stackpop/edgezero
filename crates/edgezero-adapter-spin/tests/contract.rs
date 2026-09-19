@@ -27,10 +27,12 @@ mod store_trait_compile_checks {
 )]
 mod tests {
     use bytes::Bytes;
+    #[cfg(feature = "test-utils")]
+    use edgezero_adapter_spin::build_app_for_test;
     use edgezero_adapter_spin::context::SpinRequestContext;
     #[cfg(feature = "test-utils")]
     use edgezero_adapter_spin::request::deadline_body_releases_source_for_test;
-    use edgezero_core::app::App;
+    use edgezero_core::app::{App, Hooks};
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
@@ -46,6 +48,33 @@ mod tests {
     use futures::stream;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// Config store that returns a value only for the expected key.
+    struct FailingConfiguration;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test hook exercises only adapter startup failure"
+    )]
+    impl Hooks for FailingConfiguration {
+        fn configure(_app: &mut App) -> Result<(), EdgeError> {
+            Err(EdgeError::service_unavailable("configuration unavailable"))
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn failing_configuration() {
+        let Err(error) = build_app_for_test::<FailingConfiguration>() else {
+            panic!("configuration must fail before request dispatch");
+        };
+        assert_eq!(error.to_string(), "application configuration failed");
+        assert!(format!("{error:#}").contains("configuration unavailable"));
+    }
 
     /// Config store that returns a value only for the expected key.
     struct FixedConfigStore {

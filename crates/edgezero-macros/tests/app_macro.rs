@@ -29,7 +29,7 @@ mod configured_app {
     use edgezero_core::response_egress::ResponseEgressCompletion;
     use edgezero_core::time::MonotonicInstant;
 
-    fn configure_app(app: &mut App) {
+    fn configure_app(app: &mut App) -> Result<(), edgezero_core::EdgeError> {
         app.set_ingress_admission_policy(|_| {
             let mut response = Response::new(Body::empty());
             *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
@@ -38,6 +38,7 @@ mod configured_app {
                 response,
             }
         });
+        Ok(())
     }
 
     edgezero_core::app!(
@@ -48,7 +49,7 @@ mod configured_app {
 
     #[test]
     fn app_macro_configure_callback_installs_ingress_policy() {
-        let app = ConfiguredApp::build_app();
+        let app = ConfiguredApp::build_app().expect("configured app");
         let head = IngressHeadParts::new(
             Method::GET,
             Uri::from_static("/"),
@@ -70,5 +71,30 @@ mod configured_app {
             prepared.into_response().status(),
             StatusCode::TOO_MANY_REQUESTS
         );
+    }
+}
+
+#[cfg(test)]
+mod failing_configured_app {
+    use edgezero_core::app::{App, Hooks as _};
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::http::StatusCode;
+
+    fn configure_app(_app: &mut App) -> Result<(), EdgeError> {
+        Err(EdgeError::service_unavailable("configuration unavailable"))
+    }
+
+    edgezero_core::app!(
+        "tests/fixtures/owns_logging.toml",
+        FailingConfiguredApp,
+        configure = configure_app
+    );
+
+    #[test]
+    fn app_macro_propagates_configuration_failure() {
+        let Err(error) = FailingConfiguredApp::build_app() else {
+            panic!("configuration failure must stop application assembly");
+        };
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
