@@ -67,9 +67,9 @@ pub use error::{
 pub use ingress::{
     AdmissionDecision, AdmittedIngress, BufferedIngressResponse, DEFAULT_INBOUND_READ_BUDGET,
     DEFAULT_MAX_REQUEST_HEADER_BYTES, DEFAULT_MAX_REQUEST_HEADER_COUNT,
-    DEFAULT_MAX_REQUEST_TARGET_BYTES, IngressAdmissionOutcome, IngressBeginOutcome, IngressFraming,
-    IngressGrant, IngressHead, IngressHeadAccounting, IngressHeadLimits, IngressHeadParts,
-    PreparedIngress,
+    DEFAULT_MAX_REQUEST_TARGET_BYTES, IngressAdmissionOutcome, IngressBeginOutcome,
+    IngressDispatchOutcome, IngressFraming, IngressGrant, IngressHead, IngressHeadAccounting,
+    IngressHeadLimits, IngressHeadParts, PreparedIngress,
 };
 pub use manifest::{
     AtomicHost, BakedManifest, Capability, CapabilitySupport, HostParseError, HostPat,

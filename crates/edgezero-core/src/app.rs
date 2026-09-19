@@ -7,8 +7,8 @@ use crate::http::header::CONTENT_TYPE;
 use crate::http::{HeaderValue, Method, Request, Response, StatusCode};
 use crate::ingress::{
     AdmissionDecision, IngressAdmissionOutcome, IngressAdmissionPolicy, IngressBeginOutcome,
-    IngressFraming, IngressHead, IngressHeadAccounting, IngressHeadLimits, IngressHeadParts,
-    PreparedIngress, apply_admission_policy, default_admission_policy,
+    IngressDispatchOutcome, IngressFraming, IngressHead, IngressHeadAccounting, IngressHeadLimits,
+    IngressHeadParts, PreparedIngress, apply_admission_policy, default_admission_policy,
 };
 use crate::manifest::BakedManifest;
 use crate::response::IntoResponse as _;
@@ -51,12 +51,21 @@ impl App {
     #[inline]
     pub fn admit_ingress(&self, head: &IngressHead) -> Result<IngressAdmissionOutcome, EdgeError> {
         match apply_admission_policy(&self.ingress_policy, head, self.monotonic_clock())? {
-            IngressAdmissionOutcome::Admitted(admitted) => Ok(IngressAdmissionOutcome::Admitted(
-                admitted.with_config_extraction_limits(self.config_extraction_limits),
-            )),
-            IngressAdmissionOutcome::Refused(response) => {
-                Ok(IngressAdmissionOutcome::Refused(response))
-            }
+            IngressAdmissionOutcome::Admitted {
+                completion,
+                ingress,
+            } => Ok(IngressAdmissionOutcome::Admitted {
+                completion,
+                ingress: ingress.with_config_extraction_limits(self.config_extraction_limits),
+            }),
+            IngressAdmissionOutcome::Refused {
+                completion,
+                response,
+            } => Ok(IngressAdmissionOutcome::Refused {
+                completion,
+                response,
+            }),
+            IngressAdmissionOutcome::Aborted => Ok(IngressAdmissionOutcome::Aborted),
         }
     }
 
@@ -75,12 +84,13 @@ impl App {
         let request_method = prepared.request_method().clone();
         let request_start = prepared.request_start();
         let route = prepared.route_metadata().cloned();
-        drop(prepared);
+        let (_resolved, _admitted, completion) = prepared.into_parts();
         self.response_egress_envelope(
             render_error_response(error),
             request_method,
             request_start,
             route,
+            completion,
         )
     }
 
@@ -103,12 +113,22 @@ impl App {
         let head = head_parts.into_head(request_start, resolved.resolution().clone());
 
         match self.admit_ingress(&head)? {
-            IngressAdmissionOutcome::Admitted(admitted) => Ok(IngressBeginOutcome::Admitted(
-                PreparedIngress::new(resolved, admitted),
-            )),
-            IngressAdmissionOutcome::Refused(response) => Ok(IngressBeginOutcome::Refused(
-                self.detached_response_egress(response, request_method, request_start),
-            )),
+            IngressAdmissionOutcome::Admitted {
+                completion,
+                ingress,
+            } => Ok(IngressBeginOutcome::Admitted(PreparedIngress::new(
+                resolved, ingress, completion,
+            ))),
+            IngressAdmissionOutcome::Refused {
+                completion,
+                response,
+            } => Ok(IngressBeginOutcome::Refused(self.detached_response_egress(
+                response,
+                request_method,
+                request_start,
+                completion,
+            ))),
+            IngressAdmissionOutcome::Aborted => Ok(IngressBeginOutcome::Aborted),
         }
     }
 
@@ -138,7 +158,12 @@ impl App {
         request_method: Method,
         request_start: MonotonicInstant,
     ) -> ResponseEgressEnvelope {
-        self.detached_response_egress(render_error_response(error), request_method, request_start)
+        self.detached_response_egress(
+            render_error_response(error),
+            request_method,
+            request_start,
+            ResponseEgressCompletion::empty(),
+        )
     }
 
     fn detached_response_egress(
@@ -146,12 +171,13 @@ impl App {
         response: Response,
         request_method: Method,
         request_start: MonotonicInstant,
+        completion: ResponseEgressCompletion,
     ) -> ResponseEgressEnvelope {
         ResponseEgressEnvelope::detached(
             response,
             request_start,
             request_method,
-            ResponseEgressCompletion::empty(),
+            completion,
             self.monotonic_clock(),
         )
     }
@@ -167,7 +193,7 @@ impl App {
         let request_method = request.method().clone();
         let request_start = prepared.request_start();
         let route = prepared.route_metadata().cloned();
-        let (resolved, admitted) = prepared.into_parts();
+        let (resolved, admitted, completion) = prepared.into_parts();
         let response = match self
             .router
             .dispatch_resolved(resolved, request, admitted)
@@ -176,14 +202,15 @@ impl App {
             Ok(response) => response,
             Err(error) => render_error_response(error),
         };
-        self.response_egress_envelope(response, request_method, request_start, route)
+        self.response_egress_envelope(response, request_method, request_start, route, completion)
     }
 
     /// Resolves, admits, and dispatches one normalized inbound request into owned egress.
     ///
-    /// Adapters must call this before polling the request body and retain the returned envelope
-    /// through their response transmission boundary. The route selected for admission is consumed
-    /// during dispatch, so handlers cannot observe a different route identity.
+    /// Adapters must call this before polling the request body. A response outcome owns its
+    /// envelope through the transmission boundary; an aborted outcome produces no HTTP response.
+    /// The route selected for admission is consumed during dispatch, so handlers cannot observe a
+    /// different route identity.
     ///
     /// # Errors
     /// Returns an error only when admission or error rendering fails. Handler and routing errors
@@ -195,13 +222,16 @@ impl App {
         request_start: MonotonicInstant,
         head_accounting: IngressHeadAccounting,
         framing: IngressFraming,
-    ) -> Result<ResponseEgressEnvelope, EdgeError> {
+    ) -> Result<IngressDispatchOutcome, EdgeError> {
         let head_parts = IngressHeadParts::from_request(&request, head_accounting, framing);
         match self.begin_ingress(head_parts, request_start)? {
-            IngressBeginOutcome::Admitted(prepared) => {
-                Ok(self.dispatch_admitted(prepared, request).await)
+            IngressBeginOutcome::Admitted(prepared) => Ok(IngressDispatchOutcome::Response(
+                self.dispatch_admitted(prepared, request).await,
+            )),
+            IngressBeginOutcome::Refused(response) => {
+                Ok(IngressDispatchOutcome::Response(response))
             }
-            IngressBeginOutcome::Refused(response) => Ok(response),
+            IngressBeginOutcome::Aborted => Ok(IngressDispatchOutcome::Aborted),
         }
     }
 
@@ -252,13 +282,14 @@ impl App {
         request_method: Method,
         request_start: MonotonicInstant,
         route: Option<RouteMetadata>,
+        completion: ResponseEgressCompletion,
     ) -> ResponseEgressEnvelope {
         ResponseEgressEnvelope::new(
             response,
             request_start,
             route,
             request_method,
-            ResponseEgressCompletion::empty(),
+            completion,
             self.response_egress_policy(),
             self.response_egress_observer(),
             self.monotonic_clock(),
@@ -497,8 +528,8 @@ mod tests {
         HeaderMap, HeaderValue, Method, StatusCode, Version, request_builder, response_builder,
     };
     use crate::ingress::{
-        BufferedIngressResponse, IngressBeginOutcome, IngressFraming, IngressGrant,
-        IngressHeadAccounting, IngressHeadParts,
+        BufferedIngressResponse, IngressBeginOutcome, IngressDispatchOutcome, IngressFraming,
+        IngressGrant, IngressHeadAccounting, IngressHeadParts,
     };
     use crate::manifest::BakedManifest;
     use crate::middleware::{Middleware, Next};
@@ -639,6 +670,7 @@ mod tests {
     ) {
         let grant_drops = Arc::clone(drops);
         app.set_ingress_admission_policy(move |_| AdmissionDecision::ReadBodyBeforeFallback {
+            completion: ResponseEgressCompletion::empty(),
             grant: IngressGrant::new(GrantDropProbe(Arc::clone(&grant_drops))),
             max_body_bytes,
             read_deadline,
@@ -653,14 +685,14 @@ mod tests {
             .uri("/known")
             .body(body)
             .expect("request");
-        let envelope: ResponseEgressEnvelope = block_on(app.dispatch_ingress(
+        let outcome = block_on(app.dispatch_ingress(
             request,
             MonotonicInstant::now(),
             IngressHeadAccounting::HostManaged,
             IngressFraming::HostManaged,
         ))
         .expect("response");
-        complete_envelope(envelope)
+        complete_dispatch(outcome)
     }
 
     fn complete_envelope(envelope: ResponseEgressEnvelope) -> Response {
@@ -670,6 +702,20 @@ mod tests {
         assert!(attempt.begin_writing());
         assert!(attempt.complete(clock.now()));
         prepared.into_response()
+    }
+
+    fn complete_dispatch(outcome: IngressDispatchOutcome) -> Response {
+        let IngressDispatchOutcome::Response(envelope) = outcome else {
+            panic!("expected response");
+        };
+        complete_envelope(envelope)
+    }
+
+    fn counted_completion(calls: &Arc<AtomicUsize>) -> ResponseEgressCompletion {
+        let observed_calls = Arc::clone(calls);
+        ResponseEgressCompletion::new(move |_report| {
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+        })
     }
 
     fn empty_router() -> RouterService {
@@ -862,7 +908,7 @@ mod tests {
             .uri("/limits")
             .body(Body::empty())
             .expect("request");
-        let response = complete_envelope(
+        let response = complete_dispatch(
             block_on(app.dispatch_ingress(
                 request,
                 MonotonicInstant::now(),
@@ -891,11 +937,14 @@ mod tests {
             IngressFraming::HostManaged,
         );
 
-        let IngressAdmissionOutcome::Admitted(admitted) =
-            app.admit_ingress(&head).expect("admitted")
+        let IngressAdmissionOutcome::Admitted {
+            completion,
+            ingress: admitted,
+        } = app.admit_ingress(&head).expect("admitted")
         else {
             panic!("expected admission");
         };
+        drop(completion);
         assert_eq!(admitted.request_start(), start);
         assert!(admitted.read_deadline().instant() > start);
         assert!(
@@ -926,13 +975,14 @@ mod tests {
         let admission_counter = Arc::clone(&admission_calls);
         app.set_ingress_admission_policy(move |_| {
             admission_counter.fetch_add(1, Ordering::SeqCst);
-            AdmissionDecision::Refuse(
-                response_builder()
+            AdmissionDecision::Refuse {
+                completion: ResponseEgressCompletion::empty(),
+                response: response_builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
                     .header("x-admission", "saturated")
                     .body(Body::from("busy"))
                     .expect("response"),
-            )
+            }
         });
         let body_polls = Arc::new(AtomicUsize::new(0));
         let poll_counter = Arc::clone(&body_polls);
@@ -946,7 +996,7 @@ mod tests {
             .body(body)
             .expect("request");
 
-        let response = complete_envelope(
+        let response = complete_dispatch(
             block_on(app.dispatch_ingress(
                 request,
                 MonotonicInstant::now(),
@@ -969,6 +1019,139 @@ mod tests {
     }
 
     #[test]
+    fn admitted_response_retains_completion_until_terminal_egress() {
+        let completions = Arc::new(AtomicUsize::new(0));
+        let observed_completions = Arc::clone(&completions);
+        let mut app = App::new(
+            RouterService::builder()
+                .get("/ok", |_ctx: RequestContext| async move {
+                    Ok::<_, EdgeError>("ok")
+                })
+                .build(),
+        );
+        app.set_ingress_admission_policy(move |head| AdmissionDecision::Admit {
+            completion: counted_completion(&observed_completions),
+            grant: IngressGrant::empty(),
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+        });
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/ok")
+            .body(Body::empty())
+            .expect("request");
+
+        let outcome = block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("dispatch");
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+        let IngressDispatchOutcome::Response(envelope) = outcome else {
+            panic!("expected response");
+        };
+        assert_eq!(complete_envelope(envelope).status(), StatusCode::OK);
+        assert_eq!(completions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn refusal_response_retains_completion_until_terminal_egress() {
+        let completions = Arc::new(AtomicUsize::new(0));
+        let observed_completions = Arc::clone(&completions);
+        let mut app = App::new(empty_router());
+        app.set_ingress_admission_policy(move |_| AdmissionDecision::Refuse {
+            completion: counted_completion(&observed_completions),
+            response: response_builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::empty())
+                .expect("response"),
+        });
+        let head = IngressHeadParts::new(
+            Method::GET,
+            "/".parse().expect("URI"),
+            Version::HTTP_11,
+            HeaderMap::new(),
+        );
+
+        let IngressBeginOutcome::Refused(envelope) = app
+            .begin_ingress(head, MonotonicInstant::now())
+            .expect("begin ingress")
+        else {
+            panic!("expected refusal");
+        };
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            complete_envelope(envelope).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(completions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn fallback_terminal_response_retains_completion_until_terminal_egress() {
+        let completions = Arc::new(AtomicUsize::new(0));
+        let observed_completions = Arc::clone(&completions);
+        let mut app = App::new(empty_router());
+        app.set_ingress_admission_policy(move |head| AdmissionDecision::ReadBodyBeforeFallback {
+            completion: counted_completion(&observed_completions),
+            grant: IngressGrant::empty(),
+            max_body_bytes: 1,
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(StatusCode::REQUEST_TIMEOUT, "late"),
+        });
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/missing")
+            .body(Body::from("ab"))
+            .expect("request");
+
+        let outcome = block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("dispatch");
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+        let IngressDispatchOutcome::Response(envelope) = outcome else {
+            panic!("expected response");
+        };
+        assert_eq!(
+            complete_envelope(envelope).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(completions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn admission_abort_has_no_body_or_response_lifecycle() {
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&body_polls);
+        let mut app = App::new(empty_router());
+        app.set_ingress_admission_policy(|_| AdmissionDecision::Abort);
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/missing")
+            .body(Body::stream(poll_fn(move |_| {
+                observed_polls.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(None::<Bytes>)
+            })))
+            .expect("request");
+
+        let outcome = block_on(app.dispatch_ingress(
+            request,
+            MonotonicInstant::now(),
+            IngressHeadAccounting::HostManaged,
+            IngressFraming::HostManaged,
+        ))
+        .expect("dispatch");
+        assert!(matches!(outcome, IngressDispatchOutcome::Aborted));
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn ingress_refusal_is_detached_from_application_response_egress() {
         let router = RouterService::builder()
             .post("/upload/{id}", |_ctx: RequestContext| async move {
@@ -978,13 +1161,12 @@ mod tests {
         let reports = Arc::new(Mutex::new(Vec::new()));
         let policy_calls = Arc::new(AtomicUsize::new(0));
         let mut app = App::new(router);
-        app.set_ingress_admission_policy(|_| {
-            AdmissionDecision::Refuse(
-                response_builder()
-                    .status(StatusCode::TOO_MANY_REQUESTS)
-                    .body(Body::empty())
-                    .expect("response"),
-            )
+        app.set_ingress_admission_policy(|_| AdmissionDecision::Refuse {
+            completion: ResponseEgressCompletion::empty(),
+            response: response_builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(Body::empty())
+                .expect("response"),
         });
         app.set_response_egress_observer(AppEgressObserver(Arc::clone(&reports)));
         let request_start = MonotonicInstant::now();
@@ -1040,6 +1222,7 @@ mod tests {
         let observed_grant_drops = Arc::clone(&grant_drops);
         let mut app = App::new(router);
         app.set_ingress_admission_policy(move |head| AdmissionDecision::Admit {
+            completion: ResponseEgressCompletion::empty(),
             grant: IngressGrant::new(GrantDropProbe(Arc::clone(&observed_grant_drops))),
             read_deadline: head.read_deadline_after(Duration::from_secs(1)),
         });
@@ -1084,14 +1267,13 @@ mod tests {
     #[test]
     fn ingress_method_reaches_owned_response_framing() {
         let mut app = App::new(RouterService::builder().build());
-        app.set_ingress_admission_policy(|_| {
-            AdmissionDecision::Refuse(
-                response_builder()
-                    .status(StatusCode::OK)
-                    .header("content-length", "7")
-                    .body(Body::from("ignored"))
-                    .expect("response"),
-            )
+        app.set_ingress_admission_policy(|_| AdmissionDecision::Refuse {
+            completion: ResponseEgressCompletion::empty(),
+            response: response_builder()
+                .status(StatusCode::OK)
+                .header("content-length", "7")
+                .body(Body::from("ignored"))
+                .expect("response"),
         });
         let head = IngressHeadParts::new(
             Method::HEAD,
@@ -1131,6 +1313,7 @@ mod tests {
             .build();
         let mut app = App::new(router);
         app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            completion: ResponseEgressCompletion::empty(),
             grant: IngressGrant::empty(),
             max_body_bytes: 4_096,
             read_deadline: head.read_deadline_after(Duration::from_secs(1)),
@@ -1154,6 +1337,7 @@ mod tests {
     fn fallback_body_exact_cap_preserves_not_found() {
         let mut app = App::new(empty_router());
         app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            completion: ResponseEgressCompletion::empty(),
             grant: IngressGrant::empty(),
             max_body_bytes: 4,
             read_deadline: head.read_deadline_after(Duration::from_secs(1)),
@@ -1169,7 +1353,7 @@ mod tests {
             ])))
             .expect("request");
 
-        let response = complete_envelope(
+        let response = complete_dispatch(
             block_on(app.dispatch_ingress(
                 request,
                 MonotonicInstant::now(),
@@ -1191,6 +1375,7 @@ mod tests {
             .build();
         let mut app = App::new(router);
         app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            completion: ResponseEgressCompletion::empty(),
             grant: IngressGrant::empty(),
             max_body_bytes: 4,
             read_deadline: head.read_deadline_after(Duration::from_secs(1)),
@@ -1206,7 +1391,7 @@ mod tests {
             ])))
             .expect("request");
 
-        let response = complete_envelope(
+        let response = complete_dispatch(
             block_on(app.dispatch_ingress(
                 request,
                 MonotonicInstant::now(),
@@ -1223,6 +1408,7 @@ mod tests {
     fn fallback_body_zero_cap_accepts_only_empty_body() {
         let mut app = App::new(empty_router());
         app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            completion: ResponseEgressCompletion::empty(),
             grant: IngressGrant::empty(),
             max_body_bytes: 0,
             read_deadline: head.read_deadline_after(Duration::from_secs(1)),
@@ -1239,7 +1425,7 @@ mod tests {
                 .uri("/missing")
                 .body(body)
                 .expect("request");
-            let response = complete_envelope(
+            let response = complete_dispatch(
                 block_on(app.dispatch_ingress(
                     request,
                     MonotonicInstant::now(),
@@ -1265,6 +1451,7 @@ mod tests {
         let mut app = App::new(empty_router());
         app.set_monotonic_clock(MonotonicClock::new(move || start));
         app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            completion: ResponseEgressCompletion::empty(),
             grant: IngressGrant::empty(),
             max_body_bytes: 4_096,
             read_deadline: Deadline::at_instant(head.request_start()),
@@ -1280,7 +1467,7 @@ mod tests {
             .body(body)
             .expect("request");
 
-        let response = complete_envelope(
+        let response = complete_dispatch(
             block_on(app.dispatch_ingress(
                 request,
                 start,
@@ -1564,7 +1751,7 @@ mod tests {
                 .body(body)
                 .expect("request");
 
-            let response = complete_envelope(
+            let response = complete_dispatch(
                 block_on(app.dispatch_ingress(
                     request,
                     MonotonicInstant::now(),
@@ -1593,6 +1780,7 @@ mod tests {
                 RouteResolution::Matched(metadata) if metadata.pattern() == "/upload"
             ));
             AdmissionDecision::Admit {
+                completion: ResponseEgressCompletion::empty(),
                 grant: IngressGrant::empty(),
                 read_deadline: Deadline::after(Duration::from_secs(1)),
             }
