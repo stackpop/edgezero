@@ -103,8 +103,9 @@ mod tests {
     use edgezero_core::body::Body;
     use edgezero_core::http::{HeaderMap, Method, StatusCode, Version};
     use edgezero_core::response_egress::{
-        ResponseEgressAttempt, ResponseEgressHead, ResponseEgressObserver,
-        ResponseEgressObserverHandle, ResponseEgressOutcome, ResponseEgressReport,
+        ResponseEgressAttempt, ResponseEgressCompletion, ResponseEgressHead,
+        ResponseEgressObserver, ResponseEgressObserverHandle, ResponseEgressOutcome,
+        ResponseEgressReport,
     };
     use edgezero_core::router::RouteMetadata;
     use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
@@ -147,6 +148,7 @@ mod tests {
         ResponseEgressAttempt::new(
             &head,
             started_at,
+            ResponseEgressCompletion::empty(),
             ResponseEgressObserverHandle::new(observer.clone()),
             MonotonicClock::default(),
         )
@@ -347,6 +349,7 @@ mod tests {
         let attempt = ResponseEgressAttempt::new(
             &head,
             started_at,
+            ResponseEgressCompletion::empty(),
             ResponseEgressObserverHandle::new(observer.clone()),
             frozen_clock.clone(),
         );

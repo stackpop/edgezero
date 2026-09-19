@@ -1016,11 +1016,16 @@ mod synthesis_tests {
         }));
         let request = FastlyRequest::new(Method::GET, "http://example.test/clock");
 
-        let response = FastlyService::new(&app)
+        let envelope = FastlyService::new(&app)
             .dispatch_with(request, |_request, _extensions| {})
             .expect("dispatch")
-            .into_envelope()
-            .into_response();
+            .into_envelope();
+        let Ok((prepared, _, mut attempt, egress_clock)) = envelope.begin() else {
+            panic!("begin response egress");
+        };
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(egress_clock.now()));
+        let response = prepared.into_response();
 
         assert_eq!(response.body().as_bytes(), Some(b"7".as_slice()));
         assert!(observations.load(Ordering::SeqCst) >= 3);

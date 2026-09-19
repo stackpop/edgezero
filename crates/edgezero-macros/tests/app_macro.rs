@@ -57,8 +57,13 @@ mod configured_app {
         let IngressBeginOutcome::Refused(response) = outcome else {
             panic!("configured policy must refuse ingress");
         };
+        let Ok((prepared, _, mut attempt, clock)) = response.begin() else {
+            panic!("begin response egress");
+        };
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(clock.now()));
         assert_eq!(
-            response.into_response().status(),
+            prepared.into_response().status(),
             StatusCode::TOO_MANY_REQUESTS
         );
     }

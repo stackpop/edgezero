@@ -189,6 +189,59 @@ pub struct ResponseEgressReport {
     pub route: Option<RouteMetadata>,
 }
 
+/// Non-clone owner of one response-scoped terminal callback.
+///
+/// The callback moves with the ingress/egress lifecycle and runs at most once. Use [`Self::empty`]
+/// when no application resource needs to remain live through response transmission.
+///
+/// ```compile_fail
+/// use edgezero_core::ResponseEgressCompletion;
+///
+/// let completion = ResponseEgressCompletion::empty();
+/// let _duplicate = completion.clone();
+/// ```
+///
+/// ```compile_fail
+/// use edgezero_core::{Extensions, ResponseEgressCompletion};
+///
+/// let mut extensions = Extensions::new();
+/// extensions.insert(ResponseEgressCompletion::empty());
+/// ```
+pub struct ResponseEgressCompletion {
+    callback: Option<Box<dyn FnOnce(&ResponseEgressReport) + Send + 'static>>,
+}
+
+impl ResponseEgressCompletion {
+    fn complete(&mut self, report: &ResponseEgressReport) {
+        let Some(callback) = self.callback.take() else {
+            return;
+        };
+        let result = catch_unwind(AssertUnwindSafe(|| callback(report)));
+        if result.is_err() {
+            log::error!("response-egress completion panicked after terminal transition");
+        }
+    }
+
+    /// Creates a completion with no response-scoped callback.
+    #[must_use]
+    #[inline]
+    pub const fn empty() -> Self {
+        Self { callback: None }
+    }
+
+    /// Retains one response-scoped callback until terminal egress.
+    #[must_use]
+    #[inline]
+    pub fn new<Complete>(complete: Complete) -> Self
+    where
+        Complete: FnOnce(&ResponseEgressReport) + Send + 'static,
+    {
+        Self {
+            callback: Some(Box::new(complete)),
+        }
+    }
+}
+
 /// Synchronous observer for terminal response-egress reports.
 pub trait ResponseEgressObserver: Send + Sync + 'static {
     fn complete(&self, report: &ResponseEgressReport);
@@ -211,6 +264,7 @@ pub struct ResponseEgressObserverHandle {
 #[doc(hidden)]
 pub struct ResponseEgressEnvelope {
     clock: MonotonicClock,
+    completion: ResponseEgressCompletion,
     observer: ResponseEgressObserverHandle,
     policy: ResponseEgressPolicyCallback,
     request_method: Method,
@@ -269,8 +323,13 @@ impl ResponseEgressEnvelope {
             self.request_start,
             self.route.as_ref(),
         );
-        let attempt =
-            ResponseEgressAttempt::new(&head, egress_started_at, self.observer, self.clock.clone());
+        let attempt = ResponseEgressAttempt::new(
+            &head,
+            egress_started_at,
+            self.completion,
+            self.observer,
+            self.clock.clone(),
+        );
         let Ok(selected_policy) =
             catch_unwind(AssertUnwindSafe(|| (self.policy)(&head, egress_started_at)))
         else {
@@ -316,6 +375,7 @@ impl ResponseEgressEnvelope {
         response: Response,
         request_start: MonotonicInstant,
         request_method: Method,
+        completion: ResponseEgressCompletion,
         clock: MonotonicClock,
     ) -> Self {
         Self::new(
@@ -323,17 +383,11 @@ impl ResponseEgressEnvelope {
             request_start,
             None,
             request_method,
+            completion,
             Arc::new(default_response_egress_policy),
             ResponseEgressObserverHandle::default(),
             clock,
         )
-    }
-
-    /// Extracts the response for low-level callers that do not own a platform converter.
-    #[must_use]
-    #[inline]
-    pub fn into_response(self) -> Response {
-        self.response
     }
 
     pub(crate) fn new(
@@ -341,12 +395,14 @@ impl ResponseEgressEnvelope {
         request_start: MonotonicInstant,
         route: Option<RouteMetadata>,
         request_method: Method,
+        completion: ResponseEgressCompletion,
         policy: ResponseEgressPolicyCallback,
         observer: ResponseEgressObserverHandle,
         clock: MonotonicClock,
     ) -> Self {
         Self {
             clock,
+            completion,
             observer,
             policy,
             request_method,
@@ -414,6 +470,7 @@ pub struct ResponseEgressAttempt {
     body_kind: ResponseEgressBodyKind,
     bytes_written: u64,
     clock: MonotonicClock,
+    completion: ResponseEgressCompletion,
     egress_started_at: MonotonicInstant,
     fallback_cause: Option<ResponseEgressOutcome>,
     fallback_disposition: Option<ResponseEgressFallbackDisposition>,
@@ -531,6 +588,7 @@ impl ResponseEgressAttempt {
     pub fn new(
         head: &ResponseEgressHead<'_>,
         egress_started_at: MonotonicInstant,
+        completion: ResponseEgressCompletion,
         observer: ResponseEgressObserverHandle,
         clock: MonotonicClock,
     ) -> Self {
@@ -538,6 +596,7 @@ impl ResponseEgressAttempt {
             body_kind: ResponseEgressBodyKind::Application,
             bytes_written: 0,
             clock,
+            completion,
             egress_started_at,
             fallback_cause: None,
             fallback_disposition: None,
@@ -603,11 +662,13 @@ impl ResponseEgressAttempt {
             route: self.route.clone(),
         };
         self.state = AttemptState::Terminal(report);
-
-        if let AttemptState::Terminal(terminal_report) = &self.state {
-            self.observer.complete(terminal_report);
+        if let AttemptState::Terminal(report) = &self.state {
+            self.completion.complete(report);
+            self.observer.complete(report);
+            true
+        } else {
+            false
         }
-        true
     }
 }
 
@@ -678,6 +739,24 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct OrderedObserver(Arc<Mutex<Vec<&'static str>>>);
+
+    impl ResponseEgressObserver for OrderedObserver {
+        fn complete(&self, _report: &ResponseEgressReport) {
+            self.0.lock().expect("ordered events lock").push("observer");
+        }
+    }
+
+    struct CompletionDropProbe(Arc<Mutex<usize>>);
+
+    impl Drop for CompletionDropProbe {
+        fn drop(&mut self) {
+            let mut drops = self.0.lock().expect("completion drops lock");
+            *drops += 1;
+        }
+    }
+
     fn head<'head>(
         headers: &'head HeaderMap,
         request_start: MonotonicInstant,
@@ -702,6 +781,7 @@ mod tests {
         ResponseEgressAttempt::new(
             &head,
             started_at,
+            ResponseEgressCompletion::empty(),
             ResponseEgressObserverHandle::new(observer.clone()),
             MonotonicClock::default(),
         )
@@ -769,6 +849,93 @@ mod tests {
         let observer = RecordingObserver::default();
         assert_object_safe(&observer);
         let _: ResponseEgressObserverHandle = ResponseEgressObserverHandle::default();
+    }
+
+    #[test]
+    fn response_completion_runs_once_before_the_global_observer() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let completion_events = Arc::clone(&events);
+        let observer = OrderedObserver(Arc::clone(&events));
+        let started_at = MonotonicInstant::now();
+        let headers = HeaderMap::new();
+        let head = head(&headers, started_at, None);
+        let mut attempt = ResponseEgressAttempt::new(
+            &head,
+            started_at,
+            ResponseEgressCompletion::new(move |_| {
+                completion_events
+                    .lock()
+                    .expect("ordered events lock")
+                    .push("completion");
+            }),
+            ResponseEgressObserverHandle::new(observer),
+            MonotonicClock::default(),
+        );
+
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(started_at));
+        assert!(!attempt.complete(started_at));
+        assert!(!attempt.terminate(ResponseEgressOutcome::TransportError, started_at));
+        drop(attempt);
+
+        assert_eq!(
+            events.lock().expect("ordered events lock").as_slice(),
+            &["completion", "observer"]
+        );
+    }
+
+    #[test]
+    fn response_completion_panic_does_not_suppress_the_global_observer() {
+        let observer = RecordingObserver::default();
+        let started_at = MonotonicInstant::now();
+        let headers = HeaderMap::new();
+        let head = head(&headers, started_at, None);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut attempt = ResponseEgressAttempt::new(
+                &head,
+                started_at,
+                ResponseEgressCompletion::new(|_| panic!("completion panic")),
+                ResponseEgressObserverHandle::new(observer.clone()),
+                MonotonicClock::default(),
+            );
+            assert!(attempt.terminate(ResponseEgressOutcome::ConversionError, started_at));
+        }));
+
+        result.unwrap_or_else(|_| panic!("completion panic escaped terminal transition"));
+        assert_eq!(observer.reports().len(), 1);
+    }
+
+    #[test]
+    fn unbegun_envelope_drops_completion_without_a_terminal_report() {
+        let observer = RecordingObserver::default();
+        let callback_calls = Arc::new(Mutex::new(0_usize));
+        let completion_drops = Arc::new(Mutex::new(0_usize));
+        let observed_calls = Arc::clone(&callback_calls);
+        let probe = CompletionDropProbe(Arc::clone(&completion_drops));
+        let started_at = MonotonicInstant::now();
+        let response = response_builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .expect("response");
+
+        drop(ResponseEgressEnvelope::new(
+            response,
+            started_at,
+            None,
+            Method::GET,
+            ResponseEgressCompletion::new(move |_| {
+                let _keep_probe_until_completion = &probe;
+                let mut calls = observed_calls.lock().expect("completion calls lock");
+                *calls += 1;
+            }),
+            Arc::new(default_response_egress_policy),
+            ResponseEgressObserverHandle::new(observer.clone()),
+            MonotonicClock::default(),
+        ));
+
+        assert_eq!(*callback_calls.lock().expect("completion calls lock"), 0);
+        assert_eq!(*completion_drops.lock().expect("completion drops lock"), 1);
+        assert!(observer.reports().is_empty());
     }
 
     #[test]
@@ -855,6 +1022,7 @@ mod tests {
         let mut attempt = ResponseEgressAttempt::new(
             &head,
             started_at,
+            ResponseEgressCompletion::empty(),
             ResponseEgressObserverHandle::new(observer.clone()),
             MonotonicClock::default(),
         );
@@ -922,6 +1090,7 @@ mod tests {
         drop(ResponseEgressAttempt::new(
             &head,
             started_at,
+            ResponseEgressCompletion::empty(),
             ResponseEgressObserverHandle::new(observer.clone()),
             clock,
         ));
@@ -982,6 +1151,7 @@ mod tests {
             let mut attempt = ResponseEgressAttempt::new(
                 &head,
                 started_at,
+                ResponseEgressCompletion::empty(),
                 ResponseEgressObserverHandle::new(PanickingObserver),
                 MonotonicClock::default(),
             );
@@ -996,6 +1166,7 @@ mod tests {
             drop(ResponseEgressAttempt::new(
                 &head,
                 started_at,
+                ResponseEgressCompletion::empty(),
                 ResponseEgressObserverHandle::new(PanickingObserver),
                 MonotonicClock::default(),
             ));
@@ -1102,6 +1273,7 @@ mod tests {
             request_start,
             None,
             Method::GET,
+            ResponseEgressCompletion::empty(),
             Arc::new(|_, _| panic!("private token=secret")),
             ResponseEgressObserverHandle::new(observer.clone()),
             clock,
@@ -1163,6 +1335,7 @@ mod tests {
             request_start,
             None,
             Method::GET,
+            ResponseEgressCompletion::empty(),
             Arc::new(default_response_egress_policy),
             ResponseEgressObserverHandle::new(observer.clone()),
             clock,
@@ -1212,6 +1385,7 @@ mod tests {
             request_start,
             None,
             Method::GET,
+            ResponseEgressCompletion::empty(),
             Arc::new(move |head, observed_start| {
                 assert_eq!(observed_start, egress_started_at);
                 assert_eq!(
@@ -1258,6 +1432,7 @@ mod tests {
             request_start,
             None,
             Method::HEAD,
+            ResponseEgressCompletion::empty(),
             Arc::new(move |head, started_at| {
                 *policy_status.lock().expect("policy status") = Some(head.status());
                 ResponseEgressPolicy {

@@ -89,11 +89,11 @@ pub use outbound::{
 };
 pub use response_egress::{
     DEFAULT_RESPONSE_WRITE_BUDGET, RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt,
-    ResponseEgressBeginFailure, ResponseEgressBodyKind, ResponseEgressDeadline,
-    ResponseEgressEnvelope, ResponseEgressFallbackDisposition, ResponseEgressHead,
-    ResponseEgressObserver, ResponseEgressObserverHandle, ResponseEgressOutcome,
-    ResponseEgressPolicy, ResponseEgressPolicyCallback, ResponseEgressReport,
-    default_response_egress_policy,
+    ResponseEgressBeginFailure, ResponseEgressBodyKind, ResponseEgressCompletion,
+    ResponseEgressDeadline, ResponseEgressEnvelope, ResponseEgressFallbackDisposition,
+    ResponseEgressHead, ResponseEgressObserver, ResponseEgressObserverHandle,
+    ResponseEgressOutcome, ResponseEgressPolicy, ResponseEgressPolicyCallback,
+    ResponseEgressReport, default_response_egress_policy,
 };
 pub use router::{ResolvedDispatch, RouteId, RouteInfo, RouteMetadata, RouteResolution};
 pub use time::{

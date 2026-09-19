@@ -836,8 +836,8 @@ mod tests {
 
     use edgezero_core::http::{Version, response_builder};
     use edgezero_core::response_egress::{
-        ResponseEgressBodyKind, ResponseEgressHead, ResponseEgressObserver,
-        ResponseEgressObserverHandle, ResponseEgressReport,
+        ResponseEgressBodyKind, ResponseEgressCompletion, ResponseEgressHead,
+        ResponseEgressObserver, ResponseEgressObserverHandle, ResponseEgressReport,
     };
     use futures::executor::block_on;
     use futures_util::stream::poll_fn;
@@ -1010,6 +1010,7 @@ mod tests {
         ResponseEgressAttempt::new(
             &head,
             started_at,
+            ResponseEgressCompletion::empty(),
             ResponseEgressObserverHandle::new(observer.clone()),
             MonotonicClock::default(),
         )
