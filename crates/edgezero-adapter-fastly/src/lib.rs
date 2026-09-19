@@ -611,9 +611,11 @@ pub fn serve_app<A: Hooks>(serve: Serve) -> ServeSummary<fastly::Error> {
 /// even if later reads recover store selectors. Initialization errors terminate
 /// the SDK loop; construction panics remain sandbox failures.
 ///
-/// The mutable callback runs per request. For mutable native requests, manual
-/// streaming, response finalization, or custom initialization, use [`Serve`]
-/// directly with the existing raw conversion/dispatch APIs.
+/// The callback runs per request, but the closure and its captured state live
+/// for the entire serving loop. Only the supplied extensions are freshly created
+/// for each request; create request-local mutable data inside the callback.
+/// For mutable native requests, manual streaming, response finalization, or
+/// custom initialization, use [`lifecycle::serve_custom`].
 #[must_use = "inspect the serving summary or call into_result() to handle terminal errors"]
 #[inline]
 pub fn serve_app_with_request_extensions<A, F>(

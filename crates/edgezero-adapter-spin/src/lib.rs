@@ -132,6 +132,11 @@ pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinFullRespo
 /// native handles and pending work belong to the request. Shared app state
 /// must support overlapping invocations.
 ///
+/// Store metadata is a caller precondition: `App` carries no store provenance,
+/// so this function cannot validate the pairing. Mismatched metadata can fail
+/// binding resolution or select unintended bindings. Keep the app and its
+/// construction metadata together; normally both come from the same `Hooks` type.
+///
 /// # Errors
 /// Returns conversion or dispatch errors from the existing adapter boundary.
 #[inline]

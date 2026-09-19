@@ -151,6 +151,26 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    async fn dispatch_app_reuses_router_with_fresh_request_bodies() {
+        let app = build_test_app();
+        for body in [b"first".as_slice(), b"second".as_slice()] {
+            let (env, ctx) = test_env_ctx();
+            let request = cf_request(CfMethod::Post, "/mirror", Some(body));
+            let mut response = edgezero_adapter_cloudflare::dispatch_app(
+                &app,
+                edgezero_core::app::StoresMetadata::default(),
+                request,
+                env,
+                ctx,
+            )
+            .await
+            .expect("prebuilt dispatch response");
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(response.bytes().await.expect("response bytes"), body);
+        }
+    }
+
+    #[wasm_bindgen_test]
     async fn dispatch_passes_request_body_to_handlers() {
         let app = build_test_app();
         let req = cf_request(CfMethod::Post, "/mirror", Some(b"echo"));

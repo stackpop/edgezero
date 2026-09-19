@@ -17,6 +17,8 @@ pub mod proxy;
 pub mod request;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod response;
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+mod response_headers;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod secret_store;
 
@@ -132,6 +134,11 @@ pub async fn run_app<A: Hooks>(
 /// the app (normally `MyApp::stores()`). Retain only application-owned values;
 /// native handles and pending work belong to the request. Shared app state
 /// must support overlapping invocations.
+///
+/// Store metadata is a caller precondition: `App` carries no store provenance,
+/// so this function cannot validate the pairing. Mismatched metadata can fail
+/// binding resolution or select unintended bindings. Keep the app and its
+/// construction metadata together; normally both come from the same `Hooks` type.
 ///
 /// # Errors
 /// Returns conversion or dispatch errors from the existing adapter boundary.

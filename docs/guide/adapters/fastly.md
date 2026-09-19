@@ -319,13 +319,20 @@ for fresh extensions on every request. The first callback initializes logging
 and builds the app. Each callback reads runtime configuration and constructs new
 store registries. App construction and `configure` execute once per retained
 owner; explicit work elsewhere still executes whenever the application calls it.
+The extension callback and its captures are retained for the whole serving loop;
+only the supplied extensions are fresh. Create request-specific mutable data
+inside the callback or store it in those extensions.
 
 Logging takes the first configuration snapshot, unless the app owns logging.
 An unavailable optional runtime configuration store disables logging for that
 sandbox, even if subsequent reads recover store selectors. It does not silently
 retry or reconfigure logging. The current overlay enables logging when an
 endpoint exists and uses `echo_stdout: true`. Applications requiring another
-initialization policy should use a custom SDK callback.
+initialization policy should use `lifecycle::serve_custom` and `setup_once`.
+The resolved configuration does not distinguish intentionally disabled logging
+from an unavailable first snapshot. Warnings through the log facade may be lost
+before a logger is installed; absence of a warning does not establish a healthy
+configuration read.
 
 SDK 0.12.1 exposes `with_max_requests`, `with_timeout`, `with_max_lifetime`, and
 `with_max_memory`. A value of zero disables the request-count or memory limit;
