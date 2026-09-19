@@ -13,7 +13,7 @@ use crate::ingress::{
 use crate::manifest::BakedManifest;
 use crate::response::IntoResponse as _;
 use crate::response_egress::{
-    ResponseEgressEnvelope, ResponseEgressHead, ResponseEgressObserver,
+    ResponseEgressCompletion, ResponseEgressEnvelope, ResponseEgressHead, ResponseEgressObserver,
     ResponseEgressObserverHandle, ResponseEgressPolicy, ResponseEgressPolicyCallback,
     default_response_egress_policy,
 };
@@ -151,6 +151,7 @@ impl App {
             response,
             request_start,
             request_method,
+            ResponseEgressCompletion::empty(),
             self.monotonic_clock(),
         )
     }
@@ -257,6 +258,7 @@ impl App {
             request_start,
             route,
             request_method,
+            ResponseEgressCompletion::empty(),
             self.response_egress_policy(),
             self.response_egress_observer(),
             self.monotonic_clock(),
@@ -658,7 +660,16 @@ mod tests {
             IngressFraming::HostManaged,
         ))
         .expect("response");
-        envelope.into_response()
+        complete_envelope(envelope)
+    }
+
+    fn complete_envelope(envelope: ResponseEgressEnvelope) -> Response {
+        let Ok((prepared, _, mut attempt, clock)) = envelope.begin() else {
+            panic!("response egress begin");
+        };
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(clock.now()));
+        prepared.into_response()
     }
 
     fn empty_router() -> RouterService {
@@ -812,6 +823,7 @@ mod tests {
         let mut attempt = ResponseEgressAttempt::new(
             &head,
             started_at,
+            ResponseEgressCompletion::empty(),
             app.response_egress_observer(),
             app.monotonic_clock(),
         );
@@ -850,14 +862,15 @@ mod tests {
             .uri("/limits")
             .body(Body::empty())
             .expect("request");
-        let response = block_on(app.dispatch_ingress(
-            request,
-            MonotonicInstant::now(),
-            IngressHeadAccounting::HostManaged,
-            IngressFraming::HostManaged,
-        ))
-        .expect("response")
-        .into_response();
+        let response = complete_envelope(
+            block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("response"),
+        );
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -933,14 +946,15 @@ mod tests {
             .body(body)
             .expect("request");
 
-        let response = block_on(app.dispatch_ingress(
-            request,
-            MonotonicInstant::now(),
-            IngressHeadAccounting::HostManaged,
-            IngressFraming::HostManaged,
-        ))
-        .expect("response")
-        .into_response();
+        let response = complete_envelope(
+            block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("response"),
+        );
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -1155,14 +1169,15 @@ mod tests {
             ])))
             .expect("request");
 
-        let response = block_on(app.dispatch_ingress(
-            request,
-            MonotonicInstant::now(),
-            IngressHeadAccounting::HostManaged,
-            IngressFraming::HostManaged,
-        ))
-        .expect("response")
-        .into_response();
+        let response = complete_envelope(
+            block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("response"),
+        );
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -1191,14 +1206,15 @@ mod tests {
             ])))
             .expect("request");
 
-        let response = block_on(app.dispatch_ingress(
-            request,
-            MonotonicInstant::now(),
-            IngressHeadAccounting::HostManaged,
-            IngressFraming::HostManaged,
-        ))
-        .expect("response")
-        .into_response();
+        let response = complete_envelope(
+            block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("response"),
+        );
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
@@ -1223,14 +1239,15 @@ mod tests {
                 .uri("/missing")
                 .body(body)
                 .expect("request");
-            let response = block_on(app.dispatch_ingress(
-                request,
-                MonotonicInstant::now(),
-                IngressHeadAccounting::HostManaged,
-                IngressFraming::HostManaged,
-            ))
-            .expect("response")
-            .into_response();
+            let response = complete_envelope(
+                block_on(app.dispatch_ingress(
+                    request,
+                    MonotonicInstant::now(),
+                    IngressHeadAccounting::HostManaged,
+                    IngressFraming::HostManaged,
+                ))
+                .expect("response"),
+            );
 
             assert_eq!(response.status(), expected);
         }
@@ -1263,14 +1280,15 @@ mod tests {
             .body(body)
             .expect("request");
 
-        let response = block_on(app.dispatch_ingress(
-            request,
-            start,
-            IngressHeadAccounting::HostManaged,
-            IngressFraming::HostManaged,
-        ))
-        .expect("response")
-        .into_response();
+        let response = complete_envelope(
+            block_on(app.dispatch_ingress(
+                request,
+                start,
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("response"),
+        );
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(
@@ -1327,7 +1345,7 @@ mod tests {
 
         assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
         assert_eq!(
-            egress.into_response().status(),
+            complete_envelope(egress).status(),
             StatusCode::METHOD_NOT_ALLOWED
         );
         assert_no_fallback_dispatch(&handler_calls, &middleware_calls);
@@ -1546,14 +1564,15 @@ mod tests {
                 .body(body)
                 .expect("request");
 
-            let response = block_on(app.dispatch_ingress(
-                request,
-                MonotonicInstant::now(),
-                IngressHeadAccounting::HostManaged,
-                IngressFraming::HostManaged,
-            ))
-            .expect("response")
-            .into_response();
+            let response = complete_envelope(
+                block_on(app.dispatch_ingress(
+                    request,
+                    MonotonicInstant::now(),
+                    IngressHeadAccounting::HostManaged,
+                    IngressFraming::HostManaged,
+                ))
+                .expect("response"),
+            );
 
             assert_eq!(response.status(), expected);
             assert_eq!(body_polls.load(Ordering::SeqCst), 0);
@@ -1599,7 +1618,7 @@ mod tests {
             .body(Body::from("payload"))
             .expect("request");
         let response = block_on(app.dispatch_admitted(prepared, request));
-        assert_eq!(response.into_response().status(), StatusCode::OK);
+        assert_eq!(complete_envelope(response).status(), StatusCode::OK);
     }
 
     #[test]

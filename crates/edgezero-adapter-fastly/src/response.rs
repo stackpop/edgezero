@@ -624,8 +624,8 @@ mod tests {
     use edgezero_core::http::{Version, request_builder, response_builder};
     use edgezero_core::ingress::{IngressFraming, IngressHeadAccounting};
     use edgezero_core::response_egress::{
-        ResponseEgressBodyKind, ResponseEgressHead, ResponseEgressObserver,
-        ResponseEgressObserverHandle, ResponseEgressReport,
+        ResponseEgressBodyKind, ResponseEgressCompletion, ResponseEgressHead,
+        ResponseEgressObserver, ResponseEgressObserverHandle, ResponseEgressReport,
     };
     use edgezero_core::router::RouterService;
     use edgezero_core::time::MonotonicInstant;
@@ -757,6 +757,7 @@ mod tests {
         ResponseEgressAttempt::new(
             &head,
             now,
+            ResponseEgressCompletion::empty(),
             ResponseEgressObserverHandle::new(observer.clone()),
             MonotonicClock::default(),
         )
