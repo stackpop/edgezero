@@ -11,9 +11,11 @@ use tokio::time::{Instant as TokioInstant, sleep_until};
 
 use crate::response::AxumBodyError;
 use crate::response::EgressConnection;
+use crate::service::AxumIngressAbort;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConnectionExit {
+    AdmissionAborted,
     Completed,
     DeadlineExceeded,
 }
@@ -75,9 +77,23 @@ fn classify_connection_result(
 ) -> Result<ConnectionExit, hyper::Error> {
     match result {
         Ok(()) => Ok(ConnectionExit::Completed),
+        Err(error) if error_chain_has_admission_abort(&error) => {
+            Ok(ConnectionExit::AdmissionAborted)
+        }
         Err(error) if error_chain_has_deadline(&error) => Ok(ConnectionExit::DeadlineExceeded),
         Err(error) => Err(error),
     }
+}
+
+fn error_chain_has_admission_abort(error: &hyper::Error) -> bool {
+    let mut source = error.source();
+    while let Some(current) = source {
+        if current.downcast_ref::<AxumIngressAbort>().is_some() {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 fn error_chain_has_deadline(error: &hyper::Error) -> bool {

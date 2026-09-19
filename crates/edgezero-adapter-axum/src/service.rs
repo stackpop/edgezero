@@ -1,4 +1,5 @@
-use std::convert::Infallible;
+use std::error::Error as StdError;
+use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -31,6 +32,19 @@ use tower::Service as TowerService;
 use crate::outbound::AxumOutboundClient;
 use crate::request::into_core_request_parts;
 use crate::response::{AxumEgressBody, EgressConnection, prepare_egress_response};
+
+/// Private Hyper service error used only to close/reset an admission-aborted connection.
+#[derive(Debug)]
+pub(crate) struct AxumIngressAbort;
+
+impl fmt::Display for AxumIngressAbort {
+    #[inline]
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ingress admission aborted")
+    }
+}
+
+impl StdError for AxumIngressAbort {}
 
 /// Shared application state used to construct one private Hyper service per HTTP/1 connection.
 #[derive(Clone)]
@@ -202,7 +216,7 @@ impl AxumServiceState {
         mut request: Request<AxumBody>,
         connection: &EgressConnection,
         remote_addr: Option<SocketAddr>,
-    ) -> Response<AxumEgressBody> {
+    ) -> Result<Response<AxumEgressBody>, AxumIngressAbort> {
         if let Some(peer_addr) = remote_addr {
             request.extensions_mut().insert(ConnectInfo(peer_addr));
         }
@@ -213,10 +227,10 @@ impl AxumServiceState {
         let (parts, native_body) = request.into_parts();
         let request_method = parts.method.clone();
         if let Err(error) = validate_normalized_ingress_parts(&parts, app.ingress_head_limits()) {
-            return prepare_egress_response(
+            return Ok(prepare_egress_response(
                 app.detached_ingress_error_egress(error, request_method.clone(), request_start),
                 connection,
-            );
+            ));
         }
         let head_parts = IngressHeadParts::from_parts(
             &parts,
@@ -226,16 +240,11 @@ impl AxumServiceState {
         let prepared = match app.begin_ingress(head_parts, request_start) {
             Ok(IngressBeginOutcome::Admitted(prepared)) => prepared,
             Ok(IngressBeginOutcome::Refused(response)) => {
-                return prepare_egress_response(response, connection);
+                return Ok(prepare_egress_response(response, connection));
             }
-            Err(error) => {
-                return prepare_egress_response(
-                    app.detached_ingress_error_egress(error, request_method.clone(), request_start),
-                    connection,
-                );
-            }
+            Ok(IngressBeginOutcome::Aborted) => return Err(AxumIngressAbort),
             Ok(_) => {
-                return prepare_egress_response(
+                return Ok(prepare_egress_response(
                     app.detached_ingress_error_egress(
                         EdgeError::internal(anyhow::anyhow!(
                             "unsupported ingress admission outcome"
@@ -244,7 +253,13 @@ impl AxumServiceState {
                         request_start,
                     ),
                     connection,
-                );
+                ));
+            }
+            Err(error) => {
+                return Ok(prepare_egress_response(
+                    app.detached_ingress_error_egress(error, request_method.clone(), request_start),
+                    connection,
+                ));
             }
         };
         let read_deadline = prepared.read_deadline();
@@ -256,7 +271,7 @@ impl AxumServiceState {
                     "failed to initialize outbound HTTP transport"
                 )),
             );
-            return prepare_egress_response(egress, connection);
+            return Ok(prepare_egress_response(egress, connection));
         };
         let mut core_request = match into_core_request_parts(
             parts,
@@ -272,7 +287,7 @@ impl AxumServiceState {
                         "failed to convert inbound request: {error}"
                     )),
                 );
-                return prepare_egress_response(egress, connection);
+                return Ok(prepare_egress_response(egress, connection));
             }
         };
 
@@ -287,7 +302,7 @@ impl AxumServiceState {
         }
 
         let egress = app.dispatch_admitted(prepared, core_request).await;
-        prepare_egress_response(egress, connection)
+        Ok(prepare_egress_response(egress, connection))
     }
 }
 
@@ -299,7 +314,7 @@ pub(crate) struct AxumConnectionService {
 }
 
 impl HyperService<Request<Incoming>> for AxumConnectionService {
-    type Error = Infallible;
+    type Error = AxumIngressAbort;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
     type Response = Response<AxumEgressBody>;
 
@@ -310,25 +325,25 @@ impl HyperService<Request<Incoming>> for AxumConnectionService {
         let remote_addr = self.remote_addr;
         let converted_request = req.map(AxumBody::new);
         Box::pin(async move {
-            Ok(state
+            state
                 .dispatch_request(converted_request, &connection, Some(remote_addr))
-                .await)
+                .await
         })
     }
 }
 
 #[cfg(test)]
 impl TowerService<Request<AxumBody>> for AxumServiceState {
-    type Error = Infallible;
+    type Error = AxumIngressAbort;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
     type Response = Response<AxumEgressBody>;
 
     fn call(&mut self, req: Request<AxumBody>) -> Self::Future {
         let state = self.clone();
         Box::pin(async move {
-            Ok(state
+            state
                 .dispatch_request(req, &EgressConnection::default(), None)
-                .await)
+                .await
         })
     }
 
@@ -360,8 +375,8 @@ mod tests {
     use edgezero_core::middleware::{Middleware, Next};
     use edgezero_core::outbound::OutboundRequest;
     use edgezero_core::response_egress::{
-        ResponseEgressFallbackDisposition, ResponseEgressObserver, ResponseEgressOutcome,
-        ResponseEgressPolicy, ResponseEgressReport,
+        ResponseEgressCompletion, ResponseEgressFallbackDisposition, ResponseEgressObserver,
+        ResponseEgressOutcome, ResponseEgressPolicy, ResponseEgressReport,
     };
     use edgezero_core::router::{RouteMetadata, RouteResolution};
     use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
@@ -374,6 +389,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{sleep, timeout};
     use tower::ServiceExt as _;
 
@@ -458,6 +475,95 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_abort_skips_body_handler_middleware_and_egress() {
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_body_polls = Arc::clone(&body_polls);
+        let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
+            observed_body_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::<Option<Result<Bytes, io::Error>>>::Pending
+        }));
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let observed_handler_calls = Arc::clone(&handler_calls);
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let router = RouterService::builder()
+            .post("/upload", move |_ctx: RequestContext| {
+                let calls = Arc::clone(&observed_handler_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, EdgeError>("unexpected")
+                }
+            })
+            .middleware(CountingMiddleware(Arc::clone(&middleware_calls)))
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(|_| AdmissionDecision::Abort);
+        app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/upload")
+            .body(native_body)
+            .expect("request");
+
+        let result = AxumServiceState::from_app(app).oneshot(request).await;
+
+        assert!(result.is_err());
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
+        assert!(reports.lock().expect("reports lock").is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[expect(
+        clippy::integer_division_remainder_used,
+        reason = "tokio::join! expands to internal randomized branch selection arithmetic"
+    )]
+    async fn admission_abort_closes_http1_without_response_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let mut app = App::new(RouterService::builder().build());
+        app.set_ingress_admission_policy(|_| AdmissionDecision::Abort);
+        let state = AxumServiceState::from_app(app);
+
+        let server = async move {
+            let (stream, remote_addr) = listener.accept().await.expect("accept client");
+            let responses = EgressConnection::default();
+            crate::connection::serve_http1(
+                stream,
+                state.for_connection(remote_addr, responses.clone()),
+                responses,
+            )
+            .await
+            .expect("intentional admission abort")
+        };
+        let client = async move {
+            let mut stream = TcpStream::connect(address).await.expect("connect client");
+            stream
+                .write_all(
+                    b"POST /missing HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\ndata",
+                )
+                .await
+                .expect("write request");
+            let mut response = Vec::new();
+            let read = stream.read_to_end(&mut response).await;
+            (read, response)
+        };
+
+        let (exit, (read, response)) = tokio::join!(server, client);
+        assert_eq!(exit, crate::connection::ConnectionExit::AdmissionAborted);
+        if let Err(error) = read {
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+            ));
+        }
+        assert!(response.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn standard_service_installs_the_exact_application_outbound_clock() {
         async fn elapsed(ctx: RequestContext) -> Result<String, EdgeError> {
             let client = ctx
@@ -532,12 +638,13 @@ mod tests {
                 head.route_resolution(),
                 RouteResolution::Matched(_)
             ));
-            AdmissionDecision::Refuse(
-                response_builder()
+            AdmissionDecision::Refuse {
+                completion: ResponseEgressCompletion::empty(),
+                response: response_builder()
                     .status(StatusCode::TOO_MANY_REQUESTS)
                     .body(Body::empty())
                     .expect("refusal"),
-            )
+            }
         });
         let mut service = AxumServiceState::from_app(app);
         let request = Request::builder()
@@ -603,6 +710,7 @@ mod tests {
             .build();
         let mut app = App::new(router);
         app.set_ingress_admission_policy(move |head| AdmissionDecision::Admit {
+            completion: ResponseEgressCompletion::empty(),
             grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
             read_deadline: head.read_deadline_after(Duration::from_secs(1)),
         });
@@ -658,11 +766,13 @@ mod tests {
         let observed_grant_drops = Arc::clone(grant_drop_count);
         app.set_ingress_admission_policy(move |head| match head.route_resolution() {
             RouteResolution::Matched(_) => AdmissionDecision::Admit {
+                completion: ResponseEgressCompletion::empty(),
                 grant: IngressGrant::empty(),
                 read_deadline: head.read_deadline_after(read_budget),
             },
             RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound | _ => {
                 AdmissionDecision::ReadBodyBeforeFallback {
+                    completion: ResponseEgressCompletion::empty(),
                     grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
                     max_body_bytes,
                     read_deadline: head.read_deadline_after(read_budget),
@@ -918,12 +1028,13 @@ mod tests {
                     head.route_resolution(),
                     RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound
                 ));
-                AdmissionDecision::Refuse(
-                    response_builder()
+                AdmissionDecision::Refuse {
+                    completion: ResponseEgressCompletion::empty(),
+                    response: response_builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
                         .body(Body::from("fallback unavailable\n"))
                         .expect("refusal response"),
-                )
+                }
             });
             let request = Request::builder()
                 .method("POST")
@@ -1055,6 +1166,7 @@ mod tests {
         app.set_ingress_admission_policy(move |head| {
             assert_eq!(head.request_start(), request_start);
             AdmissionDecision::Admit {
+                completion: ResponseEgressCompletion::empty(),
                 grant: IngressGrant::empty(),
                 read_deadline: Deadline::at_instant(head.request_start()),
             }
