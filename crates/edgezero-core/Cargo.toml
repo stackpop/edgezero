@@ -27,6 +27,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_path_to_error = { workspace = true }
 serde_urlencoded = { workspace = true }
+base16ct = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
