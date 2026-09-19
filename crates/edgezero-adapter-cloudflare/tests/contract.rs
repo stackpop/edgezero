@@ -20,7 +20,7 @@ mod tests {
     use edgezero_adapter_cloudflare::context::CloudflareRequestContext;
     use edgezero_adapter_cloudflare::request::{CloudflareService, into_core_request};
     use edgezero_adapter_cloudflare::response::from_core_response;
-    use edgezero_core::app::App;
+    use edgezero_core::app::{App, StoresMetadata};
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
@@ -158,7 +158,7 @@ mod tests {
             let request = cf_request(CfMethod::Post, "/mirror", Some(body));
             let mut response = edgezero_adapter_cloudflare::dispatch_app(
                 &app,
-                edgezero_core::app::StoresMetadata::default(),
+                StoresMetadata::default(),
                 request,
                 env,
                 ctx,
