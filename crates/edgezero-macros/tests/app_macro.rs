@@ -26,13 +26,17 @@ mod configured_app {
     use edgezero_core::body::Body;
     use edgezero_core::http::{HeaderMap, Method, Response, StatusCode, Uri, Version};
     use edgezero_core::ingress::{AdmissionDecision, IngressBeginOutcome, IngressHeadParts};
+    use edgezero_core::response_egress::ResponseEgressCompletion;
     use edgezero_core::time::MonotonicInstant;
 
     fn configure_app(app: &mut App) {
         app.set_ingress_admission_policy(|_| {
             let mut response = Response::new(Body::empty());
             *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-            AdmissionDecision::Refuse(response)
+            AdmissionDecision::Refuse {
+                completion: ResponseEgressCompletion::empty(),
+                response,
+            }
         });
     }
 

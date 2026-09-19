@@ -127,15 +127,17 @@ enum SecretSource {
 }
 
 enum DispatchOutcome {
+    Aborted,
     Detached(ResponseEgressEnvelope),
     Routed(ResponseEgressEnvelope),
 }
 
 impl DispatchOutcome {
     #[cfg(any(test, feature = "test-utils"))]
-    fn into_envelope(self) -> ResponseEgressEnvelope {
+    fn into_envelope(self) -> Result<ResponseEgressEnvelope, FastlyError> {
         match self {
-            Self::Detached(envelope) | Self::Routed(envelope) => envelope,
+            Self::Detached(envelope) | Self::Routed(envelope) => Ok(envelope),
+            Self::Aborted => Err(FastlyError::msg("ingress admission aborted")),
         }
     }
 }
@@ -150,7 +152,7 @@ impl<'app> FastlyService<'app> {
         req: FastlyRequest,
     ) -> Result<ResponseEgressEnvelope, FastlyError> {
         self.dispatch_with(req, |_req, _extensions| {})
-            .map(DispatchOutcome::into_envelope)
+            .and_then(DispatchOutcome::into_envelope)
     }
 
     fn dispatch_with<Prepare>(
@@ -368,6 +370,7 @@ where
     Deliver: FnOnce(ResponseEgressEnvelope) -> Result<(), FastlyError>,
 {
     match outcome {
+        DispatchOutcome::Aborted => Err(FastlyError::msg("ingress admission aborted")),
         DispatchOutcome::Detached(envelope) => {
             deliver(envelope)?;
             Ok(None)
@@ -472,6 +475,7 @@ where
             IngressBeginOutcome::Refused(response) => {
                 return DispatchOutcome::Detached(response);
             }
+            IngressBeginOutcome::Aborted => return DispatchOutcome::Aborted,
             _ => {
                 return DispatchOutcome::Detached(app.detached_ingress_error_egress(
                     EdgeError::internal(anyhow::anyhow!("unsupported ingress admission outcome")),
@@ -804,14 +808,49 @@ where
     core_request
         .extensions_mut()
         .insert(outbound_client(app.monotonic_clock()));
-    Ok(dispatch_ingress_reader(
+    dispatch_ingress_reader(
         app,
         core_request,
         Stores::default(),
         request_start,
         move || Ok(source),
     )
-    .into_envelope())
+    .into_envelope()
+}
+
+/// Exercises admission ordering with observable reader construction and delivery closures.
+#[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
+#[doc(hidden)]
+#[inline]
+pub fn dispatch_ingress_with_for_test<Source, MakeSource, Deliver>(
+    app: &App,
+    method: Method,
+    uri: Uri,
+    make_source: MakeSource,
+    deliver: Deliver,
+) -> Result<(), FastlyError>
+where
+    Source: Read + 'static,
+    MakeSource: FnOnce() -> Result<Source, EdgeError>,
+    Deliver: FnOnce(ResponseEgressEnvelope) -> Result<(), FastlyError>,
+{
+    let request_start = app.monotonic_now();
+    let mut core_request = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(|error| map_edge_error(&EdgeError::internal(error)))?;
+    core_request
+        .extensions_mut()
+        .insert(outbound_client(app.monotonic_clock()));
+    let outcome = dispatch_ingress_reader(
+        app,
+        core_request,
+        Stores::default(),
+        request_start,
+        make_source,
+    );
+    deliver_with_hooks(outcome, |_response| (), deliver).map(|_state| ())
 }
 
 /// Exercises a reader-construction failure after admission through the production seam.
@@ -832,7 +871,7 @@ pub fn dispatch_ingress_source_error_for_test(
     core_request
         .extensions_mut()
         .insert(outbound_client(app.monotonic_clock()));
-    Ok(dispatch_ingress_reader(
+    dispatch_ingress_reader(
         app,
         core_request,
         Stores::default(),
@@ -843,7 +882,7 @@ pub fn dispatch_ingress_source_error_for_test(
             )))
         },
     )
-    .into_envelope())
+    .into_envelope()
 }
 
 fn map_edge_error(err: &EdgeError) -> FastlyError {
@@ -1019,7 +1058,8 @@ mod synthesis_tests {
         let envelope = FastlyService::new(&app)
             .dispatch_with(request, |_request, _extensions| {})
             .expect("dispatch")
-            .into_envelope();
+            .into_envelope()
+            .expect("response envelope");
         let Ok((prepared, _, mut attempt, egress_clock)) = envelope.begin() else {
             panic!("begin response egress");
         };
