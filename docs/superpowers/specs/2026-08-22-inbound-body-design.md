@@ -58,26 +58,34 @@ performs this ordered protocol exactly once per platform request:
    headers, `IngressHeadAccounting`, `IngressFraming`, adapter request metadata, public
    `request_start`, and the stable route resolution. The accounting and framing values say
    whether EdgeZero validated the raw boundary or the host owns those decisions.
-5. Invoke the one admission policy stored on `App`. It returns `Refuse(Response)`,
-   `Admit { grant, read_deadline }`, or `ReadBodyBeforeFallback { grant,
-   max_body_bytes, read_deadline, on_exceeded, on_timeout }`. The callback is synchronous
-   and body-blind: it can inspect the head but cannot obtain or poll the body. A refusal
-   bypasses resolved dispatch, terminates the unread platform body with the strongest
-   target-specific primitive, drops any policy-local resources, and converts that response as
-   detached ingress egress. Head-validation failures and admission refusals are typed HTTP
-   responses, but they invoke the application's response-egress policy and observer zero times:
-   no successful admission exists for the application to observe.
+5. Invoke the one admission policy stored on `App`. It returns `Abort`,
+   `Refuse { response, completion }`, `Admit { completion, grant, read_deadline }`, or
+   `ReadBodyBeforeFallback { completion, grant, max_body_bytes, read_deadline, on_exceeded,
+   on_timeout }`. The callback is synchronous and body-blind: it can inspect the head but cannot
+   obtain or poll the body. Every response-producing decision carries exactly one non-clone
+   `ResponseEgressCompletion`; applications without a response-owned resource use
+   `ResponseEgressCompletion::empty()`.
+   A refusal bypasses resolved dispatch, terminates the unread platform body with the strongest
+   target-specific primitive, and converts that response as detached ingress egress. It skips the
+   application response-egress policy and global observer but retains and terminally invokes the
+   refusal's response-scoped completion. Head-validation failures use an empty completion because
+   no application resource was acquired.
+   `Abort` is a distinct non-response outcome: it polls no body, invokes no middleware or handler,
+   constructs no response-egress attempt, invokes no completion or observer, and instructs the
+   adapter to terminate the request at its strongest pre-response reset/error/close boundary.
 6. For `Admit`, wrap the still-unread platform body with the absolute deadline and native
    cancellation owner, construct the core `Request`, and call
    `RouterService::dispatch_resolved` with the exact token from step 3. For `Matched`, the
    router constructs `RequestContext` with `request_start`, route metadata, and the
-   request-owned grant before middleware. For `MethodNotAllowed`/`NotFound`, ordinary
+   request-owned grant before middleware. `PreparedIngress` retains the non-clone completion
+   separately from the request and router token. For `MethodNotAllowed`/`NotFound`, ordinary
    admission retains immediate 405/404 handling without polling the body; no middleware or
    handler runs and the grant is dropped exactly once. The wrapper is installed for
    `Body::Once` and `Body::Stream`; a content-type path must not pre-buffer before this point.
    After `PreparedIngress` is returned, every adapter setup or conversion failure consumes that
    proof through `App::admitted_error_egress`. The resulting envelope retains the admitted app
-   clock, request start, request method, route metadata, response-egress policy, and observer.
+   clock, request start, request method, route metadata, response-egress policy, completion, and
+   observer.
    No adapter may convert such a failure directly to a provider error or detached response.
 7. `ReadBodyBeforeFallback` is valid only for the pre-resolved `MethodNotAllowed` and
    `NotFound` outcomes. It preserves the exact resolved token, installs the same absolute
@@ -88,9 +96,11 @@ performs this ordered protocol exactly once per platform request:
    cap accepts only an empty body. The grant remains live through every body poll and is dropped
    exactly once after the drain terminates and before response conversion; dropping the core
    drain future also releases it. This path invokes no middleware, handler, or `RequestContext`
-   and never rematches. Returning this decision for `Matched` fails closed before native body
-   construction. Adapter-level cancellation follows the target caveats in §1.3; in particular,
-   Axum's current blocking bridge is deadline-bounded but not promptly cancellable.
+   and never rematches. The decision's completion follows whichever terminal response wins: the
+   canonical 404/405, exact-cap response, overflow response, timeout response, or a later admitted
+   conversion error. Returning this decision for `Matched` fails closed before native body
+   construction and drops its completion/resource without a report because no response attempt
+   began. Adapter-level cancellation follows the target caveats in §1.3.
 
 Route identity is stable and structural, never a registration ordinal or randomized hash:
 
@@ -176,6 +186,15 @@ impl IngressGrant {
     pub fn new<T: Send + Sync + 'static>(value: T) -> Self;
 }
 
+pub struct ResponseEgressCompletion { /* non-clone FnOnce callback owner */ }
+
+impl ResponseEgressCompletion {
+    pub fn empty() -> Self;
+    pub fn new<Complete>(complete: Complete) -> Self
+    where
+        Complete: FnOnce(&ResponseEgressReport) + Send + 'static;
+}
+
 #[derive(Clone, Debug)]
 pub struct BufferedIngressResponse { /* exact status + HeaderMap + Bytes */ }
 
@@ -190,19 +209,59 @@ impl BufferedIngressResponse {
 #[non_exhaustive]
 pub enum AdmissionDecision {
     Admit {
+        completion: ResponseEgressCompletion,
         grant: IngressGrant,
         read_deadline: Deadline,
     },
     ReadBodyBeforeFallback {
+        completion: ResponseEgressCompletion,
         grant: IngressGrant,
         max_body_bytes: usize,
         read_deadline: Deadline,
         on_exceeded: BufferedIngressResponse,
         on_timeout: BufferedIngressResponse,
     },
-    Refuse(Response),
+    Refuse {
+        completion: ResponseEgressCompletion,
+        response: Response,
+    },
+    Abort,
+}
+
+#[non_exhaustive]
+pub enum IngressAdmissionOutcome {
+    Admitted {
+        completion: ResponseEgressCompletion,
+        ingress: AdmittedIngress,
+    },
+    Refused {
+        completion: ResponseEgressCompletion,
+        response: Response,
+    },
+    Aborted,
+}
+
+#[non_exhaustive]
+pub enum IngressBeginOutcome {
+    Admitted(PreparedIngress),
+    Refused(ResponseEgressEnvelope),
+    Aborted,
+}
+
+#[non_exhaustive]
+pub enum IngressDispatchOutcome {
+    Response(ResponseEgressEnvelope),
+    Aborted,
 }
 ```
+
+`ResponseEgressCompletion` is never stored in `Response` extensions and is never cloneable. The
+validated `IngressAdmissionOutcome` transfers it into `PreparedIngress`, which owns it beside the
+grant-bearing `AdmittedIngress` and resolved router token. Immediately before router dispatch,
+`App::dispatch_admitted` separates the completion from the remaining ingress proof and retains it
+while the router consumes the request and grant. It then moves that exact completion into the
+envelope for whichever response dispatch produces. A response replacement therefore cannot lose
+or duplicate the resource.
 
 `BufferedIngressResponse` is deliberately finite and transport-neutral: it cannot carry a
 streaming body or deferred provider work. `new` preserves the application-selected status,
@@ -212,8 +271,9 @@ type and exact content length.
 The matched `RequestContext` stores the grant in an unsynchronized one-shot cell because
 extractors receive `&RequestContext`. `take_ingress_grant(&self)` removes and returns it at
 most once; a second call returns `None`. If application code never takes it, context drop
-releases it. A refusal never creates a request-owned grant. An ordinary admitted 404/405 owns
-the grant only until the resolved terminal response, then drops it. The bounded fallback path
+releases it. A refusal never creates a request-owned grant. `Abort` creates neither a grant nor a
+completion. An ordinary admitted 404/405 owns the grant only until the resolved terminal response,
+then drops it. The bounded fallback path
 holds its grant through the body drain and drops it exactly once before converting the canonical
 or application-selected terminal response. It never exposes the grant through a request context.
 The carrier exposes no type-id string, serializer, or platform handle API; application code
@@ -228,11 +288,15 @@ admission. `IngressHead::route_resolution()` exposes the value above, and a matc
 
 `App::detached_ingress_error_egress(error, method, request_start)` is the adapter boundary for
 normalized validation and admission-policy failures. It renders the typed error using a bounded
-default response-egress policy and no-op observer, never the application policy or observer.
+default response-egress policy, `ResponseEgressCompletion::empty()`, and a no-op observer, never
+the application policy or observer. An admitted policy error before an attempt begins drops the
+decision-owned completion/resource without a report.
 `App::admitted_error_egress(prepared, error)` consumes the single-use admission proof, releases
-its grant exactly once, and creates an application-owned envelope with the captured request and
-route metadata. `App::dispatch_admitted` is infallible at this boundary: handler and routing
-errors are rendered into the same owned envelope instead of escaping after admission.
+its grant exactly once, and creates an application-owned envelope with the captured request,
+route metadata, and exact completion. `App::dispatch_admitted` is infallible at this boundary:
+handler and routing errors are rendered into the same owned envelope instead of escaping after
+admission. The higher-level `App::dispatch_ingress` returns `IngressDispatchOutcome`, so it cannot
+accidentally translate `Abort` into an HTTP response.
 
 ```rust
 pub type MonotonicInstant = web_time::Instant;
@@ -266,9 +330,11 @@ and clamps to `DEADLINE_FAR_FUTURE`. Calling the global-clock `Deadline::after` 
 while a custom app clock is installed is a caller error; explicit low-level APIs likewise
 cannot validate that two bare `MonotonicInstant` values came from the same source.
 
-`Hooks::configure(&mut App)` is the existing app-owned configuration point and uses a new
+`Hooks::configure(&mut App) -> Result<(), EdgeError>` is the app-owned configuration point and
+uses a new
 `App` admission-policy setter. Manifest-generated and hand-written apps that do not install
-one use the portable default: admit with `grant = IngressGrant::empty()` and
+one use the portable default: admit with `grant = IngressGrant::empty()`,
+`completion = ResponseEgressCompletion::empty()`, and
 `read_deadline = request_start + DEFAULT_INBOUND_READ_BUDGET`, where
 `DEFAULT_INBOUND_READ_BUDGET = 30 s`. Admission cannot return "no deadline". The adapter
 normalizes every admitted deadline to no later than
@@ -311,9 +377,10 @@ impl IngressHeadLimits {
 }
 ```
 
-All three values must be nonzero. Validation runs when `App` is finalized and before a
-listener/guest service starts. Invalid configuration is `Internal`; it never silently means
-unlimited. Limits are inclusive and use checked `u64` accounting.
+All three values must be nonzero. Validation runs when `App` is finalized, before core request
+conversion, body polling, admission, or dispatch; Axum additionally validates before listener
+bind. Invalid configuration is `Internal`; it never silently means unlimited. Limits are
+inclusive and use checked `u64` accounting.
 
 This seam starts when EdgeZero receives control. It cannot reject or time-bound bytes a
 provider accepted or buffered before invoking guest code; adapter capability documentation
@@ -437,11 +504,19 @@ non-outbound capability cells to the shared capability ladder:
 | Capability | Axum | Cloudflare | Fastly | Spin |
 | --- | --- | --- | --- | --- |
 | `ingress-admission` | Native | Native | Native | Native |
+| `ingress-admission-abort` | Native | BestEffort | BestEffort | BestEffort |
 | `inbound-read-deadlines` | Native | BestEffort until a deployed cancellation probe passes | BestEffort (synchronous host reads are not guest-preemptible) | BestEffort until host-observed cancellation is bounded |
 | `raw-ingress-head-limits` | Unsupported | Unsupported | Unsupported | Unsupported |
 | `raw-ingress-framing-validation` | Unsupported | Unsupported | Unsupported | Unsupported |
 
-BestEffort implementations still use pre-read/post-ready checks and release ownership when
+Axum maps `Abort` to a service error from its owned Hyper HTTP/1 connection and drops the
+connection before response-head construction; a raw-socket test proves EOF/reset and zero response
+bytes. Cloudflare, Fastly, and Spin return the strongest fixed platform error available before core
+request-body construction, but remain `BestEffort` until deployed evidence proves that the host
+does not synthesize a response or retain the request. No adapter is permitted to translate `Abort`
+into EdgeZero's ordinary JSON error response or invoke response-egress callbacks.
+
+BestEffort deadline implementations still use pre-read/post-ready checks and release ownership when
 expiry is observed; they do not claim a finite bound around an uninterruptible or opaque host
 call. Fastly cannot preempt its synchronous read. Spin races each pending body read against
 `spin_sdk::time::sleep(remaining)` and selects the timer first, so guest code can promptly emit
@@ -814,8 +889,8 @@ platform runtime or network.
 | Successful cache | The platform stream is polled only once; repeated reads clone the same bytes. A permissive read followed by a stricter cached read returns an over-cap error while leaving the cell `Cached`; a later permissive read succeeds. |
 | Failed drain | Source error and initial-drain cap overflow transition to `Poisoned`; every later buffered accessor, `take_body`, and `into_request` reconstructs the same variant, status, message, and structured fields. The source is never polled again. |
 | Parser-level head limits (future acceptance criterion) | Exact-limit request targets, header bytes, and header counts pass at a raw parser boundary. One byte/field over rejects before route resolution, admission, request construction, or body polling with 414/431 and redacted diagnostics. Raw accounting includes duplicate field lines and framing syntax; checked overflow fails closed. Current host-normalized recounts never report `RawValidated` and do not satisfy this row. |
-| Admission ordering and route identity | Raw validation runs first where available. Route resolution then runs exactly once without middleware or body polling, and the callback sees the resulting stable `RouteResolution`. Admission runs exactly once before resolved dispatch/body polling. A matched dispatch uses the admitted route and path parameters without rematching; method/path mutation or a foreign token fails closed. Route class reaches matched and 405 metadata but never changes `RouteId`. Refusal polls no body, invokes no middleware/handler, terminates the native reader, and preserves the chosen response. The default policy supplies an empty grant and one finite deadline derived from `request_start`. |
-| Bounded fallback precedence | For pre-resolved 404/405 requests, ordinary `Admit` retains no-poll routing behavior. Opt-in `ReadBodyBeforeFallback` holds the application grant while draining a lengthless or chunked body to EOF under one absolute deadline: exact cap preserves the canonical 404/405, the first byte over returns the exact `on_exceeded` status/header/body response first, and expiry returns the exact `on_timeout` response first. The grant is live during every poll and drops exactly once before response conversion, when the core drain future is dropped, or when the finite deadline terminates it. No path rematches or invokes middleware, a handler, or `RequestContext`; `Refuse` remains zero-read; selecting fallback drain for a matched route fails before body construction. Every adapter suite covers both 404 and 405 exact-cap cases plus exact custom terminal responses at its honestly reported deadline capability. Axum additionally proves that an outer abort request cannot cancel its blocking bridge but that the read deadline still releases the source and grant exactly once. |
+| Admission ordering and route identity | Raw validation runs first where available. Route resolution then runs exactly once without middleware or body polling, and the callback sees the resulting stable `RouteResolution`. Admission runs exactly once before resolved dispatch/body polling. A matched dispatch uses the admitted route and path parameters without rematching; method/path mutation or a foreign token fails closed. Route class reaches matched and 405 metadata but never changes `RouteId`. Refusal polls no body, invokes no middleware/handler, terminates the native reader, preserves the chosen response, and carries its completion through detached egress. `Abort` polls no body, creates no response/attempt, invokes no middleware/handler/completion/observer, and reaches the adapter abort boundary. The default policy supplies empty grant/completion values and one finite deadline derived from `request_start`. |
+| Bounded fallback precedence | For pre-resolved 404/405 requests, ordinary `Admit` retains no-poll routing behavior. Opt-in `ReadBodyBeforeFallback` holds the application grant while draining a lengthless or chunked body to EOF under one absolute deadline: exact cap preserves the canonical 404/405, the first byte over returns the exact `on_exceeded` status/header/body response first, and expiry returns the exact `on_timeout` response first. The grant is live during every poll and drops exactly once before response conversion, when the core drain future is dropped, or when the finite deadline terminates it. The completion survives each response choice and settles exactly once at egress; it is not exposed through `RequestContext`. No path rematches or invokes middleware, a handler, or `RequestContext`; `Refuse` and `Abort` remain zero-read; selecting fallback drain for a matched route fails before body construction and drops the never-started completion without a report. Every adapter suite covers both 404 and 405 exact-cap cases plus exact custom terminal responses at its honestly reported deadline capability. |
 | Request ingress metadata | `IngressHead` and matched `RequestContext` expose the same captured `request_start`, paired app clock, and route metadata. `take_ingress_grant()` returns the non-clone grant exactly once, then `None`; untaken, refused, 404, and 405 grants each drop exactly once. The preserved low-level context constructor exposes no route and makes no admission claim. |
 | Absolute read deadline | A 1-byte-per-step under-cap stream cannot extend its lifetime: first-byte, inter-chunk, EOF, and source-error races use one absolute deadline and the admitted app clock; expiry wins simultaneous readiness, cancels native ownership, and poisons a draining cell as `request_timeout` (408). A manually advanced injected clock proves the tie behavior without wall-clock sleeps. Spin additionally proves that a timer wake interrupts a permanently pending matched or fallback source, preserves the correct terminal response, and releases source/grant ownership exactly once. Cached success is not retroactively poisoned. |
 | Cancellation | A stream held at `Pending` leaves the cell `Draining`; dropping the first `body_bytes` future transitions it to the documented cancellation poison, and the next access returns that stored internal error. |
@@ -851,16 +926,21 @@ eventual release.
   whole-request borrow accessors.
 - `crates/edgezero-core/src/app.rs`: add the synchronous, body-blind admission policy and
   immutable `IngressHeadLimits` plus the injectable `MonotonicClock` to `App`, its default
-  finite inbound read budget, and the normalized ingress-head/decision/accounting types.
-  The macro continues to use
-  `Hooks::configure(&mut App)` as the app-owned setter point.
+  finite inbound read budget, the normalized ingress-head/decision/accounting types, and the
+  response-or-abort dispatch result. Carry each decision-owned completion through prepared,
+  refused, fallback, error, and normal response paths without response extensions.
+  The macro uses
+  `Hooks::configure(&mut App) -> Result<(), EdgeError>` as the app-owned setter point, and
+  `Hooks::build_app()` prevents request conversion, admission, body polling, or dispatch when
+  startup policy is invalid. Axum also fails before listener bind; Cloudflare, Fastly, and Spin
+  enforce this boundary per host invocation.
 - `crates/edgezero-core/src/error.rs`: add `RequestHeaderFieldsTooLarge { message }` with
   status 431 and kind `request_header_fields_too_large`, `RequestTimeout { message }` with
   status 408 and kind `request_timeout`, and `UriTooLong { message }` with status 414 and
   kind `uri_too_long`; update every exhaustive match and wire-shape matrix.
 - `crates/edgezero-core/src/manifest.rs`, `crates/edgezero-core/src/router.rs`, and
   `crates/edgezero-adapter/src/registry.rs`: add optional trigger `class`, carry it as
-  non-identity route metadata, add the four inbound capability cells, and retain fail-closed
+  non-identity route metadata, add the five inbound capability cells, and retain fail-closed
   required-capability handling. Keep these counts separate from the outbound design's
   eight-cell tuple.
 - `crates/edgezero-core/src/extractor.rs`: route JSON/form extractors through bounded
@@ -871,7 +951,8 @@ eventual release.
 - `crates/edgezero-adapter-{axum,cloudflare,fastly,spin}` request/dispatch services: stamp
   `request_start`, apply normalized defense-in-depth checks while reporting the raw boundary
   as host-managed, resolve once, and run app admission before middleware/handler dispatch or
-  body polling; stop eager collection; dispatch with the opaque resolved token; and wrap each
+  body polling; stop eager collection; dispatch with the opaque resolved token; map the explicit
+  abort outcome to the strongest non-response platform boundary; and wrap each
   platform request body with its absolute deadline and strongest available read-ownership
   primitive. Keep `Body::Once` only when the platform already owns bounded bytes and admission
   has already run.

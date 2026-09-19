@@ -10,8 +10,8 @@ This design owns the lifetime after router dispatch returns a core `Response` an
 adapter has either reached its strongest observable completion boundary or terminally aborted
 the response. It covers one absolute response-write deadline enforced to the adapter's
 declared capability boundary, demand-driven body production, client cancellation where
-observable, post-commit abort behavior, payload-byte accounting, and one terminal
-notification.
+observable, post-commit abort behavior, payload-byte accounting, one terminal report, one
+response-scoped completion slot, and one global observer notification.
 
 It does not extend an outbound fetch deadline, classify upstream failures, or change outbound
 response decoding. Those end when the outbound adapter returns an `OutboundResponse`, as
@@ -45,19 +45,22 @@ request signals, connection supervisors, and platform writers submit events to t
 they do not own independent attempt guards. The coordinator serializes competing terminal
 events and releases all source and transport resources after the first terminal transition.
 
-Every final client response produced after successful admission uses the application-owned
-transport path, including successful handlers, handler errors, framework 404/405 responses, and
-adapter-private fallbacks. Errors that arise after `PreparedIngress` exists but before normal
-dispatch complete consume that proof through `App::admitted_error_egress`; the envelope retains
-the app clock, request metadata, policy, observer, deadline, and exactly-once terminal semantics.
+Every final client response produced by an admission decision uses the owned transport path,
+including successful handlers, handler errors, framework 404/405 responses, bounded fallback
+responses, and admission refusals. Errors that arise after `PreparedIngress` exists but before
+normal dispatch completes consume that proof through `App::admitted_error_egress`; the envelope
+retains the app clock, request metadata, policy, observer, response-scoped completion, deadline,
+and exactly-once terminal semantics.
 An adapter must not turn source construction, core request conversion, or dispatch failure into a
 provider error or detached response after this boundary.
 
-Normalized head-validation failures and admission refusals occur before successful admission.
-They are converted to typed HTTP responses through detached ingress egress and invoke the
-application response-egress policy and observer zero times. Host/parser-generated responses
-emitted before EdgeZero can construct normalized ingress metadata remain outside this lifecycle
-and are governed by the raw-ingress capability contract.
+An admission refusal uses detached ingress policy and a no-op global observer, but carries the
+response-scoped completion supplied by that refusal. Normalized head-validation failures use the
+same detached transport path with `ResponseEgressCompletion::empty()` because no application
+resource was acquired. `AdmissionDecision::Abort` produces no response, starts no egress attempt,
+and invokes neither completion nor observer. Host/parser-generated responses emitted before
+EdgeZero can construct normalized ingress metadata remain outside this lifecycle and are governed
+by the raw-ingress capability contract.
 
 ## 3. Core contract
 
@@ -162,7 +165,50 @@ pub struct ResponseEgressReport {
     pub request_start: MonotonicInstant,
     pub route: Option<RouteMetadata>,
 }
+
+pub struct ResponseEgressCompletion { /* non-clone callback owner */ }
+
+impl ResponseEgressCompletion {
+    pub fn empty() -> Self;
+
+    pub fn new<Complete>(complete: Complete) -> Self
+    where
+        Complete: FnOnce(&ResponseEgressReport) + Send + 'static;
+}
 ```
+
+An application that must retain a response-scoped resource until terminal egress constructs one
+non-clone `ResponseEgressCompletion` whose `FnOnce` callback owns that resource. The completion is
+not attached to a `Response` and never enters `http::Extensions`; it is a separate ownership token
+carried by `AdmissionDecision`, `PreparedIngress`, `ResponseEgressEnvelope`, and finally the sole
+`ResponseEgressAttempt`. Consequently response cloning, replacement, error rendering, and
+framework-generated 404/405 responses cannot duplicate or silently detach the resource.
+
+Every response-producing admission decision supplies exactly one completion. Applications that
+do not need a resource use `ResponseEgressCompletion::empty()`. `Admit` and
+`ReadBodyBeforeFallback` transfer it into `PreparedIngress`; `App::dispatch_admitted` removes it
+before handing the remaining ingress state to the router and attaches it to whichever response
+dispatch produces. That includes handler success, handler error, canonical 404/405, fallback exact
+cap, fallback overflow, fallback timeout, and post-admission adapter failure. `Refuse` transfers its
+completion directly into detached egress. Pre-admission framework errors use an empty completion.
+
+`ResponseEgressEnvelope::begin()` moves the completion into the sole
+`ResponseEgressAttempt` before policy evaluation or framing. The attempt retains it through
+application writes, fallback writes, cancellation, adapter errors, and guard drop. The first
+terminal transition stores the report in `AttemptState::Terminal`, takes the callback, and invokes
+it exactly once. A later signal observes terminal state and cannot complete twice. If an envelope
+is dropped before `begin()`, the completion and captured resource are dropped without fabricating
+a terminal report. Standard adapters must call `begin()` exactly once for every response envelope.
+`ResponseEgressEnvelope` exposes no `into_response()` escape hatch: obtaining a transmittable
+response requires `begin()`, which first transfers the completion into the attempt. Dropping an
+unbegun envelope is permitted only as cancellation before transmission; it releases the resource
+without exposing the response or inventing a report.
+
+The response-scoped completion runs before the global observer. Each callback is isolated by its
+own unwind boundary: a completion panic is logged with a category-only message and does not
+prevent the global observer from receiving the report; an observer panic does not re-enter the
+completion callback. Panic-abort targets retain the trusted-callback limitation below. Neither
+callback can alter the response or terminal outcome.
 
 `ResponseEgressBodyKind::{Application, Fallback}` identifies which bounded wire body the
 reported byte count describes. Application bytes and fallback bytes are never mixed because
@@ -179,15 +225,16 @@ write accounts only its accepted prefix and never retries that prefix.
 backward, the report records zero, classifies `Unspecified`, logs the clock fault, and still
 completes exactly once.
 
-The observer cannot alter the client response. Adapter code catches observer unwinds where the
-target supports containment; observer failure is logged after the state becomes terminal and
-cannot trigger a second notification. EdgeZero emits only a category-level message for a caught
-callback panic. Rust invokes the application-owned process panic hook before `catch_unwind`
-returns, so panic-hook output is outside EdgeZero's diagnostic-redaction guarantee; applications
-whose panic payloads may contain secrets must install an appropriate redacting hook during startup.
-On panic-abort targets, including the pinned Fastly WASM build, callback panics terminate the
-instance and cannot produce a fallback or terminal report. Application callbacks are trusted not
-to panic there; only unwind-capable targets can exercise the contained-panic fallback contract.
+Neither completion nor observer callbacks can alter the client response. EdgeZero emits only a
+category-level message for a caught callback panic. Rust invokes the application-owned process
+panic hook before `catch_unwind` returns, so panic-hook output is outside EdgeZero's
+diagnostic-redaction guarantee; applications whose panic payloads may contain secrets must install
+an appropriate redacting hook during startup. On panic-abort targets, including the pinned Fastly
+WASM build, a policy panic occurs before terminal state and terminates the instance without a
+report. A completion or observer panic occurs after terminal state is stored and any fallback has
+settled, but terminates the instance before later callbacks can be guaranteed. Application
+callbacks are trusted not to panic there; only unwind-capable targets can exercise the contained
+panic and callback-ordering contract.
 
 `Completed` means core EOF and any supported trailers reached the adapter's documented
 successful finish boundary. `HostHandoff` means the provider accepted the complete
@@ -218,12 +265,55 @@ Dropping an `Initial` guard reports `ConversionError`. Dropping a `Writing` guar
 otherwise it reports `TransportError`. Empty and `Body::Once` responses enter `Writing` and
 produce one lifecycle report just like streamed responses.
 
-The existing non-clone core attempt remains the only terminal guard. `begin()` changes so
+The existing non-clone core attempt remains the only terminal guard and owns the mandatory
+response-scoped completion slot; an empty slot is represented by
+`ResponseEgressCompletion::empty()`, not `Option`. `begin()` changes so
 policy panic/normalization failure returns the still-live attempt, clock, and failure cause to
 the adapter instead of notifying before a fallback is written. The attempt records whether
 application or fallback bytes are being written. Adapters may add private event/coordinator
 types but must not add a shared runtime writer abstraction, make `BodyStream` require `Send`,
 or attach provider capability declarations to individual reports.
+
+### 3.4 Fallible application assembly
+
+Application configuration is startup policy and must not require `expect` or panic to reject
+invalid limits. The `Hooks` contract is a hard cut to a fallible builder:
+
+```rust
+pub trait Hooks {
+    fn build_app() -> Result<App, EdgeError> {
+        let mut app = App::with_name(Self::routes(), Self::name());
+        Self::configure(&mut app)?;
+        Ok(app)
+    }
+
+    fn configure(_app: &mut App) -> Result<(), EdgeError> {
+        Ok(())
+    }
+}
+```
+
+The `app!` macro emits the same signatures. A supplied `configure = <expr>` callback must return
+`Result<(), EdgeError>` and its result is returned directly rather than discarded. No adapter
+continues with a partially configured `App`:
+
+- Axum builds before binding its listener and returns an `anyhow::Error` retaining the
+  `EdgeError` source.
+- Cloudflare builds at the start of each host invocation, before core request conversion,
+  admission, body polling, or dispatch. It logs only the stable `EdgeError::kind()` and returns a
+  fixed `worker::Error::RustError("application configuration failed")` so private diagnostics are
+  not wire-visible.
+- Fastly builds after fixed runtime/logger setup but before receiving, converting, admitting, or
+  dispatching the client request. Its top-level error retains the `EdgeError` source under the
+  fixed `"application configuration failed"` context.
+- Spin builds at the start of each host invocation before core request conversion, admission,
+  body polling, or dispatch. Its `anyhow::Error` retains the `EdgeError` source under the same
+  fixed context.
+
+Cloudflare, Fastly, and Spin are per-invocation build boundaries, not process-start boundaries.
+No compatibility `build_app_unchecked`, infallible callback coercion, or panic fallback remains.
+The demo, generated template, hand-written `Hooks` implementations, guides, and tests migrate
+atomically.
 
 ## 4. Write, commit, and abort semantics
 
@@ -471,6 +561,12 @@ The implementation is atomic. It removes rather than deprecates:
   pre-enqueue accounting branches;
 - the converter-only `ResponseEgressOutcome::ResponseReturned` variant and its zero-byte special
   case;
+- public `ResponseEgressEnvelope::into_response()` and every test/helper that extracts a response
+  without beginning and terminally settling its attempt;
+- any response-extension-based completion carrier or cloneable shared callback slot; completion is
+  a direct, non-clone admission/envelope/attempt ownership chain;
+- infallible `Hooks::configure` and `Hooks::build_app` signatures, callback-result discards, and
+  application-side `expect` calls used only to bridge fallible startup policy;
 - obsolete tests, fixtures, imports, dependencies, capability footnotes, and adapter-guide
   text that describe buffered egress; and
 - the superseded Fastly-only response-egress plan.
@@ -515,14 +611,14 @@ Every adapter gets deterministic lifecycle tests before provider integration:
 | Surface      | Required proof                                                                                                                                                                                                     |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Timing       | One absolute deadline covers conversion, first byte, source waits, writes, backpressure, and finish. Equality expiry wins; no chunk resets the budget. Frozen/backward clocks still settle exactly once.           |
-| Completion   | Empty, buffered, streamed EOF, source failure, transport failure, timeout, disconnect, conversion failure, never-polled body, and guard drop each notify once. Competing terminal events still produce one report. |
+| Completion   | Empty, buffered, streamed EOF, source failure, transport failure, timeout, disconnect, conversion failure, never-polled body, and guard drop each notify once. Competing terminal events still produce one report. The exact decision-owned completion survives normal dispatch, handler/routing errors, canonical 404/405, bounded fallback outcomes, refusal, policy/framing failure, adapter fallback, and guard drop; it runs before the global observer and remains independent when either callback panics on unwind targets. A dropped pre-begin envelope releases its resource without fabricating a report. Pre-admission validation uses an empty completion; explicit ingress abort starts no attempt and invokes no callback. Compile-time tests prove the completion is non-clone and cannot be stored in response extensions. |
 | Accounting   | Exact payload totals, zero-byte response, checked overflow, short/partial writes, cancellation prefixes, and no headers/framing in the count.                                                                      |
 | Commit       | Pre-commit failure may synthesize a bounded fallback; post-commit failure aborts without rewriting status or appending a body.                                                                                     |
 | Backpressure | Holding one platform write prevents the next source poll and bounds EdgeZero staging to one chunk.                                                                                                                 |
 | Teardown     | Source drop and native abort/reset/error/close occur on every supported failure path. A terminal stream error releases its source/native state before yielding `Err`, without a repoll or wrapper drop. A losing future cannot mutate terminal state. |
 | Headers      | Repeated fields, including `Set-Cookie`, survive the new low-level conversion paths.                                                                                                                               |
 | Framing      | `HEAD`, body-forbidden statuses, content-length exact/short/long bodies, removed transfer encoding, unsupported upgrades, and early EOF behave identically across adapters.                                        |
-| Migration    | Removed APIs fail to compile; generated and demo applications compile only against the new entrypoints and response types.                                                                                         |
+| Migration    | Removed APIs fail to compile; generated and demo applications compile only against the new entrypoints, response types, and fallible configure signature. Every adapter proves a failing configure result prevents request conversion, body polling, admission, and dispatch. Axum additionally proves no listener bind and a retained `EdgeError` source. Fastly proves no client-request receive and a retained source under the fixed context. Spin proves the retained source and fixed context. Cloudflare proves stable-kind-only logging and the fixed public `worker::Error`. |
 
 Target evidence adds:
 
