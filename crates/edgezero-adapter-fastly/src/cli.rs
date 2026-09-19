@@ -1771,6 +1771,7 @@ fn parse_snapshot_array(label: &str, raw: &str) -> Result<serde_json::Value, Str
             .as_object_mut()
             .ok_or_else(|| format!("Fastly {label} snapshot record #{index} must be an object"))?;
         remove_snapshot_metadata(object);
+        row.sort_all_objects();
     }
     rows.sort_by_cached_key(ToString::to_string);
     Ok(value)
@@ -1795,6 +1796,7 @@ fn parse_snapshot_object(label: &str, raw: &str) -> Result<serde_json::Value, St
         .as_object_mut()
         .ok_or_else(|| format!("Fastly {label} snapshot must be a complete JSON object"))?;
     remove_snapshot_metadata(object);
+    value.sort_all_objects();
     Ok(value)
 }
 
@@ -8136,6 +8138,28 @@ mod tests {
                 r#"{"general.default_ttl":3600,"service_id":"SVC","version":42}"#,
             )
         );
+    }
+
+    #[test]
+    fn version_configuration_snapshot_ignores_json_object_key_order() {
+        let source = parse_snapshot_array(
+            "backends",
+            r#"[
+                {"name":"origin-a","hostname":"z.example","tls":{"check":true,"sni":"z.example"}},
+                {"name":"origin-b","hostname":"a.example","tls":{"check":false,"sni":"a.example"}}
+            ]"#,
+        )
+        .expect("source snapshot");
+        let reread = parse_snapshot_array(
+            "backends",
+            r#"[
+                {"tls":{"sni":"a.example","check":false},"hostname":"a.example","name":"origin-b"},
+                {"tls":{"sni":"z.example","check":true},"hostname":"z.example","name":"origin-a"}
+            ]"#,
+        )
+        .expect("reordered snapshot");
+
+        assert_eq!(source, reread);
     }
 
     #[test]
