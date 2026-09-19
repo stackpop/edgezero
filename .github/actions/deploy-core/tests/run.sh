@@ -3113,7 +3113,9 @@ test_build_app_cli_archive() {
   local dir="$WORK_DIR/build-app-cli-archive"
   local app_dir="$dir/workspace/app"
   local action_ws="$dir/runner/invocation"
-  mkdir -p "$app_dir" "$dir/bin" "$action_ws"
+  local cached_target="$dir/runner/edgezero-rust-cache/example-app/target"
+  mkdir -p "$app_dir" "$dir/bin" "$action_ws" "$cached_target"
+  touch "$cached_target/restored-cache-entry"
   printf '[package]\nname = "fixture-cli"\nversion = "1.2.3"\nedition = "2021"\n' \
     >"$app_dir/Cargo.toml"
   printf 'version = 3\n' >"$app_dir/Cargo.lock"
@@ -3157,6 +3159,7 @@ EOF
     GITHUB_WORKSPACE="$dir/workspace" RUNNER_TEMP="$dir/runner" \
     EDGEZERO__ACTION__ROOT="$REPO_ROOT" \
     EDGEZERO__ACTION__WORKSPACE="$action_ws" \
+    EDGEZERO__RUST_CACHE__TARGET_DIR="$cached_target" \
     EDGEZERO__ACTION__OUTPUT_FILE="$handoff" \
     EDGEZERO__APP__CLI__PACKAGE=fixture-cli \
     EDGEZERO__APP__CLI__ARTIFACT=fixture-upload-name \
@@ -3177,6 +3180,10 @@ EOF
     $'app-cli-meta.json\nfixture-cli' "$(tar -tf "$tarball" | sort)"
   assert_succeeds "the configurable GitHub artifact name is preserved" \
     grep -qx 'app-cli-artifact=fixture-upload-name' "$published"
+  assert_succeeds "build-app-cli uses the restored Cargo target directory" \
+    test -x "$cached_target/release/fixture-cli"
+  assert_succeeds "build-app-cli preserves restored Cargo target artifacts" \
+    test -f "$cached_target/restored-cache-entry"
   assert_succeeds "the upload step consumes the published tarball-path" \
     grep -Fq "path: \${{ steps.build.outputs['tarball-path'] }}" \
     "$ACTIONS_DIR/build-app-cli/action.yml"

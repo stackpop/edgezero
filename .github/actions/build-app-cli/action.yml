@@ -105,6 +105,9 @@ runs:
         EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
         EDGEZERO__PROJECT__RUST_TOOLCHAIN: ${{ inputs['rust-toolchain'] }}
         EDGEZERO__APP__CLI__ARTIFACT: ${{ inputs['app-cli-artifact'] }}
+        # setup-rust-build-cache publishes this through GITHUB_ENV only when its
+        # opt-in target cache is enabled. build-app-cli confines it to RUNNER_TEMP.
+        EDGEZERO__RUST_CACHE__TARGET_DIR: ${{ env.EDGEZERO__RUST_CACHE__TARGET_DIR }}
         # This step runs app-controlled code, so it emits NO outputs through the
         # runner's GITHUB_OUTPUT (blanked below). It collects them into this
         # action-owned file; the separate "Publish CLI outputs" step re-emits them.

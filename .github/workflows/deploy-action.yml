@@ -137,6 +137,8 @@ jobs:
       - name: Set up Rust build cache
         uses: ./.github/actions/setup-rust-build-cache
         with:
+          app-name: store-aware-fixture
+          cache-target: true
           working-directory: fixture-app
 
       - name: Build the application-owned CLI once
@@ -186,6 +188,8 @@ jobs:
       - name: Set up Rust build cache
         uses: ./.github/actions/setup-rust-build-cache
         with:
+          app-name: store-free-fixture
+          cache-target: true
           working-directory: fixture-app
 
       - name: Build the store-free application CLI once

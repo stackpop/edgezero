@@ -30,14 +30,23 @@ and before its Rust build steps:
 - name: Set up Rust build cache
   uses: stackpop/edgezero/.github/actions/setup-rust-build-cache@<ref>
   with:
+    app-name: example-app
+    cache-target: true
     working-directory: application
 ```
 
-`working-directory` identifies the Cargo workspace containing the committed
-`Cargo.lock`. The action restores Cargo registry and Git dependency sources,
-installs a pinned `sccache`, and enables compiler caching for every later native
-or WASM Rust build in the job. It does not cache a Cargo `target` directory or
-change any build, package, release, adapter, or deployment command.
+`app-name` is a stable lowercase cache namespace for one application.
+`working-directory` identifies its Cargo workspace containing the committed
+`Cargo.lock`. The action restores application-scoped Cargo registry and Git
+dependency sources, installs a pinned `sccache`, and enables compiler caching
+for every later native or WASM Rust build in the job. With `cache-target: true`,
+it also restores an application-scoped Cargo target directory containing Cargo
+fingerprints, build-script outputs, generated code, libraries, and linking
+inputs. Cargo keeps target triples, profiles, features, and compiler fingerprints
+separate inside that directory. The source revision completes the primary target
+cache key, while the restore prefix can reuse the preceding cache for the same
+application and lockfile. Existing build, package, release, adapter, and
+deployment commands remain unchanged.
 
 Use the release packager after the application CLI and Fastly package have been
 built in the credential-free producer job:
