@@ -660,7 +660,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   messages, adapter capability claims, generated code, and every `build_app()` call. Remove dead
   branches and imports introduced by the hard cut; do not retain compatibility aliases.
 
-- [ ] **Step 6: Commit any verification fixes and push PR #275**
+- [x] **Step 6: Commit any verification fixes and push PR #275**
 
   ```bash
   git add -A
