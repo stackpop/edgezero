@@ -81,28 +81,55 @@ the spec, §6.6):
 
 ### Runtime environment variables
 
-`__` (double underscore) separates segments. Absent variables fall
-back to their listed defaults.
+`__` (double underscore) separates segments. Resolution uses this exact
+precedence: parent value > manifest variable default > logical default. A parent
+environment or GitHub Environment value wins; otherwise a default declared for
+the manifest variable is used; otherwise a store selector resolves to its logical
+ID. Fastly resolves physical names during deployment and attaches them under
+logical aliases; it does not add a service ID to any canonical variable name.
 
-| Variable                                   | Role                                                                                                                   | Default         |
-| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | --------------- |
-| `EDGEZERO__STORES__<KIND>__<ID>__NAME`     | platform name for logical store `<id>`                                                                                 | the logical id  |
-| `EDGEZERO__STORES__CONFIG__<ID>__KEY`      | config-store **key** the runtime reads the blob from — the staging/canary selector that pairs with `config push --key` | the logical id  |
-| `EDGEZERO__STORES__<KIND>__<ID>__<SUFFIX>` | free-form per-adapter tuning (e.g. spin's `MAX_LIST_KEYS`)                                                             | —               |
-| `EDGEZERO__ADAPTER__HOST`                  | bind host (axum)                                                                                                       | `127.0.0.1`     |
-| `EDGEZERO__ADAPTER__PORT`                  | bind port (axum)                                                                                                       | `8787`          |
-| `EDGEZERO__LOGGING__LEVEL`                 | log level                                                                                                              | adapter default |
+| Variable                                   | Role                                                                                           | Default         |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------- | --------------- |
+| `EDGEZERO__STORES__<KIND>__<ID>__NAME`     | platform name for logical store `<id>`                                                         | the logical id  |
+| `EDGEZERO__STORES__CONFIG__<ID>__KEY`      | config-store key for adapters that support runtime key selection; Fastly rejects this selector | the logical id  |
+| `EDGEZERO__STORES__<KIND>__<ID>__<SUFFIX>` | free-form per-adapter tuning (e.g. spin's `MAX_LIST_KEYS`)                                     | —               |
+| `EDGEZERO__ADAPTER__HOST`                  | bind host (axum)                                                                               | `127.0.0.1`     |
+| `EDGEZERO__ADAPTER__PORT`                  | bind port (axum)                                                                               | `8787`          |
+| `EDGEZERO__LOGGING__LEVEL`                 | log level                                                                                      | adapter default |
 
 `<KIND>` ∈ `KV` / `CONFIG` / `SECRETS`; `<ID>` is the upper-case logical
-id. The literal `__KEY` selector is config-only — it swaps which blob
-the `AppConfig<C>` extractor loads (see
+id. On adapters that support runtime key selection, the config-only `__KEY`
+selector swaps which blob the `AppConfig<C>` extractor loads (see
 [the blob migration guide](./blob-app-config-migration.md#per-environment-key-override)).
+Fastly always uses the logical ID as the Config Store key and rejects `__KEY`.
 
-These are the canonical names EdgeZero presents to each adapter. Fastly stores
-an override in `edgezero_runtime_env` as
-`EDGEZERO__SERVICES__<SERVICE_ID>__<canonical suffix>` and translates it back
-at runtime. Do not write the unscoped canonical key directly into that Config
-Store; see the [Fastly adapter guide](./adapters/fastly.md#config-store).
+For example, an application can declare all three store kinds while keeping the
+Secret Store optional:
+
+```toml
+[stores.config]
+ids = ["app_config"]
+
+[stores.kv]
+ids = ["cache"]
+
+[stores.secrets]
+ids = ["credentials"]
+```
+
+```text
+EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-prod
+EDGEZERO__STORES__KV__CACHE__NAME=cache-prod
+EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME=credentials-prod
+```
+
+The Secret selector names a physical store. Secret values never belong in these
+variables. Fastly resolves the selected physical resources at deployment and
+links them to the target version under the manifest's logical IDs. The package
+contains no service ID or deployment-specific store name. Fastly fixes Config
+Store keys to the logical ID (`app_config`) for every target; omit `__KEY` for
+Fastly. See the
+[Fastly adapter guide](./adapters/fastly.md#store-selection-and-deployment).
 
 ## What this means for handler code
 

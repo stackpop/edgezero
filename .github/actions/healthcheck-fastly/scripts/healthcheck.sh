@@ -14,7 +14,7 @@ set -euo pipefail
 #   EDGEZERO__LIFECYCLE__VERSION          required  version to probe
 #   EDGEZERO__LIFECYCLE__DOMAIN           required  domain to probe
 #   EDGEZERO__LIFECYCLE__PATH             optional  URL path to probe (default: /)
-#   FASTLY_API_TOKEN                      staging-only  provider token (staging-IP resolution)
+#   EDGEZERO__FASTLY__API_TOKEN           staging-only  action-private provider token
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
 #   EDGEZERO__LIFECYCLE__RETRY            optional  attempts before unhealthy (default: 3)
 #   EDGEZERO__LIFECYCLE__RETRY_DELAY      optional  seconds between attempts (default: 5)
@@ -25,14 +25,14 @@ set -euo pipefail
 # Exits non-zero when the deployment is not provably healthy (the rollback gate).
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../../deploy-core/scripts/common.sh
-source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 validate_inputs() {
   require_linux_x86_64
   # `required: true` in action metadata does not fail an omitted input, so the
   # only real guard against probing with an empty service/version is this one.
-  require_input_matching fastly-service-id "${EDGEZERO__LIFECYCLE__SERVICE_ID:-}" '^[A-Za-z0-9]+$'
+  require_fastly_service_id "${EDGEZERO__LIFECYCLE__SERVICE_ID:-}"
   require_input_matching fastly-version "${EDGEZERO__LIFECYCLE__VERSION:-}" '^[0-9]+$'
   require_input_matching domain "${EDGEZERO__LIFECYCLE__DOMAIN:-}" '^[A-Za-z0-9._-]+$'
   # The path is appended to https://<domain> as one curl argument (the CLI
@@ -62,7 +62,7 @@ validate_inputs() {
   # production probe just curls the public domain, so it needs no token — and the
   # wrapper passes none.
   if [[ "${EDGEZERO__DEPLOY__TO:-}" == "staging" ]]; then
-    require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
+    require_input fastly-api-token "${EDGEZERO__FASTLY__API_TOKEN:-}"
   fi
 }
 
@@ -80,8 +80,10 @@ main() {
   local cli_bin
   cli_bin=$(resolve_app_cli)
   require_cmd "$cli_bin"
+  cli_bin=$(command -v "$cli_bin") || fail "application CLI is unavailable"
+  export EDGEZERO__APP__CLI__PATH="$cli_bin"
   local argv=(
-    "$cli_bin" healthcheck
+    healthcheck
     --adapter fastly
     --service-id "$EDGEZERO__LIFECYCLE__SERVICE_ID"
     --version "$EDGEZERO__LIFECYCLE__VERSION"
@@ -95,9 +97,27 @@ main() {
     argv+=(--staging)
   fi
 
+  require_cmd jq
+  local workspace="${EDGEZERO__ACTION__WORKSPACE:-$(dirname -- "$cli_bin")}"
+  mkdir -p "$workspace"
+  export EDGEZERO__ACTION__WORKSPACE="$workspace"
+  local args_file="$workspace/healthcheck-argv.nul"
+  local clear_file="$workspace/fastly-provider-clear.nul"
+  printf '%s\0' "${argv[@]}" >"$args_file"
+  write_fastly_provider_clear_file "$clear_file"
+  if [[ "$EDGEZERO__DEPLOY__TO" == "staging" ]]; then
+    EDGEZERO__PROVIDER__ENV=$(jq -n --arg token "${EDGEZERO__FASTLY__API_TOKEN:-}" '{FASTLY_API_TOKEN:$token}')
+  else
+    EDGEZERO__PROVIDER__ENV='{}'
+  fi
+  export EDGEZERO__PROVIDER__ENV
+  export EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$clear_file"
+  export EDGEZERO__APP__CLI__ARGS_FILE="$args_file"
+  export EDGEZERO__APP__CLI__MUTATES=false
+
   new_private_log
   local rc=0
-  "${argv[@]}" 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
+  "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
 
   local healthy status
   healthy=$(read_bool_line healthy "$LIFECYCLE_LOG")

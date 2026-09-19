@@ -1,0 +1,25 @@
+{
+  "lifecycle_protocol": 1,
+  "probes": [
+    {
+      "command": ["deploy"],
+      "required_flags": ["--adapter", "--service-id", "--application-release", "--staging"]
+    },
+    {
+      "command": ["config", "push"],
+      "required_flags": ["--adapter", "--manifest", "--app-config", "--store", "--staging", "--no-env", "--yes", "--no-diff"]
+    },
+    {
+      "command": ["healthcheck"],
+      "required_flags": ["--adapter", "--service-id", "--version", "--domain", "--path", "--retry", "--retry-delay", "--timeout", "--staging"]
+    },
+    {
+      "command": ["rollback"],
+      "required_flags": ["--adapter", "--service-id", "--version", "--rollback-to", "--staging"]
+    },
+    {
+      "command": ["active-version"],
+      "required_flags": ["--adapter", "--service-id"]
+    }
+  ]
+}

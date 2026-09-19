@@ -233,46 +233,39 @@ mechanism.**
 | **Axum**       | Process env: `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging <app-cli> serve --adapter axum`                                                                   |
 | **Cloudflare** | `.dev.vars` (local) or `wrangler.toml` `[vars]` (deployed) -- wrangler surfaces it to `env.var(...)` in the worker                                                           |
 | **Spin**       | `[application.variables]` in `spin.toml` (defaulted) plus `SPIN_VARIABLE_EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging spin up` for a per-invocation override |
-| **Fastly**     | A dedicated `edgezero_runtime_env` Config Store (Compute@Edge has no process env). See below.                                                                                |
+| **Fastly**     | Do not set a custom key. Production, staging, and local Viceroy all use the logical key `app_config`; select a different physical store with `__NAME`.                       |
 
 #### Fastly specifically
 
-Compute@Edge has no `std::env`, so EdgeZero reads runtime overrides
-from a Fastly Config Store named `edgezero_runtime_env`. The store is
-created automatically by `edgezero provision --adapter fastly`. After
-provisioning:
+Fastly deployment variables select physical stores, while the application always
+opens the logical Config Store ID. Managed deploy links the selected physical
+store under that logical alias. Production and staging both read key
+`app_config` from the physical store selected by their deployment environment:
 
-```sh
-# Look up the platform store id (matches by name).
-fastly config-store list --json | jq -r '.[] | select(.name=="edgezero_runtime_env") | .id'
+```bash
+# Production environment
+EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-prod
+<app-cli> config push --adapter fastly --store app_config --yes
 
-# Set the override for one service. Config Store keys are case-sensitive.
-fastly config-store-entry update \
-  --store-id=<STORE-ID> \
-  --key=EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__APP_CONFIG__KEY \
-  --value=app_config_staging \
-  --upsert
+# Staging environment
+EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-stage
+<app-cli> config push --adapter fastly --store app_config --staging --yes
 ```
 
-Fastly runtime overrides are service-scoped because the Config Store can be
-linked to multiple services. Legacy unscoped `EDGEZERO__STORES__...` entries are
-not read; migrate manually managed entries by rewriting them under the service
-prefix shown above. Provisioning a non-default store-name mapping requires
-`service_id` in `fastly.toml` or `FASTLY_SERVICE_ID` so the command cannot write
-into an ambiguous namespace. If both are set, they must match.
+Do not set a custom Fastly `__KEY`: a conflicting value fails before provider
+mutation. Production and staging may select the same physical Config Store or
+different stores. Store selection changes resource links on the target Fastly
+version and does not change the application release or package.
 
-Locally, Viceroy reports the fixed service ID
-`0000000000000000000000`, regardless of the deployment `service_id` in
-`fastly.toml`. Put local overrides under that namespace:
+For local Viceroy testing, use the logical store name and production key:
 
 ```toml
-[local_server.config_stores.edgezero_runtime_env.contents]
-EDGEZERO__SERVICES__0000000000000000000000__STORES__CONFIG__APP_CONFIG__KEY = "app_config_staging"
-```
+[local_server.config_stores.app_config]
+format = "inline-toml"
 
-If the local `edgezero_runtime_env` store is missing, EdgeZero logs a one-line
-warning and falls back to the binding's default id. The runtime keeps serving,
-but the per-environment override is inactive.
+[local_server.config_stores.app_config.contents]
+app_config = '''{"version":1,"generated_at":"2026-09-17T00:00:00Z","sha256":"<digest>","data":{}}'''
+```
 
 ### Drift detection in CI
 

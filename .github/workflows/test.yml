@@ -14,9 +14,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: cargo test
+  host-tests:
+    name: ${{ matrix.suite }} tests
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [workspace, cli, axum, app-demo]
     steps:
       - uses: actions/checkout@v6
 
@@ -29,13 +33,13 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.suite }}-tests-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-${{ matrix.suite }}-tests-
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust tool chain
@@ -43,61 +47,59 @@ jobs:
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
 
-      - name: Add wasm targets
-        run: rustup target add wasm32-wasip1 wasm32-wasip2 wasm32-unknown-unknown
-
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
 
       - name: No placeholder pins
+        if: matrix.suite == 'workspace'
         run: ./scripts/check_no_placeholder_pins.sh
 
       - name: No legacy typed reads
+        if: matrix.suite == 'workspace'
         run: ./scripts/check_no_legacy_typed_reads.sh
 
       - name: Nested AppConfig audit
+        if: matrix.suite == 'cli'
         run: cargo run -q --bin check_no_nested_app_config --features nested-app-config-check -- examples/app-demo crates/edgezero-cli/src/templates
 
-      # The checker's own unit tests live behind `required-features =
-      # ["nested-app-config-check"]`, so the unfeatured
-      # `cargo test --workspace` step below does not compile or run them.
-      # Exercise them explicitly to keep the coverage closure enforced by CI.
       - name: Nested AppConfig checker tests
+        if: matrix.suite == 'cli'
         run: cargo test -p edgezero-cli --features nested-app-config-check --bin check_no_nested_app_config
 
       - name: Run workspace tests
+        if: matrix.suite == 'workspace'
         run: cargo test --workspace --all-targets
 
-      # The adapter CLI dispatch (build/deploy/stage/healthcheck/rollback) and
-      # its tests live behind the `cli` feature, which the unfeatured
-      # `cargo test --workspace` step above does not enable — so none of those
-      # tests compile or run there. Exercise them explicitly.
+      - name: Run EdgeZero CLI tests
+        if: matrix.suite == 'cli'
+        run: cargo test -p edgezero-cli --all-targets
+
       - name: Adapter CLI dispatch tests
-        run: cargo test -p edgezero-adapter-fastly --all-targets --features cli
+        if: matrix.suite == 'cli'
+        run: >-
+          cargo test
+          -p edgezero-adapter-axum
+          -p edgezero-adapter-cloudflare
+          -p edgezero-adapter-fastly
+          -p edgezero-adapter-spin
+          --all-targets
+          --no-default-features
+          --features cli
 
       - name: Check feature compilation
+        if: matrix.suite == 'workspace'
         run: cargo check --workspace --all-targets --features "fastly cloudflare spin"
 
       - name: Verify a generated project compiles
+        if: matrix.suite == 'cli'
         run: cargo test -p edgezero-cli --test generated_project_builds -- --ignored
 
-      # `examples/app-demo` is excluded from the root workspace, so
-      # `cargo test --workspace` above does not cover it. Run its own
-      # workspace tests separately. An end-to-end push →
-      # AxumConfigStore → handler roundtrip in
-      # `app-demo-cli/tests/config_flow.rs` exists to be exercised by
-      # THIS step — without it, a regression in the JSON-file contract
-      # between `config push --adapter axum` and
-      # `AxumConfigStore::from_path` would not be caught by CI.
-      # Axum-only path, no live external calls — intentionally kept
-      # off the wasm matrix.
-      # `--locked`: app-demo is excluded from the root workspace and keeps its own
-      # committed lockfile, which drifts when the edgezero crates' dependencies
-      # change (e.g. a `syn` major bump lands in the root lock but not here).
-      # Without `--locked` CI silently regenerates it and MASKS that drift; with
-      # it, a stale app-demo lockfile fails here instead of at a consumer's
-      # `cargo build --locked`.
+      - name: Run Axum host tests
+        if: matrix.suite == 'axum'
+        run: cargo test -p edgezero-adapter-axum --all-targets --features axum
+
       - name: Run app-demo workspace tests
+        if: matrix.suite == 'app-demo'
         working-directory: examples/app-demo
         run: cargo test --locked --workspace --all-targets
 
@@ -139,7 +141,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust tool chain

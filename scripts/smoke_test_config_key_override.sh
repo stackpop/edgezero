@@ -148,44 +148,6 @@ upper() {
   printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
 }
 
-# Seed the Fastly local config store `edgezero_runtime_env` with the
-# runtime override env vars. The Fastly Compute@Edge runtime has no
-# process env, so EDGEZERO__* overrides are read from this dedicated
-# Config Store (see runtime_env_config in
-# crates/edgezero-adapter-fastly/src/lib.rs). $1 is the fastly.toml
-# path; $2 is the per-row __KEY override value (empty -> no override).
-seed_fastly_runtime_env() {
-  local fastly_toml="$1"
-  local key_override="$2"
-  # Strip any prior block we wrote in a previous row -- toml_edit
-  # doesn't support remove-by-prefix from bash, so we re-write the
-  # whole block each time. backup_in_tree already restores the
-  # tracked content on cleanup.
-  python3 - "$fastly_toml" "$key_override" <<'PY'
-import re
-import sys
-path, key_override = sys.argv[1], sys.argv[2]
-with open(path, 'r', encoding='utf-8') as fh:
-    text = fh.read()
-# Drop any prior edgezero_runtime_env block (idempotent across rows).
-pattern = re.compile(
-    r'\n\[local_server\.config_stores\.edgezero_runtime_env\][^\[]*'
-    r'\[local_server\.config_stores\.edgezero_runtime_env\.contents\][^\[]*',
-    re.MULTILINE,
-)
-text = pattern.sub('\n', text)
-if key_override:
-    text += (
-        '\n[local_server.config_stores.edgezero_runtime_env]\n'
-        'format = "inline-toml"\n'
-        '[local_server.config_stores.edgezero_runtime_env.contents]\n'
-        f'EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY = "{key_override}"\n'
-    )
-with open(path, 'w', encoding='utf-8') as fh:
-    fh.write(text)
-PY
-}
-
 check() {
   local label="$1" expect="$2" actual="$3"
   if [ "$actual" = "$expect" ]; then
@@ -396,14 +358,6 @@ boot_runtime() {
       # hyphens in the filename (`app-demo-adapter-fastly.wasm`,
       # not `app_demo_adapter_fastly.wasm`).
       #
-      # The Fastly Compute@Edge runtime has no process env, so
-      # __KEY overrides come from a Fastly Config Store named
-      # `edgezero_runtime_env`. Seed the local viceroy copy with
-      # whatever shell env override the smoke set so the
-      # staging assertion sees the right binding.
-      local fastly_toml="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
-      seed_fastly_runtime_env "$fastly_toml" \
-        "${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-}"
       (cd "$DEMO_DIR/crates/app-demo-adapter-fastly" && \
         DEMO_API_TOKEN_SECRET=resolved-token \
         viceroy serve -C fastly.toml --addr "127.0.0.1:${PORT}" \
@@ -435,7 +389,7 @@ SUITES=(
   "spin:--local"
 )
 
-# -- 12.7: per-adapter __KEY override loop -------------------------------
+# -- 12.7: per-adapter Config key policy ---------------------------------
 
 for suite in "${SUITES[@]}"; do
   adapter="${suite%%:*}"
@@ -535,6 +489,32 @@ for suite in "${SUITES[@]}"; do
 
   # 2. Push the staging blob under app_config_staging.
   write_staging_blob "$tmp"
+  if [ "$adapter" = "fastly" ]; then
+    if (cd "$DEMO_DIR" && cargo run --quiet -p app-demo-cli -- \
+      config push --adapter fastly --local \
+      --app-config "$tmp/app-demo.toml" --key app_config_staging --yes >/dev/null 2>&1); then
+      check "fastly rejects a custom local Config key" "failure" "success"
+    else
+      check "fastly rejects a custom local Config key" "failure" "failure"
+    fi
+
+    unset EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
+    if ! boot_runtime "$adapter"; then
+      printf '  FAIL  fastly row: runtime failed to boot (default step)\n' >&2
+      FAIL=$((FAIL + 1))
+      cleanup
+      rm -rf "$tmp"
+      trap cleanup EXIT INT TERM
+      continue
+    fi
+    result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
+    check "fastly fixed local key returns default" "default-blob" "$result"
+    cleanup
+    rm -rf "$tmp"
+    trap cleanup EXIT INT TERM
+    continue
+  fi
+
   (cd "$DEMO_DIR" && cargo run --quiet -p app-demo-cli -- \
     config push --adapter "$adapter" $extra \
     --app-config "$tmp/app-demo.toml" --key app_config_staging --yes >/dev/null)

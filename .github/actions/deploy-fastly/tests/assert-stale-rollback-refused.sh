@@ -22,8 +22,8 @@ set -euo pipefail
 #   EDGEZERO__TEST__LOG_SNAPSHOT  required  call-log line count BEFORE the rollback
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../scripts/common.sh
-source "$SCRIPT_DIR/../scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 main() {
   local log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"

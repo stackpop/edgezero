@@ -4,9 +4,9 @@ set -euo pipefail
 # Asserts one config-push-fastly invocation against the fake Fastly CLI.
 #
 # The contract that matters is the staging model: staging and production write
-# DIFFERENT KEYS in the SAME store, so a staged push can never overwrite the key
-# the live service is reading. This runs once per push — re-seeding the fake
-# truncates the call log, so each push is asserted against its own log.
+# the same logical key in the physical store selected by each environment. This
+# runs once per push; re-seeding the fake truncates the call log, so each
+# environment-selected store is asserted separately.
 #
 # Reads (env):
 #   FAKE_CALL_LOG                 required  the fake fastly call log
@@ -16,8 +16,8 @@ set -euo pipefail
 #   EDGEZERO__TEST__REJECT_KEY    optional  a key that must NOT appear in the log
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../scripts/common.sh
-source "$SCRIPT_DIR/../scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"
 expect_key="${EDGEZERO__TEST__EXPECT_KEY:?EDGEZERO__TEST__EXPECT_KEY is required}"
@@ -44,7 +44,7 @@ grep -q 'fastly config-store list' "$log" ||
 grep -qE "fastly config-store-entry update .*--key=${expect_key}( |$)" "$log" ||
   fail "config push never wrote --key=$expect_key via 'fastly config-store-entry update'"
 
-# Staging must not touch the production key (and vice versa).
+# The push must not use a rejected target-derived key.
 if [[ -n "$reject_key" ]]; then
   if grep -qE "config-store-entry update .*--key=${reject_key}( |$)" "$log"; then
     fail "this push wrote --key=$reject_key, which it must never touch"

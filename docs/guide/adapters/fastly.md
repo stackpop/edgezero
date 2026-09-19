@@ -49,17 +49,54 @@ fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
 }
 ```
 
-`run_app` reads logging and store config at runtime from `EDGEZERO__*`
-environment variables (see
-[the migration guide](../manifest-store-migration.md)) and builds
-per-id `KV` / `Config` / `Secret` registries from the portable store
-metadata baked into `App` by the `app!` macro. No `edgezero.toml` is
-loaded by the runtime.
+`run_app` builds per-id `KV` / `Config` / `Secret` registries from the portable
+store metadata baked into `App` by the `app!` macro. Logging settings are baked
+in at the same time. A managed deployment resolves `EDGEZERO__*` store selectors
+and links each selected Fastly resource under its logical ID; no
+`edgezero.toml` or deployment environment is read by the runtime. See
+[the migration guide](../manifest-store-migration.md).
 
 The low-level `dispatch()` helper remains available only for fully manual wiring and does not inject
 store metadata. Prefer `run_app` or `dispatch_with_config` for normal use.
 `dispatch_with_config_handle` exists for advanced/manual cases where you already have a prepared
 `ConfigStoreHandle`.
+
+### Migrating a custom entrypoint
+
+Custom entrypoints previously loaded selectors from the
+`edgezero_runtime_env` Config Store on every request and passed an `EnvConfig`
+to `dispatch_with_registries`:
+
+```rust
+let stores = MyHooks::stores();
+let env = edgezero_adapter_fastly::runtime_env_config(stores);
+edgezero_adapter_fastly::request::dispatch_with_registries(
+    &app,
+    req,
+    stores,
+    &env,
+    extend,
+)
+```
+
+Remove the `runtime_env_config` call, any use of
+`RUNTIME_ENV_STORE_NAME`, and the `env` argument:
+
+```rust
+let stores = MyHooks::stores();
+edgezero_adapter_fastly::request::dispatch_with_registries(
+    &app,
+    req,
+    stores,
+    extend,
+)
+```
+
+`EDGEZERO__STORES__<KIND>__<ID>__NAME` is now a deployment input. EdgeZero
+resolves it before provider mutation and binds that physical resource to the
+version under the stable logical `<ID>` alias. The runtime opens the alias
+directly. Fastly Config Stores always use `<ID>` as the entry key, so remove
+Fastly `__KEY` selectors as well.
 
 ### Capturing raw-request signals (JA4, H2 fingerprint)
 
@@ -135,15 +172,20 @@ This starts a local server at `http://127.0.0.1:7676`.
 
 ## Deployment
 
-Deploy to Fastly Compute@Edge:
+Deploy a verified application release with the adapter-managed lifecycle:
 
 ```bash
-# Using the CLI
-edgezero deploy --adapter fastly
-
-# Or directly
-fastly compute deploy
+edgezero deploy --adapter fastly \
+  --service-id "$FASTLY_SERVICE_ID" \
+  --application-release "$RELEASE_ROOT"
 ```
+
+The release fixes the package, `edgezero.toml`, and its referenced Fastly
+manifest before runtime configuration is selected. A bare
+`edgezero deploy --adapter fastly` remains only as store-free production
+compatibility for an existing manifest command. Staging and any deployment that
+declares a Config, KV, or Secret Store require the verified release-backed
+managed command above.
 
 ## Backends
 
@@ -184,64 +226,90 @@ fn main() {
 Fastly logging is wired when you call `init_logger` (or `run_app`); otherwise no logger is installed.
 :::
 
-## Config Store
+## Store selection and deployment
 
-Fastly uses a native Config Store resource link for runtime configuration. Declare logical config
-ids in `edgezero.toml`; each id opens its own platform store via
-`EDGEZERO__STORES__CONFIG__<ID>__NAME` (default = the logical id):
-
-Because `edgezero_runtime_env` is an account-wide Fastly resource, its stored
-keys are scoped by the current service ID:
+Fastly Compute applications open Config, KV, and Secret Stores by resource-link
+name. EdgeZero bakes the logical IDs declared in `edgezero.toml` into the package.
+A managed deployment resolves these optional deployment selectors:
 
 ```text
-EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__<ID>__NAME
-EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__<ID>__KEY
+EDGEZERO__STORES__CONFIG__<ID>__NAME
+EDGEZERO__STORES__KV__<ID>__NAME
+EDGEZERO__STORES__SECRETS__<ID>__NAME
 ```
 
-The runtime obtains `<SERVICE_ID>` from Fastly and translates these entries back
-to the portable `EDGEZERO__STORES__*` form. Legacy unscoped entries are ignored
-because they have no safe owner when the Config Store is linked to multiple
-services. Re-run `edgezero provision --adapter fastly` to write scoped `__NAME`
-entries, and rewrite any manually managed adapter, logging, or `__KEY` entries
-under the service prefix. Provision writes only the selected service's
-namespace; a non-default store-name mapping therefore requires top-level
-`service_id` in `fastly.toml` or `FASTLY_SERVICE_ID`. If both are set, they must
-match.
+Each selected physical store is linked to the unpublished target version under
+the stable logical `<ID>` alias. An absent `__NAME` defaults to `<ID>`; a present
+blank or invalid value fails before provider mutation. The same logical ID can be
+used independently by Config, KV, and Secret Stores because link identity is the
+pair `(resource kind, logical ID)`.
 
-Viceroy reports `0000000000000000000000` as its local service ID. Entries in a
-local `[local_server.config_stores.edgezero_runtime_env.contents]` block must
-therefore use `EDGEZERO__SERVICES__0000000000000000000000__...`, not the
-production service ID or the unscoped canonical key.
+Config keys are deterministic on Fastly: production, staging, and local Viceroy
+all read `<ID>`. The selected Environment chooses the physical store through
+`__NAME`; the same name shares config and different names isolate it. A
+conflicting `__KEY` or `--key` fails before a write. Logging is resolved from
+`[adapters.fastly.logging]` when the package is built.
+
+Before publication, EdgeZero:
+
+1. verifies the immutable release package and manifests;
+2. resolves complete Config, KV, and Secret Store inventories;
+3. selects the exact active, staged, or initialized-draft source;
+4. uploads the verified package to an unreachable draft;
+5. replaces declared links whose selected physical resource changed and creates
+   missing declared links under their logical aliases;
+6. preserves links not declared by the application;
+7. re-reads the exact links, source state, draft state, and provider-visible
+   package identity; and
+8. stages or activates the prepared version without another EdgeZero mutation.
+
+Production and staging can select different physical resources while deploying
+identical package bytes. Secret Stores remain optional. Links the application
+does not declare are preserved.
+
+### Declaring and using stores
+
+Declare portable logical IDs in `edgezero.toml`:
 
 ```toml
 [stores.config]
-ids     = ["app_config"]
-# default = "app_config"   # required when ids.len() > 1
+ids = ["app_config"]
+
+[stores.kv]
+ids = ["cache"]
+
+# Optional: omit this table when the app uses no Secret Store.
+[stores.secrets]
+ids = ["credentials"]
 ```
 
-For local Viceroy testing, mirror the platform name in `fastly.toml`:
+For local Viceroy tests, expose the Config Store under its logical ID and
+write the production key under that store. Local Viceroy uses the production
+key because it has no Fastly staging publication state:
 
 ```toml
 [local_server.config_stores.app_config]
 format = "inline-toml"
 
 [local_server.config_stores.app_config.contents]
-greeting = "hello from config store"
+app_config = "hello from config store"
 ```
 
-Handlers read values through the `Config` extractor or `ctx.config_store(id)`:
+Handlers read values through the `Config` extractor or
+`ctx.config_store(id)`:
 
 ```rust
 async fn handler(config: Config) -> Result<Response, EdgeError> {
-    let store = config.named("app_config").ok_or_else(|| EdgeError::service_unavailable("no `app_config`"))?;
+    let store = config
+        .named("app_config")
+        .ok_or_else(|| EdgeError::service_unavailable("no `app_config`"))?;
     let greeting = store.get("greeting").await?.unwrap_or_default();
     // …
 }
 ```
 
-If a configured store link is missing, the adapter logs a one-time warning
-and drops that id from the registry. Migrating from `name`/`adapters.*`?
-See [the migration guide](../manifest-store-migration.md).
+See [the store migration guide](../manifest-store-migration.md) for store selection and [the GitHub Actions guide](../deploy-github-actions.md) for the
+immutable-release workflow.
 
 ## Context Access
 

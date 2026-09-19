@@ -4,45 +4,41 @@ set -euo pipefail
 # Pushes the application's typed config to a Fastly config store, and emits the
 # key that was written.
 #
-# Like healthcheck.sh and rollback.sh (its sibling lifecycle actions), this calls
-# the app CLI directly with FASTLY_API_TOKEN in the step env — the adapter's own
-# convention, which `fastly config-store-entry update` reads to authenticate. The
-# wrapper blanks every other FASTLY_* alias, so an inherited FASTLY_ENDPOINT or
-# FASTLY_TOKEN can never redirect or re-auth the push.
+# Like its sibling lifecycle actions, this passes the token to the shared runner
+# as typed data. The runner clears every Fastly alias before importing only the
+# validated token, so inherited endpoint or token aliases cannot redirect or
+# re-authenticate the push.
 #
-# Staging: `deploy-to: staging` passes `--staging` to the CLI, which writes the
-# `<logical-store-id>_staging` variant in the SAME store — the key the staging
-# selector points a staged version at, never the production key the live service
-# reads. `key` is production-only (the wrapper rejects key + staging up front).
+# Every target uses `<logical-store-id>` as the config entry key. The selected
+# environment chooses the physical store through `__NAME`; using the same name
+# shares config, while different names isolate it.
 #
-# Path confinement: working-directory, manifest, and app-config are
-# caller strings handed to a credential-bearing CLI, so each is canonicalized
-# (resolving symlinks) and required to stay inside the application directory
-# beneath github.workspace. Absolute paths, `..` traversal, and symlink escapes
-# are rejected rather than read.
+# The manifest is an absolute verified member of the immutable application
+# release. Publisher-owned app-config files remain confined beneath the selected
+# working directory; inline config is written to an action-owned temporary file.
 #
 # Reads (env):
 #   EDGEZERO__APP__CLI__PATH              optional  absolute path to the app CLI (preferred; avoids PATH shadowing)
 #   EDGEZERO__APP__CLI__BIN               optional  app CLI name, used when __PATH is unset
-#   FASTLY_API_TOKEN                      required  provider token (Fastly's own convention)
+#   EDGEZERO__FASTLY__API_TOKEN           required  action-private Fastly API token
 #   EDGEZERO__PROJECT__WORKING_DIRECTORY  required  app dir, relative to github.workspace
 #   GITHUB_WORKSPACE                      required  confinement root
 #   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
 #   EDGEZERO__CONFIG_PUSH__STORE          optional  logical config-store id
-#   EDGEZERO__CONFIG_PUSH__KEY            optional  explicit base key
-#   EDGEZERO__CONFIG_PUSH__MANIFEST       optional  edgezero.toml path (relative to the app dir)
+#   EDGEZERO__CONFIG_PUSH__KEY            deprecated; nonempty is rejected
+#   EDGEZERO__CONFIG_PUSH__MANIFEST       required  verified absolute release manifest
 #   EDGEZERO__CONFIG_PUSH__APP_CONFIG     optional  typed config file path (relative to the app dir)
 #   EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE optional  raw inline typed-config content (exclusive with APP_CONFIG)
 #   EDGEZERO__CONFIG_PUSH__NO_ENV         optional  'true' to pass --no-env (skip the env overlay); default false
 #   RUNNER_TEMP                           optional  scratch root for the inline-config temp file (default: /tmp)
 # Writes (outputs):
 #   mutation-attempted                    true, emitted before the CLI runs (reconcile signal)
-#   pushed-key                            the key written (base, or its _staging variant)
+#   pushed-key                            canonical environment key, or the logical ID fallback
 #   store                                 the logical store id the CLI resolved
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../../deploy-core/scripts/common.sh
-source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 # Resolve a caller-supplied file path relative to the app dir and prove it stays
 # inside it. Echoes the path relative to the app dir (what the CLI is given).
@@ -66,16 +62,26 @@ main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local deploy_to="${EDGEZERO__DEPLOY__TO:-production}"
   local store="${EDGEZERO__CONFIG_PUSH__STORE:-}"
-  local key="${EDGEZERO__CONFIG_PUSH__KEY:-}"
+  local deprecated_key="${EDGEZERO__CONFIG_PUSH__KEY:-}"
   local manifest="${EDGEZERO__CONFIG_PUSH__MANIFEST:-}"
   local app_config="${EDGEZERO__CONFIG_PUSH__APP_CONFIG:-}"
   local app_config_inline="${EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE:-}"
   local no_env="${EDGEZERO__CONFIG_PUSH__NO_ENV:-false}"
   local inline_file=""
+  local token="${EDGEZERO__FASTLY__API_TOKEN:-}"
 
-  require_input fastly-api-token "${FASTLY_API_TOKEN:-}"
+  if [[ -n "$deprecated_key" ]]; then
+    fail "input 'key' is deprecated and unsupported; use EDGEZERO__STORES__CONFIG__<ID>__KEY"
+  fi
+  require_input fastly-api-token "$token"
+  require_input application-manifest "$manifest"
+  [[ "$manifest" == /* && -f "$manifest" && ! -L "$manifest" ]] ||
+    fail "the bundled application manifest must be an absolute regular file"
   require_cmd "$cli_bin"
+  cli_bin=$(command -v "$cli_bin") || fail "application CLI is unavailable"
+  export EDGEZERO__APP__CLI__PATH="$cli_bin"
   require_cmd git
+  require_cmd jq
   # A typo in deploy-to must never silently push to production.
   case "$deploy_to" in
     production | staging) ;;
@@ -89,8 +95,9 @@ main() {
   esac
   # A file path and inline content name the same thing two ways; requiring
   # exactly one avoids a silent precedence surprise.
-  if [[ -n "$app_config" && -n "$app_config_inline" ]]; then
-    fail "inputs 'app-config' and 'app-config-inline' are mutually exclusive"
+  if [[ -z "$app_config" && -z "$app_config_inline" ]] ||
+    [[ -n "$app_config" && -n "$app_config_inline" ]]; then
+    fail "exactly one of 'app-config' or 'app-config-inline' is required"
   fi
 
   # Confine the app directory to github.workspace, then every path to the app.
@@ -101,19 +108,8 @@ main() {
   app_dir=$(canonical_path "$workspace/$working_directory")
   is_under "$workspace_real" "$app_dir" ||
     fail "input 'working-directory' must resolve inside github.workspace"
-  if [[ -n "$manifest" ]]; then
-    manifest=$(confine_to_app "$manifest" "$app_dir" manifest)
-  elif [[ -e "$app_dir/edgezero.toml" ]]; then
-    # Default discovery is confined too: the CLI reads `edgezero.toml` from the
-    # app dir, and a committed symlink there could point its deploy/store config
-    # outside the app while this step holds provider credentials.
-    local default_manifest
-    default_manifest=$(canonical_path "$app_dir/edgezero.toml")
-    is_under "$app_dir" "$default_manifest" ||
-      fail "the default 'edgezero.toml' resolves outside the application directory — refusing to read a manifest that escapes it"
-  fi
-  # Committed-source guard: config pushed from the CHECKED-OUT tree (a manifest or an
-  # app-config FILE) must come from committed source, so the store the live service
+  # Committed-source guard: config pushed from a checked-out app-config FILE must
+  # come from committed source, so the store the live service
   # reads always corresponds to a revision that can be reconciled later — the same
   # guarantee deploy gets from resolve-project.sh. Inline config is caller-supplied
   # CONTENT (a workflow variable), not the tree, so it is exempt.
@@ -158,27 +154,30 @@ main() {
   fi
 
   # Build the argv through a Bash array — never eval. --yes and --no-diff make the
-  # push non-interactive in CI; --staging selects the `<logical>_staging` variant.
-  local argv=("$cli_bin" config push --adapter fastly)
-  if [[ -n "$manifest" ]]; then argv+=(--manifest "$manifest"); fi
-  if [[ -n "$app_config" ]]; then argv+=(--app-config "$app_config"); fi
+  # push non-interactive in CI. --staging selects the Fastly lifecycle target;
+  # it does not change the runtime config key.
+  local argv=(config push --adapter fastly --manifest "$manifest" --app-config "$app_config")
   if [[ -n "$store" ]]; then argv+=(--store "$store"); fi
-  if [[ -n "$key" ]]; then argv+=(--key "$key"); fi
   if [[ "$deploy_to" == "staging" ]]; then argv+=(--staging); fi
   if [[ "$no_env" == "true" ]]; then argv+=(--no-env); fi
   argv+=(--yes --no-diff)
 
-  # Enter the app dir BEFORE signalling: a directory-entry failure here means the
-  # CLI was never invoked, so it must NOT falsely claim a mutation was attempted.
-  cd "$app_dir" || fail "could not enter working-directory '$app_dir'"
-  # Record that a provider mutation is being ATTEMPTED before the CLI runs, so the
-  # signal survives a failed step (readable via `if: always()`). If the push
-  # succeeds but its canonical `pushed-key=`/`pushed-store=` lines are missing
-  # below, the caller can still reconcile the config store rather than assume the
-  # store is unchanged.
-  append_output mutation-attempted true
+  local action_workspace="${EDGEZERO__ACTION__WORKSPACE:-$(dirname -- "$cli_bin")}"
+  mkdir -p "$action_workspace"
+  export EDGEZERO__ACTION__WORKSPACE="$action_workspace"
+  local args_file="$action_workspace/config-push-argv.nul"
+  local clear_file="$action_workspace/fastly-provider-clear.nul"
+  printf '%s\0' "${argv[@]}" >"$args_file"
+  write_fastly_provider_clear_file "$clear_file"
+  EDGEZERO__PROVIDER__ENV=$(jq -n --arg token "$token" '{FASTLY_API_TOKEN:$token}')
+  export EDGEZERO__PROVIDER__ENV
+  export EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$clear_file"
+  export EDGEZERO__APP__CLI__ARGS_FILE="$args_file"
+  export EDGEZERO__APP__CLI__MUTATES=true
+  export EDGEZERO__PROJECT__WORKING_DIRECTORY="$app_dir"
+  export EDGEZERO__PROJECT__MANIFEST_PATH="$manifest"
   local rc=0
-  "${argv[@]}" 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
+  "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" 2>&1 | tee "$LIFECYCLE_LOG" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     fail_with "$rc" "config push failed (CLI exit $rc)"
   fi

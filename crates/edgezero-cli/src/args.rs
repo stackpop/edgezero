@@ -255,6 +255,11 @@ pub struct DeployArgs {
     /// staging-intended deploy to PRODUCTION.
     #[arg(last = true)]
     pub adapter_args: Vec<String>,
+    /// Canonical root of an already-extracted immutable application release.
+    /// The generic CLI confines the loaded application manifest to this root;
+    /// the selected adapter validates its own release metadata.
+    #[arg(long)]
+    pub application_release: Option<PathBuf>,
     /// Platform service id the deploy targets. Consumed by the Fastly
     /// staging lifecycle: production deploy passes it
     /// through to `fastly compute deploy` and resolves the activated
@@ -468,9 +473,9 @@ pub struct ConfigDiffArgs {
     /// Path to the adapter's runtime configuration file.
     #[arg(long)]
     pub runtime_config: Option<PathBuf>,
-    /// Diff against the staging key (`<logical-id>_staging`) in the same store,
-    /// so a staged diff compares exactly what `config push --staging` would
-    /// write. Mutually exclusive with `--key`, for the same reason as on push.
+    /// Diff against the environment-selected staging Config Store. The entry
+    /// key remains the logical store ID. Mutually exclusive with `--key`, for
+    /// the same reason as on push.
     #[arg(long, conflicts_with = "key")]
     pub staging: bool,
     /// Logical config store id to diff against. Defaults to the
@@ -560,14 +565,11 @@ pub struct ConfigPushArgs {
     /// `runtime-config.toml` next to the adapter manifest.
     #[arg(long)]
     pub runtime_config: Option<PathBuf>,
-    /// Push to staging: write the config under the `<logical-id>_staging` key
-    /// in the SAME store, so it never overwrites the production key the live
-    /// service reads. The same `--staging` verb `deploy`/`healthcheck`/`rollback`
-    /// use. Mutually exclusive with `--key`: the
-    /// staging key is derived from the
-    /// store's logical id because that is what the staging selector store (created
-    /// and linked by a staged deploy) points a staged version at, so an explicit
-    /// key would be written where nothing reads it.
+    /// Push to the physical Config Store selected by the staging environment.
+    /// The entry key remains the logical store ID. Production and staging may
+    /// select the same or different physical stores. The same `--staging` verb
+    /// `deploy`/`healthcheck`/`rollback` use. Mutually exclusive with `--key` so
+    /// the deployed runtime and pushed entry cannot diverge.
     #[arg(long, conflicts_with = "key")]
     pub staging: bool,
     /// Logical config store id to push to. Defaults to the
@@ -798,6 +800,30 @@ mod tests {
         };
         assert_eq!(adapter, "fastly");
         assert_eq!(adapter_args, vec!["--flag", "value"]);
+    }
+
+    #[test]
+    fn deploy_parses_application_release_before_passthrough_boundary() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "deploy",
+            "--adapter",
+            "fastly",
+            "--application-release",
+            "/tmp/application-release",
+            "--",
+            "--comment",
+            "publisher deploy",
+        ])
+        .expect("parse deploy");
+        let Command::Deploy(deploy) = args.cmd else {
+            panic!("expected Command::Deploy");
+        };
+        assert_eq!(
+            deploy.application_release,
+            Some(PathBuf::from("/tmp/application-release"))
+        );
+        assert_eq!(deploy.adapter_args, ["--comment", "publisher deploy"]);
     }
 
     #[test]
