@@ -143,7 +143,8 @@ grep -Fq "steps.prepare.outputs['cargo-target-dir']" "$action" ||
   fail "Cargo target cache does not use the validated target directory"
 grep -Fq "inputs['cache-target'] == 'true'" "$action" ||
   fail "Cargo target cache is not gated by the cache-target input"
-grep -Fq '${{ github.sha }}' "$action" ||
+github_sha_expression="\${{ github.sha }}"
+grep -Fq "$github_sha_expression" "$action" ||
   fail "Cargo target cache primary key is not bound to the source revision"
 
 printf 'setup-rust-build-cache action tests passed\n'
