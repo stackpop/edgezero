@@ -42,6 +42,7 @@ fn build_app_for_dispatch<A: Hooks>() -> Result<App, WorkerError> {
 /// Test seam for the production application-assembly error mapping.
 #[cfg(all(feature = "test-utils", feature = "cloudflare", target_arch = "wasm32"))]
 #[doc(hidden)]
+#[inline]
 pub fn build_app_for_test<A: Hooks>() -> Result<App, WorkerError> {
     build_app_for_dispatch::<A>()
 }

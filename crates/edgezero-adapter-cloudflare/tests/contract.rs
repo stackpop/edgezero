@@ -43,7 +43,9 @@ mod tests {
     #[cfg(feature = "test-utils")]
     use edgezero_adapter_cloudflare::request::deadline_body_releases_source_for_test;
     use edgezero_adapter_cloudflare::request::{CloudflareService, into_core_request};
-    use edgezero_core::app::{App, Hooks};
+    use edgezero_core::app::App;
+    #[cfg(feature = "test-utils")]
+    use edgezero_core::app::Hooks;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
@@ -63,8 +65,10 @@ mod tests {
 
     struct FixedConfigStore(&'static str);
 
+    #[cfg(feature = "test-utils")]
     struct FailingConfiguration;
 
+    #[cfg(feature = "test-utils")]
     #[expect(
         clippy::missing_trait_methods,
         reason = "test hook exercises only adapter startup failure"
@@ -84,9 +88,9 @@ mod tests {
     #[cfg(feature = "test-utils")]
     #[wasm_bindgen_test]
     fn failing_configuration() {
-        let Err(error) = build_app_for_test::<FailingConfiguration>() else {
-            panic!("configuration must fail before request dispatch");
-        };
+        let result = build_app_for_test::<FailingConfiguration>();
+        assert!(result.is_err());
+        let error = result.err().expect("configuration must fail");
         assert!(matches!(
             error,
             worker::Error::RustError(message) if message == "application configuration failed"
@@ -621,7 +625,7 @@ mod tests {
                 "/missing".parse().expect("URI"),
                 move || {
                     observed_source_calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(futures::stream::empty::<Result<Bytes, io::Error>>())
+                    Ok(stream::empty::<Result<Bytes, io::Error>>())
                 },
                 move |_response| {
                     observed_delivery_calls.fetch_add(1, Ordering::SeqCst);

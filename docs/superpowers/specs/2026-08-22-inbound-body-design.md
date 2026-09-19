@@ -208,6 +208,7 @@ impl BufferedIngressResponse {
 
 #[non_exhaustive]
 pub enum AdmissionDecision {
+    Abort,
     Admit {
         completion: ResponseEgressCompletion,
         grant: IngressGrant,
@@ -225,11 +226,11 @@ pub enum AdmissionDecision {
         completion: ResponseEgressCompletion,
         response: Response,
     },
-    Abort,
 }
 
 #[non_exhaustive]
 pub enum IngressAdmissionOutcome {
+    Aborted,
     Admitted {
         completion: ResponseEgressCompletion,
         ingress: AdmittedIngress,
@@ -238,20 +239,19 @@ pub enum IngressAdmissionOutcome {
         completion: ResponseEgressCompletion,
         response: Response,
     },
-    Aborted,
 }
 
 #[non_exhaustive]
 pub enum IngressBeginOutcome {
+    Aborted,
     Admitted(PreparedIngress),
     Refused(ResponseEgressEnvelope),
-    Aborted,
 }
 
 #[non_exhaustive]
 pub enum IngressDispatchOutcome {
-    Response(ResponseEgressEnvelope),
     Aborted,
+    Response(Box<ResponseEgressEnvelope>),
 }
 ```
 

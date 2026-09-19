@@ -395,6 +395,11 @@ fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
     A::build_app().context("application configuration failed")
 }
 
+/// Runs an application with the Axum development server.
+///
+/// # Errors
+/// Returns an error if application configuration, runtime setup, store initialization, listener
+/// binding, or connection serving fails.
 #[inline]
 pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
     let app = build_app_for_dispatch::<A>()?;

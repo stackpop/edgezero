@@ -189,6 +189,8 @@ pub struct ResponseEgressReport {
     pub route: Option<RouteMetadata>,
 }
 
+type ResponseEgressCompletionCallback = Box<dyn FnOnce(&ResponseEgressReport) + Send + 'static>;
+
 /// Non-clone owner of one response-scoped terminal callback.
 ///
 /// The callback moves with the ingress/egress lifecycle and runs at most once. Use [`Self::empty`]
@@ -208,7 +210,7 @@ pub struct ResponseEgressReport {
 /// extensions.insert(ResponseEgressCompletion::empty());
 /// ```
 pub struct ResponseEgressCompletion {
-    callback: Option<Box<dyn FnOnce(&ResponseEgressReport) + Send + 'static>>,
+    callback: Option<ResponseEgressCompletionCallback>,
 }
 
 impl ResponseEgressCompletion {
@@ -271,6 +273,27 @@ pub struct ResponseEgressEnvelope {
     request_start: MonotonicInstant,
     response: Response,
     route: Option<RouteMetadata>,
+}
+
+pub(crate) struct ResponseEgressRequestMetadata {
+    request_method: Method,
+    request_start: MonotonicInstant,
+    route: Option<RouteMetadata>,
+}
+
+impl ResponseEgressRequestMetadata {
+    #[inline]
+    pub(crate) const fn new(
+        request_method: Method,
+        request_start: MonotonicInstant,
+        route: Option<RouteMetadata>,
+    ) -> Self {
+        Self {
+            request_method,
+            request_start,
+            route,
+        }
+    }
 }
 
 /// Live response-egress state returned when application response preparation fails precommit.
@@ -380,9 +403,7 @@ impl ResponseEgressEnvelope {
     ) -> Self {
         Self::new(
             response,
-            request_start,
-            None,
-            request_method,
+            ResponseEgressRequestMetadata::new(request_method, request_start, None),
             completion,
             Arc::new(default_response_egress_policy),
             ResponseEgressObserverHandle::default(),
@@ -392,9 +413,7 @@ impl ResponseEgressEnvelope {
 
     pub(crate) fn new(
         response: Response,
-        request_start: MonotonicInstant,
-        route: Option<RouteMetadata>,
-        request_method: Method,
+        metadata: ResponseEgressRequestMetadata,
         completion: ResponseEgressCompletion,
         policy: ResponseEgressPolicyCallback,
         observer: ResponseEgressObserverHandle,
@@ -405,10 +424,10 @@ impl ResponseEgressEnvelope {
             completion,
             observer,
             policy,
-            request_method,
-            request_start,
+            request_method: metadata.request_method,
+            request_start: metadata.request_start,
             response,
-            route,
+            route: metadata.route,
         }
     }
 
@@ -662,9 +681,9 @@ impl ResponseEgressAttempt {
             route: self.route.clone(),
         };
         self.state = AttemptState::Terminal(report);
-        if let AttemptState::Terminal(report) = &self.state {
-            self.completion.complete(report);
-            self.observer.complete(report);
+        if let AttemptState::Terminal(terminal_report) = &self.state {
+            self.completion.complete(terminal_report);
+            self.observer.complete(terminal_report);
             true
         } else {
             false
@@ -753,7 +772,7 @@ mod tests {
     impl Drop for CompletionDropProbe {
         fn drop(&mut self) {
             let mut drops = self.0.lock().expect("completion drops lock");
-            *drops += 1;
+            *drops = (*drops).saturating_add(1);
         }
     }
 
@@ -920,9 +939,7 @@ mod tests {
 
         drop(ResponseEgressEnvelope::new(
             response,
-            started_at,
-            None,
-            Method::GET,
+            ResponseEgressRequestMetadata::new(Method::GET, started_at, None),
             ResponseEgressCompletion::new(move |_| {
                 let _keep_probe_until_completion = &probe;
                 let mut calls = observed_calls.lock().expect("completion calls lock");
@@ -1270,9 +1287,7 @@ mod tests {
             .expect("response");
         let envelope = ResponseEgressEnvelope::new(
             response,
-            request_start,
-            None,
-            Method::GET,
+            ResponseEgressRequestMetadata::new(Method::GET, request_start, None),
             ResponseEgressCompletion::empty(),
             Arc::new(|_, _| panic!("private token=secret")),
             ResponseEgressObserverHandle::new(observer.clone()),
@@ -1332,9 +1347,7 @@ mod tests {
             .expect("response");
         let envelope = ResponseEgressEnvelope::new(
             response,
-            request_start,
-            None,
-            Method::GET,
+            ResponseEgressRequestMetadata::new(Method::GET, request_start, None),
             ResponseEgressCompletion::empty(),
             Arc::new(default_response_egress_policy),
             ResponseEgressObserverHandle::new(observer.clone()),
@@ -1382,9 +1395,7 @@ mod tests {
             .insert(ResponseEgressDeadline::new(application_deadline));
         let envelope = ResponseEgressEnvelope::new(
             response,
-            request_start,
-            None,
-            Method::GET,
+            ResponseEgressRequestMetadata::new(Method::GET, request_start, None),
             ResponseEgressCompletion::empty(),
             Arc::new(move |head, observed_start| {
                 assert_eq!(observed_start, egress_started_at);
@@ -1429,9 +1440,7 @@ mod tests {
             .expect("response");
         let mut envelope = ResponseEgressEnvelope::new(
             response,
-            request_start,
-            None,
-            Method::HEAD,
+            ResponseEgressRequestMetadata::new(Method::HEAD, request_start, None),
             ResponseEgressCompletion::empty(),
             Arc::new(move |head, started_at| {
                 *policy_status.lock().expect("policy status") = Some(head.status());

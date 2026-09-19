@@ -148,6 +148,8 @@ impl BufferedIngressResponse {
 /// Application decision made before an inbound body can be consumed.
 #[non_exhaustive]
 pub enum AdmissionDecision {
+    /// Closes or resets the native request without producing an HTTP response.
+    Abort,
     Admit {
         completion: ResponseEgressCompletion,
         grant: IngressGrant,
@@ -167,8 +169,6 @@ pub enum AdmissionDecision {
         completion: ResponseEgressCompletion,
         response: Response,
     },
-    /// Closes or resets the native request without producing an HTTP response.
-    Abort,
 }
 
 struct FallbackDispatch {
@@ -221,6 +221,7 @@ impl FallbackIngress {
 /// `Admitted` includes both normal routed dispatch and an opt-in bounded fallback drain.
 #[non_exhaustive]
 pub enum IngressAdmissionOutcome {
+    Aborted,
     Admitted {
         completion: ResponseEgressCompletion,
         ingress: AdmittedIngress,
@@ -229,22 +230,21 @@ pub enum IngressAdmissionOutcome {
         completion: ResponseEgressCompletion,
         response: Response,
     },
-    Aborted,
 }
 
 /// Result of route resolution plus application admission before native body ownership moves.
 #[non_exhaustive]
 pub enum IngressBeginOutcome {
+    Aborted,
     Admitted(PreparedIngress),
     Refused(ResponseEgressEnvelope),
-    Aborted,
 }
 
 /// Result of complete ingress dispatch, preserving abort as a non-response outcome.
 #[non_exhaustive]
 pub enum IngressDispatchOutcome {
-    Response(ResponseEgressEnvelope),
     Aborted,
+    Response(Box<ResponseEgressEnvelope>),
 }
 
 /// Proof that the application selected one request disposition with a finite read deadline.
@@ -1140,14 +1140,14 @@ mod tests {
                 .expect("response"),
         });
         let IngressAdmissionOutcome::Refused {
-            completion,
+            completion: refusal_completion,
             response,
         } = apply_admission_policy(&refuse_policy, &head, MonotonicClock::default())
             .expect("refusal")
         else {
             panic!("expected refusal");
         };
-        drop(completion);
+        drop(refusal_completion);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 

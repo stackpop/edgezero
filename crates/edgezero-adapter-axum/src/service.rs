@@ -1,5 +1,3 @@
-use std::error::Error as StdError;
-use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -29,22 +27,16 @@ use hyper::service::Service as HyperService;
 #[cfg(test)]
 use tower::Service as TowerService;
 
+#[cfg(test)]
+use crate::connection::{ConnectionExit, serve_http1};
 use crate::outbound::AxumOutboundClient;
 use crate::request::into_core_request_parts;
 use crate::response::{AxumEgressBody, EgressConnection, prepare_egress_response};
 
 /// Private Hyper service error used only to close/reset an admission-aborted connection.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("ingress admission aborted")]
 pub(crate) struct AxumIngressAbort;
-
-impl fmt::Display for AxumIngressAbort {
-    #[inline]
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ingress admission aborted")
-    }
-}
-
-impl StdError for AxumIngressAbort {}
 
 /// Shared application state used to construct one private Hyper service per HTTP/1 connection.
 #[derive(Clone)]
@@ -515,10 +507,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[expect(
-        clippy::integer_division_remainder_used,
-        reason = "tokio::join! expands to internal randomized branch selection arithmetic"
-    )]
     async fn admission_abort_closes_http1_without_response_bytes() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -531,7 +519,7 @@ mod tests {
         let server = async move {
             let (stream, remote_addr) = listener.accept().await.expect("accept client");
             let responses = EgressConnection::default();
-            crate::connection::serve_http1(
+            serve_http1(
                 stream,
                 state.for_connection(remote_addr, responses.clone()),
                 responses,
@@ -553,7 +541,7 @@ mod tests {
         };
 
         let (exit, (read, response)) = tokio::join!(server, client);
-        assert_eq!(exit, crate::connection::ConnectionExit::AdmissionAborted);
+        assert_eq!(exit, ConnectionExit::AdmissionAborted);
         if let Err(error) = read {
             assert!(matches!(
                 error.kind(),

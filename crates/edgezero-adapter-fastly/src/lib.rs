@@ -58,18 +58,6 @@ const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";
 pub const RUNTIME_ENV_STORE_NAME: &str = "edgezero_runtime_env";
 
 #[cfg(feature = "fastly")]
-fn build_app_for_dispatch<A: Hooks>() -> Result<App, fastly::Error> {
-    A::build_app().context("application configuration failed")
-}
-
-/// Test seam for the production application-assembly error mapping.
-#[cfg(all(feature = "test-utils", feature = "fastly"))]
-#[doc(hidden)]
-pub fn build_app_for_test<A: Hooks>() -> Result<App, fastly::Error> {
-    build_app_for_dispatch::<A>()
-}
-
-#[cfg(feature = "fastly")]
 static FASTLY_ABI_INIT: Once = Once::new();
 
 #[cfg(any(feature = "fastly", test))]
@@ -126,6 +114,19 @@ impl From<&EnvConfig> for FastlyLogging {
             use_fastly_logger,
         }
     }
+}
+
+#[cfg(feature = "fastly")]
+fn build_app_for_dispatch<A: Hooks>() -> Result<App, fastly::Error> {
+    A::build_app().context("application configuration failed")
+}
+
+/// Test seam for the production application-assembly error mapping.
+#[cfg(all(feature = "test-utils", feature = "fastly"))]
+#[doc(hidden)]
+#[inline]
+pub fn build_app_for_test<A: Hooks>() -> Result<App, fastly::Error> {
+    build_app_for_dispatch::<A>()
 }
 
 #[cfg(feature = "fastly")]

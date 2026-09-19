@@ -46,18 +46,6 @@ use spin_sdk::wasip3::http::types::Response as WasiResponse;
 pub type SpinResponse = WasiResponse;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
-    A::build_app().context("application configuration failed")
-}
-
-/// Test seam for the production application-assembly error mapping.
-#[cfg(all(feature = "test-utils", feature = "spin", target_arch = "wasm32"))]
-#[doc(hidden)]
-pub fn build_app_for_test<A: Hooks>() -> anyhow::Result<App> {
-    build_app_for_dispatch::<A>()
-}
-
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub trait AppExt {
     /// Dispatch a Spin request and return the raw response backed by `EdgeZero`'s owned writer.
     fn dispatch<'app>(
@@ -75,6 +63,19 @@ impl AppExt for App {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<SpinResponse>> + 'app>> {
         Box::pin(request::dispatch(self, req))
     }
+}
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
+    A::build_app().context("application configuration failed")
+}
+
+/// Test seam for the production application-assembly error mapping.
+#[cfg(all(feature = "test-utils", feature = "spin", target_arch = "wasm32"))]
+#[doc(hidden)]
+#[inline]
+pub fn build_app_for_test<A: Hooks>() -> anyhow::Result<App> {
+    build_app_for_dispatch::<A>()
 }
 
 /// Initialize the logger for Spin.

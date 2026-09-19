@@ -278,7 +278,7 @@ mod lifecycle_tests {
         let IngressDispatchOutcome::Response(envelope) = outcome else {
             panic!("expected response");
         };
-        complete_envelope(envelope)
+        complete_envelope(*envelope)
     }
 
     fn complete_envelope(envelope: ResponseEgressEnvelope) -> Response {

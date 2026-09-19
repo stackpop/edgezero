@@ -648,13 +648,6 @@ mod tests {
         }
     }
 
-    fn response_egress(outcome: IngressDispatchOutcome) -> ResponseEgressEnvelope {
-        let IngressDispatchOutcome::Response(envelope) = outcome else {
-            panic!("expected response egress");
-        };
-        envelope
-    }
-
     #[derive(Default)]
     struct SinkState {
         abandon: MockTerminal,
@@ -751,6 +744,13 @@ mod tests {
             self.prepare_plan.pop_front().unwrap_or(Ok(()))?;
             Ok((status, headers.clone(), transmits_body))
         }
+    }
+
+    fn response_egress(outcome: IngressDispatchOutcome) -> ResponseEgressEnvelope {
+        let IngressDispatchOutcome::Response(envelope) = outcome else {
+            panic!("expected response egress");
+        };
+        *envelope
     }
 
     fn stable_clock(now: MonotonicInstant) -> MonotonicClock {
