@@ -137,11 +137,21 @@ fn build_stores_tokens(manifest: &Manifest) -> TokenStream2 {
 
 fn build_configure_tokens(callback: Option<&syn::Expr>) -> TokenStream2 {
     callback.map_or_else(
-        || quote! { fn configure(_app: &mut edgezero_core::app::App) {} },
+        || {
+            quote! {
+                fn configure(
+                    _app: &mut edgezero_core::app::App,
+                ) -> Result<(), edgezero_core::error::EdgeError> {
+                    Ok(())
+                }
+            }
+        },
         |configure| {
             quote! {
-                fn configure(app: &mut edgezero_core::app::App) {
-                    (#configure)(app);
+                fn configure(
+                    app: &mut edgezero_core::app::App,
+                ) -> Result<(), edgezero_core::error::EdgeError> {
+                    (#configure)(app)
                 }
             }
         },
@@ -289,10 +299,10 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
 
             #stores_tokens
 
-            fn build_app() -> edgezero_core::app::App {
+            fn build_app() -> Result<edgezero_core::app::App, edgezero_core::error::EdgeError> {
                 let mut app = edgezero_core::app::App::with_name(Self::routes(), Self::name());
-                Self::configure(&mut app);
-                app
+                Self::configure(&mut app)?;
+                Ok(app)
             }
         }
 

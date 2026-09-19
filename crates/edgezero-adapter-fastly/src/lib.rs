@@ -1,6 +1,9 @@
 //! Utilities for bridging Fastly Compute@Edge requests into the
 //! `edgezero-core` service abstractions.
 
+#[cfg(feature = "fastly")]
+use anyhow::Context as _;
+
 // Only compiled where it is actually used (the CLI push/GC path and the Fastly
 // runtime resolver). Gating it keeps a `--no-default-features` build dead-code
 // clean instead of dragging in helpers no feature references.
@@ -28,10 +31,10 @@ pub mod response;
 #[cfg(feature = "fastly")]
 pub mod secret_store;
 
-#[cfg(feature = "fastly")]
-use edgezero_core::app::Hooks;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::app::StoresMetadata;
+#[cfg(feature = "fastly")]
+use edgezero_core::app::{App, Hooks};
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(feature = "fastly")]
@@ -53,6 +56,18 @@ const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";
 /// staging twin and links it into the staged version under THIS name, which is
 /// how the runtime resolves staged selectors without knowing the twin exists.
 pub const RUNTIME_ENV_STORE_NAME: &str = "edgezero_runtime_env";
+
+#[cfg(feature = "fastly")]
+fn build_app_for_dispatch<A: Hooks>() -> Result<App, fastly::Error> {
+    A::build_app().context("application configuration failed")
+}
+
+/// Test seam for the production application-assembly error mapping.
+#[cfg(all(feature = "test-utils", feature = "fastly"))]
+#[doc(hidden)]
+pub fn build_app_for_test<A: Hooks>() -> Result<App, fastly::Error> {
+    build_app_for_dispatch::<A>()
+}
 
 #[cfg(feature = "fastly")]
 static FASTLY_ABI_INIT: Once = Once::new();
@@ -193,6 +208,7 @@ where
     Finalize: FnOnce(&mut Response) -> State,
 {
     init_fastly_abi();
+    let app = build_app_for_dispatch::<A>()?;
     let stores = A::stores();
     let env = runtime_env_config(stores);
     let logging = FastlyLogging::from(&env);
@@ -200,7 +216,6 @@ where
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
-    let app = A::build_app();
     request::send_with_registries_and_hooks(&app, stores, &env, prepare, finalize)
 }
 
@@ -327,11 +342,11 @@ pub fn run_app_with_config<A: Hooks>(
     config_store_name: Option<&str>,
 ) -> Result<(), fastly::Error> {
     init_fastly_abi();
+    let app = build_app_for_dispatch::<A>()?;
     if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
-    let app = A::build_app();
     let mut service = request::FastlyService::new(&app);
     if let Some(name) = config_store_name {
         service = service.with_config(name);
