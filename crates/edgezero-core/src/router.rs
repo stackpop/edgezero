@@ -832,11 +832,14 @@ mod tests {
             IngressHeadAccounting::HostManaged,
             IngressFraming::HostManaged,
         );
-        let IngressAdmissionOutcome::Admitted(admitted) =
-            app.admit_ingress(&head).expect("admission")
+        let IngressAdmissionOutcome::Admitted {
+            completion,
+            ingress: admitted,
+        } = app.admit_ingress(&head).expect("admission")
         else {
             panic!("expected admission");
         };
+        drop(completion);
         admitted
     }
 
@@ -873,14 +876,18 @@ mod tests {
         );
         let mut app = App::new(router.clone());
         app.set_ingress_admission_policy(|_| AdmissionDecision::Admit {
+            completion: crate::response_egress::ResponseEgressCompletion::empty(),
             grant: IngressGrant::new(String::from("lease")),
             read_deadline: Deadline::after(Duration::from_secs(1)),
         });
-        let IngressAdmissionOutcome::Admitted(admitted) =
-            app.admit_ingress(&head).expect("admission")
+        let IngressAdmissionOutcome::Admitted {
+            completion,
+            ingress: admitted,
+        } = app.admit_ingress(&head).expect("admission")
         else {
             panic!("expected admission");
         };
+        drop(completion);
         assert_eq!(admitted.request_start(), start);
         let response = block_on(router.dispatch_resolved(resolved, request, admitted))
             .expect("resolved response");

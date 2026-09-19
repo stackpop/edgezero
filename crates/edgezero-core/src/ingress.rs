@@ -13,7 +13,7 @@ use crate::http::{
     Version,
     header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING},
 };
-use crate::response_egress::ResponseEgressEnvelope;
+use crate::response_egress::{ResponseEgressCompletion, ResponseEgressEnvelope};
 use crate::router::{ResolvedDispatch, RouteMetadata, RouteResolution};
 use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock, MonotonicInstant};
 
@@ -149,19 +149,26 @@ impl BufferedIngressResponse {
 #[non_exhaustive]
 pub enum AdmissionDecision {
     Admit {
+        completion: ResponseEgressCompletion,
         grant: IngressGrant,
         read_deadline: Deadline,
     },
     /// Drains an unmatched or wrong-method request body before returning the canonical
     /// pre-resolved 404/405 response.
     ReadBodyBeforeFallback {
+        completion: ResponseEgressCompletion,
         grant: IngressGrant,
         max_body_bytes: usize,
         read_deadline: Deadline,
         on_exceeded: BufferedIngressResponse,
         on_timeout: BufferedIngressResponse,
     },
-    Refuse(Response),
+    Refuse {
+        completion: ResponseEgressCompletion,
+        response: Response,
+    },
+    /// Closes or resets the native request without producing an HTTP response.
+    Abort,
 }
 
 struct FallbackDispatch {
@@ -214,8 +221,15 @@ impl FallbackIngress {
 /// `Admitted` includes both normal routed dispatch and an opt-in bounded fallback drain.
 #[non_exhaustive]
 pub enum IngressAdmissionOutcome {
-    Admitted(AdmittedIngress),
-    Refused(Response),
+    Admitted {
+        completion: ResponseEgressCompletion,
+        ingress: AdmittedIngress,
+    },
+    Refused {
+        completion: ResponseEgressCompletion,
+        response: Response,
+    },
+    Aborted,
 }
 
 /// Result of route resolution plus application admission before native body ownership moves.
@@ -223,6 +237,14 @@ pub enum IngressAdmissionOutcome {
 pub enum IngressBeginOutcome {
     Admitted(PreparedIngress),
     Refused(ResponseEgressEnvelope),
+    Aborted,
+}
+
+/// Result of complete ingress dispatch, preserving abort as a non-response outcome.
+#[non_exhaustive]
+pub enum IngressDispatchOutcome {
+    Response(ResponseEgressEnvelope),
+    Aborted,
 }
 
 /// Proof that the application selected one request disposition with a finite read deadline.
@@ -639,12 +661,15 @@ impl IngressHead {
 /// Opaque, single-use admission proof paired with the exact resolved dispatch token.
 pub struct PreparedIngress {
     admitted: AdmittedIngress,
+    completion: ResponseEgressCompletion,
     resolved: ResolvedDispatch,
 }
 
 impl PreparedIngress {
-    pub(crate) fn into_parts(self) -> (ResolvedDispatch, AdmittedIngress) {
-        (self.resolved, self.admitted)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (ResolvedDispatch, AdmittedIngress, ResponseEgressCompletion) {
+        (self.resolved, self.admitted, self.completion)
     }
 
     #[must_use]
@@ -653,8 +678,16 @@ impl PreparedIngress {
         self.admitted.monotonic_clock()
     }
 
-    pub(crate) fn new(resolved: ResolvedDispatch, admitted: AdmittedIngress) -> Self {
-        Self { admitted, resolved }
+    pub(crate) fn new(
+        resolved: ResolvedDispatch,
+        admitted: AdmittedIngress,
+        completion: ResponseEgressCompletion,
+    ) -> Self {
+        Self {
+            admitted,
+            completion,
+            resolved,
+        }
     }
 
     #[must_use]
@@ -698,6 +731,7 @@ pub(crate) type IngressAdmissionPolicy =
 
 pub(crate) fn default_admission_policy() -> IngressAdmissionPolicy {
     Arc::new(|head| AdmissionDecision::Admit {
+        completion: ResponseEgressCompletion::empty(),
         grant: IngressGrant::empty(),
         read_deadline: head.read_deadline_after(DEFAULT_INBOUND_READ_BUDGET),
     })
@@ -708,15 +742,29 @@ pub(crate) fn apply_admission_policy(
     head: &IngressHead,
     monotonic_clock: MonotonicClock,
 ) -> Result<IngressAdmissionOutcome, EdgeError> {
-    let (grant, read_deadline, dispatch_disposition) = match policy(head) {
-        AdmissionDecision::Refuse(response) => {
-            return Ok(IngressAdmissionOutcome::Refused(response));
+    let (completion, grant, read_deadline, dispatch_disposition) = match policy(head) {
+        AdmissionDecision::Refuse {
+            completion,
+            response,
+        } => {
+            return Ok(IngressAdmissionOutcome::Refused {
+                completion,
+                response,
+            });
         }
+        AdmissionDecision::Abort => return Ok(IngressAdmissionOutcome::Aborted),
         AdmissionDecision::Admit {
+            completion,
             grant,
             read_deadline,
-        } => (grant, read_deadline, IngressDispatchDisposition::Dispatch),
+        } => (
+            completion,
+            grant,
+            read_deadline,
+            IngressDispatchDisposition::Dispatch,
+        ),
         AdmissionDecision::ReadBodyBeforeFallback {
+            completion,
             grant,
             max_body_bytes,
             read_deadline,
@@ -732,6 +780,7 @@ pub(crate) fn apply_admission_policy(
                 }
             }
             (
+                completion,
                 grant,
                 read_deadline,
                 IngressDispatchDisposition::ReadBodyBeforeFallback(Box::new(FallbackDispatch {
@@ -751,14 +800,17 @@ pub(crate) fn apply_admission_policy(
             ))
         })?;
     let deadline = Deadline::at_instant(read_deadline.instant().min(maximum));
-    Ok(IngressAdmissionOutcome::Admitted(AdmittedIngress {
-        config_extraction_limits: ConfigExtractionLimits::default(),
-        dispatch_disposition,
-        grant,
-        monotonic_clock,
-        read_deadline: deadline,
-        request_start: head.request_start(),
-    }))
+    Ok(IngressAdmissionOutcome::Admitted {
+        completion,
+        ingress: AdmittedIngress {
+            config_extraction_limits: ConfigExtractionLimits::default(),
+            dispatch_disposition,
+            grant,
+            monotonic_clock,
+            read_deadline: deadline,
+            request_start: head.request_start(),
+        },
+    })
 }
 
 fn require_nonzero(name: &str, value: u64) -> Result<(), EdgeError> {
@@ -1062,34 +1114,40 @@ mod tests {
                 .expect("deadline"),
         );
         let admit_policy: IngressAdmissionPolicy = Arc::new(move |_| AdmissionDecision::Admit {
+            completion: ResponseEgressCompletion::empty(),
             grant: IngressGrant::empty(),
             read_deadline: too_late,
         });
-        let IngressAdmissionOutcome::Admitted(admitted) =
-            apply_admission_policy(&admit_policy, &head, MonotonicClock::default())
-                .expect("admission")
+        let IngressAdmissionOutcome::Admitted {
+            completion,
+            ingress: admitted,
+        } = apply_admission_policy(&admit_policy, &head, MonotonicClock::default())
+            .expect("admission")
         else {
             panic!("expected admission");
         };
+        drop(completion);
         assert_eq!(
             admitted.read_deadline().instant(),
             start.checked_add(DEADLINE_FAR_FUTURE).expect("maximum")
         );
 
-        let refuse_policy: IngressAdmissionPolicy = Arc::new(|_| {
-            AdmissionDecision::Refuse(
-                response_builder()
-                    .status(StatusCode::TOO_MANY_REQUESTS)
-                    .body(Body::empty())
-                    .expect("response"),
-            )
+        let refuse_policy: IngressAdmissionPolicy = Arc::new(|_| AdmissionDecision::Refuse {
+            completion: ResponseEgressCompletion::empty(),
+            response: response_builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .body(Body::empty())
+                .expect("response"),
         });
-        let IngressAdmissionOutcome::Refused(response) =
-            apply_admission_policy(&refuse_policy, &head, MonotonicClock::default())
-                .expect("refusal")
+        let IngressAdmissionOutcome::Refused {
+            completion,
+            response,
+        } = apply_admission_policy(&refuse_policy, &head, MonotonicClock::default())
+            .expect("refusal")
         else {
             panic!("expected refusal");
         };
+        drop(completion);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
