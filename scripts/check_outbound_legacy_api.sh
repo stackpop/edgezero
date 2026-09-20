@@ -17,6 +17,109 @@ scan() {
   return "$status"
 }
 
+scan_detached_send_tuple() {
+  node --input-type=module - "$@" <<'NODE'
+import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+
+const send = ['DetachedResponseEgressDecision::', 'Send'].join('')
+const trivia = String.raw`(?:[ \t\r\n]|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*(?:\r?\n|$))*`
+
+function findLegacyDetachedSendConstructors(source) {
+  const pattern = new RegExp(`${send}${trivia}\\(`, 'gu')
+  return Array.from(source.matchAll(pattern), (match) => ({
+    index: match.index ?? 0,
+    text: match[0],
+  }))
+}
+
+for (const [name, source] of [
+  ['same-line tuple', `${send}(completion)`],
+  ['newline tuple', `${send}\n(completion)`],
+  ['line-comment tuple', `${send} // legacy\n(completion)`],
+  ['block-comment tuple', `${send} /* legacy */ (completion)`],
+]) {
+  if (findLegacyDetachedSendConstructors(source).length !== 1) {
+    process.stderr.write(`legacy tuple checker self-test failed: ${name}\n`)
+    process.exit(2)
+  }
+}
+for (const source of [
+  `${send} { completion, deadline }`,
+  ['"DetachedResponseEgressDecision::",', '"Send("'].join('\n'),
+]) {
+  if (findLegacyDetachedSendConstructors(source).length !== 0) {
+    process.stderr.write('legacy tuple checker self-test matched a supported form\n')
+    process.exit(2)
+  }
+}
+
+const roots = process.argv.slice(2)
+const docsIndexFixture = {
+  path: 'docs/index.md',
+  source: `${send} /* legacy */ (completion)`,
+}
+if (
+  !roots.includes(docsIndexFixture.path) ||
+  findLegacyDetachedSendConstructors(docsIndexFixture.source).length !== 1
+) {
+  process.stderr.write('legacy tuple checker did not reject the docs index fixture\n')
+  process.exit(2)
+}
+const tracked = execFileSync('git', ['ls-files', '-z', '--', ...roots])
+  .toString('utf8')
+  .split('\0')
+  .filter(Boolean)
+let failed = false
+for (const path of tracked) {
+  const source = readFileSync(path, 'utf8')
+  for (const match of findLegacyDetachedSendConstructors(source)) {
+    const line = source.slice(0, match.index).split(/\r?\n/u).length
+    process.stdout.write(`${path}:${line}:${match.text.replace(/\s+/gu, ' ')}\n`)
+    failed = true
+  }
+}
+process.exit(failed ? 1 : 0)
+NODE
+}
+
+active_surfaces=(
+  crates
+  examples/app-demo
+  .github/actions
+  .github/workflows
+  docs/.vitepress
+  docs/guide
+  docs/index.md
+  docs/specs
+  docs/superpowers/specs
+  scripts
+  README.md
+  CLAUDE.md
+  TODO.md
+  Cargo.toml
+)
+
+assert_active_surface_fixture_rejected() {
+  local path=$1
+  local pattern=$2
+  local source=$3
+  local active
+
+  for active in "${active_surfaces[@]}"; do
+    if [ "$active" = "$path" ]; then
+      if printf '%s\n' "$source" | grep -Eq "$pattern"; then
+        return 0
+      fi
+      printf 'legacy checker did not reject the %s fixture\n' "$path" >&2
+      return 2
+    fi
+  done
+
+  printf 'legacy checker does not scan the %s fixture\n' "$path" >&2
+  return 2
+}
+
 failed=0
 
 scan \
@@ -81,5 +184,23 @@ scan \
   'DetachedResponseEgressCompletionFactory|set_detached_response_egress_completion_factory' \
   crates examples/app-demo docs/guide docs/superpowers/specs README.md \
   ':(exclude)crates/edgezero-cli/src/generator.rs' || failed=1
+
+# Detached response egress uses named fields only. This scanner spans comments
+# and newlines, and its embedded fixtures keep those cases covered in CI.
+scan_detached_send_tuple "${active_surfaces[@]}" || failed=1
+
+# Retired staging command identifiers must not return to active code or public
+# documentation. Historical plans are outside these paths, and the exact terms
+# below intentionally do not match ordinary Fastly "staged" provider-state prose.
+staging_pattern='DeploySta'
+staging_pattern+='ged|deploy_sta'
+staging_pattern+='ged|deploy-sta'
+staging_pattern+='ged|--sta'
+staging_pattern+='ged'
+staging_fixture='deploy-sta'
+staging_fixture+='ged'
+assert_active_surface_fixture_rejected \
+  docs/index.md "$staging_pattern" "$staging_fixture" || failed=1
+scan "$staging_pattern" "${active_surfaces[@]}" || failed=1
 
 exit "$failed"

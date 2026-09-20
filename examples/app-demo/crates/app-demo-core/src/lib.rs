@@ -19,6 +19,7 @@ use edgezero_core::{
     AdmissionDecision, BufferedIngressResponse, ConfigExtractionLimits,
     DetachedResponseEgressDecision, EdgeError, IngressGrant, ResponseEgressCompletion,
     ResponseEgressResource, ResponseEgressResourceInstallError, RouteResolution,
+    DEFAULT_RESPONSE_WRITE_BUDGET,
 };
 
 const DEFAULT_INGRESS_READ_BUDGET: Duration = Duration::from_secs(30);
@@ -95,9 +96,13 @@ fn configure_app(app: &mut EdgeZeroApp) -> Result<(), EdgeError> {
     app.set_config_extraction_limits(ConfigExtractionLimits::default())?;
     app.set_detached_response_egress_decision_factory(|head| {
         let permit = ResponsePermit::new(Some(format!("detached:{}", head.error_kind())));
-        DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(move |_report| {
+        let completion = ResponseEgressCompletion::new(move |_report| {
             permit.release();
-        }))
+        });
+        DetachedResponseEgressDecision::Send {
+            completion,
+            deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),
+        }
     });
     app.set_ingress_admission_policy(|head| {
         if let RouteResolution::Matched(metadata) = head.route_resolution().clone() {
@@ -107,14 +112,15 @@ fn configure_app(app: &mut EdgeZeroApp) -> Result<(), EdgeError> {
             } else {
                 DEFAULT_INGRESS_READ_BUDGET
             };
-            let (lease, completion) = response_lifecycle(route_class);
+            let permit = ResponsePermit::new(route_class.clone());
+            let (lease, completion) = response_lifecycle(route_class, permit);
             AdmissionDecision::Admit {
                 completion,
                 grant: IngressGrant::new(lease),
                 read_deadline: head.read_deadline_after(read_budget),
             }
         } else {
-            let (lease, completion) = response_lifecycle(None);
+            let (lease, completion) = response_lifecycle(None, ResponsePermit::new(None));
             AdmissionDecision::ReadBodyBeforeFallback {
                 completion,
                 grant: IngressGrant::new(lease),
@@ -134,9 +140,15 @@ fn configure_app(app: &mut EdgeZeroApp) -> Result<(), EdgeError> {
     Ok(())
 }
 
-/// Pairs a core-owned late-bound resource installer with terminal response egress.
-fn response_lifecycle(route_class: Option<String>) -> (AdmissionLease, ResponseEgressCompletion) {
-    let (response_resource, completion) = ResponseEgressCompletion::late_bound();
+/// Composes a held permit with a core-owned late-bound response resource.
+fn response_lifecycle(
+    route_class: Option<String>,
+    permit: ResponsePermit,
+) -> (AdmissionLease, ResponseEgressCompletion) {
+    let static_completion = ResponseEgressCompletion::new(move |_report| {
+        permit.release();
+    });
+    let (response_resource, late_bound_completion) = ResponseEgressCompletion::late_bound();
     (
         AdmissionLease {
             #[cfg(test)]
@@ -144,7 +156,7 @@ fn response_lifecycle(route_class: Option<String>) -> (AdmissionLease, ResponseE
             response_resource,
             route_class,
         },
-        completion,
+        static_completion.join(late_bound_completion),
     )
 }
 
@@ -259,7 +271,8 @@ mod lifecycle_tests {
                 panic!("admission route must resolve");
             };
             let route_class = metadata.class().map(str::to_owned);
-            let (mut lease, completion) = super::response_lifecycle(route_class);
+            let permit = super::ResponsePermit::new(route_class.clone());
+            let (mut lease, completion) = super::response_lifecycle(route_class, permit);
             lease.observe_response_permit_releases(Arc::clone(&policy_releases));
             AdmissionDecision::Admit {
                 completion,
@@ -280,6 +293,65 @@ mod lifecycle_tests {
         let response = complete_envelope(envelope);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn composed_response_completion() {
+        let static_effects = Arc::new(AtomicUsize::new(0));
+        let late_bound_effects = Arc::new(AtomicUsize::new(0));
+        let static_effects_for_policy = Arc::clone(&static_effects);
+        let late_bound_effects_for_policy = Arc::clone(&late_bound_effects);
+        let mut app = super::App::build_app().expect("configured app");
+        app.set_ingress_admission_policy(move |head| {
+            let static_permit = super::ResponsePermit {
+                release_counter: Some(Arc::clone(&static_effects_for_policy)),
+                route_class: None,
+            };
+            let (mut lease, completion) = super::response_lifecycle(None, static_permit);
+            lease.observe_response_permit_releases(Arc::clone(&late_bound_effects_for_policy));
+            lease
+                .install_response_permit()
+                .expect("install late-bound response permit");
+            AdmissionDecision::Admit {
+                completion,
+                grant: IngressGrant::empty(),
+                read_deadline: head.read_deadline_after(Duration::from_secs(30)),
+            }
+        });
+
+        let prepared_ingress = begin_ingress(&app, "/", MonotonicInstant::now());
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .expect("request");
+        let envelope = block_on(app.dispatch_admitted(prepared_ingress, request));
+
+        assert_eq!(static_effects.load(Ordering::SeqCst), 0);
+        assert_eq!(late_bound_effects.load(Ordering::SeqCst), 0);
+        let Ok((prepared_response, _, mut attempt, clock)) = envelope.begin() else {
+            panic!("response egress begin");
+        };
+        assert_eq!(static_effects.load(Ordering::SeqCst), 0);
+        assert_eq!(late_bound_effects.load(Ordering::SeqCst), 0);
+
+        assert!(attempt.begin_writing());
+        assert_eq!(static_effects.load(Ordering::SeqCst), 0);
+        assert_eq!(late_bound_effects.load(Ordering::SeqCst), 0);
+
+        let observed_at = clock.now();
+        assert!(attempt.complete(observed_at));
+        assert_eq!(static_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(late_bound_effects.load(Ordering::SeqCst), 1);
+
+        assert!(!attempt.complete(observed_at));
+        assert_eq!(static_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(late_bound_effects.load(Ordering::SeqCst), 1);
+        drop(attempt);
+
+        assert_eq!(static_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(late_bound_effects.load(Ordering::SeqCst), 1);
+        assert_eq!(prepared_response.into_response().status(), StatusCode::OK);
     }
 
     #[test]

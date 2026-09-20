@@ -13,6 +13,7 @@ use edgezero_core::{
     AdmissionDecision, BufferedIngressResponse, ConfigExtractionLimits,
     DetachedResponseEgressDecision, EdgeError, IngressGrant, ResponseEgressCompletion,
     ResponseEgressResource, ResponseEgressResourceInstallError, RouteResolution,
+    DEFAULT_RESPONSE_WRITE_BUDGET,
 };
 
 const DEFAULT_INGRESS_READ_BUDGET: Duration = Duration::from_secs(30);
@@ -81,9 +82,13 @@ fn configure_app(app: &mut EdgeZeroApp) -> Result<(), EdgeError> {
     app.set_config_extraction_limits(ConfigExtractionLimits::default())?;
     app.set_detached_response_egress_decision_factory(|head| {
         let permit = ResponsePermit::new(Some(format!("detached:{}", head.error_kind())));
-        DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(move |_report| {
+        let completion = ResponseEgressCompletion::new(move |_report| {
             permit.release();
-        }))
+        });
+        DetachedResponseEgressDecision::Send {
+            completion,
+            deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),
+        }
     });
     app.set_ingress_admission_policy(|head| {
         if let RouteResolution::Matched(metadata) = head.route_resolution().clone() {
@@ -93,14 +98,15 @@ fn configure_app(app: &mut EdgeZeroApp) -> Result<(), EdgeError> {
             } else {
                 DEFAULT_INGRESS_READ_BUDGET
             };
-            let (lease, completion) = response_lifecycle(route_class);
+            let permit = ResponsePermit::new(route_class.clone());
+            let (lease, completion) = response_lifecycle(route_class, permit);
             AdmissionDecision::Admit {
                 completion,
                 grant: IngressGrant::new(lease),
                 read_deadline: head.read_deadline_after(read_budget),
             }
         } else {
-            let (lease, completion) = response_lifecycle(None);
+            let (lease, completion) = response_lifecycle(None, ResponsePermit::new(None));
             AdmissionDecision::ReadBodyBeforeFallback {
                 completion,
                 grant: IngressGrant::new(lease),
@@ -120,9 +126,15 @@ fn configure_app(app: &mut EdgeZeroApp) -> Result<(), EdgeError> {
     Ok(())
 }
 
-/// Pairs a core-owned late-bound resource installer with terminal response egress.
-fn response_lifecycle(route_class: Option<String>) -> (AdmissionLease, ResponseEgressCompletion) {
-    let (response_resource, completion) = ResponseEgressCompletion::late_bound();
+/// Composes a held permit with a core-owned late-bound response resource.
+fn response_lifecycle(
+    route_class: Option<String>,
+    permit: ResponsePermit,
+) -> (AdmissionLease, ResponseEgressCompletion) {
+    let static_completion = ResponseEgressCompletion::new(move |_report| {
+        permit.release();
+    });
+    let (response_resource, late_bound_completion) = ResponseEgressCompletion::late_bound();
     (
         AdmissionLease {
             #[cfg(test)]
@@ -130,7 +142,7 @@ fn response_lifecycle(route_class: Option<String>) -> (AdmissionLease, ResponseE
             response_resource,
             route_class,
         },
-        completion,
+        static_completion.join(late_bound_completion),
     )
 }
 

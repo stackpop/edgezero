@@ -405,10 +405,15 @@ const handlersGuideSource = hardCutSurfaces[1][1]
 for (const requiredFragment of [
   'fn configure_app(app: &mut edgezero_core::app::App) -> Result<(), EdgeError>',
   'completion: ResponseEgressCompletion::empty()',
+  'DetachedResponseEgressDecision::Send {',
+  'deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),',
   'ResponseEgressCompletion::new(move |report| ... )',
+  'Use `left.join(right)`',
   '`AdmissionDecision::Abort`',
   '`App::set_detached_response_egress_decision_factory`',
   '`DetachedResponseEgressDecision::Abort`',
+  'Every `Send` deadline is mandatory and absolute',
+  '`Abort` creates no response or egress attempt and invokes no completion callback',
   'never belongs in response extensions',
 ]) {
   if (!handlersGuideSource.includes(requiredFragment)) {
@@ -541,8 +546,14 @@ const inboundSpecSource = readFileSync(inboundSpecPath, 'utf8')
 for (const requiredFragment of [
   '    Abort,',
   'pub enum DetachedResponseEgressDecision',
-  'Send(ResponseEgressCompletion)',
-  'The default is\n`Send(ResponseEgressCompletion::empty())`',
+  '    Send {',
+  '        completion: ResponseEgressCompletion,',
+  '        deadline: Deadline,',
+  'DetachedResponseEgressDecision::Send {',
+  'deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),',
+  'The deadline is mandatory, absolute',
+  'Joined completions run left then right with the same borrowed report at most once',
+  'Factory `Abort` creates no response or attempt',
   'make no transport-observed reset claim',
   'ResponseEgressCompletion::empty()',
   'Hooks::configure(&mut App) -> Result<(), EdgeError>',
@@ -678,10 +689,18 @@ for (const requiredFragment of [
   'pub struct ResponseEgressDeadline(Deadline);',
   'pub struct ResponseEgressCompletion',
   'pub enum DetachedResponseEgressDecision',
-  'Send(ResponseEgressCompletion)',
+  '    Send {',
+  '        completion: ResponseEgressCompletion,',
+  '        deadline: Deadline,',
+  'DetachedResponseEgressDecision::Send {',
+  'deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),',
+  'mandatory absolute deadline',
+  'pub fn join(self, other: Self) -> Self;',
+  '`ResponseEgressCompletion::join` consumes a left and right completion',
+  'the same borrowed `ResponseEgressReport`; the joined owner executes at most once',
   'existing non-response abort/error boundary',
   'Normalized pre-admission validation invokes the detached-egress decision factory exactly once',
-  '`Abort` constructs no response or attempt and invokes no callback',
+  '`Abort` constructs no response or attempt and invokes no completion, observer, handler, middleware, or body poll',
   'ResponseEgressCompletion::empty()',
   'not attached to a `Response` and never enters `http::Extensions`',
   'ResponseEgressHead::application_deadline()',
@@ -708,6 +727,100 @@ for (const requiredFragment of [
 ]) {
   if (!capabilitySource.includes(requiredFragment)) {
     fail(`${capabilityPath} is missing detached-ingress abort caveat: ${requiredFragment}`)
+  }
+}
+
+const responseEgressHeadingIndex = lines.findIndex(
+  (line) => line.trim() === '## Response Egress Matrix',
+)
+if (responseEgressHeadingIndex === -1) {
+  fail(`${capabilityPath} is missing the response-egress section`)
+}
+const nextCapabilityHeadingIndex = lines.findIndex(
+  (line, index) =>
+    index > responseEgressHeadingIndex && line.startsWith('## '),
+)
+const responseEgressSectionEnd =
+  nextCapabilityHeadingIndex === -1 ? lines.length : nextCapabilityHeadingIndex
+const responseEgressSection = lines
+  .slice(responseEgressHeadingIndex, responseEgressSectionEnd)
+  .join('\n')
+for (const requiredFragment of [
+  'The boundaries remain `BestEffort` because none proves end-client receipt:',
+  'Provider-owned buffering, SDK allocations, and bytes beyond each stated acceptance boundary are',
+]) {
+  if (!responseEgressSection.includes(requiredFragment)) {
+    fail(
+      `${capabilityPath} response-egress section is missing caveat: ${requiredFragment}`,
+    )
+  }
+}
+
+function responseEgressProviderBullet(provider) {
+  const bulletIndex = lines.findIndex(
+    (line, index) =>
+      index > responseEgressHeadingIndex &&
+      index < responseEgressSectionEnd &&
+      line.startsWith(`- ${provider} `),
+  )
+  if (bulletIndex === -1) {
+    fail(`${capabilityPath} is missing the ${provider} response-egress caveat`)
+  }
+  const bullet = [lines[bulletIndex]]
+  for (
+    let index = bulletIndex + 1;
+    index < responseEgressSectionEnd;
+    index += 1
+  ) {
+    if (!lines[index].startsWith('  ')) break
+    bullet.push(lines[index].trim())
+  }
+  return bullet.join(' ')
+}
+
+const responseEgressProviderCaveats = new Map([
+  [
+    'Axum',
+    [
+      'commits when Hyper accepts the response head',
+      'closes the owned HTTP/1 connection on deadline',
+      'reports clean source EOF as `HostHandoff`',
+    ],
+  ],
+  [
+    'Cloudflare',
+    [
+      'awaits JavaScript writer promises',
+      'races request abort/deadline signals',
+      'coordinator alive with `waitUntil`',
+      'deployed disconnect and completion timing remain unproved',
+    ],
+  ],
+  [
+    'Fastly',
+    [
+      'accounts synchronous body-handle writes through `stream_to_client` close',
+      'cannot preempt a blocked source poll or hostcall',
+      'loses the body handle if `finish` itself fails',
+    ],
+  ],
+  [
+    'Spin',
+    [
+      'owns the WASI response/body/result writers through handoff',
+      'races pending operations against its timer',
+      'host teardown and network completion remain provider-observable only',
+    ],
+  ],
+])
+for (const [provider, requiredFragments] of responseEgressProviderCaveats) {
+  const bullet = responseEgressProviderBullet(provider)
+  for (const requiredFragment of requiredFragments) {
+    if (!bullet.includes(requiredFragment)) {
+      fail(
+        `${capabilityPath} ${provider} response-egress caveat is missing: ${requiredFragment}`,
+      )
+    }
   }
 }
 
