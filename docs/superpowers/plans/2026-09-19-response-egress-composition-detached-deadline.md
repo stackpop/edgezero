@@ -200,11 +200,11 @@
 - Modify: `scripts/check_outbound_legacy_api.sh`
 - Modify: `scripts/check_outbound_docs_contract.mjs`
 
-- [ ] **Step 1: Write failing generator, demo, and guard assertions**
+- [x] **Step 1: Write failing generator, demo, and guard assertions**
 
   Require generated source to contain the named `completion` and `deadline` fields, the exact `head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET)` expression, and `.join(`. Add a demo lifecycle test proving both composed completion effects occur exactly once. Extend the legacy checker to reject `DetachedResponseEgressDecision::Send(`, `DeployStaged`, `deploy_staged`, `deploy-staged`, and `--staged` in active public/code surfaces while excluding historical plans and legitimate Fastly provider-state prose.
 
-- [ ] **Step 2: Run the focused checks and observe RED**
+- [x] **Step 2: Run the focused checks and observe RED**
 
   Run: `cargo test -p edgezero-cli generate_new_scaffolds_workspace_layout`
 
@@ -214,15 +214,15 @@
 
   Expected: FAIL until the template, demo, and stale specification text are migrated.
 
-- [ ] **Step 3: Migrate the reference app and template**
+- [x] **Step 3: Migrate the reference app and template**
 
   Return `Send { completion, deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET) }`. Add a concise example composing the static completion with a late-bound completion using `join` without introducing application-specific terminology, and make the new demo lifecycle test pass.
 
-- [ ] **Step 4: Strengthen the documentation contract checker**
+- [x] **Step 4: Strengthen the documentation contract checker**
 
   Require the named detached decision fields, mandatory deadline semantics, composition semantics, unchanged abort behavior, and the existing provider capability caveats.
 
-- [ ] **Step 5: Run demo, generator, and contract checks**
+- [x] **Step 5: Run demo, generator, and contract checks**
 
   Run: `cargo test -p edgezero-cli generate_new_scaffolds_workspace_layout`
 

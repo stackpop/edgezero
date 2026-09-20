@@ -1425,7 +1425,9 @@ mod tests {
         let fallback = normalize_source_whitespace(fallback_initializer_block(core_lib));
         assert!(
             core_lib.contains("FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024")
-                && core_lib.contains("let (lease, completion) = response_lifecycle(None);")
+                && core_lib.contains(
+                    "let (lease, completion) = response_lifecycle(None, ResponsePermit::new(None));",
+                )
                 && fallback.contains("completion,")
                 && fallback.contains("grant: IngressGrant::new(lease)")
                 && fallback.contains("max_body_bytes: FALLBACK_INGRESS_BODY_BYTES")
@@ -1565,11 +1567,35 @@ mod tests {
                 && core_lib.contains("set_detached_response_egress_decision_factory")
                 && !core_lib.contains("set_detached_response_egress_completion_factory")
                 && core_lib.contains("fn response_lifecycle(")
-                && core_lib.contains("let (lease, completion) = response_lifecycle(route_class);")
+                && core_lib.contains("let permit = ResponsePermit::new(route_class.clone());")
+                && core_lib
+                    .contains("let (lease, completion) = response_lifecycle(route_class, permit);")
                 && core_lib.contains("grant: IngressGrant::new(lease)")
                 && core_lib.contains("ResponseEgressCompletion::late_bound")
                 && core_lib.contains("ResponseEgressResource<ResponsePermit>"),
             "generated admission decisions must pair grants with explicit response completions",
+        );
+        let detached_send_fields = core_lib
+            .split_once("DetachedResponseEgressDecision::Send {")
+            .and_then(|(_, suffix)| suffix.split_once('}'))
+            .map(|(fields, _)| normalize_source_whitespace(fields))
+            .expect("generated detached response egress must use the named Send variant");
+        assert!(
+            !core_lib.contains(concat!("DetachedResponseEgressDecision::", "Send(")),
+            "generated detached response egress must not use the tuple Send variant",
+        );
+        assert!(
+            detached_send_fields.contains("completion,"),
+            "generated detached response egress must name its completion field",
+        );
+        assert!(
+            detached_send_fields
+                .contains("deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),"),
+            "generated detached response egress must name its mandatory default deadline",
+        );
+        assert!(
+            core_lib.contains("static_completion.join(late_bound_completion)"),
+            "generated response lifecycle must compose static and late-bound completions",
         );
         assert!(
             !core_lib.contains("struct ResponsePermitSlot")
