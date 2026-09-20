@@ -407,6 +407,8 @@ for (const requiredFragment of [
   'completion: ResponseEgressCompletion::empty()',
   'ResponseEgressCompletion::new(move |report| ... )',
   '`AdmissionDecision::Abort`',
+  '`App::set_detached_response_egress_decision_factory`',
+  '`DetachedResponseEgressDecision::Abort`',
   'never belongs in response extensions',
 ]) {
   if (!handlersGuideSource.includes(requiredFragment)) {
@@ -538,6 +540,10 @@ if (cloudflareExactDeadlineRecommendation.test(outboundSpecSource)) {
 const inboundSpecSource = readFileSync(inboundSpecPath, 'utf8')
 for (const requiredFragment of [
   '    Abort,',
+  'pub enum DetachedResponseEgressDecision',
+  'Send(ResponseEgressCompletion)',
+  'The default is\n`Send(ResponseEgressCompletion::empty())`',
+  'make no transport-observed reset claim',
   'ResponseEgressCompletion::empty()',
   'Hooks::configure(&mut App) -> Result<(), EdgeError>',
 ]) {
@@ -671,6 +677,11 @@ const responseEgressSpecSource = readFileSync(responseEgressSpecPath, 'utf8')
 for (const requiredFragment of [
   'pub struct ResponseEgressDeadline(Deadline);',
   'pub struct ResponseEgressCompletion',
+  'pub enum DetachedResponseEgressDecision',
+  'Send(ResponseEgressCompletion)',
+  'existing non-response abort/error boundary',
+  'Normalized pre-admission validation invokes the detached-egress decision factory exactly once',
+  '`Abort` constructs no response or attempt and invokes no callback',
   'ResponseEgressCompletion::empty()',
   'not attached to a `Response` and never enters `http::Extensions`',
   'ResponseEgressHead::application_deadline()',
@@ -680,6 +691,23 @@ for (const requiredFragment of [
     fail(
       `${responseEgressSpecPath} is missing application deadline contract: ${requiredFragment}`,
     )
+  }
+}
+
+if (
+  responseEgressSpecSource.includes(
+    'Normalized pre-admission validation obtains exactly one completion',
+  )
+) {
+  fail('response-egress evidence still claims every normalized rejection has a completion')
+}
+
+for (const requiredFragment of [
+  'detached-egress decision factory',
+  'this does not promote their `BestEffort` capability cells',
+]) {
+  if (!capabilitySource.includes(requiredFragment)) {
+    fail(`${capabilityPath} is missing detached-ingress abort caveat: ${requiredFragment}`)
   }
 }
 

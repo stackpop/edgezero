@@ -12,11 +12,12 @@ use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{Extensions, Request, Response, request_builder};
 #[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
-use edgezero_core::http::{Method, Uri};
+use edgezero_core::http::Uri;
+use edgezero_core::http::{Extensions, Method, Request, Response, request_builder};
 use edgezero_core::ingress::{
-    IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts, PreparedIngress,
+    IngressBeginOutcome, IngressDispatchOutcome, IngressFraming, IngressHeadAccounting,
+    IngressHeadParts, PreparedIngress,
 };
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::outbound::HttpClient;
@@ -360,6 +361,18 @@ impl<'app> FastlyService<'app> {
     }
 }
 
+fn detached_error_outcome(
+    app: &App,
+    error: EdgeError,
+    request_method: Method,
+    request_start: MonotonicInstant,
+) -> DispatchOutcome {
+    match app.detached_ingress_error_egress(error, request_method, request_start) {
+        IngressDispatchOutcome::Response(envelope) => DispatchOutcome::Detached(*envelope),
+        IngressDispatchOutcome::Aborted | _ => DispatchOutcome::Aborted,
+    }
+}
+
 fn deliver_with_hooks<State, Finalize, Deliver>(
     outcome: DispatchOutcome,
     finalize: Finalize,
@@ -463,11 +476,7 @@ where
         IngressFraming::HostManaged,
     );
     if let Err(error) = head_parts.validate_normalized(app.ingress_head_limits()) {
-        return DispatchOutcome::Detached(app.detached_ingress_error_egress(
-            error,
-            request_method,
-            request_start,
-        ));
+        return detached_error_outcome(app, error, request_method, request_start);
     }
     let prepared = match app.begin_ingress(head_parts, request_start) {
         Ok(outcome) => match outcome {
@@ -477,19 +486,16 @@ where
             }
             IngressBeginOutcome::Aborted => return DispatchOutcome::Aborted,
             _ => {
-                return DispatchOutcome::Detached(app.detached_ingress_error_egress(
+                return detached_error_outcome(
+                    app,
                     EdgeError::internal(anyhow::anyhow!("unsupported ingress admission outcome")),
                     request_method,
                     request_start,
-                ));
+                );
             }
         },
         Err(error) => {
-            return DispatchOutcome::Detached(app.detached_ingress_error_egress(
-                error,
-                request_method,
-                request_start,
-            ));
+            return detached_error_outcome(app, error, request_method, request_start);
         }
     };
     let source = match make_source() {

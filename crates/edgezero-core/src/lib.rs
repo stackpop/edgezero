@@ -88,14 +88,14 @@ pub use outbound::{
     rechunk_stream, validate_for_dispatch,
 };
 pub use response_egress::{
-    DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressCompletionFactory,
-    DetachedResponseEgressHead, RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt,
-    ResponseEgressBeginFailure, ResponseEgressBodyKind, ResponseEgressCompletion,
-    ResponseEgressDeadline, ResponseEgressEnvelope, ResponseEgressFallbackDisposition,
-    ResponseEgressHead, ResponseEgressObserver, ResponseEgressObserverHandle,
-    ResponseEgressOutcome, ResponseEgressPolicy, ResponseEgressPolicyCallback,
-    ResponseEgressReport, ResponseEgressResource, ResponseEgressResourceInstallError,
-    default_response_egress_policy,
+    DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressDecision,
+    DetachedResponseEgressDecisionFactory, DetachedResponseEgressHead,
+    RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt, ResponseEgressBeginFailure,
+    ResponseEgressBodyKind, ResponseEgressCompletion, ResponseEgressDeadline,
+    ResponseEgressEnvelope, ResponseEgressFallbackDisposition, ResponseEgressHead,
+    ResponseEgressObserver, ResponseEgressObserverHandle, ResponseEgressOutcome,
+    ResponseEgressPolicy, ResponseEgressPolicyCallback, ResponseEgressReport,
+    ResponseEgressResource, ResponseEgressResourceInstallError, default_response_egress_policy,
 };
 pub use router::{ResolvedDispatch, RouteId, RouteInfo, RouteMetadata, RouteResolution};
 pub use time::{

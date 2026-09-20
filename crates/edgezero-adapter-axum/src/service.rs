@@ -11,9 +11,10 @@ use axum::http::{Request, Response};
 use edgezero_core::app::App;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
+use edgezero_core::http::Method;
 use edgezero_core::ingress::{
-    IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts,
-    validate_normalized_ingress_parts,
+    IngressBeginOutcome, IngressDispatchOutcome, IngressFraming, IngressHeadAccounting,
+    IngressHeadParts, validate_normalized_ingress_parts,
 };
 use edgezero_core::key_value_store::KvHandle;
 #[cfg(test)]
@@ -22,6 +23,7 @@ use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry,
 };
+use edgezero_core::time::MonotonicInstant;
 use hyper::body::Incoming;
 use hyper::service::Service as HyperService;
 #[cfg(test)]
@@ -219,10 +221,13 @@ impl AxumServiceState {
         let (parts, native_body) = request.into_parts();
         let request_method = parts.method.clone();
         if let Err(error) = validate_normalized_ingress_parts(&parts, app.ingress_head_limits()) {
-            return Ok(prepare_egress_response(
-                app.detached_ingress_error_egress(error, request_method.clone(), request_start),
+            return prepare_detached_ingress_error(
+                &app,
+                error,
+                request_method.clone(),
+                request_start,
                 connection,
-            ));
+            );
         }
         let head_parts = IngressHeadParts::from_parts(
             &parts,
@@ -236,22 +241,22 @@ impl AxumServiceState {
             }
             Ok(IngressBeginOutcome::Aborted) => return Err(AxumIngressAbort),
             Ok(_) => {
-                return Ok(prepare_egress_response(
-                    app.detached_ingress_error_egress(
-                        EdgeError::internal(anyhow::anyhow!(
-                            "unsupported ingress admission outcome"
-                        )),
-                        request_method,
-                        request_start,
-                    ),
+                return prepare_detached_ingress_error(
+                    &app,
+                    EdgeError::internal(anyhow::anyhow!("unsupported ingress admission outcome")),
+                    request_method,
+                    request_start,
                     connection,
-                ));
+                );
             }
             Err(error) => {
-                return Ok(prepare_egress_response(
-                    app.detached_ingress_error_egress(error, request_method.clone(), request_start),
+                return prepare_detached_ingress_error(
+                    &app,
+                    error,
+                    request_method.clone(),
+                    request_start,
                     connection,
-                ));
+                );
             }
         };
         let read_deadline = prepared.read_deadline();
@@ -344,6 +349,21 @@ impl TowerService<Request<AxumBody>> for AxumServiceState {
     }
 }
 
+fn prepare_detached_ingress_error(
+    app: &App,
+    error: EdgeError,
+    request_method: Method,
+    request_start: MonotonicInstant,
+    connection: &EgressConnection,
+) -> Result<Response<AxumEgressBody>, AxumIngressAbort> {
+    match app.detached_ingress_error_egress(error, request_method, request_start) {
+        IngressDispatchOutcome::Response(envelope) => {
+            Ok(prepare_egress_response(*envelope, connection))
+        }
+        IngressDispatchOutcome::Aborted | _ => Err(AxumIngressAbort),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(
@@ -370,8 +390,9 @@ mod tests {
     use edgezero_core::middleware::{Middleware, Next};
     use edgezero_core::outbound::OutboundRequest;
     use edgezero_core::response_egress::{
-        ResponseEgressCompletion, ResponseEgressFallbackDisposition, ResponseEgressObserver,
-        ResponseEgressOutcome, ResponseEgressPolicy, ResponseEgressReport,
+        DetachedResponseEgressDecision, ResponseEgressCompletion,
+        ResponseEgressFallbackDisposition, ResponseEgressObserver, ResponseEgressOutcome,
+        ResponseEgressPolicy, ResponseEgressReport,
     };
     use edgezero_core::router::{RouteMetadata, RouteResolution};
     use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
@@ -687,12 +708,12 @@ mod tests {
         app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
         let observed_factory_calls = Arc::clone(&factory_calls);
         let observed_completion_calls = Arc::clone(&completion_calls);
-        app.set_detached_response_egress_completion_factory(move |_head| {
+        app.set_detached_response_egress_decision_factory(move |_head| {
             observed_factory_calls.fetch_add(1, Ordering::SeqCst);
             let terminal_calls = Arc::clone(&observed_completion_calls);
-            ResponseEgressCompletion::new(move |_report| {
+            DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(move |_report| {
                 terminal_calls.fetch_add(1, Ordering::SeqCst);
-            })
+            }))
         });
         let request = Request::builder()
             .uri("/too-long")
@@ -718,8 +739,62 @@ mod tests {
         assert!(clock_samples.load(Ordering::SeqCst) >= 2);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn normalized_ingress_error_decision_abort_closes_without_response() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let address = listener.local_addr().expect("listener address");
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let observed_factory_calls = Arc::clone(&factory_calls);
+        let mut app = App::new(RouterService::builder().build());
+        app.set_ingress_head_limits(
+            IngressHeadLimits::default()
+                .with_max_request_target_bytes(4)
+                .expect("target limit"),
+        );
+        app.set_detached_response_egress_decision_factory(move |_head| {
+            observed_factory_calls.fetch_add(1, Ordering::SeqCst);
+            DetachedResponseEgressDecision::Abort
+        });
+        let state = AxumServiceState::from_app(app);
+
+        let server = async move {
+            let (stream, remote_addr) = listener.accept().await.expect("accept client");
+            let responses = EgressConnection::default();
+            serve_http1(
+                stream,
+                state.for_connection(remote_addr, responses.clone()),
+                responses,
+            )
+            .await
+            .expect("intentional detached error abort")
+        };
+        let client = async move {
+            let mut stream = TcpStream::connect(address).await.expect("connect client");
+            stream
+                .write_all(b"GET /too-long HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .expect("write request");
+            let mut response = Vec::new();
+            let read = stream.read_to_end(&mut response).await;
+            (read, response)
+        };
+
+        let (exit, (read, response)) = tokio::join!(server, client);
+        assert_eq!(exit, ConnectionExit::AdmissionAborted);
+        if let Err(error) = read {
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+            ));
+        }
+        assert!(response.is_empty());
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn admission_policy_error_uses_detached_completion_factory() {
+    async fn admission_policy_error_decision_send_uses_detached_completion() {
         let body_polls = Arc::new(AtomicUsize::new(0));
         let observed_body_polls = Arc::clone(&body_polls);
         let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
@@ -774,12 +849,12 @@ mod tests {
         let completion_calls = Arc::new(AtomicUsize::new(0));
         let observed_factory_calls = Arc::clone(&factory_calls);
         let observed_completion_calls = Arc::clone(&completion_calls);
-        app.set_detached_response_egress_completion_factory(move |_head| {
+        app.set_detached_response_egress_decision_factory(move |_head| {
             observed_factory_calls.fetch_add(1, Ordering::SeqCst);
             let terminal_calls = Arc::clone(&observed_completion_calls);
-            ResponseEgressCompletion::new(move |_report| {
+            DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(move |_report| {
                 terminal_calls.fetch_add(1, Ordering::SeqCst);
-            })
+            }))
         });
         let request = Request::builder()
             .uri("/matched")
@@ -803,6 +878,68 @@ mod tests {
         assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
         assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
         assert_eq!(completion_calls.load(Ordering::SeqCst), 1);
+        assert!(reports.lock().expect("reports lock").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_policy_error_decision_abort_skips_response_and_application_work() {
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_body_polls = Arc::clone(&body_polls);
+        let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
+            observed_body_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::<Option<Result<Bytes, io::Error>>>::Pending
+        }));
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let observed_handler_calls = Arc::clone(&handler_calls);
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .get("/matched", move |_ctx: RequestContext| {
+                let calls = Arc::clone(&observed_handler_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, EdgeError>("handler must not run")
+                }
+            })
+            .middleware(CountingMiddleware(Arc::clone(&middleware_calls)))
+            .build();
+        let decision_resource_drops = Arc::new(AtomicUsize::new(0));
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        let observed_decision_resource_drops = Arc::clone(&decision_resource_drops);
+        let observed_grant_drops = Arc::clone(&grant_drops);
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(move |head| AdmissionDecision::ReadBodyBeforeFallback {
+            completion: ResponseEgressCompletion::new({
+                let resource = DropSignal(Arc::clone(&observed_decision_resource_drops));
+                move |_report| drop(resource)
+            }),
+            grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
+            max_body_bytes: 1,
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(StatusCode::REQUEST_TIMEOUT, "timeout"),
+        });
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let observed_factory_calls = Arc::clone(&factory_calls);
+        app.set_detached_response_egress_decision_factory(move |_head| {
+            observed_factory_calls.fetch_add(1, Ordering::SeqCst);
+            DetachedResponseEgressDecision::Abort
+        });
+        let request = Request::builder()
+            .uri("/matched")
+            .body(native_body)
+            .expect("request");
+
+        let outcome = AxumServiceState::from_app(app).oneshot(request).await;
+
+        assert!(outcome.is_err());
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(decision_resource_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
         assert!(reports.lock().expect("reports lock").is_empty());
     }
 

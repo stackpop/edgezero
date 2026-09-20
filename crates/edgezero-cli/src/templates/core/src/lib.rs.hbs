@@ -10,9 +10,9 @@ use std::time::Duration;
 use edgezero_core::app::App as EdgeZeroApp;
 use edgezero_core::http::StatusCode;
 use edgezero_core::{
-    AdmissionDecision, BufferedIngressResponse, ConfigExtractionLimits, EdgeError, IngressGrant,
-    ResponseEgressCompletion, ResponseEgressResource, ResponseEgressResourceInstallError,
-    RouteResolution,
+    AdmissionDecision, BufferedIngressResponse, ConfigExtractionLimits,
+    DetachedResponseEgressDecision, EdgeError, IngressGrant, ResponseEgressCompletion,
+    ResponseEgressResource, ResponseEgressResourceInstallError, RouteResolution,
 };
 
 const DEFAULT_INGRESS_READ_BUDGET: Duration = Duration::from_secs(30);
@@ -79,9 +79,11 @@ impl Drop for ResponsePermit {
 /// Installs request-lifecycle policy before any adapter begins polling a body.
 fn configure_app(app: &mut EdgeZeroApp) -> Result<(), EdgeError> {
     app.set_config_extraction_limits(ConfigExtractionLimits::default())?;
-    app.set_detached_response_egress_completion_factory(|head| {
+    app.set_detached_response_egress_decision_factory(|head| {
         let permit = ResponsePermit::new(Some(format!("detached:{}", head.error_kind())));
-        ResponseEgressCompletion::new(move |_report| permit.release())
+        DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(move |_report| {
+            permit.release();
+        }))
     });
     app.set_ingress_admission_policy(|head| {
         if let RouteResolution::Matched(metadata) = head.route_resolution().clone() {

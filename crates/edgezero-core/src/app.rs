@@ -13,10 +13,10 @@ use crate::ingress::{
 use crate::manifest::BakedManifest;
 use crate::response::IntoResponse as _;
 use crate::response_egress::{
-    DetachedResponseEgressCompletionFactory, DetachedResponseEgressHead, ResponseEgressCompletion,
-    ResponseEgressEnvelope, ResponseEgressHead, ResponseEgressObserver,
-    ResponseEgressObserverHandle, ResponseEgressPolicy, ResponseEgressPolicyCallback,
-    ResponseEgressRequestMetadata, default_response_egress_policy,
+    DetachedResponseEgressDecision, DetachedResponseEgressDecisionFactory,
+    DetachedResponseEgressHead, ResponseEgressCompletion, ResponseEgressEnvelope,
+    ResponseEgressHead, ResponseEgressObserver, ResponseEgressObserverHandle, ResponseEgressPolicy,
+    ResponseEgressPolicyCallback, ResponseEgressRequestMetadata, default_response_egress_policy,
 };
 use crate::router::{RouteMetadata, RouterService};
 use crate::time::{MonotonicClock, MonotonicInstant};
@@ -34,7 +34,7 @@ pub const SPIN_ADAPTER: &str = "spin";
 /// Lightweight container around a `RouterService` that can be extended via hook implementations.
 pub struct App {
     config_extraction_limits: ConfigExtractionLimits,
-    detached_response_egress_completion_factory: DetachedResponseEgressCompletionFactory,
+    detached_response_egress_decision_factory: DetachedResponseEgressDecisionFactory,
     ingress_head_limits: IngressHeadLimits,
     ingress_policy: IngressAdmissionPolicy,
     monotonic_clock: MonotonicClock,
@@ -147,10 +147,10 @@ impl App {
         DEFAULT_APP_NAME
     }
 
-    /// Converts a failure that occurred before successful admission into detached egress.
+    /// Chooses detached egress or a non-response abort for a pre-admission failure.
     ///
-    /// Detached ingress responses use the adapter response converter but do not invoke the
-    /// application's response-egress policy or observer.
+    /// A sent response uses the adapter response converter without invoking the application's
+    /// response-egress policy or observer. An abort constructs no response.
     ///
     #[must_use]
     #[inline]
@@ -159,20 +159,24 @@ impl App {
         error: EdgeError,
         request_method: Method,
         request_start: MonotonicInstant,
-    ) -> ResponseEgressEnvelope {
+    ) -> IngressDispatchOutcome {
         let head = DetachedResponseEgressHead::new(
             &request_method,
             request_start,
             error.status(),
             error.kind(),
         );
-        let completion = (self.detached_response_egress_completion_factory)(&head);
-        self.detached_response_egress(
-            render_error_response(error),
-            request_method,
-            request_start,
-            completion,
-        )
+        match (self.detached_response_egress_decision_factory)(&head) {
+            DetachedResponseEgressDecision::Abort => IngressDispatchOutcome::Aborted,
+            DetachedResponseEgressDecision::Send(completion) => {
+                IngressDispatchOutcome::Response(Box::new(self.detached_response_egress(
+                    render_error_response(error),
+                    request_method,
+                    request_start,
+                    completion,
+                )))
+            }
+        }
     }
 
     fn detached_response_egress(
@@ -337,16 +341,16 @@ impl App {
         Ok(())
     }
 
-    /// Installs the synchronous factory for detached ingress-error response completions.
+    /// Installs the synchronous decision factory for detached normalized-ingress errors.
     #[inline]
-    pub fn set_detached_response_egress_completion_factory<Factory>(&mut self, factory: Factory)
+    pub fn set_detached_response_egress_decision_factory<Factory>(&mut self, factory: Factory)
     where
-        Factory: for<'head> Fn(&DetachedResponseEgressHead<'head>) -> ResponseEgressCompletion
+        Factory: for<'head> Fn(&DetachedResponseEgressHead<'head>) -> DetachedResponseEgressDecision
             + Send
             + Sync
             + 'static,
     {
-        self.detached_response_egress_completion_factory = Arc::new(factory);
+        self.detached_response_egress_decision_factory = Arc::new(factory);
     }
 
     /// Installs the synchronous body-blind ingress admission callback.
@@ -408,8 +412,8 @@ impl App {
     {
         Self {
             config_extraction_limits: ConfigExtractionLimits::default(),
-            detached_response_egress_completion_factory: Arc::new(|_| {
-                ResponseEgressCompletion::empty()
+            detached_response_egress_decision_factory: Arc::new(|_| {
+                DetachedResponseEgressDecision::Send(ResponseEgressCompletion::empty())
             }),
             ingress_head_limits: IngressHeadLimits::default(),
             ingress_policy: default_admission_policy(),
@@ -563,8 +567,9 @@ mod tests {
     use crate::manifest::BakedManifest;
     use crate::middleware::{Middleware, Next};
     use crate::response_egress::{
-        DEFAULT_RESPONSE_WRITE_BUDGET, ResponseEgressAttempt, ResponseEgressHead,
-        ResponseEgressObserver, ResponseEgressOutcome, ResponseEgressPolicy, ResponseEgressReport,
+        DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressDecision, ResponseEgressAttempt,
+        ResponseEgressHead, ResponseEgressObserver, ResponseEgressOutcome, ResponseEgressPolicy,
+        ResponseEgressReport,
     };
     use crate::router::{RouteMetadata, RouteResolution};
     use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock, MonotonicInstant};
@@ -1265,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_ingress_error_uses_application_completion_factory() {
+    fn detached_ingress_error_send_uses_application_completion() {
         let router = RouterService::builder().build();
         let factory_calls = Arc::new(AtomicUsize::new(0));
         let completion_calls = Arc::new(AtomicUsize::new(0));
@@ -1274,7 +1279,7 @@ mod tests {
         let observed_factory_calls = Arc::clone(&factory_calls);
         let observed_completion_calls = Arc::clone(&completion_calls);
         let captured_heads = Arc::clone(&observed_heads);
-        app.set_detached_response_egress_completion_factory(move |head| {
+        app.set_detached_response_egress_decision_factory(move |head| {
             observed_factory_calls.fetch_add(1, Ordering::SeqCst);
             captured_heads.lock().expect("heads lock").push((
                 head.request_method().clone(),
@@ -1283,17 +1288,19 @@ mod tests {
                 head.error_kind(),
             ));
             let terminal_calls = Arc::clone(&observed_completion_calls);
-            ResponseEgressCompletion::new(move |_report| {
+            DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(move |_report| {
                 terminal_calls.fetch_add(1, Ordering::SeqCst);
-            })
+            }))
         });
         let request_start = MonotonicInstant::now();
 
-        let egress = app.detached_ingress_error_egress(
+        let IngressDispatchOutcome::Response(egress) = app.detached_ingress_error_egress(
             EdgeError::uri_too_long("request target exceeded configured limit"),
             Method::POST,
             request_start,
-        );
+        ) else {
+            panic!("expected detached response");
+        };
 
         assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
         assert_eq!(completion_calls.load(Ordering::SeqCst), 0);
@@ -1322,23 +1329,61 @@ mod tests {
         let mut app = App::new(RouterService::builder().build());
         let observed_resource_drops = Arc::clone(&resource_drops);
         let observed_completion_calls = Arc::clone(&completion_calls);
-        app.set_detached_response_egress_completion_factory(move |_head| {
+        app.set_detached_response_egress_decision_factory(move |_head| {
             let resource = GrantDropProbe(Arc::clone(&observed_resource_drops));
             let terminal_calls = Arc::clone(&observed_completion_calls);
-            ResponseEgressCompletion::new(move |_report| {
+            DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(move |_report| {
                 let _resource = resource;
                 terminal_calls.fetch_add(1, Ordering::SeqCst);
-            })
+            }))
         });
 
-        drop(app.detached_ingress_error_egress(
+        let IngressDispatchOutcome::Response(egress) = app.detached_ingress_error_egress(
             EdgeError::bad_request("invalid request head"),
             Method::GET,
             MonotonicInstant::now(),
-        ));
+        ) else {
+            panic!("expected detached response");
+        };
+        drop(egress);
 
         assert_eq!(completion_calls.load(Ordering::SeqCst), 0);
         assert_eq!(resource_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn detached_ingress_error_abort_returns_non_response_outcome() {
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let observed_factory_calls = Arc::clone(&factory_calls);
+        let mut app = App::new(RouterService::builder().build());
+        app.set_detached_response_egress_decision_factory(move |_head| {
+            observed_factory_calls.fetch_add(1, Ordering::SeqCst);
+            DetachedResponseEgressDecision::Abort
+        });
+
+        let outcome = app.detached_ingress_error_egress(
+            EdgeError::bad_request("invalid request head"),
+            Method::GET,
+            MonotonicInstant::now(),
+        );
+
+        assert!(matches!(outcome, IngressDispatchOutcome::Aborted));
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn detached_ingress_error_defaults_to_empty_completion_response() {
+        let app = App::new(RouterService::builder().build());
+
+        let IngressDispatchOutcome::Response(egress) = app.detached_ingress_error_egress(
+            EdgeError::bad_request("invalid request head"),
+            Method::GET,
+            MonotonicInstant::now(),
+        ) else {
+            panic!("default detached decision must send a response");
+        };
+
+        assert_eq!(complete_envelope(*egress).status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

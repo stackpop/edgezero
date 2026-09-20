@@ -384,10 +384,12 @@ surviving installer and releases an installed permit without fabricating a termi
 
 Normalized request-head rejections happen before admission; admission-policy errors can also fail
 before an admission decision transfers its completion. Configure
-`App::set_detached_response_egress_completion_factory` when those responses also need an
-application-owned completion resource. Raw parser failures that occur before EdgeZero receives a
-request, and platform-to-core head-conversion failures that occur before a normalized head exists,
-remain outside this hook.
+`App::set_detached_response_egress_decision_factory` to return
+`DetachedResponseEgressDecision::Send(completion)` when those responses need an application-owned
+completion resource, or `DetachedResponseEgressDecision::Abort` when no bounded response resource
+is available. `Abort` creates no response or egress attempt. Raw parser failures that occur before
+EdgeZero receives a request, and platform-to-core head-conversion failures that occur before a
+normalized head exists, remain outside this hook.
 
 ## Response Types
 
