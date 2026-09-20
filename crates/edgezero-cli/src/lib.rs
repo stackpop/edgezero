@@ -184,7 +184,7 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     // when provided, ahead of any operator passthrough args. Fastly
     // consumes it; adapters that don't need a service id ignore it.
     let action = if args.staging {
-        adapter::Action::DeployStaged
+        adapter::Action::DeployStaging
     } else {
         adapter::Action::Deploy
     };

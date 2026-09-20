@@ -4,7 +4,7 @@
 > **Branch:** `docs/outbound-http-spec` · **Audience:** EdgeZero maintainers
 > **Driving pattern:** fan-out HTTP workloads — N outbound requests under a shared wall-clock deadline, terminal results observed in completion order while preserving input indices. The spec is written against this pattern as a portable substrate; it deliberately does not name a specific consumer.
 > **Historical target baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **now merged into `main`** (squash-merged as `e483723`). Relevant baseline changes were the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, expanded runtime `AdapterAction` variants, the then-current Spin SDK 6 / wasip2 integration, the contributor-only `demo` command replacing `dev`, and the app-demo integration crate. The current implementation pins Spin SDK 7.0.0. Non-outbound store/config lifecycle changes remain outside this design.
-> **Current checkout (post-#269 and staged-deploy work):** the CLI surface includes `Command::{Build, Serve, Deploy, Auth, Provision, Config, Demo, New}`; `Action` / `AdapterAction` additionally include `DeployStaged`, `EmitVersion`, `Healthcheck`, and `Rollback`; and adapter dispatch has both `execute(..)` and `execute_capture(..)` entry points. `dev` is gone. This outbound spec gates construction/deployment of the current runtime: `build` / `serve` / `deploy` / `deploy --staging` through both dispatch entry points, plus `demo` before Axum starts. Operational auth/version/health/rollback actions and provisioning/config/store lifecycle policy are exempt or belong to their owning specifications (§3.5.3).
+> **Current checkout (post-#269 and staging-deploy work):** the CLI surface includes `Command::{Build, Serve, Deploy, Auth, Provision, Config, Demo, New}`; `Action` / `AdapterAction` additionally include `DeployStaging`, `EmitVersion`, `Healthcheck`, and `Rollback`; and adapter dispatch has both `execute(..)` and `execute_capture(..)` entry points. `dev` is gone. This outbound spec gates construction/deployment of the current runtime: `build` / `serve` / `deploy` / `deploy --staging` through both dispatch entry points, plus `demo` before Axum starts. Operational auth/version/health/rollback actions and provisioning/config/store lifecycle policy are exempt or belong to their owning specifications (§3.5.3).
 > **Where rebase claims live (authoritative surfaces):** §3.5.3 build-enforcement, §3.5.2 `Adapter` trait shape, §5.4 capability tests, and the §7 `edgezero-cli` migration bullet. The §3.5.3 + §7 active text is authoritative.
 
 ## 1. Overview
@@ -3763,7 +3763,7 @@ cross-capability gate.
 // action must be deliberately classified here; it must not inherit an accidental default.
 fn produces_current_runtime(action: Action) -> bool {
     match action {
-        Action::Build | Action::Deploy | Action::DeployStaged | Action::Serve => true,
+        Action::Build | Action::Deploy | Action::DeployStaging | Action::Serve => true,
         Action::AuthLogin
         | Action::AuthLogout
         | Action::AuthStatus
@@ -3878,7 +3878,7 @@ Commands covered by the outbound gate sites above:
 | `edgezero build` | `run_build` resolves `Action::Build` → `execute_runtime(runtime, ..)` | `execute_runtime(..)` — **gated** |
 | `edgezero serve` | `run_serve` resolves `Action::Serve` → `execute_runtime(runtime, ..)` | `execute_runtime(..)` — **gated** |
 | `edgezero deploy` | `run_deploy` resolves `Action::Deploy` → `execute_runtime(runtime, ..)` or, for captured Fastly output, `execute_capture_runtime(runtime, ..)` | whichever outbound-scoped dispatcher is selected — **gated before its shell branch** |
-| `edgezero deploy --staging` | `run_deploy` resolves `Action::DeployStaged` → `execute_runtime(runtime, ..)` | `execute_runtime(..)` — **gated** |
+| `edgezero deploy --staging` | `run_deploy` resolves `Action::DeployStaging` → `execute_runtime(runtime, ..)` | `execute_runtime(..)` — **gated** |
 | `edgezero auth login` / `logout` / `status` | existing `run_auth` → existing `execute(adapter, action, manifest, ..)` | **EXEMPT** (credential + read-only class); no paired resolver migration |
 | version emission / healthcheck / rollback | existing operational call sites → existing dispatcher | **EXEMPT** — no paired resolver or manifest requirement |
 | `edgezero demo` (feature `demo-example`) | `run_demo` → Axum runner. `run_demo()` takes **no path or loader** and reads no manifest file, so a file-based gate is impossible. **Locked resolution — gate on baked manifest metadata via a new `Hooks` accessor** (see below) | `run_demo()` calls `ensure_capabilities("axum", <App as Hooks>::manifest().as_contract())` before the Axum runner starts |
@@ -4335,7 +4335,7 @@ target/manifest types expose read-only getters for their listed fields. No `Reso
 constructor or mutator is exposed outside the resolver.
 
 `ResolvedRuntime` exists only for the outbound-gated runtime-producing actions `Build`,
-`Serve`, `Deploy`, and `DeployStaged`. Its `ResolvedAdapterTarget` is action-specific and
+`Serve`, `Deploy`, and `DeployStaging`. Its `ResolvedAdapterTarget` is action-specific and
 complete: the shell variant owns every input the current shell dispatcher derives from a
 manifest; the registered variant pins its app root and optional platform
 manifest/component. `AdapterExecutionTarget::app_root` and `ResolvedShellTarget::root` are
@@ -6845,7 +6845,7 @@ Adapter-specific work:
   directory, resolve one target/contract pair, and pass the resulting `ResolvedRuntime` to
   `src/adapter.rs::execute_runtime` or `execute_capture_runtime`. A shared private action gate runs exactly
   once at the start of both outbound-scoped dispatch functions and gates `Build` / `Serve` /
-  `Deploy` / `DeployStaged` before either function's shell-command branch or registry
+  `Deploy` / `DeployStaging` before either function's shell-command branch or registry
   lookup. It executes the pinned target without rediscovery or reparsing. Auth,
   `EmitVersion`, `Healthcheck`, and `Rollback` keep the existing dispatcher and resolution
   behavior; they do not construct `ResolvedRuntime`.

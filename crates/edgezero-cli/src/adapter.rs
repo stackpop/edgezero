@@ -23,7 +23,7 @@ pub enum Action {
     Build,
     Deploy,
     /// Fastly staging lifecycle: stage a draft version.
-    DeployStaged,
+    DeployStaging,
     /// Fastly staging lifecycle: emit the active version.
     EmitVersion,
     /// Fastly staging lifecycle: probe health.
@@ -43,7 +43,7 @@ impl fmt::Display for Action {
             Action::Build => "build",
             Action::Deploy => "deploy",
             Action::Serve => "serve",
-            Action::DeployStaged => "deploy --staging",
+            Action::DeployStaging => "deploy --staging",
             Action::EmitVersion => "deploy (version)",
             Action::Healthcheck => "healthcheck",
             Action::Rollback => "rollback",
@@ -62,7 +62,7 @@ impl From<Action> for AdapterAction {
             Action::Build => AdapterAction::Build,
             Action::Deploy => AdapterAction::Deploy,
             Action::Serve => AdapterAction::Serve,
-            Action::DeployStaged => AdapterAction::DeployStaged,
+            Action::DeployStaging => AdapterAction::DeployStaging,
             Action::EmitVersion => AdapterAction::EmitVersion,
             Action::Healthcheck => AdapterAction::Healthcheck,
             Action::Rollback => AdapterAction::Rollback,
@@ -394,7 +394,7 @@ pub(crate) fn ensure_capabilities(
 
 fn produces_current_runtime(action: Action) -> bool {
     match action {
-        Action::Build | Action::Deploy | Action::DeployStaged | Action::Serve => true,
+        Action::Build | Action::Deploy | Action::DeployStaging | Action::Serve => true,
         Action::AuthLogin
         | Action::AuthLogout
         | Action::AuthStatus
@@ -422,7 +422,9 @@ fn manifest_command<'manifest>(
         // adapter's built-in Fastly logic directly. Returning None
         // routes `adapter::execute` past the manifest-command path to
         // the registered adapter's `execute`.
-        Action::DeployStaged | Action::EmitVersion | Action::Healthcheck | Action::Rollback => None,
+        Action::DeployStaging | Action::EmitVersion | Action::Healthcheck | Action::Rollback => {
+            None
+        }
     }
 }
 
@@ -902,7 +904,7 @@ mod tests {
             Action::Build,
             Action::Serve,
             Action::Deploy,
-            Action::DeployStaged,
+            Action::DeployStaging,
         ] {
             let runtime = resolve_runtime_from(
                 "spin",

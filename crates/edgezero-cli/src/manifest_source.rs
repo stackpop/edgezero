@@ -181,7 +181,7 @@ fn command_for(manifest: &Manifest, adapter: &str, action: Action) -> Option<Str
         Action::Build => config.commands.build.clone(),
         Action::Deploy => config.commands.deploy.clone(),
         Action::Serve => config.commands.serve.clone(),
-        Action::DeployStaged
+        Action::DeployStaging
         | Action::AuthLogin
         | Action::AuthLogout
         | Action::AuthStatus
@@ -308,7 +308,7 @@ fn platform_manifest_name(adapter: &str) -> &'static str {
 
 fn produces_current_runtime(action: Action) -> bool {
     match action {
-        Action::Build | Action::Deploy | Action::DeployStaged | Action::Serve => true,
+        Action::Build | Action::Deploy | Action::DeployStaging | Action::Serve => true,
         Action::AuthLogin
         | Action::AuthLogout
         | Action::AuthStatus
