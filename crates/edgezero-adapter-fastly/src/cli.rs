@@ -184,7 +184,7 @@ const COMPUTE_UPDATE_VALUE_FLAGS: &[&str] = &[
 /// `--autoclone` plus the Fastly CLI globals. NOTE the absence of
 /// `--comment` -- `compute update` does NOT support it (unlike
 /// `compute deploy`), which is why an operator `--comment` is routed to
-/// `service-version update` instead (see `deploy_staged`).
+/// `service-version update` instead (see `deploy_staging`).
 const COMPUTE_UPDATE_BOOL_FLAGS: &[&str] = &[
     "--autoclone",
     "--accept-defaults",
@@ -209,8 +209,8 @@ const FUTURE_FORMAT_READ_ERROR: &str = "the remote value uses a config format th
 struct FastlyCliAdapter;
 
 /// An operator passthrough arg list split for a staged deploy (see
-/// `split_staged_passthrough`).
-struct StagedPassthrough {
+/// `split_staging_passthrough`).
+struct StagingPassthrough {
     /// The `--comment` value, applied to the version separately via
     /// `fastly service-version update --comment` (`compute update` has
     /// no `--comment` flag).
@@ -411,7 +411,7 @@ impl Adapter for FastlyCliAdapter {
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),
             // Fastly staging lifecycle.
-            AdapterAction::DeployStaged => deploy_staged(args),
+            AdapterAction::DeployStaging => deploy_staging(args),
             AdapterAction::EmitVersion => emit_active_version(args),
             AdapterAction::Healthcheck => healthcheck(args),
             AdapterAction::Rollback => rollback(args),
@@ -4385,8 +4385,8 @@ fn split_inline_value(arg: &str) -> (&str, Option<&str>) {
 /// `compute update` one), and drop the rest.
 ///
 /// Both `--comment value` and `--comment=value` are recognised.
-fn split_staged_passthrough(args: &[String]) -> StagedPassthrough {
-    let mut split = StagedPassthrough {
+fn split_staging_passthrough(args: &[String]) -> StagingPassthrough {
+    let mut split = StagingPassthrough {
         forwarded: Vec::with_capacity(args.len()),
         comment: None,
         dropped: Vec::new(),
@@ -5011,7 +5011,7 @@ fn fastly_api_put(path: &str, token: &str) -> Result<u16, String> {
 }
 
 /// Resolve the directory containing the Fastly manifest for a deploy
-/// (production [`deploy`] or [`deploy_staged`]).
+/// (production [`deploy`] or [`deploy_staging`]).
 ///
 /// The CLI (`edgezero_cli::run_deploy`) resolves the `edgezero.toml`
 /// manifest — honouring `EDGEZERO_MANIFEST` — and threads the
@@ -5042,7 +5042,7 @@ fn resolve_manifest_dir(args: &[String]) -> Result<PathBuf, String> {
 /// `deploy --adapter fastly --service-id <id> --staging`:
 /// build, upload to a new draft version (no activation), stage it, and
 /// emit `version=<N>`.
-fn deploy_staged(args: &[String]) -> Result<(), String> {
+fn deploy_staging(args: &[String]) -> Result<(), String> {
     let service_id = resolve_service_id(args)?;
     validate_service_id(&service_id)?;
     // The Fastly CLI reads FASTLY_API_TOKEN from the env; fail fast
@@ -5079,7 +5079,7 @@ fn deploy_staged(args: &[String]) -> Result<(), String> {
         &args_without_flag_value(&deploy_args, "--service-id"),
         "--manifest-path",
     );
-    let passthrough = split_staged_passthrough(&extra);
+    let passthrough = split_staging_passthrough(&extra);
     if !passthrough.dropped.is_empty() {
         log::warn!(
             "[edgezero] ignoring deploy args not supported by `fastly compute update`: {}",
@@ -5664,13 +5664,13 @@ mod tests {
     }
 
     #[test]
-    fn split_staged_passthrough_lifts_comment_out_of_compute_update() {
+    fn split_staging_passthrough_lifts_comment_out_of_compute_update() {
         // `fastly compute update` has NO `--comment` flag (verified against
         // `fastly compute update --help`, CLI v15) — forwarding it makes the
         // command exit non-zero and fails the whole staged deploy. It must be
         // lifted out and applied via `service-version update` instead.
         for args in [owned(&["--comment", "ci run 12"]), owned(&["--comment=x"])] {
-            let split = split_staged_passthrough(&args);
+            let split = split_staging_passthrough(&args);
             assert!(
                 !split
                     .forwarded
@@ -5685,17 +5685,17 @@ mod tests {
             );
         }
         assert_eq!(
-            split_staged_passthrough(&owned(&["--comment", "ci run 12"])).comment,
+            split_staging_passthrough(&owned(&["--comment", "ci run 12"])).comment,
             Some("ci run 12".to_owned())
         );
         assert_eq!(
-            split_staged_passthrough(&owned(&["--comment=x"])).comment,
+            split_staging_passthrough(&owned(&["--comment=x"])).comment,
             Some("x".to_owned())
         );
     }
 
     #[test]
-    fn split_staged_passthrough_forwards_supported_flags_only() {
+    fn split_staging_passthrough_forwards_supported_flags_only() {
         let args = owned(&[
             "--package",
             "pkg.tar.gz",
@@ -5707,7 +5707,7 @@ mod tests {
             "stage",
             "--status-check-off",
         ]);
-        let split = split_staged_passthrough(&args);
+        let split = split_staging_passthrough(&args);
         // Supported by `compute update`: kept (value flags keep their value).
         assert_eq!(
             split.forwarded,
@@ -6010,7 +6010,7 @@ mod tests {
     fn parse_fastly_version_rejects_confusable_lines() {
         // The old parser took ANY digits after the word "version", so each
         // of these silently produced a WRONG service version. They must now
-        // all be `None`, which makes `deploy_staged` fail closed.
+        // all be `None`, which makes `deploy_staging` fail closed.
         assert_eq!(
             parse_fastly_version("Uploaded package to service 12345, version unchanged"),
             None
@@ -9708,7 +9708,7 @@ echo 'unexpected' >&2; exit 1
         let dir = tempdir().expect("tempdir");
         let record = dir.path().join("argv.log");
         let script_path = dir.path().join("fastly");
-        // Answers every call `deploy_staged` makes. The staging relink needs the
+        // Answers every call `deploy_staging` makes. The staging relink needs the
         // selector store to resolve and the inherited link to be listed; without
         // these the staged path fails closed (which is correct, but not what
         // these tests are exercising).
@@ -9739,18 +9739,18 @@ echo 'unexpected' >&2; exit 1
         (dir, record)
     }
 
-    /// Run `deploy_staged` against a fake `fastly`, returning the result
+    /// Run `deploy_staging` against a fake `fastly`, returning the result
     /// and the recorded argv lines.
     #[cfg(unix)]
-    fn run_deploy_staged_with_fake(
+    fn run_deploy_staging_with_fake(
         update_stdout: &str,
         extra: &[&str],
     ) -> (Result<(), String>, Vec<String>) {
-        run_deploy_staged_with_fake_and_env(update_stdout, extra, None)
+        run_deploy_staging_with_fake_and_env(update_stdout, extra, None)
     }
 
     #[cfg(unix)]
-    fn run_deploy_staged_with_fake_and_env(
+    fn run_deploy_staging_with_fake_and_env(
         update_stdout: &str,
         extra: &[&str],
         store_name_override: Option<(&str, &str)>,
@@ -9774,7 +9774,7 @@ echo 'unexpected' >&2; exit 1
             manifest.display().to_string(),
         ];
         args.extend(extra.iter().map(|arg| (*arg).to_owned()));
-        let result = deploy_staged(&args);
+        let result = deploy_staging(&args);
 
         let recorded = fs::read_to_string(&record).unwrap_or_default();
         let lines = recorded.lines().map(str::to_owned).collect();
@@ -9783,13 +9783,13 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn deploy_staged_routes_comment_to_service_version_update() {
+    fn deploy_staging_routes_comment_to_service_version_update() {
         // `--comment` is allowlisted for `deploy-args` and recommended by the
         // adoption guide, but `fastly compute update` has no such flag. It
         // must NOT be forwarded there (that would fail the deploy) and must
         // instead land on the version via `service-version update`.
         for comment_args in [vec!["--comment", "ci run 12"], vec!["--comment=ci run 12"]] {
-            let (result, argv) = run_deploy_staged_with_fake(
+            let (result, argv) = run_deploy_staging_with_fake(
                 "SUCCESS: Updated package (service SVC1, version 7)",
                 &comment_args,
             );
@@ -11246,8 +11246,8 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn deploy_staged_ignores_ambient_store_name_overrides() {
-        let (result, argv) = run_deploy_staged_with_fake_and_env(
+    fn deploy_staging_ignores_ambient_store_name_overrides() {
+        let (result, argv) = run_deploy_staging_with_fake_and_env(
             "SUCCESS: Updated package (service SVC1, version 7)",
             &["--edgezero-staging-config=app_config"],
             Some((
@@ -11268,13 +11268,13 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn deploy_staged_points_the_draft_at_the_staging_selector_store() {
+    fn deploy_staging_points_the_draft_at_the_staging_selector_store() {
         // The defect this closes: a clone inherits the active version's links,
         // so without a relink the staged version opens production's selector
         // store and reads PRODUCTION config -- `config push --staging` would
         // write a key nothing ever reads. The CLI threads the declared config
         // store as `--edgezero-staging-config=<logical>`.
-        let (result, argv) = run_deploy_staged_with_fake(
+        let (result, argv) = run_deploy_staging_with_fake(
             "SUCCESS: Updated package (service SVC1, version 7)",
             &["--edgezero-staging-config=app_config"],
         );
@@ -11341,7 +11341,7 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn deploy_staged_works_for_an_app_that_selects_no_config() {
+    fn deploy_staging_works_for_an_app_that_selects_no_config() {
         use std::os::unix::fs::PermissionsExt as _;
 
         // An app declaring no config stores threads no
@@ -11366,7 +11366,7 @@ echo 'unexpected' >&2; exit 1
         fs::write(app.path().join("fastly.toml"), "name = \"app\"\n").expect("write fastly.toml");
         let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
 
-        deploy_staged(&[
+        deploy_staging(&[
             "--service-id".to_owned(),
             "SVC1".to_owned(),
             "--manifest-path".to_owned(),
@@ -11377,7 +11377,7 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn deploy_staged_auto_creates_the_staging_twin_when_absent() {
+    fn deploy_staging_auto_creates_the_staging_twin_when_absent() {
         use std::os::unix::fs::PermissionsExt as _;
 
         // A staged deploy owns the twin end to end: if the account has no
@@ -11424,7 +11424,7 @@ echo 'unexpected' >&2; exit 1
         fs::write(app.path().join("fastly.toml"), "name = \"app\"\n").expect("write fastly.toml");
         let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
 
-        deploy_staged(&[
+        deploy_staging(&[
             "--service-id".to_owned(),
             "SVC1".to_owned(),
             "--manifest-path".to_owned(),
@@ -11443,7 +11443,7 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn deploy_staged_isolates_when_config_declared_but_prod_store_absent() {
+    fn deploy_staging_isolates_when_config_declared_but_prod_store_absent() {
         use std::os::unix::fs::PermissionsExt as _;
 
         // The app DECLARES config but has no `edgezero_runtime_env` store (never
@@ -11492,7 +11492,7 @@ echo 'unexpected' >&2; exit 1
         fs::write(app.path().join("fastly.toml"), "name = \"app\"\n").expect("write fastly.toml");
         let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
 
-        deploy_staged(&[
+        deploy_staging(&[
             "--service-id".to_owned(),
             "SVC1".to_owned(),
             "--manifest-path".to_owned(),
@@ -11518,7 +11518,7 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn deploy_staged_fails_closed_when_config_store_list_is_unreadable() {
+    fn deploy_staging_fails_closed_when_config_store_list_is_unreadable() {
         use std::os::unix::fs::PermissionsExt as _;
 
         // If the store listing can't be parsed (a CLI schema change), we cannot
@@ -11541,7 +11541,7 @@ echo 'unexpected' >&2; exit 1
         fs::write(app.path().join("fastly.toml"), "name = \"app\"\n").expect("write fastly.toml");
         let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
 
-        let err = deploy_staged(&[
+        let err = deploy_staging(&[
             "--service-id".to_owned(),
             "SVC1".to_owned(),
             "--manifest-path".to_owned(),
@@ -11557,9 +11557,9 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn deploy_staged_without_comment_makes_no_version_comment_call() {
+    fn deploy_staging_without_comment_makes_no_version_comment_call() {
         let (result, argv) =
-            run_deploy_staged_with_fake("SUCCESS: Updated package (service SVC1, version 7)", &[]);
+            run_deploy_staging_with_fake("SUCCESS: Updated package (service SVC1, version 7)", &[]);
         result.expect("staged deploy must succeed");
         assert!(
             !argv
@@ -11571,11 +11571,11 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn deploy_staged_fails_closed_when_version_is_unparseable() {
+    fn deploy_staging_fails_closed_when_version_is_unparseable() {
         // The old code fell back to the service's HIGHEST version here, which
         // could silently adopt a version created by a CONCURRENT deploy. We
         // must error out instead of guessing.
-        let (result, argv) = run_deploy_staged_with_fake("uploaded, but nothing parseable", &[]);
+        let (result, argv) = run_deploy_staging_with_fake("uploaded, but nothing parseable", &[]);
         let err = result.expect_err("unparseable version must fail closed");
         assert!(
             err.contains("could not determine the staged version"),
@@ -11591,11 +11591,11 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn deploy_staged_does_not_duplicate_non_interactive_from_passthrough() {
+    fn deploy_staging_does_not_duplicate_non_interactive_from_passthrough() {
         // `--non-interactive` is an allowlisted `compute update` flag, so a
         // caller-supplied one is FORWARDED. We must not then append our own:
         // passing the switch twice makes the Fastly CLI exit non-zero.
-        let (result, argv) = run_deploy_staged_with_fake(
+        let (result, argv) = run_deploy_staging_with_fake(
             "SUCCESS: Updated package (service SVC1, version 7)",
             &["--non-interactive"],
         );
