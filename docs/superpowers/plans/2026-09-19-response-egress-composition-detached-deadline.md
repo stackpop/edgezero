@@ -280,7 +280,7 @@
 
   Expected: PASS.
 
-- [ ] **Step 3: Run runner-backed WASM tests**
+- [x] **Step 3: Run runner-backed WASM tests**
 
   With the pinned runners installed, run:
 
@@ -320,7 +320,7 @@
 
   Verify no tuple `Send` constructor, compatibility shim, legacy public staging identifier, application-specific terminology, unrelated refactor, or unbounded detached response remains.
 
-- [ ] **Step 6: Commit and push**
+- [x] **Step 6: Commit and push**
 
   Commit with an application-neutral message, push to the existing PR #275 branch, and wait for the hosted check matrix on the exact pushed head.
 
