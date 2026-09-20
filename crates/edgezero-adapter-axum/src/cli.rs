@@ -178,7 +178,7 @@ impl Adapter for AxumCliAdapter {
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),
             // The Fastly staging lifecycle is Fastly-only.
-            AdapterAction::DeployStaged
+            AdapterAction::DeployStaging
             | AdapterAction::EmitVersion
             | AdapterAction::Healthcheck
             | AdapterAction::Rollback => Err(format!(
@@ -201,7 +201,7 @@ impl Adapter for AxumCliAdapter {
             AdapterAction::AuthLogin
             | AdapterAction::AuthLogout
             | AdapterAction::AuthStatus
-            | AdapterAction::DeployStaged
+            | AdapterAction::DeployStaging
             | AdapterAction::EmitVersion
             | AdapterAction::Healthcheck
             | AdapterAction::Rollback
