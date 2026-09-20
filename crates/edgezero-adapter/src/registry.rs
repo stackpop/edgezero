@@ -304,7 +304,7 @@ pub enum ReadConfigEntry {
     /// or pushed under a different key).
     MissingKey,
     /// The store itself is absent — wrangler.toml has no matching binding,
-    /// fastly.toml has no setup table, axum's local-config-<id>.json file
+    /// fastly.toml has no setup table, axum's `local-config-<id>.json` file
     /// doesn't exist yet.
     MissingStore,
     /// The remote held the key; the body is the serialised envelope JSON.

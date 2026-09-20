@@ -17,16 +17,22 @@
 //! backing has no such restriction.
 
 use std::future::Future;
+#[cfg(test)]
+use std::future::{pending, ready};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use edgezero_core::config_store::{BoundedStoreRead, ConfigStore, ConfigStoreError};
+use edgezero_core::config_store::{
+    BoundedStoreRead, ConfigStore, ConfigStoreError, finish_bounded_config_read,
+};
 use edgezero_core::time::{Deadline, MonotonicClock};
+use futures_util::future::{Either, select};
 #[cfg(test)]
 use std::collections::HashMap;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-use worker::Env;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use worker::kv::KvStore as WorkerKvStore;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+use worker::{Delay, Env};
 
 /// Config store backed by a Cloudflare KV namespace.
 ///
@@ -104,8 +110,8 @@ impl ConfigStore for CloudflareConfigStore {
     }
 }
 
-// Workers KV returns a complete string, so these bounds are cooperative and
-// apply immediately after host materialization rather than during allocation.
+// Workers KV returns a complete string, so the byte bounds apply after host
+// materialization. The timer race bounds guest return but does not prove host cancellation.
 async fn bounded_config_read<F>(
     read: F,
     clock: &MonotonicClock,
@@ -116,35 +122,76 @@ async fn bounded_config_read<F>(
 where
     F: Future<Output = Result<Option<String>, ConfigStoreError>>,
 {
-    if deadline.is_expired_at(clock.now()) {
-        return Err(ConfigStoreError::DeadlineExceeded);
+    #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+    {
+        return bounded_config_read_with_timer(
+            read,
+            clock,
+            deadline,
+            max_backend_bytes,
+            max_value_bytes,
+            Delay::from,
+        )
+        .await;
     }
-
-    let result = read.await;
-    if deadline.is_expired_at(clock.now()) {
-        drop(result);
-        return Err(ConfigStoreError::DeadlineExceeded);
+    #[cfg(not(all(feature = "cloudflare", target_arch = "wasm32")))]
+    {
+        bounded_config_read_with_timer(
+            read,
+            clock,
+            deadline,
+            max_backend_bytes,
+            max_value_bytes,
+            |_| pending(),
+        )
+        .await
     }
-    let value = result?;
+}
 
-    let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
-        u64::try_from(stored_value.len()).map_err(|_length_error| ConfigStoreError::ValueTooLarge)
-    })?;
-    if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
-        drop(value);
-        return Err(ConfigStoreError::ValueTooLarge);
+async fn bounded_config_read_with_timer<F, MakeTimer, Timer>(
+    read: F,
+    clock: &MonotonicClock,
+    deadline: Deadline,
+    max_backend_bytes: u64,
+    max_value_bytes: u64,
+    mut make_timer: MakeTimer,
+) -> Result<BoundedStoreRead<String>, ConfigStoreError>
+where
+    F: Future<Output = Result<Option<String>, ConfigStoreError>>,
+    MakeTimer: FnMut(Duration) -> Timer,
+    Timer: Future<Output = ()>,
+{
+    futures_util::pin_mut!(read);
+    loop {
+        let Some(remaining) = deadline.remaining_at(clock.now()) else {
+            return Err(ConfigStoreError::DeadlineExceeded);
+        };
+        let timer = make_timer(remaining);
+        futures_util::pin_mut!(timer);
+        match select(timer, read.as_mut()).await {
+            Either::Left(((), _read)) => {
+                if deadline.is_expired_at(clock.now()) {
+                    return Err(ConfigStoreError::DeadlineExceeded);
+                }
+            }
+            Either::Right((result, _timer)) => {
+                return finish_bounded_config_read(
+                    result,
+                    clock,
+                    deadline,
+                    max_backend_bytes,
+                    max_value_bytes,
+                );
+            }
+        }
     }
-
-    Ok(BoundedStoreRead {
-        backend_bytes,
-        value,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -157,6 +204,97 @@ mod tests {
             ("contract.key.b".to_owned(), "value_b".to_owned()),
         ])
     });
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn clock_reaching_deadline() -> (MonotonicClock, Deadline) {
+        let start = edgezero_core::MonotonicInstant::now();
+        let terminal = start
+            .checked_add(Duration::from_secs(1))
+            .expect("terminal instant");
+        let samples = Arc::new(AtomicUsize::new(0));
+        let observed_samples = Arc::clone(&samples);
+        let clock = MonotonicClock::new(move || {
+            if observed_samples.fetch_add(1, Ordering::SeqCst) == 0 {
+                start
+            } else {
+                terminal
+            }
+        });
+        (clock, Deadline::at_instant(terminal))
+    }
+
+    #[test]
+    fn bounded_read_timer_drops_never_ready_provider() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guard = DropProbe(Arc::clone(&drops));
+        let read = async move {
+            let _guard = guard;
+            pending::<Result<Option<String>, ConfigStoreError>>().await
+        };
+        let (clock, deadline) = clock_reaching_deadline();
+
+        let error = block_on(bounded_config_read_with_timer(
+            read,
+            &clock,
+            deadline,
+            1,
+            1,
+            |_| ready(()),
+        ))
+        .expect_err("timer must terminate a pending config read");
+
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn bounded_read_rearms_after_an_early_timer_wake() {
+        let timer_calls = Arc::new(AtomicUsize::new(0));
+        let observed_timer_calls = Arc::clone(&timer_calls);
+        let clock = MonotonicClock::default();
+        let error = block_on(bounded_config_read_with_timer(
+            ready(Err(ConfigStoreError::unavailable("provider error"))),
+            &clock,
+            Deadline::after(Duration::from_secs(1)),
+            1,
+            1,
+            move |_| {
+                let early_wake = observed_timer_calls.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if !early_wake {
+                        pending::<()>().await;
+                    }
+                }
+            },
+        ))
+        .expect_err("provider error must win after an early timer wake");
+
+        assert!(matches!(error, ConfigStoreError::Unavailable { .. }));
+        assert_eq!(timer_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn bounded_read_timer_wins_simultaneous_ready_error_at_deadline() {
+        let (clock, deadline) = clock_reaching_deadline();
+        let error = block_on(bounded_config_read_with_timer(
+            ready(Err(ConfigStoreError::unavailable("provider error"))),
+            &clock,
+            deadline,
+            1,
+            1,
+            |_| ready(()),
+        ))
+        .expect_err("timer readiness at the deadline must win equality");
+
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+    }
 
     #[test]
     fn bounded_read_reports_exact_bytes_and_accepts_exact_caps() {

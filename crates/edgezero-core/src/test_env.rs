@@ -16,7 +16,8 @@
 //! The guards below are RAII: they capture the prior value on construction and
 //! restore it on drop, so a panicking test cannot leak state into the next one.
 //! That alone does not make concurrent mutation sound — callers must also
-//! serialise env-mutating tests on a process-wide mutex ([`env_lock`], or the
+//! serialise env-mutating tests on a process-wide mutex
+//! ([`crate::test_env::env_lock()`], or the
 //! calling crate's own equivalent) and hold it for the guard's whole lifetime.
 //! The `unsafe` here is sound only under that discipline, which is why this
 //! module is test-only and never compiled into a production build.
@@ -36,7 +37,8 @@ use std::sync::{Mutex, OnceLock};
 /// and restores the prior value — or removes the variable if it was previously
 /// unset — on drop.
 ///
-/// Construct it while holding [`env_lock`] (or the calling crate's equivalent);
+/// Construct it while holding [`crate::test_env::env_lock()`] (or the calling
+/// crate's equivalent);
 /// see the module docs for the full safety contract.
 pub struct EnvOverride {
     key: OsString,

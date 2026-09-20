@@ -4533,7 +4533,7 @@ useful field-path hint. Without it, every schema-mismatch
 response says "missing field" with no anchor — operators have
 to grep the typed struct manually.
 
-### 6.3.2 Bounded, cancellable extraction reads
+### 6.3.2 Bounded, capability-scoped extraction reads
 
 Typed app-config extraction never calls the unbounded convenience methods
 `ConfigStoreHandle::get` or `SecretHandle::get_bytes`. It uses bounded variants under one
@@ -4562,6 +4562,7 @@ pub struct BoundedStoreRead<T> {
 
 #[async_trait(?Send)]
 pub trait ConfigStore: Send + Sync {
+    // Required: there is no cooperative default that can hide a never-ready provider future.
     async fn get_bounded(
         &self,
         key: &str,
@@ -4577,6 +4578,7 @@ pub trait ConfigStore: Send + Sync {
 
 #[async_trait(?Send)]
 pub trait SecretStore: Send + Sync {
+    // Required for the same reason as ConfigStore::get_bounded.
     async fn get_bytes_bounded(
         &self,
         store_name: &str,
@@ -4657,9 +4659,15 @@ entering a host read and after the host read becomes ready. The post-ready clock
 before applying `?` or otherwise propagating the provider result, so equality expiry wins a
 simultaneously ready success or provider error. Fastly uses the same clock for the root read,
 each pointer chunk, and every synchronous secret-store open/lookup/plaintext operation. Equality
-is expired. Promotion from `BestEffort` to `Native` additionally requires racing each pending
-provider read against the remaining budget and proving that expiry cancels or aborts the native
-operation within a finite bound; no current adapter claims that proof.
+is expired. Cloudflare KV and Spin KV/variable reads additionally race the guest-visible provider
+future against a runtime-native timer for the remaining absolute budget. Because a runtime timer
+may wake early or round its duration, EdgeZero resamples the injected clock when the timer resolves
+and re-arms it for the new remaining duration unless the absolute deadline is expired. At equality,
+timer readiness wins a simultaneously ready provider result, and the losing guest future is
+dropped. This bounds when EdgeZero returns `DeadlineExceeded`, but it does not prove that the
+provider cancels host-side work. Fastly's synchronous host calls cannot be guest-preempted. The
+bounded trait methods are required implementation points: core supplies no default that can
+silently await an unbounded provider call forever.
 
 Each bounded method applies both remaining extraction-wide backend-byte allowance and its
 per-value output cap. `backend_bytes` counts every byte exposed to guest code while
@@ -4690,21 +4698,25 @@ These are distinct guarantees:
 - **Host-allocation bound:** only a target whose host API supports streaming/size-aware reads
   can prevent the provider SDK from first materializing an oversized value.
 - **Cancellation bound:** cooperative pre/post checks give a typed eventual result, but only
-  a target with a cancellable async read can claim a finite wall-clock bound.
+  a target with a cancellable async read and deployed host evidence can claim that provider work
+  terminates within a finite wall-clock bound. A guest timer race alone proves prompt EdgeZero
+  return, not provider cancellation.
 
 The capability ladder therefore gains two config-owned cells:
 
 | Capability | Axum | Cloudflare | Fastly | Spin |
 | --- | --- | --- | --- | --- |
 | `config-read-allocation-bounds` | Unsupported while startup JSON is preloaded; promote only after the local-file reader caps before allocation | Unsupported until the SDK exposes/proves a pre-materialization bound | Unsupported until host API documentation and a probe prove it | Unsupported until host API documentation and a probe prove it |
-| `config-read-deadlines` | BestEffort while request-time reads are synchronous map clones with pre/post checks | BestEffort until host cancellation is observed | BestEffort; synchronous host reads are not guest-preemptible | BestEffort until host cancellation is observed |
+| `config-read-deadlines` | BestEffort while request-time reads are synchronous map clones with pre/post checks | BestEffort: guest timer race returns promptly, but host cancellation is unproved | BestEffort; synchronous host reads are not guest-preemptible | BestEffort: guest timer race returns promptly, but host cancellation is unproved |
 
 Apps that require a strict RSS or elapsed-time guarantee declare the corresponding Native
 capability and fail before startup/deploy on weaker targets. Capability documentation must
 name provider-side materialization, parser allocation, SDK copies, and uninterruptible host
 calls as exclusions; it must not imply that a post-return `String::len()` check bounded host
-RSS. One deployed timing probe per non-Axum target records whether cancellation/return occurs
-within the documented tolerance before any capability cell is upgraded.
+RSS. A downstream requirement for cancellation is satisfied only by a `Native` capability cell;
+none of the current adapters makes that claim. One deployed timing probe per non-Axum target
+records whether provider cancellation occurs within the documented tolerance before any
+capability cell is upgraded.
 
 ### 6.4 Per-request caching
 
@@ -5341,10 +5353,13 @@ bulk put <tempfile.json> --namespace-id=<id> --remote`
   `wrangler kv key get --binding <BINDING> <KEY> --remote`
   (Wrangler 4.x's four-segment subcommand path; the older
   three-segment `wrangler kv get` is deprecated).
-- Runtime: `CloudflareConfigStore::get_bounded` returns the same JSON string and enforces
-  guest-visible byte/deadline checks from §6.3.2; the host may materialize the value before
-  guest code can reject it, so allocation support remains Unsupported. The `AppConfig<C>`
-  extractor parses and verifies only after charging the bounded read.
+- Runtime: `CloudflareConfigStore::get_bounded` returns the same JSON string and races the
+  provider future against a Worker timer under the absolute deadline before applying the
+  guest-visible byte checks from §6.3.2. It verifies each timer wake against the injected clock and
+  re-arms after an early wake. The timer race bounds EdgeZero's return but does not prove host-side
+  cancellation; the host may also materialize the value before guest code can reject it, so
+  deadline support remains BestEffort and allocation support remains Unsupported. The
+  `AppConfig<C>` extractor parses and verifies only after charging the bounded read.
 - `--local` push: `wrangler kv bulk put <tempfile.json>
 --binding <BINDING> --local` — lands in
   `.wrangler/state`. Local push deliberately addresses by
@@ -5472,9 +5487,12 @@ key-value set --stdin` or `--from-file`.
     keeps the "no multi-blob merge" stance — splitting
     is operator-side schema work.
 
-- Runtime: `SpinConfigStore::get_bounded` returns the JSON value and applies the cooperative
-  guest-visible checks from §6.3.2; the host read is not claimed preemptible or
-  pre-allocation-bounded. The extractor parses only after the bounded read is charged.
+- Runtime: `SpinConfigStore::get_bounded` returns the JSON value and races the provider future
+  against a Spin timer under the absolute deadline before applying the guest-visible checks from
+  §6.3.2. Spin secret reads use the same clock-verified, early-wake-rearming race. The timer bounds
+  EdgeZero's return but does not prove host-side cancellation or pre-allocation bounds, so deadline
+  support remains BestEffort and allocation support remains Unsupported. The extractor parses only
+  after the bounded read is charged.
 
 ## 10. Migration
 

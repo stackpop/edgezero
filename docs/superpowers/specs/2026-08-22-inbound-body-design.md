@@ -68,8 +68,10 @@ performs this ordered protocol exactly once per platform request:
    A refusal bypasses resolved dispatch, terminates the unread platform body with the strongest
    target-specific primitive, and converts that response as detached ingress egress. It skips the
    application response-egress policy and global observer but retains and terminally invokes the
-   refusal's response-scoped completion. Head-validation failures use an empty completion because
-   no application resource was acquired.
+   refusal's response-scoped completion. Normalized head-validation failures obtain their
+   completion from the application's detached-egress completion factory; its default returns an
+   empty completion. Raw parser failures and platform-to-core head-conversion failures before
+   EdgeZero captures a normalized head remain outside the application lifecycle contract.
    `Abort` is a distinct non-response outcome: it polls no body, invokes no middleware or handler,
    constructs no response-egress attempt, invokes no completion or observer, and instructs the
    adapter to terminate the request at its strongest pre-response reset/error/close boundary.
@@ -288,9 +290,17 @@ admission. `IngressHead::route_resolution()` exposes the value above, and a matc
 
 `App::detached_ingress_error_egress(error, method, request_start)` is the adapter boundary for
 normalized validation and admission-policy failures. It renders the typed error using a bounded
-default response-egress policy, `ResponseEgressCompletion::empty()`, and a no-op observer, never
-the application policy or observer. An admitted policy error before an attempt begins drops the
-decision-owned completion/resource without a report.
+default response-egress policy, the completion returned by the application's detached-egress
+completion factory, and a no-op observer, never the application policy or observer. The factory
+sees the request method, captured request start, response status, and stable error kind, and runs
+once without middleware, handler, or body polling. For normalized validation failures it also runs
+before routing and admission; for an admission-policy error, route resolution and the failing
+policy invocation have already occurred, but no decision-owned completion exists. Its default
+returns `ResponseEgressCompletion::empty()`. Raw parser failures and platform-to-core
+head-conversion failures that occur before EdgeZero can construct normalized `IngressHeadParts`
+remain explicitly outside the portable lifecycle, even when an adapter has already sampled request
+start. A failure after successful admission but before an attempt begins drops the decision-owned
+completion/resource without a report.
 `App::admitted_error_egress(prepared, error)` consumes the single-use admission proof, releases
 its grant exactly once, and creates an application-owned envelope with the captured request,
 route metadata, and exact completion. `App::dispatch_admitted` is infallible at this boundary:

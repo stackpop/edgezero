@@ -700,12 +700,8 @@ pub(crate) async fn drain_body_discard(
 
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::missing_trait_methods,
-        reason = "legacy provider stubs intentionally exercise the bounded-read compatibility default"
-    )]
-
     use super::*;
+    use crate::config_store::ready_config_store_bounded_read;
     use crate::http::{HeaderMap, HeaderValue, Method, StatusCode, request_builder};
     use crate::outbound::{
         HttpClient, OutboundBatch, OutboundBatchDriverEvent, OutboundHttpClient, OutboundRequest,
@@ -1262,6 +1258,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(Some(self.0.to_owned()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let primary_handle = ConfigStoreHandle::new(Arc::new(FixedStore("primary")));
@@ -1380,6 +1378,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(None)
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let binding = ConfigStoreBinding {
@@ -1427,6 +1427,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(None)
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let registry: ConfigRegistry = StoreRegistry::new(

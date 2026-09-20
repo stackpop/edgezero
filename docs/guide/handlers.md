@@ -335,11 +335,59 @@ binding its listener.
 
 Every response-producing admission decision owns one explicit `ResponseEgressCompletion`. Use
 `ResponseEgressCompletion::empty()` when there is no response-scoped resource. To hold a permit
-through terminal egress, move it directly into `ResponseEgressCompletion::new(move |report| ... )`.
-The completion is non-clone and never belongs in response extensions. It follows admitted,
-refused, fallback, handler-error, and middleware-error responses into the adapter's exactly-once
-egress attempt. `AdmissionDecision::Abort` is different: it returns no response and therefore owns
-no completion.
+acquired during admission through terminal egress, move it directly into
+`ResponseEgressCompletion::new(move |report| ... )`. The completion is non-clone.
+It never belongs in response extensions. It follows admitted, refused, fallback, handler-error,
+and middleware-error responses into the adapter's exactly-once egress attempt.
+`AdmissionDecision::Abort` is different: it returns no response and therefore owns no completion.
+
+When the handler acquires the permit later, use EdgeZero's late-bound resource owner. Put the
+non-clone installer in the typed `IngressGrant` and transfer its paired completion with the
+admission decision. The handler consumes the grant and installs the permit; terminal completion
+takes and drops it:
+
+```rust
+use edgezero_core::{
+    IngressGrant, ResponseEgressCompletion, ResponseEgressResource,
+    ResponseEgressResourceInstallError,
+};
+
+struct Permit;
+
+struct AdmissionLease {
+    response_resource: ResponseEgressResource<Permit>,
+}
+
+impl AdmissionLease {
+    fn install(&self, permit: Permit) -> Result<(), ResponseEgressResourceInstallError> {
+        self.response_resource.install(permit)
+    }
+}
+
+fn response_lifecycle() -> (IngressGrant, ResponseEgressCompletion) {
+    let (response_resource, completion) = ResponseEgressCompletion::late_bound();
+    (
+        IngressGrant::new(AdmissionLease { response_resource }),
+        completion,
+    )
+}
+```
+
+`install` consumes the permit. A second install returns `AlreadyInstalled`; an install after
+terminal completion or pre-egress abandonment returns `Closed`. Both failures release the rejected
+permit before returning. `ResponseEgressResourceInstallError` implements `std::error::Error`, so a
+handler returning `Result<_, EdgeError>` can use
+`lease.install(permit).map_err(EdgeError::internal)?`. Do not keep the permit only in a
+handler-local guard: that releases it when the handler returns, before response transmission. If
+the response envelope is abandoned before egress begins, dropping the completion closes the
+surviving installer and releases an installed permit without fabricating a terminal report.
+
+Normalized request-head rejections happen before admission; admission-policy errors can also fail
+before an admission decision transfers its completion. Configure
+`App::set_detached_response_egress_completion_factory` when those responses also need an
+application-owned completion resource. Raw parser failures that occur before EdgeZero receives a
+request, and platform-to-core head-conversion failures that occur before a normalized head exists,
+remain outside this hook.
 
 ## Response Types
 

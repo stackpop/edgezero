@@ -354,7 +354,10 @@ mod tests {
     use super::*;
     use bytes::{Bytes, BytesMut};
     use edgezero_core::body::Body;
-    use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+    use edgezero_core::config_store::{
+        BoundedStoreRead, ConfigStore, ConfigStoreError, ConfigStoreHandle,
+        finish_bounded_config_read,
+    };
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{
@@ -438,13 +441,29 @@ mod tests {
     }
 
     #[async_trait::async_trait(?Send)]
-    #[expect(
-        clippy::missing_trait_methods,
-        reason = "the legacy test provider intentionally exercises the bounded-read compatibility default"
-    )]
     impl ConfigStore for FixedConfigStore {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(Some(self.0.clone()))
+        }
+
+        async fn get_bounded(
+            &self,
+            key: &str,
+            clock: &MonotonicClock,
+            deadline: Deadline,
+            max_backend_bytes: u64,
+            max_value_bytes: u64,
+        ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+            if deadline.is_expired_at(clock.now()) {
+                return Err(ConfigStoreError::DeadlineExceeded);
+            }
+            finish_bounded_config_read(
+                self.get(key).await,
+                clock,
+                deadline,
+                max_backend_bytes,
+                max_value_bytes,
+            )
         }
     }
 
@@ -651,6 +670,8 @@ mod tests {
     async fn normalized_ingress_error_returns_typed_response_without_application_observation() {
         let reports = Arc::new(Mutex::new(Vec::new()));
         let clock_samples = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let completion_calls = Arc::new(AtomicUsize::new(0));
         let observed_clock_samples = Arc::clone(&clock_samples);
         let now = MonotonicInstant::now();
         let mut app = App::new(RouterService::builder().build());
@@ -664,6 +685,15 @@ mod tests {
                 .expect("target limit"),
         );
         app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+        let observed_factory_calls = Arc::clone(&factory_calls);
+        let observed_completion_calls = Arc::clone(&completion_calls);
+        app.set_detached_response_egress_completion_factory(move |_head| {
+            observed_factory_calls.fetch_add(1, Ordering::SeqCst);
+            let terminal_calls = Arc::clone(&observed_completion_calls);
+            ResponseEgressCompletion::new(move |_report| {
+                terminal_calls.fetch_add(1, Ordering::SeqCst);
+            })
+        });
         let request = Request::builder()
             .uri("/too-long")
             .body(AxumBody::empty())
@@ -683,7 +713,97 @@ mod tests {
                 .contains("uri_too_long")
         );
         assert!(reports.lock().expect("reports lock").is_empty());
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(completion_calls.load(Ordering::SeqCst), 1);
         assert!(clock_samples.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_policy_error_uses_detached_completion_factory() {
+        let body_polls = Arc::new(AtomicUsize::new(0));
+        let observed_body_polls = Arc::clone(&body_polls);
+        let native_body = AxumBody::from_stream(poll_fn(move |_cx| {
+            observed_body_polls.fetch_add(1, Ordering::SeqCst);
+            Poll::<Option<Result<Bytes, io::Error>>>::Pending
+        }));
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let observed_handler_calls = Arc::clone(&handler_calls);
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .get("/matched", move |_ctx: RequestContext| {
+                let request_handler_calls = Arc::clone(&observed_handler_calls);
+                async move {
+                    request_handler_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, EdgeError>("handler must not run")
+                }
+            })
+            .middleware(CountingMiddleware(Arc::clone(&middleware_calls)))
+            .build();
+        let decision_completion_calls = Arc::new(AtomicUsize::new(0));
+        let decision_resource_drops = Arc::new(AtomicUsize::new(0));
+        let grant_drops = Arc::new(AtomicUsize::new(0));
+        let mut app = App::new(router);
+        let observed_decision_completion_calls = Arc::clone(&decision_completion_calls);
+        let observed_decision_resource_drops = Arc::clone(&decision_resource_drops);
+        let observed_grant_drops = Arc::clone(&grant_drops);
+        app.set_ingress_admission_policy(move |head| {
+            assert!(matches!(
+                head.route_resolution(),
+                RouteResolution::Matched(_)
+            ));
+            let decision_resource = DropSignal(Arc::clone(&observed_decision_resource_drops));
+            let terminal_calls = Arc::clone(&observed_decision_completion_calls);
+            AdmissionDecision::ReadBodyBeforeFallback {
+                completion: ResponseEgressCompletion::new(move |_report| {
+                    let _resource = decision_resource;
+                    terminal_calls.fetch_add(1, Ordering::SeqCst);
+                }),
+                grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
+                max_body_bytes: 1,
+                read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+                on_exceeded: BufferedIngressResponse::text(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "too large",
+                ),
+                on_timeout: BufferedIngressResponse::text(StatusCode::REQUEST_TIMEOUT, "timeout"),
+            }
+        });
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let completion_calls = Arc::new(AtomicUsize::new(0));
+        let observed_factory_calls = Arc::clone(&factory_calls);
+        let observed_completion_calls = Arc::clone(&completion_calls);
+        app.set_detached_response_egress_completion_factory(move |_head| {
+            observed_factory_calls.fetch_add(1, Ordering::SeqCst);
+            let terminal_calls = Arc::clone(&observed_completion_calls);
+            ResponseEgressCompletion::new(move |_report| {
+                terminal_calls.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        let request = Request::builder()
+            .uri("/matched")
+            .body(native_body)
+            .expect("request");
+
+        let response = AxumServiceState::from_app(app)
+            .oneshot(request)
+            .await
+            .expect("typed policy error response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let _body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+
+        assert_eq!(body_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(decision_completion_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(decision_resource_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(completion_calls.load(Ordering::SeqCst), 1);
+        assert!(reports.lock().expect("reports lock").is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

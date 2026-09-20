@@ -1521,16 +1521,13 @@ fn first_violating_field(errors: &validator::ValidationErrors) -> Option<String>
 
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::missing_trait_methods,
-        reason = "legacy provider stubs intentionally exercise the bounded-read compatibility default"
-    )]
-
     use super::*;
     use crate::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
     use crate::blob_envelope::BlobEnvelope;
     use crate::body::Body;
-    use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+    use crate::config_store::{
+        ConfigStore, ConfigStoreError, ConfigStoreHandle, ready_config_store_bounded_read,
+    };
     use crate::context::RequestContext;
     use crate::http::{HeaderValue, Method, StatusCode, request_builder};
     use crate::params::PathParams;
@@ -2354,6 +2351,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(Some(self.0.to_owned()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let registry: ConfigRegistry = StoreRegistry::new(
@@ -2410,6 +2409,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(Some("legacy".to_owned()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let mut request = request_builder()
@@ -2456,6 +2457,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(None)
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let binding = ConfigStoreBinding {
@@ -2505,6 +2508,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(None)
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let registry: ConfigRegistry = StoreRegistry::new(
@@ -2650,6 +2655,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(Some(self.0.clone()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let data = serde_json::json!({ "greeting": "hello", "timeout_ms": 500_u32 });
@@ -2841,6 +2848,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(None)
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(EmptyStore, "the_key");
@@ -2868,6 +2877,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Err(ConfigStoreError::unavailable("backend offline"))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(DownStore, "the_key");
@@ -2887,6 +2898,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Err(ConfigStoreError::invalid_key("key is malformed"))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(BadKeyStore, "the_key");
@@ -2906,6 +2919,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Err(ConfigStoreError::internal(anyhow::anyhow!("disk on fire")))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(BrokenStore, "the_key");
@@ -2935,6 +2950,8 @@ mod tests {
                 env.sha256 = SENTINEL.to_owned();
                 Ok(Some(serde_json::to_string(&env).unwrap()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(TamperedStore, "key");
@@ -2976,6 +2993,8 @@ mod tests {
                 value["version"] = serde_json::json!(2_u32);
                 Ok(Some(value.to_string()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(FutureVersionStore, "key");
@@ -3015,6 +3034,8 @@ mod tests {
                 value["edgezero_kind"] = serde_json::json!("new_format");
                 Ok(Some(value.to_string()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(KindTaggedStore, "key");
@@ -3045,6 +3066,8 @@ mod tests {
                     "{{\"edgezero_\\u006bind\":\"new_format\",{serialized_body}"
                 )))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(EscapedKindTaggedStore, "key");
@@ -3074,6 +3097,8 @@ mod tests {
                 );
                 Ok(Some(serde_json::to_string(&env).unwrap()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(TypeErrorStore, "key");
@@ -3107,6 +3132,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(Some("not-json-at-all".to_owned()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(GarbageStore, "key");
@@ -3143,6 +3170,8 @@ mod tests {
                 });
                 Ok(Some(make_envelope(data)))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(BadDataStore, "key");
@@ -3174,6 +3203,8 @@ mod tests {
                 let data = serde_json::json!({ "greeting": "hi", "timeout_ms": 0_u32 });
                 Ok(Some(make_envelope(data)))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(ZeroTimeoutStore, "key");
@@ -3201,6 +3232,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(Some(self.0.clone()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         // Blob has `api_token = "my_key_name"` (a key name, not the secret).
@@ -3229,6 +3262,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(Some(self.0.clone()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         // Blob references a key that doesn't exist in the secret store.
@@ -3260,6 +3295,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(Some(self.0.clone()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         // The blob's secret field holds the secret's KEY NAME — config data that
@@ -3490,6 +3527,8 @@ mod tests {
                 let data = serde_json::json!({ "greeting": key, "timeout_ms": 200_u32 });
                 Ok(Some(make_envelope(data)))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let ctx = ctx_with_config_store(KeyEchoStore, "default_key");
@@ -3510,6 +3549,8 @@ mod tests {
                 let data = serde_json::json!({ "greeting": self.0, "timeout_ms": 300_u32 });
                 Ok(Some(make_envelope(data)))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         // Wire two config stores: "primary" (default) and "secondary".
@@ -3597,6 +3638,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(Some(self.0.clone()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         // Blob carries the key name "short" (5 chars) — push skipped the
@@ -3641,6 +3684,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(Some(self.0.clone()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         // The secret store resolves the key to a 5-char value — too short.
@@ -3692,6 +3737,8 @@ mod tests {
             async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(Some(self.0.clone()))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         // A distinctive resolved secret that fails the `length(min = 100)` rule.

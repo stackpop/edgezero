@@ -88,12 +88,14 @@ pub use outbound::{
     rechunk_stream, validate_for_dispatch,
 };
 pub use response_egress::{
-    DEFAULT_RESPONSE_WRITE_BUDGET, RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt,
+    DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressCompletionFactory,
+    DetachedResponseEgressHead, RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt,
     ResponseEgressBeginFailure, ResponseEgressBodyKind, ResponseEgressCompletion,
     ResponseEgressDeadline, ResponseEgressEnvelope, ResponseEgressFallbackDisposition,
     ResponseEgressHead, ResponseEgressObserver, ResponseEgressObserverHandle,
     ResponseEgressOutcome, ResponseEgressPolicy, ResponseEgressPolicyCallback,
-    ResponseEgressReport, default_response_egress_policy,
+    ResponseEgressReport, ResponseEgressResource, ResponseEgressResourceInstallError,
+    default_response_egress_policy,
 };
 pub use router::{ResolvedDispatch, RouteId, RouteInfo, RouteMetadata, RouteResolution};
 pub use time::{
@@ -126,5 +128,17 @@ mod public_config_extraction_contract_tests {
         assert_eq!(crate::BATCH_DISPATCH_SLACK_MAX, Duration::from_millis(25));
         assert_eq!(crate::DEADLINE_FAR_FUTURE, Duration::from_hours(168));
         assert_eq!(crate::DEFAULT_NO_DEADLINE_BUDGET, Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod public_response_egress_contract_tests {
+    #[test]
+    fn late_bound_resource_types_are_root_exports() {
+        let (resource, completion) = crate::ResponseEgressCompletion::late_bound::<Vec<u8>>();
+        let _: crate::ResponseEgressResource<Vec<u8>> = resource;
+        let _: crate::ResponseEgressResourceInstallError =
+            crate::ResponseEgressResourceInstallError::Closed;
+        drop(completion);
     }
 }

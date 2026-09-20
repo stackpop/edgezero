@@ -87,10 +87,13 @@ parser allocation, SDK copies, or other work performed before the value reaches 
 Config reads use one absolute extraction deadline in the application's monotonic clock domain.
 Core passes that same clock through every root, Fastly chunk, and secret read. Adapters sample it
 before provider dispatch and after readiness, before propagating either success or provider
-failure, so equality expiry wins simultaneous readiness. Current provider operations are not
-proved cancellable within a finite wall-clock interval, so every adapter reports `BestEffort`
-for `config-read-deadlines`. The
-[configuration design](https://github.com/stackpop/edgezero/blob/main/docs/superpowers/specs/2026-06-16-blob-app-config.md#632-bounded-cancellable-extraction-reads)
+failure, so equality expiry wins simultaneous readiness. Cloudflare and Spin also race asynchronous
+guest futures against native timers. A timer wake is checked against the injected clock and re-armed
+when it arrives early. This bounds EdgeZero's return but does not prove host-side cancellation. Axum
+and Fastly provider operations are synchronous and guest-nonpreemptible. No provider operation is
+proved cancellable within a finite wall-clock interval, so every adapter reports `BestEffort` for
+`config-read-deadlines`. The
+[configuration design](https://github.com/stackpop/edgezero/blob/main/docs/superpowers/specs/2026-06-16-blob-app-config.md#632-bounded-capability-scoped-extraction-reads)
 defines the normative accounting, cancellation, error, and promotion requirements.
 
 Application assembly is fallible. `Hooks::configure(&mut App) -> Result<(), EdgeError>` runs before

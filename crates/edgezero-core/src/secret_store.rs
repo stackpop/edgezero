@@ -388,9 +388,9 @@ pub trait SecretStore: Send + Sync {
 
     /// Retrieves one value under an absolute deadline and independent backend/value caps.
     ///
-    /// The default checks cooperatively around the existing provider call and discards an
-    /// oversized materialized value. Providers must override it before claiming native bounds.
-    #[inline]
+    /// Implementations must define their deadline and allocation behavior explicitly. There is
+    /// no compatibility default because awaiting an unbounded provider call can hide a
+    /// never-ready future.
     async fn get_bytes_bounded(
         &self,
         store_name: &str,
@@ -399,31 +399,104 @@ pub trait SecretStore: Send + Sync {
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
-    ) -> Result<BoundedStoreRead<Bytes>, SecretError> {
-        if deadline.is_expired_at(clock.now()) {
-            return Err(SecretError::DeadlineExceeded);
+    ) -> Result<BoundedStoreRead<Bytes>, SecretError>;
+}
+
+#[cfg(test)]
+macro_rules! ready_secret_store_bounded_read {
+    () => {
+        fn get_bytes_bounded<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+            &'life0 self,
+            store_name: &'life1 str,
+            key: &'life2 str,
+            clock: &'life3 $crate::time::MonotonicClock,
+            deadline: $crate::time::Deadline,
+            max_backend_bytes: u64,
+            max_value_bytes: u64,
+        ) -> ::std::pin::Pin<
+            Box<
+                dyn ::std::future::Future<
+                        Output = Result<
+                            $crate::config_store::BoundedStoreRead<::bytes::Bytes>,
+                            $crate::secret_store::SecretError,
+                        >,
+                    > + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            'life3: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                if deadline.is_expired_at(clock.now()) {
+                    return Err($crate::secret_store::SecretError::DeadlineExceeded);
+                }
+                let Some(result) =
+                    ::futures_util::FutureExt::now_or_never(self.get_bytes(store_name, key))
+                else {
+                    return Err($crate::secret_store::SecretError::Internal(
+                        ::anyhow::anyhow!("ready secret-store test fixture returned pending"),
+                    ));
+                };
+                if deadline.is_expired_at(clock.now()) {
+                    return Err($crate::secret_store::SecretError::DeadlineExceeded);
+                }
+                let value = result?;
+                let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+                    u64::try_from(stored_value.len())
+                        .map_err(|_length_error| $crate::secret_store::SecretError::ValueTooLarge)
+                })?;
+                if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+                    return Err($crate::secret_store::SecretError::ValueTooLarge);
+                }
+                Ok($crate::config_store::BoundedStoreRead {
+                    backend_bytes,
+                    value,
+                })
+            })
         }
-        let result = self.get_bytes(store_name, key).await;
-        if deadline.is_expired_at(clock.now()) {
-            return Err(SecretError::DeadlineExceeded);
-        }
-        let value = result?;
-        let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
-            u64::try_from(stored_value.len()).map_err(|_length_error| SecretError::ValueTooLarge)
-        })?;
-        if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
-            return Err(SecretError::ValueTooLarge);
-        }
-        Ok(BoundedStoreRead {
-            backend_bytes,
-            value,
-        })
-    }
+    };
 }
 
 // ---------------------------------------------------------------------------
 // Shared validation
 // ---------------------------------------------------------------------------
+
+/// Applies post-read deadline precedence and byte caps to one materialized secret result.
+///
+/// This helper does not dispatch, await, cancel, or time out the provider operation. A
+/// [`SecretStore::get_bytes_bounded`] implementation must still reject an already-expired
+/// deadline and arrange any target-specific timer race before calling it.
+///
+/// # Errors
+/// Returns the provider error, [`SecretError::DeadlineExceeded`], or
+/// [`SecretError::ValueTooLarge`] according to post-read precedence.
+#[inline]
+pub fn finish_bounded_secret_read(
+    result: Result<Option<Bytes>, SecretError>,
+    clock: &MonotonicClock,
+    deadline: Deadline,
+    max_backend_bytes: u64,
+    max_value_bytes: u64,
+) -> Result<BoundedStoreRead<Bytes>, SecretError> {
+    if deadline.is_expired_at(clock.now()) {
+        return Err(SecretError::DeadlineExceeded);
+    }
+    let value = result?;
+    let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+        u64::try_from(stored_value.len()).map_err(|_length_error| SecretError::ValueTooLarge)
+    })?;
+    if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+        return Err(SecretError::ValueTooLarge);
+    }
+    Ok(BoundedStoreRead {
+        backend_bytes,
+        value,
+    })
+}
 
 fn validate_name(name: &str) -> Result<(), SecretError> {
     if name.is_empty() {
@@ -562,10 +635,6 @@ mod tests {
         }
 
         #[async_trait(?Send)]
-        #[expect(
-            clippy::missing_trait_methods,
-            reason = "the test provider advances time through the unbounded method to exercise the default bounded implementation"
-        )]
         impl SecretStore for AdvancingErrorStore {
             async fn get_bytes(
                 &self,
@@ -575,6 +644,8 @@ mod tests {
                 *self.now.lock().expect("clock lock") = self.terminal;
                 Err(SecretError::Unavailable)
             }
+
+            ready_secret_store_bounded_read!();
         }
 
         let start = MonotonicInstant::now();

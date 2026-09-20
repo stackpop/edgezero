@@ -124,7 +124,8 @@ impl log::Log for CliLogger {
 
 /// Initialize a CLI logger that prints messages without timestamps
 /// or level prefixes — the CLI's output IS the user-facing UX, not
-/// a debug log. See [`CliLogger`] for the routing rules.
+/// a debug log. Informational messages go to stdout, warnings and errors go to
+/// stderr, and debug and trace messages are filtered out.
 #[cfg(feature = "cli")]
 #[inline]
 pub fn init_cli_logger() {

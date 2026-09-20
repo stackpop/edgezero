@@ -296,10 +296,9 @@ pub trait ConfigStore: Send + Sync {
 
     /// Retrieves one value under an absolute deadline and independent backend/value caps.
     ///
-    /// The default is a cooperative compatibility implementation: it checks before and after
-    /// the unbounded provider call, then discards an oversized materialized result. Providers
-    /// must override it before claiming native allocation or cancellation guarantees.
-    #[inline]
+    /// Implementations must define their deadline and allocation behavior explicitly. There is
+    /// no compatibility default because awaiting an unbounded provider call can hide a
+    /// never-ready future.
     async fn get_bounded(
         &self,
         key: &str,
@@ -307,28 +306,67 @@ pub trait ConfigStore: Send + Sync {
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
-    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
-        if deadline.is_expired_at(clock.now()) {
-            return Err(ConfigStoreError::DeadlineExceeded);
-        }
-        let result = self.get(key).await;
-        if deadline.is_expired_at(clock.now()) {
-            return Err(ConfigStoreError::DeadlineExceeded);
-        }
-        let value = result?;
-        let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
-            u64::try_from(stored_value.len())
-                .map_err(|_length_error| ConfigStoreError::ValueTooLarge)
-        })?;
-        if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
-            return Err(ConfigStoreError::ValueTooLarge);
-        }
-        Ok(BoundedStoreRead {
-            backend_bytes,
-            value,
-        })
-    }
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError>;
 }
+
+#[cfg(test)]
+macro_rules! ready_config_store_bounded_read {
+    () => {
+        fn get_bounded<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            key: &'life1 str,
+            clock: &'life2 $crate::time::MonotonicClock,
+            deadline: $crate::time::Deadline,
+            max_backend_bytes: u64,
+            max_value_bytes: u64,
+        ) -> ::std::pin::Pin<
+            Box<
+                dyn ::std::future::Future<
+                        Output = Result<
+                            $crate::config_store::BoundedStoreRead<String>,
+                            $crate::config_store::ConfigStoreError,
+                        >,
+                    > + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                if deadline.is_expired_at(clock.now()) {
+                    return Err($crate::config_store::ConfigStoreError::DeadlineExceeded);
+                }
+                let Some(result) = ::futures_util::FutureExt::now_or_never(self.get(key)) else {
+                    return Err($crate::config_store::ConfigStoreError::internal(
+                        ::anyhow::anyhow!("ready config-store test fixture returned pending"),
+                    ));
+                };
+                if deadline.is_expired_at(clock.now()) {
+                    return Err($crate::config_store::ConfigStoreError::DeadlineExceeded);
+                }
+                let value = result?;
+                let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+                    u64::try_from(stored_value.len()).map_err(|_length_error| {
+                        $crate::config_store::ConfigStoreError::ValueTooLarge
+                    })
+                })?;
+                if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+                    return Err($crate::config_store::ConfigStoreError::ValueTooLarge);
+                }
+                Ok($crate::config_store::BoundedStoreRead {
+                    backend_bytes,
+                    value,
+                })
+            })
+        }
+    };
+}
+
+#[cfg(test)]
+pub(crate) use ready_config_store_bounded_read;
 
 // ---------------------------------------------------------------------------
 // Handle
@@ -382,17 +420,45 @@ impl ConfigStoreHandle {
     }
 }
 
+/// Applies post-read deadline precedence and byte caps to one materialized config result.
+///
+/// This helper does not dispatch, await, cancel, or time out the provider operation. A
+/// [`ConfigStore::get_bounded`] implementation must still reject an already-expired deadline and
+/// arrange any target-specific timer race before calling it.
+///
+/// # Errors
+/// Returns the provider error, [`ConfigStoreError::DeadlineExceeded`], or
+/// [`ConfigStoreError::ValueTooLarge`] according to post-read precedence.
+#[inline]
+pub fn finish_bounded_config_read(
+    result: Result<Option<String>, ConfigStoreError>,
+    clock: &MonotonicClock,
+    deadline: Deadline,
+    max_backend_bytes: u64,
+    max_value_bytes: u64,
+) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+    if deadline.is_expired_at(clock.now()) {
+        return Err(ConfigStoreError::DeadlineExceeded);
+    }
+    let value = result?;
+    let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+        u64::try_from(stored_value.len()).map_err(|_length_error| ConfigStoreError::ValueTooLarge)
+    })?;
+    if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+        return Err(ConfigStoreError::ValueTooLarge);
+    }
+    Ok(BoundedStoreRead {
+        backend_bytes,
+        value,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::missing_trait_methods,
-        reason = "legacy provider stubs intentionally exercise the bounded-read compatibility default"
-    )]
-
     // Run the shared contract tests against TestConfigStore.
     crate::config_store_contract_tests!(
         test_config_store_contract,
@@ -417,6 +483,8 @@ mod tests {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Err(ConfigStoreError::unavailable("backend offline"))
         }
+
+        ready_config_store_bounded_read!();
     }
 
     #[async_trait(?Send)]
@@ -424,6 +492,8 @@ mod tests {
         async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(self.data.get(key).cloned())
         }
+
+        ready_config_store_bounded_read!();
     }
 
     impl TestConfigStore {
@@ -518,6 +588,8 @@ mod tests {
                 *self.now.lock().expect("clock lock") = self.terminal;
                 Err(ConfigStoreError::unavailable("provider failed at expiry"))
             }
+
+            ready_config_store_bounded_read!();
         }
 
         let start = MonotonicInstant::now();

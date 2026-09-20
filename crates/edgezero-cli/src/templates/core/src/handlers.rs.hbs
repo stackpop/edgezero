@@ -130,6 +130,9 @@ pub async fn admission(RequestContext(ctx): RequestContext) -> Result<Response, 
             "admission grant route class mismatch",
         )));
     }
+    lease
+        .install_response_permit()
+        .map_err(EdgeError::internal)?;
 
     json_response(&AdmissionView {
         grant_consumed_once: ctx.take_ingress_grant().is_none(),

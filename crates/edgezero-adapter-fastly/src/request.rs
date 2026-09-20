@@ -960,7 +960,10 @@ fn warn_missing_store_once(store_name: &str, detail: &str) {
 #[cfg(test)]
 mod synthesis_tests {
     use super::*;
-    use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+    use edgezero_core::config_store::{
+        BoundedStoreRead, ConfigStore, ConfigStoreError, ConfigStoreHandle,
+        finish_bounded_config_read,
+    };
     use edgezero_core::context::RequestContext;
     use edgezero_core::key_value_store::{KvStore, NoopKvStore};
     use edgezero_core::router::RouterService;
@@ -972,13 +975,29 @@ mod synthesis_tests {
 
     struct StubConfig;
     #[async_trait::async_trait(?Send)]
-    #[expect(
-        clippy::missing_trait_methods,
-        reason = "the legacy test provider intentionally exercises the bounded-read compatibility default"
-    )]
     impl ConfigStore for StubConfig {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(None)
+        }
+
+        async fn get_bounded(
+            &self,
+            key: &str,
+            clock: &MonotonicClock,
+            deadline: Deadline,
+            max_backend_bytes: u64,
+            max_value_bytes: u64,
+        ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+            if deadline.is_expired_at(clock.now()) {
+                return Err(ConfigStoreError::DeadlineExceeded);
+            }
+            finish_bounded_config_read(
+                self.get(key).await,
+                clock,
+                deadline,
+                max_backend_bytes,
+                max_value_bytes,
+            )
         }
     }
 
