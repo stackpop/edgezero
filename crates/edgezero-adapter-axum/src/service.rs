@@ -390,7 +390,7 @@ mod tests {
     use edgezero_core::middleware::{Middleware, Next};
     use edgezero_core::outbound::OutboundRequest;
     use edgezero_core::response_egress::{
-        DetachedResponseEgressDecision, ResponseEgressCompletion,
+        DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressDecision, ResponseEgressCompletion,
         ResponseEgressFallbackDisposition, ResponseEgressObserver, ResponseEgressOutcome,
         ResponseEgressPolicy, ResponseEgressReport,
     };
@@ -400,7 +400,6 @@ mod tests {
     use http_body::Body as _;
     use std::future::poll_fn as poll_future;
     use std::io;
-    use std::str;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
@@ -690,6 +689,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn normalized_ingress_error_returns_typed_response_without_application_observation() {
         let reports = Arc::new(Mutex::new(Vec::new()));
+        let completion_reports = Arc::new(Mutex::new(Vec::new()));
         let clock_samples = Arc::new(AtomicUsize::new(0));
         let factory_calls = Arc::new(AtomicUsize::new(0));
         let completion_calls = Arc::new(AtomicUsize::new(0));
@@ -708,12 +708,21 @@ mod tests {
         app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
         let observed_factory_calls = Arc::clone(&factory_calls);
         let observed_completion_calls = Arc::clone(&completion_calls);
-        app.set_detached_response_egress_decision_factory(move |_head| {
+        let observed_completion_reports = Arc::clone(&completion_reports);
+        app.set_detached_response_egress_decision_factory(move |head| {
             observed_factory_calls.fetch_add(1, Ordering::SeqCst);
             let terminal_calls = Arc::clone(&observed_completion_calls);
-            DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(move |_report| {
-                terminal_calls.fetch_add(1, Ordering::SeqCst);
-            }))
+            let terminal_reports = Arc::clone(&observed_completion_reports);
+            DetachedResponseEgressDecision::Send {
+                completion: ResponseEgressCompletion::new(move |report| {
+                    terminal_calls.fetch_add(1, Ordering::SeqCst);
+                    terminal_reports
+                        .lock()
+                        .expect("completion reports lock")
+                        .push(report.clone());
+                }),
+                deadline: head.write_deadline_after(Duration::ZERO),
+            }
         });
         let request = Request::builder()
             .uri("/too-long")
@@ -724,18 +733,24 @@ mod tests {
             .oneshot(request)
             .await
             .expect("typed response");
-        assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("response body");
-        assert!(
-            str::from_utf8(&body)
-                .expect("UTF-8 body")
-                .contains("uri_too_long")
-        );
+        assert_eq!(body, b"response write deadline exceeded".as_slice());
         assert!(reports.lock().expect("reports lock").is_empty());
         assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
         assert_eq!(completion_calls.load(Ordering::SeqCst), 1);
+        let completed = completion_reports.lock().expect("completion reports lock");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].outcome,
+            ResponseEgressOutcome::DeadlineExceeded
+        );
+        assert_eq!(
+            completed[0].fallback_disposition,
+            Some(ResponseEgressFallbackDisposition::Completed)
+        );
         assert!(clock_samples.load(Ordering::SeqCst) >= 2);
     }
 
@@ -849,12 +864,15 @@ mod tests {
         let completion_calls = Arc::new(AtomicUsize::new(0));
         let observed_factory_calls = Arc::clone(&factory_calls);
         let observed_completion_calls = Arc::clone(&completion_calls);
-        app.set_detached_response_egress_decision_factory(move |_head| {
+        app.set_detached_response_egress_decision_factory(move |head| {
             observed_factory_calls.fetch_add(1, Ordering::SeqCst);
             let terminal_calls = Arc::clone(&observed_completion_calls);
-            DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(move |_report| {
-                terminal_calls.fetch_add(1, Ordering::SeqCst);
-            }))
+            DetachedResponseEgressDecision::Send {
+                completion: ResponseEgressCompletion::new(move |_report| {
+                    terminal_calls.fetch_add(1, Ordering::SeqCst);
+                }),
+                deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),
+            }
         });
         let request = Request::builder()
             .uri("/matched")

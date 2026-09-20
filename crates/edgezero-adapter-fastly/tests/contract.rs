@@ -408,8 +408,9 @@ mod tests {
         };
         use edgezero_core::middleware::{Middleware, Next};
         use edgezero_core::response_egress::{
-            DetachedResponseEgressDecision, ResponseEgressCompletion, ResponseEgressEnvelope,
-            ResponseEgressObserver, ResponseEgressOutcome, ResponseEgressReport,
+            DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressDecision,
+            ResponseEgressCompletion, ResponseEgressEnvelope, ResponseEgressObserver,
+            ResponseEgressOutcome, ResponseEgressReport,
         };
         use edgezero_core::router::RouteResolution;
         use edgezero_core::time::{MonotonicClock, MonotonicInstant};
@@ -659,14 +660,15 @@ mod tests {
             app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
             let observed_factory_calls = Arc::clone(&factory_calls);
             let observed_completion_calls = Arc::clone(&completion_calls);
-            app.set_detached_response_egress_decision_factory(move |_head| {
+            app.set_detached_response_egress_decision_factory(move |head| {
                 observed_factory_calls.fetch_add(1, Ordering::SeqCst);
                 let terminal_calls = Arc::clone(&observed_completion_calls);
-                DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(
-                    move |_report| {
+                DetachedResponseEgressDecision::Send {
+                    completion: ResponseEgressCompletion::new(move |_report| {
                         terminal_calls.fetch_add(1, Ordering::SeqCst);
-                    },
-                ))
+                    }),
+                    deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),
+                }
             });
 
             let egress = dispatch_ingress_reader_for_test(
@@ -768,14 +770,15 @@ mod tests {
             let completion_calls = Arc::new(AtomicUsize::new(0));
             let observed_factory_calls = Arc::clone(&factory_calls);
             let observed_completion_calls = Arc::clone(&completion_calls);
-            app.set_detached_response_egress_decision_factory(move |_head| {
+            app.set_detached_response_egress_decision_factory(move |head| {
                 observed_factory_calls.fetch_add(1, Ordering::SeqCst);
                 let terminal_calls = Arc::clone(&observed_completion_calls);
-                DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(
-                    move |_report| {
+                DetachedResponseEgressDecision::Send {
+                    completion: ResponseEgressCompletion::new(move |_report| {
                         terminal_calls.fetch_add(1, Ordering::SeqCst);
-                    },
-                ))
+                    }),
+                    deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),
+                }
             });
             let source_calls = Arc::new(AtomicUsize::new(0));
             let observed_source_calls = Arc::clone(&source_calls);

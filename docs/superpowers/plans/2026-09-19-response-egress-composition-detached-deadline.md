@@ -157,15 +157,15 @@
 - Modify: `crates/edgezero-adapter-fastly/tests/contract.rs`
 - Modify: `crates/edgezero-adapter-spin/tests/contract.rs`
 
-- [ ] **Step 1: Migrate all factories to named fields**
+- [x] **Step 1: Migrate all factories to named fields**
 
   Every `Send`-producing test factory returns `Send { completion, deadline: head.write_deadline_after(...) }`. Retain explicit `Abort` coverage. Keep adapter production dispatch unchanged because it already receives the fully prepared `ResponseEgressEnvelope`.
 
-- [ ] **Step 2: Extend the native deadline proof**
+- [x] **Step 2: Extend the native deadline proof**
 
   Add an Axum contract assertion showing an expired detached deadline reaches the response-egress conversion boundary as expired and still preserves exactly-once completion. Keep the existing raw-socket zero-byte abort proof.
 
-- [ ] **Step 3: Run focused adapter tests**
+- [x] **Step 3: Run focused adapter tests**
 
   Run:
 
@@ -179,7 +179,7 @@
 
   Expected: the two native tests execute and pass; each provider contract test target compiles. Provider execution occurs with the pinned runners in Task 6.
 
-- [ ] **Step 4: Run adapter crate tests**
+- [x] **Step 4: Run adapter crate tests**
 
   Run: `cargo test -p edgezero-adapter-axum --all-targets`
 
