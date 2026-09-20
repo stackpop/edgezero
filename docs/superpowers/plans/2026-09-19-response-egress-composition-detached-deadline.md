@@ -105,11 +105,11 @@
 - Modify: `crates/edgezero-core/src/app.rs`
 - Modify: `crates/edgezero-core/src/lib.rs` only if public re-exports require adjustment
 
-- [ ] **Step 1: Write failing head/deadline tests**
+- [x] **Step 1: Write failing head/deadline tests**
 
   Add tests proving `write_deadline_after` is anchored to `request_start`, clamps durations to `DEADLINE_FAR_FUTURE`, and fails closed to `request_start` on overflow.
 
-- [ ] **Step 2: Write failing detached-send tests**
+- [x] **Step 2: Write failing detached-send tests**
 
   Add tests proving:
 
@@ -119,7 +119,7 @@
   - `Abort` still creates no response and invokes no completion;
   - the default factory selects a finite deadline from captured request start.
 
-- [ ] **Step 3: Run focused tests and observe RED**
+- [x] **Step 3: Run focused tests and observe RED**
 
   Run: `cargo test -p edgezero-core detached_ingress_error`
 
@@ -127,19 +127,19 @@
 
   Expected: FAIL on the missing named fields/helper/deadline propagation.
 
-- [ ] **Step 4: Implement the hard-cut decision and helper**
+- [x] **Step 4: Implement the hard-cut decision and helper**
 
   Change `Send(ResponseEgressCompletion)` to the named-field variant. Implement `write_deadline_after` with `#[must_use]`, `#[inline]`, and public rustdoc covering request-start anchoring, `DEADLINE_FAR_FUTURE` clamping, and fail-closed overflow, using the same bounded arithmetic pattern as `IngressHead::read_deadline_after`.
 
-- [ ] **Step 5: Thread the deadline through detached egress**
+- [x] **Step 5: Thread the deadline through detached egress**
 
   In `App::detached_ingress_error_egress`, render the bounded response, insert `ResponseEgressDeadline::new(deadline)` into its extensions, and build the existing detached envelope with the supplied completion. Keep the default no-op observer and default policy; `ResponseEgressEnvelope::begin` already clamps the policy to the application deadline.
 
-- [ ] **Step 6: Update the default decision factory**
+- [x] **Step 6: Update the default decision factory**
 
   Return `Send { completion: ResponseEgressCompletion::empty(), deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET) }`.
 
-- [ ] **Step 7: Run focused and core tests**
+- [x] **Step 7: Run focused and core tests**
 
   Run: `cargo test -p edgezero-core detached_ingress_error`
 

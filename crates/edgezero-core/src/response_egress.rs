@@ -72,6 +72,21 @@ impl<'head> DetachedResponseEgressHead<'head> {
     pub const fn status(&self) -> StatusCode {
         self.status
     }
+
+    /// Builds a response-write deadline relative to this head's captured request start.
+    ///
+    /// The duration is clamped to [`DEADLINE_FAR_FUTURE`]. Arithmetic overflow fails closed by
+    /// returning a deadline at the captured request start.
+    #[must_use]
+    #[inline]
+    pub fn write_deadline_after(&self, duration: Duration) -> Deadline {
+        let bounded = duration.min(DEADLINE_FAR_FUTURE);
+        Deadline::at_instant(
+            self.request_start
+                .checked_add(bounded)
+                .unwrap_or(self.request_start),
+        )
+    }
 }
 
 /// Application decision for a normalized ingress error before response construction.
@@ -80,7 +95,10 @@ pub enum DetachedResponseEgressDecision {
     /// Terminates the request through the adapter's non-response abort/error boundary.
     Abort,
     /// Constructs detached egress and retains the supplied completion until terminal delivery.
-    Send(ResponseEgressCompletion),
+    Send {
+        completion: ResponseEgressCompletion,
+        deadline: Deadline,
+    },
 }
 
 /// Application-selected absolute upper bound for one response's egress lifetime.
@@ -1071,6 +1089,74 @@ mod tests {
                 .expect("default deadline")
         );
         assert_eq!(DEFAULT_RESPONSE_WRITE_BUDGET, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn detached_response_egress_head_deadline_is_anchored_to_request_start() {
+        let request_start = MonotonicInstant::now()
+            .checked_sub(Duration::from_mins(1))
+            .expect("earlier request start");
+        let head = DetachedResponseEgressHead::new(
+            &Method::GET,
+            request_start,
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        );
+
+        assert_eq!(
+            head.write_deadline_after(Duration::from_secs(2)).instant(),
+            request_start
+                .checked_add(Duration::from_secs(2))
+                .expect("relative deadline")
+        );
+    }
+
+    #[test]
+    fn detached_response_egress_head_deadline_clamps_to_far_future() {
+        let request_start = MonotonicInstant::now();
+        let head = DetachedResponseEgressHead::new(
+            &Method::GET,
+            request_start,
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        );
+
+        assert_eq!(
+            head.write_deadline_after(Duration::MAX).instant(),
+            request_start
+                .checked_add(DEADLINE_FAR_FUTURE)
+                .expect("maximum deadline")
+        );
+    }
+
+    #[test]
+    fn detached_response_egress_head_deadline_overflow_fails_closed() {
+        let origin = MonotonicInstant::now();
+        let mut low = 0_u64;
+        let mut high = u64::MAX;
+        while low < high {
+            let midpoint = low + (high - low).div_ceil(2);
+            if origin.checked_add(Duration::from_secs(midpoint)).is_some() {
+                low = midpoint;
+            } else {
+                high = midpoint - 1;
+            }
+        }
+        let request_start = origin
+            .checked_add(Duration::from_secs(low))
+            .expect("latest representable instant");
+        assert!(request_start.checked_add(Duration::from_secs(1)).is_none());
+        let head = DetachedResponseEgressHead::new(
+            &Method::GET,
+            request_start,
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+        );
+
+        assert_eq!(
+            head.write_deadline_after(Duration::from_secs(1)).instant(),
+            request_start
+        );
     }
 
     #[test]
