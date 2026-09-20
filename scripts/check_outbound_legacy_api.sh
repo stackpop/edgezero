@@ -23,25 +23,108 @@ import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 
 const send = ['DetachedResponseEgressDecision::', 'Send'].join('')
-const trivia = String.raw`(?:[ \t\r\n]|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*(?:\r?\n|$))*`
+const [decision, sendVariant] = send.split('::')
 
-function findLegacyDetachedSendConstructors(source) {
-  const pattern = new RegExp(`${send}${trivia}\\(`, 'gu')
-  return Array.from(source.matchAll(pattern), (match) => ({
-    index: match.index ?? 0,
-    text: match[0],
-  }))
+function skipRustTrivia(source, start) {
+  let index = start
+
+  while (index < source.length) {
+    if (/\s/u.test(source[index])) {
+      index += 1
+      continue
+    }
+    if (source.startsWith('//', index)) {
+      const newline = source.indexOf('\n', index + 2)
+      index = newline === -1 ? source.length : newline + 1
+      continue
+    }
+    if (source.startsWith('/*', index)) {
+      let depth = 1
+      index += 2
+      while (index < source.length && depth > 0) {
+        if (source.startsWith('/*', index)) {
+          depth += 1
+          index += 2
+        } else if (source.startsWith('*/', index)) {
+          depth -= 1
+          index += 2
+        } else {
+          index += 1
+        }
+      }
+      if (depth > 0) {
+        return null
+      }
+      continue
+    }
+    break
+  }
+
+  return index
 }
 
+function findLegacyDetachedSendConstructors(source) {
+  const matches = []
+  let searchFrom = 0
+
+  while (searchFrom < source.length) {
+    const start = source.indexOf(decision, searchFrom)
+    if (start === -1) {
+      break
+    }
+    searchFrom = start + decision.length
+
+    if (start > 0 && /[A-Za-z0-9_]/u.test(source[start - 1])) {
+      continue
+    }
+
+    let index = skipRustTrivia(source, searchFrom)
+    if (index === null || !source.startsWith('::', index)) {
+      continue
+    }
+    index = skipRustTrivia(source, index + 2)
+    if (index === null || !source.startsWith(sendVariant, index)) {
+      continue
+    }
+    index = skipRustTrivia(source, index + sendVariant.length)
+    if (index === null || source[index] !== '(') {
+      continue
+    }
+
+    matches.push({
+      index: start,
+      text: source.slice(start, index + 1),
+    })
+  }
+
+  return matches
+}
+
+let selfTestFailed = false
 for (const [name, source] of [
   ['same-line tuple', `${send}(completion)`],
   ['newline tuple', `${send}\n(completion)`],
   ['line-comment tuple', `${send} // legacy\n(completion)`],
   ['block-comment tuple', `${send} /* legacy */ (completion)`],
+  [
+    'comment before variant',
+    `${decision}:: /* legacy */ ${sendVariant}(completion)`,
+  ],
+  ['newline before path separator', `${decision}\n::${sendVariant}(completion)`],
+  [
+    'trivia around path separator',
+    `${decision} /* before */ :: /* after */ ${sendVariant}(completion)`,
+  ],
+  [
+    'nested block-comment trivia',
+    `${decision} /* outer /* nested */ outer */ :: ` +
+      `/* outer /* nested */ outer */ ${sendVariant} ` +
+      '/* outer /* nested */ outer */ (completion)',
+  ],
 ]) {
   if (findLegacyDetachedSendConstructors(source).length !== 1) {
     process.stderr.write(`legacy tuple checker self-test failed: ${name}\n`)
-    process.exit(2)
+    selfTestFailed = true
   }
 }
 for (const source of [
@@ -50,8 +133,11 @@ for (const source of [
 ]) {
   if (findLegacyDetachedSendConstructors(source).length !== 0) {
     process.stderr.write('legacy tuple checker self-test matched a supported form\n')
-    process.exit(2)
+    selfTestFailed = true
   }
+}
+if (selfTestFailed) {
+  process.exit(2)
 }
 
 const roots = process.argv.slice(2)
