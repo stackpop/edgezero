@@ -399,6 +399,25 @@ impl ResponseEgressCompletion {
         Self { callback: None }
     }
 
+    /// Joins this completion with `other` into one response-scoped completion.
+    ///
+    /// At terminal egress, both callbacks receive the same borrowed report and run at most once
+    /// in deterministic left-to-right order: this completion first, then `other`. Dropping the
+    /// joined completion before terminal egress abandons both callbacks and releases resources
+    /// captured by either callback exactly once.
+    ///
+    /// On targets where panics unwind, each callback has an independent panic boundary, so a
+    /// panic in the left callback does not suppress the right callback. On panic-abort targets,
+    /// the process may terminate during the left callback before the right callback runs.
+    #[must_use]
+    #[inline]
+    pub fn join(mut self, mut other: Self) -> Self {
+        Self::new(move |report| {
+            self.complete(report);
+            other.complete(report);
+        })
+    }
+
     /// Creates one late-bound application-resource installer and its paired completion.
     ///
     /// The completion closes the installer at terminal egress or when abandoned. An installed
@@ -930,6 +949,7 @@ mod tests {
     use std::cell::Cell;
     use std::error::Error;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr::from_ref;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
@@ -1342,6 +1362,110 @@ mod tests {
         }));
 
         result.unwrap_or_else(|_| panic!("completion panic escaped terminal transition"));
+        assert_eq!(observer.reports().len(), 1);
+    }
+
+    #[test]
+    fn response_egress_completion_join_runs_left_to_right_once_with_same_report() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let left_events = Arc::clone(&events);
+        let right_events = Arc::clone(&events);
+        let mut completion = ResponseEgressCompletion::new(move |report| {
+            left_events.lock().expect("completion events lock").push((
+                "left",
+                from_ref(report).addr(),
+                report.clone(),
+            ));
+        })
+        .join(ResponseEgressCompletion::new(move |report| {
+            right_events.lock().expect("completion events lock").push((
+                "right",
+                from_ref(report).addr(),
+                report.clone(),
+            ));
+        }));
+        let report = completed_report(MonotonicInstant::now());
+
+        completion.complete(&report);
+        completion.complete(&report);
+
+        let recorded_events = events.lock().expect("completion events lock");
+        assert_eq!(recorded_events.len(), 2);
+        assert_eq!(recorded_events[0].0, "left");
+        assert_eq!(recorded_events[1].0, "right");
+        assert_eq!(recorded_events[0].1, recorded_events[1].1);
+        assert_eq!(recorded_events[0].2, report);
+        assert_eq!(recorded_events[1].2, report);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn response_egress_completion_join_left_panic_does_not_suppress_right() {
+        let right_calls = Arc::new(AtomicUsize::new(0));
+        let observed_right_calls = Arc::clone(&right_calls);
+        let mut completion = ResponseEgressCompletion::new(|_| panic!("left completion panic"))
+            .join(ResponseEgressCompletion::new(move |_| {
+                observed_right_calls.fetch_add(1, Ordering::SeqCst);
+            }));
+        let report = completed_report(MonotonicInstant::now());
+
+        let result = catch_unwind(AssertUnwindSafe(|| completion.complete(&report)));
+
+        result.unwrap_or_else(|_| panic!("left completion panic escaped join"));
+        assert_eq!(right_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn response_egress_completion_join_abandonment_releases_both_resources_once() {
+        let left_drops = Arc::new(AtomicUsize::new(0));
+        let right_drops = Arc::new(AtomicUsize::new(0));
+        let left_probe = ResourceDropProbe(Arc::clone(&left_drops));
+        let right_probe = ResourceDropProbe(Arc::clone(&right_drops));
+        let completion = ResponseEgressCompletion::new(move |_| {
+            let _retain_until_completion = &left_probe;
+        })
+        .join(ResponseEgressCompletion::new(move |_| {
+            let _retain_until_completion = &right_probe;
+        }));
+
+        drop(completion);
+
+        assert_eq!(left_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(right_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn response_egress_completion_join_repeated_terminal_attempts_run_each_once() {
+        let left_calls = Arc::new(AtomicUsize::new(0));
+        let right_calls = Arc::new(AtomicUsize::new(0));
+        let observed_left_calls = Arc::clone(&left_calls);
+        let observed_right_calls = Arc::clone(&right_calls);
+        let completion = ResponseEgressCompletion::new(move |_| {
+            observed_left_calls.fetch_add(1, Ordering::SeqCst);
+        })
+        .join(ResponseEgressCompletion::new(move |_| {
+            observed_right_calls.fetch_add(1, Ordering::SeqCst);
+        }));
+        let observer = RecordingObserver::default();
+        let started_at = MonotonicInstant::now();
+        let headers = HeaderMap::new();
+        let head = head(&headers, started_at, None);
+        let mut attempt = ResponseEgressAttempt::new(
+            &head,
+            started_at,
+            completion,
+            ResponseEgressObserverHandle::new(observer.clone()),
+            MonotonicClock::default(),
+        );
+
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(started_at));
+        assert!(!attempt.complete(started_at));
+        assert!(!attempt.terminate(ResponseEgressOutcome::TransportError, started_at));
+        drop(attempt);
+
+        assert_eq!(left_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(right_calls.load(Ordering::SeqCst), 1);
         assert_eq!(observer.reports().len(), 1);
     }
 
