@@ -58,7 +58,7 @@
 **Files:**
 - Modify: `crates/edgezero-core/src/response_egress.rs`
 
-- [ ] **Step 1: Write failing composition tests**
+- [x] **Step 1: Write failing composition tests**
 
   Add focused tests proving:
 
@@ -67,13 +67,13 @@
   - dropping a joined completion before terminal egress releases both captured resources exactly once;
   - calling the enclosing attempt's terminal path more than once cannot rerun either callback.
 
-- [ ] **Step 2: Run the focused tests and observe RED**
+- [x] **Step 2: Run the focused tests and observe RED**
 
   Run: `cargo test -p edgezero-core response_egress_completion_join`
 
   Expected: FAIL because `ResponseEgressCompletion::join` does not exist.
 
-- [ ] **Step 3: Implement the minimal composition primitive**
+- [x] **Step 3: Implement the minimal composition primitive**
 
   Add complete public rustdoc covering deterministic order, same-report delivery, abandonment, and the unwind-versus-panic-abort qualification. Implement an `#[inline]` consuming method equivalent to:
 
@@ -90,7 +90,7 @@
 
   Reuse `complete` for each child so each callback retains its own panic boundary on unwind-capable targets. Do not add cloneability, shared mutable callback registries, or a compatibility wrapper.
 
-- [ ] **Step 4: Run focused and core tests**
+- [x] **Step 4: Run focused and core tests**
 
   Run: `cargo test -p edgezero-core response_egress_completion_join`
 
