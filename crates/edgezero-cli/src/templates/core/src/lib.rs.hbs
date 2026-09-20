@@ -11,9 +11,9 @@ use edgezero_core::app::App as EdgeZeroApp;
 use edgezero_core::http::StatusCode;
 use edgezero_core::{
     AdmissionDecision, BufferedIngressResponse, ConfigExtractionLimits,
-    DetachedResponseEgressDecision, EdgeError, IngressGrant, ResponseEgressCompletion,
-    ResponseEgressResource, ResponseEgressResourceInstallError, RouteResolution,
-    DEFAULT_RESPONSE_WRITE_BUDGET,
+    DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressDecision, EdgeError, IngressGrant,
+    ResponseEgressCompletion, ResponseEgressResource, ResponseEgressResourceInstallError,
+    RouteResolution,
 };
 
 const DEFAULT_INGRESS_READ_BUDGET: Duration = Duration::from_secs(30);
@@ -229,7 +229,8 @@ mod lifecycle_tests {
                 panic!("admission route must resolve");
             };
             let route_class = metadata.class().map(str::to_owned);
-            let (mut lease, completion) = super::response_lifecycle(route_class);
+            let permit = super::ResponsePermit::new(route_class.clone());
+            let (mut lease, completion) = super::response_lifecycle(route_class, permit);
             lease.observe_response_permit_releases(Arc::clone(&policy_releases));
             AdmissionDecision::Admit {
                 completion,
