@@ -270,7 +270,7 @@ enum VersionSource {
     Active(u64),
     InitialDraft(u64),
     Retired(u64),
-    Staged(u64),
+    Staging(u64),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -319,7 +319,7 @@ struct VersionConfigurationSnapshot {
 enum EditableVersionSource {
     CloneActive { active_version: u64 },
     CloneRetired(Box<InactiveSourceSnapshot>),
-    CloneStaged(Box<InactiveSourceSnapshot>),
+    CloneStaging(Box<InactiveSourceSnapshot>),
     InitialDraft(Box<InitialDraftSnapshot>),
 }
 
@@ -812,7 +812,7 @@ fn build_managed_deploy_plan(
         VersionSource::Active(version)
         | VersionSource::InitialDraft(version)
         | VersionSource::Retired(version)
-        | VersionSource::Staged(version) => version,
+        | VersionSource::Staging(version) => version,
     };
     let links_raw = run_fastly_json_capture(
         &[
@@ -851,7 +851,7 @@ fn build_managed_deploy_plan(
                 source_configuration.clone(),
             )))
         }
-        VersionSource::Retired(inactive_version) | VersionSource::Staged(inactive_version) => {
+        VersionSource::Retired(inactive_version) | VersionSource::Staging(inactive_version) => {
             let version = versions
                 .iter()
                 .find(|version| version.number == inactive_version)
@@ -868,7 +868,7 @@ fn build_managed_deploy_plan(
             if matches!(selected_source, VersionSource::Retired(_)) {
                 EditableVersionSource::CloneRetired(snapshot)
             } else {
-                EditableVersionSource::CloneStaged(snapshot)
+                EditableVersionSource::CloneStaging(snapshot)
             }
         }
     };
@@ -1023,7 +1023,7 @@ fn prepare_managed_version(
             clone_managed_source(plan, *active_version, cwd, emit)?
         }
         EditableVersionSource::CloneRetired(snapshot)
-        | EditableVersionSource::CloneStaged(snapshot) => {
+        | EditableVersionSource::CloneStaging(snapshot) => {
             revalidate_inactive_source(plan, snapshot, cwd, None)?;
             require_source_configuration(plan, snapshot.version.number)?;
             clone_managed_source(plan, snapshot.version.number, cwd, emit)?
@@ -1090,7 +1090,7 @@ fn clone_managed_source(
             revalidate_active_source(plan, *active_version, cwd, Some(version))?;
         }
         EditableVersionSource::CloneRetired(snapshot)
-        | EditableVersionSource::CloneStaged(snapshot) => {
+        | EditableVersionSource::CloneStaging(snapshot) => {
             revalidate_inactive_source(plan, snapshot, cwd, Some(version))?;
             require_source_configuration(plan, snapshot.version.number)?;
         }
@@ -1475,7 +1475,7 @@ fn revalidate_inactive_source(
         .collect::<Vec<_>>();
     let expected = match &plan.version_source {
         EditableVersionSource::CloneRetired(_) => VersionSource::Retired(snapshot.version.number),
-        EditableVersionSource::CloneStaged(_) => VersionSource::Staged(snapshot.version.number),
+        EditableVersionSource::CloneStaging(_) => VersionSource::Staging(snapshot.version.number),
         EditableVersionSource::CloneActive { .. } | EditableVersionSource::InitialDraft(_) => {
             return Err("internal managed deploy inactive source mismatch".to_owned());
         }
@@ -1557,7 +1557,7 @@ fn revalidate_managed_draft(
             }
             revalidate_inactive_source(plan, snapshot, cwd, Some(version))?;
         }
-        EditableVersionSource::CloneStaged(snapshot) => {
+        EditableVersionSource::CloneStaging(snapshot) => {
             if version == snapshot.version.number {
                 return Err("managed Fastly staged clone version did not advance".to_owned());
             }
@@ -2025,7 +2025,7 @@ impl Adapter for FastlyCliAdapter {
             }
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),
-            AdapterAction::DeployStaged => Err(
+            AdapterAction::DeployStaging => Err(
                 "Fastly staging requires typed deploy context and --application-release".to_owned(),
             ),
             AdapterAction::EmitVersion => emit_active_version(args),
@@ -5846,7 +5846,7 @@ fn select_version_source(versions: &[ServiceVersionRecord]) -> Result<VersionSou
         .iter()
         .filter(|version| !version.active && !version.locked && version.environments.is_empty())
         .collect::<Vec<_>>();
-    let staged = versions
+    let staging_versions = versions
         .iter()
         .filter(|version| {
             !version.active
@@ -5860,36 +5860,36 @@ fn select_version_source(versions: &[ServiceVersionRecord]) -> Result<VersionSou
         .iter()
         .filter(|version| !version.active && version.locked && version.environments.is_empty())
         .collect::<Vec<_>>();
-    match (drafts.as_slice(), staged.as_slice()) {
+    match (drafts.as_slice(), staging_versions.as_slice()) {
         ([draft], []) if draft.number == highest => {
             return Ok(VersionSource::InitialDraft(draft.number));
         }
-        ([], [staged_version]) => return Ok(VersionSource::Staged(staged_version.number)),
+        ([], [staging_version]) => return Ok(VersionSource::Staging(staging_version.number)),
         _ => {}
     }
     if drafts.is_empty()
-        && staged.is_empty()
+        && staging_versions.is_empty()
         && let Some(retired_version) = retired.iter().find(|version| version.number == highest)
     {
         return Ok(VersionSource::Retired(retired_version.number));
     }
-    if drafts.len() == 1 && staged.len() <= 1 {
+    if drafts.len() == 1 && staging_versions.len() <= 1 {
         return Err(format!(
             "first deployment requires the highest service version ({highest}) to be the initialized editable draft"
         ));
     }
-    if staged.len() > 1 || drafts.len() > 1 {
+    if staging_versions.len() > 1 || drafts.len() > 1 {
         return Err(format!(
             "deployment without an active version requires one highest editable draft, staged source, or retired source; found {} drafts, {} staged versions, and {} retired versions",
             drafts.len(),
-            staged.len(),
+            staging_versions.len(),
             retired.len()
         ));
     }
     Err(format!(
         "deployment without an active version requires one highest editable draft, staged source, or retired source; found {} drafts, {} staged versions, and {} retired versions",
         drafts.len(),
-        staged.len(),
+        staging_versions.len(),
         retired.len()
     ))
 }
@@ -5947,13 +5947,13 @@ fn staging_rollback_decision(
                 "Fastly version {requested_version} is absent from service {service_id}; refusing staging rollback"
             )
         })?;
-    let staged = matches!(
+    let is_staging_version = matches!(
         staging_records.as_slice(),
         [(record_version, environment)]
             if *record_version == requested_version
                 && environment.active_version == requested_version
     );
-    if staged {
+    if is_staging_version {
         return Ok(StagingRollbackDecision::Deactivate);
     }
     let unpublished_draft = !version.active && !version.locked && version.environments.is_empty();
@@ -7831,14 +7831,14 @@ mod tests {
     }
 
     #[test]
-    fn deploy_plan_version_source_selects_unique_shadow_staged_source_without_active() {
+    fn deploy_plan_version_source_selects_unique_shadow_staging_source_without_active() {
         let versions = parse_service_versions(
             r#"[{"number":3,"active":false,"locked":false,"staging":false,"deployed":false,"environments":[{"active_version":3,"name":"staging","service_id":"shadow-staging-service"}]}]"#,
         )
         .expect("staged version list");
         assert_eq!(
             select_version_source(&versions),
-            Ok(VersionSource::Staged(3))
+            Ok(VersionSource::Staging(3))
         );
     }
 
@@ -7868,7 +7868,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_plan_version_source_rejects_missing_duplicate_or_ambiguous_staged_source() {
+    fn deploy_plan_version_source_rejects_missing_duplicate_or_ambiguous_staging_source() {
         for invalid in [
             r#"[{"number":2,"active":false,"locked":true,"staging":false,"deployed":false,"environments":[{"active_version":2,"name":"staging","service_id":"shadow-staging-service"}]},{"number":3,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":3,"name":"staging","service_id":"shadow-staging-service"}]}]"#,
             r#"[{"number":3,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[{"active_version":2,"name":"staging","service_id":"shadow-staging-service"}]}]"#,

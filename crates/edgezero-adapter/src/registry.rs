@@ -23,7 +23,7 @@ pub enum AdapterAction {
     /// clones the active service version, uploads the built package
     /// to it, then marks it staged; other adapters return an
     /// "unsupported" error. Part of the Fastly staging lifecycle.
-    DeployStaged,
+    DeployStaging,
     /// Emit the deployed/active platform version in a parseable form
     /// (`version=<N>`) so a CI action can capture it. Fastly resolves
     /// the active service version; other adapters return
@@ -346,7 +346,7 @@ pub trait Adapter: Sync + Send {
     #[inline]
     fn deploy(&self, context: &AdapterDeployContext, args: &[String]) -> Result<(), String> {
         let action = if context.staging {
-            AdapterAction::DeployStaged
+            AdapterAction::DeployStaging
         } else {
             AdapterAction::Deploy
         };
