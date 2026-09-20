@@ -239,7 +239,7 @@
 **Files:**
 - Modify only files required by failures caused by this hard cut.
 
-- [ ] **Step 1: Run native workspace gates**
+- [x] **Step 1: Run native workspace gates**
 
   Run: `cargo fmt --all -- --check`
 
@@ -260,7 +260,7 @@
 
   Expected: PASS.
 
-- [ ] **Step 2: Run strict WASM Clippy and feature-matrix gates**
+- [x] **Step 2: Run strict WASM Clippy and feature-matrix gates**
 
   Run:
 
@@ -296,7 +296,7 @@
 
   Expected: PASS. If a pinned runner is unavailable locally, the corresponding hosted CI job must pass on the exact pushed head before completion.
 
-- [ ] **Step 4: Run docs, demo, and generated-project gates**
+- [x] **Step 4: Run docs, demo, and generated-project gates**
 
   Run:
 
@@ -316,7 +316,7 @@
 
   Expected: PASS.
 
-- [ ] **Step 5: Review the complete diff**
+- [x] **Step 5: Review the complete diff**
 
   Verify no tuple `Send` constructor, compatibility shim, legacy public staging identifier, application-specific terminology, unrelated refactor, or unbounded detached response remains.
 
