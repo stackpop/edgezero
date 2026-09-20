@@ -91,7 +91,7 @@
 
   Wrap every existing detached completion in `DetachedResponseEgressDecision::Send`. Match `IngressDispatchOutcome::Response`, `Aborted`, and a wildcard arm at every normalized-validation and admission-policy-error call site. Both `Aborted` and unknown future variants fail closed through the existing non-response abort boundary; do not add another transport error type.
 
-- [ ] **Step 3: Run core and focused adapter tests and observe GREEN**
+- [x] **Step 3: Run core and focused adapter tests and observe GREEN**
 
   Run: `cargo test -p edgezero-core detached_ingress_error`
 
@@ -159,7 +159,7 @@
 
   Expected: PASS.
 
-- [ ] **Step 3: Run feature and WASM gates**
+- [x] **Step 3: Run feature and WASM gates**
 
   Run: `cargo check --workspace --all-targets --features "fastly cloudflare spin"`
 
@@ -206,6 +206,6 @@
 
   Expected: PASS.
 
-- [ ] **Step 5: Review, commit, and push**
+- [x] **Step 5: Review, commit, and push**
 
   Review the diff for accidental compatibility shims, stale terminology, and unrelated changes. Commit with an application-neutral message and push to the existing PR branch.
