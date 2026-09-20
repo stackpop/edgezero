@@ -13,10 +13,11 @@ use crate::ingress::{
 use crate::manifest::BakedManifest;
 use crate::response::IntoResponse as _;
 use crate::response_egress::{
-    DetachedResponseEgressDecision, DetachedResponseEgressDecisionFactory,
-    DetachedResponseEgressHead, ResponseEgressCompletion, ResponseEgressEnvelope,
-    ResponseEgressHead, ResponseEgressObserver, ResponseEgressObserverHandle, ResponseEgressPolicy,
-    ResponseEgressPolicyCallback, ResponseEgressRequestMetadata, default_response_egress_policy,
+    DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressDecision,
+    DetachedResponseEgressDecisionFactory, DetachedResponseEgressHead, ResponseEgressCompletion,
+    ResponseEgressDeadline, ResponseEgressEnvelope, ResponseEgressHead, ResponseEgressObserver,
+    ResponseEgressObserverHandle, ResponseEgressPolicy, ResponseEgressPolicyCallback,
+    ResponseEgressRequestMetadata, default_response_egress_policy,
 };
 use crate::router::{RouteMetadata, RouterService};
 use crate::time::{MonotonicClock, MonotonicInstant};
@@ -168,9 +169,16 @@ impl App {
         );
         match (self.detached_response_egress_decision_factory)(&head) {
             DetachedResponseEgressDecision::Abort => IngressDispatchOutcome::Aborted,
-            DetachedResponseEgressDecision::Send(completion) => {
+            DetachedResponseEgressDecision::Send {
+                completion,
+                deadline,
+            } => {
+                let mut response = render_error_response(error);
+                response
+                    .extensions_mut()
+                    .insert(ResponseEgressDeadline::new(deadline));
                 IngressDispatchOutcome::Response(Box::new(self.detached_response_egress(
-                    render_error_response(error),
+                    response,
                     request_method,
                     request_start,
                     completion,
@@ -412,8 +420,11 @@ impl App {
     {
         Self {
             config_extraction_limits: ConfigExtractionLimits::default(),
-            detached_response_egress_decision_factory: Arc::new(|_| {
-                DetachedResponseEgressDecision::Send(ResponseEgressCompletion::empty())
+            detached_response_egress_decision_factory: Arc::new(|head| {
+                DetachedResponseEgressDecision::Send {
+                    completion: ResponseEgressCompletion::empty(),
+                    deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),
+                }
             }),
             ingress_head_limits: IngressHeadLimits::default(),
             ingress_policy: default_admission_policy(),
@@ -1270,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_ingress_error_send_uses_application_completion() {
+    fn detached_ingress_error_send_uses_application_completion_and_earlier_deadline() {
         let router = RouterService::builder().build();
         let factory_calls = Arc::new(AtomicUsize::new(0));
         let completion_calls = Arc::new(AtomicUsize::new(0));
@@ -1288,11 +1299,18 @@ mod tests {
                 head.error_kind(),
             ));
             let terminal_calls = Arc::clone(&observed_completion_calls);
-            DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(move |_report| {
-                terminal_calls.fetch_add(1, Ordering::SeqCst);
-            }))
+            DetachedResponseEgressDecision::Send {
+                completion: ResponseEgressCompletion::new(move |_report| {
+                    terminal_calls.fetch_add(1, Ordering::SeqCst);
+                }),
+                deadline: head.write_deadline_after(Duration::from_secs(5)),
+            }
         });
         let request_start = MonotonicInstant::now();
+        let egress_started_at = request_start
+            .checked_add(Duration::from_millis(10))
+            .expect("egress start");
+        app.set_monotonic_clock(MonotonicClock::new(move || egress_started_at));
 
         let IngressDispatchOutcome::Response(egress) = app.detached_ingress_error_egress(
             EdgeError::uri_too_long("request target exceeded configured limit"),
@@ -1313,13 +1331,83 @@ mod tests {
                 "uri_too_long",
             )]
         );
-        let Ok((prepared, _, mut attempt, clock)) = egress.begin() else {
+        let Ok((prepared, policy, mut attempt, clock)) = egress.begin() else {
             panic!("begin detached egress");
         };
+        assert_eq!(
+            policy.write_deadline.instant(),
+            request_start
+                .checked_add(Duration::from_secs(5))
+                .expect("detached deadline")
+        );
         assert_eq!(prepared.into_response().status(), StatusCode::URI_TOO_LONG);
         assert!(attempt.begin_writing());
         assert!(attempt.complete(clock.now()));
         assert_eq!(completion_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn detached_ingress_error_send_uses_earlier_default_policy_deadline() {
+        let request_start = MonotonicInstant::now();
+        let egress_started_at = request_start
+            .checked_add(Duration::from_secs(1))
+            .expect("egress start");
+        let mut app = App::new(RouterService::builder().build());
+        app.set_monotonic_clock(MonotonicClock::new(move || egress_started_at));
+        app.set_detached_response_egress_decision_factory(|head| {
+            DetachedResponseEgressDecision::Send {
+                completion: ResponseEgressCompletion::empty(),
+                deadline: head.write_deadline_after(Duration::from_mins(1)),
+            }
+        });
+
+        let IngressDispatchOutcome::Response(egress) = app.detached_ingress_error_egress(
+            EdgeError::bad_request("invalid request head"),
+            Method::GET,
+            request_start,
+        ) else {
+            panic!("expected detached response");
+        };
+        let Ok((_prepared, policy, _attempt, _clock)) = egress.begin() else {
+            panic!("begin detached egress");
+        };
+
+        assert_eq!(
+            policy.write_deadline.instant(),
+            egress_started_at
+                .checked_add(DEFAULT_RESPONSE_WRITE_BUDGET)
+                .expect("default policy deadline")
+        );
+    }
+
+    #[test]
+    fn detached_ingress_error_send_preserves_expired_deadline() {
+        let request_start = MonotonicInstant::now();
+        let egress_started_at = request_start
+            .checked_add(Duration::from_secs(1))
+            .expect("egress start");
+        let mut app = App::new(RouterService::builder().build());
+        app.set_monotonic_clock(MonotonicClock::new(move || egress_started_at));
+        app.set_detached_response_egress_decision_factory(move |_| {
+            DetachedResponseEgressDecision::Send {
+                completion: ResponseEgressCompletion::empty(),
+                deadline: Deadline::at_instant(request_start),
+            }
+        });
+
+        let IngressDispatchOutcome::Response(egress) = app.detached_ingress_error_egress(
+            EdgeError::bad_request("invalid request head"),
+            Method::GET,
+            request_start,
+        ) else {
+            panic!("expected detached response");
+        };
+        let Ok((_prepared, policy, _attempt, _clock)) = egress.begin() else {
+            panic!("begin detached egress");
+        };
+
+        assert_eq!(policy.write_deadline.instant(), request_start);
+        assert!(policy.write_deadline.is_expired_at(egress_started_at));
     }
 
     #[test]
@@ -1329,13 +1417,16 @@ mod tests {
         let mut app = App::new(RouterService::builder().build());
         let observed_resource_drops = Arc::clone(&resource_drops);
         let observed_completion_calls = Arc::clone(&completion_calls);
-        app.set_detached_response_egress_decision_factory(move |_head| {
+        app.set_detached_response_egress_decision_factory(move |head| {
             let resource = GrantDropProbe(Arc::clone(&observed_resource_drops));
             let terminal_calls = Arc::clone(&observed_completion_calls);
-            DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(move |_report| {
-                let _resource = resource;
-                terminal_calls.fetch_add(1, Ordering::SeqCst);
-            }))
+            DetachedResponseEgressDecision::Send {
+                completion: ResponseEgressCompletion::new(move |_report| {
+                    let _resource = resource;
+                    terminal_calls.fetch_add(1, Ordering::SeqCst);
+                }),
+                deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),
+            }
         });
 
         let IngressDispatchOutcome::Response(egress) = app.detached_ingress_error_egress(
@@ -1354,10 +1445,16 @@ mod tests {
     #[test]
     fn detached_ingress_error_abort_returns_non_response_outcome() {
         let factory_calls = Arc::new(AtomicUsize::new(0));
+        let completion_calls = Arc::new(AtomicUsize::new(0));
         let observed_factory_calls = Arc::clone(&factory_calls);
+        let observed_completion_calls = Arc::clone(&completion_calls);
         let mut app = App::new(RouterService::builder().build());
         app.set_detached_response_egress_decision_factory(move |_head| {
             observed_factory_calls.fetch_add(1, Ordering::SeqCst);
+            let terminal_calls = Arc::clone(&observed_completion_calls);
+            drop(ResponseEgressCompletion::new(move |_report| {
+                terminal_calls.fetch_add(1, Ordering::SeqCst);
+            }));
             DetachedResponseEgressDecision::Abort
         });
 
@@ -1369,21 +1466,38 @@ mod tests {
 
         assert!(matches!(outcome, IngressDispatchOutcome::Aborted));
         assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(completion_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn detached_ingress_error_defaults_to_empty_completion_response() {
-        let app = App::new(RouterService::builder().build());
+    fn detached_ingress_error_default_factory_uses_request_start_deadline() {
+        let request_start = MonotonicInstant::now();
+        let egress_started_at = request_start
+            .checked_add(Duration::from_secs(1))
+            .expect("egress start");
+        let mut app = App::new(RouterService::builder().build());
+        app.set_monotonic_clock(MonotonicClock::new(move || egress_started_at));
 
         let IngressDispatchOutcome::Response(egress) = app.detached_ingress_error_egress(
             EdgeError::bad_request("invalid request head"),
             Method::GET,
-            MonotonicInstant::now(),
+            request_start,
         ) else {
             panic!("default detached decision must send a response");
         };
+        let Ok((prepared, policy, mut attempt, clock)) = egress.begin() else {
+            panic!("begin detached egress");
+        };
 
-        assert_eq!(complete_envelope(*egress).status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            policy.write_deadline.instant(),
+            request_start
+                .checked_add(DEFAULT_RESPONSE_WRITE_BUDGET)
+                .expect("default detached deadline")
+        );
+        assert_eq!(prepared.into_response().status(), StatusCode::BAD_REQUEST);
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(clock.now()));
     }
 
     #[test]
