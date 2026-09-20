@@ -1,0 +1,418 @@
+name: Publish build container
+
+on:
+  push:
+    tags:
+      - build-container-v*
+
+permissions: {}
+
+concurrency:
+  group: edgezero-build-container-publication
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    outputs:
+      source-revision: ${{ steps.publish.outputs.source-revision }}
+      image-digest: ${{ steps.publish.outputs.image-digest }}
+      provenance-protocol: ${{ steps.publish.outputs.provenance-protocol }}
+      release-tag: ${{ steps.publish.outputs.release-tag }}
+      approval-challenge: ${{ steps.challenge.outputs.approval-challenge }}
+      build-attempt: ${{ steps.publish.outputs.build-attempt }}
+    steps:
+      - name: assert-hosted-runner-context
+        shell: bash
+        env:
+          BASH_ENV: ""
+          ENV: ""
+          EDGEZERO_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          EDGEZERO_RUNNER_OS: ${{ runner.os }}
+          EDGEZERO_RUNNER_ARCH: ${{ runner.arch }}
+          EDGEZERO_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$EDGEZERO_RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$EDGEZERO_RUNNER_OS" == Linux ]]
+          [[ "$EDGEZERO_RUNNER_ARCH" == X64 ]]
+          [[ "$EDGEZERO_REPOSITORY" == stackpop/edgezero ]]
+
+      - name: checkout-active-gate
+        if: ${{ success() }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/edgezero
+          ref: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          path: .edgezero-gate
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: checkout-release-source
+        if: ${{ success() }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/edgezero
+          ref: ${{ github.sha }}
+          path: .edgezero-source
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: assert-exact-publisher-context
+        if: ${{ success() }}
+        shell: bash
+        env:
+          EDGEZERO_EVENT_NAME: ${{ github.event_name }}
+          EDGEZERO_REF: ${{ github.ref }}
+          EDGEZERO_REF_NAME: ${{ github.ref_name }}
+          EDGEZERO_REF_PROTECTED: ${{ github.ref_protected }}
+          EDGEZERO_SHA: ${{ github.sha }}
+          EDGEZERO_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          EDGEZERO_RELEASE_STATE: ${{ vars.EDGEZERO_BUILD_CONTAINER_RELEASE_STATE }}
+          EDGEZERO_RUN_ID: ${{ github.run_id }}
+          EDGEZERO_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$EDGEZERO_EVENT_NAME" == push ]]
+          [[ "$EDGEZERO_REF_NAME" =~ ^build-container-v[1-9][0-9]*$ ]]
+          [[ "$EDGEZERO_REF" == "refs/tags/$EDGEZERO_REF_NAME" ]]
+          [[ "$EDGEZERO_REF_PROTECTED" == true ]]
+          [[ "$EDGEZERO_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EDGEZERO_SHA" == "$EDGEZERO_WORKFLOW_SHA" ]]
+          [[ "$EDGEZERO_GATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EDGEZERO_RELEASE_STATE" == enabled ]]
+          [[ "$EDGEZERO_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EDGEZERO_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+
+      - name: verify-rotation-prerequisite
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          EDGEZERO_SOURCE_REVISION: ${{ github.sha }}
+          EDGEZERO_PUBLISHER_PREREQUISITE: ${{ vars.EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE }}
+        run: |
+          set -euo pipefail
+          prerequisite="$RUNNER_TEMP/edgezero-publisher-prerequisite.json"
+          printf '%s' "$EDGEZERO_PUBLISHER_PREREQUISITE" >"$prerequisite"
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/verify-gate-rotation-lock.sh" \
+            publisher \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --gate-sha "$EDGEZERO_GATE_SHA" \
+            --source-revision "$EDGEZERO_SOURCE_REVISION" \
+            --publisher-prerequisite-json "$prerequisite"
+
+      - name: validate-release-request
+        if: ${{ success() }}
+        shell: bash
+        env:
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          EDGEZERO_SOURCE_REVISION: ${{ github.sha }}
+          EDGEZERO_RELEASE_TAG: ${{ github.ref_name }}
+          EDGEZERO_RELEASE_STATE: ${{ vars.EDGEZERO_BUILD_CONTAINER_RELEASE_STATE }}
+        run: |
+          set -euo pipefail
+          classification="$RUNNER_TEMP/edgezero-release-classification"
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/classify-build-container-change.sh" \
+            --subject-root "$GITHUB_WORKSPACE/.edgezero-source" \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --base "$EDGEZERO_GATE_SHA" \
+            --head "$EDGEZERO_SOURCE_REVISION" \
+            --kind local \
+            --gate-sha "$EDGEZERO_GATE_SHA" \
+            --release-state "$EDGEZERO_RELEASE_STATE" >"$classification"
+          printf 'mode=ordinary\nrelevant=true\n' | cmp -s - "$classification"
+          request_tag=$(git --no-replace-objects -C "$GITHUB_WORKSPACE/.edgezero-source" \
+            show "$EDGEZERO_SOURCE_REVISION:.github/docker/build-app-cli/release-request.json" | \
+            jq -er 'select(type == "object") | ."release-tag" | select(type == "string")')
+          [[ "$request_tag" == "$EDGEZERO_RELEASE_TAG" ]]
+
+      - name: stage-trusted-build-context
+        if: ${{ success() }}
+        shell: bash
+        env:
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          EDGEZERO_SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/stage-build-context.sh" \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --source-root "$GITHUB_WORKSPACE/.edgezero-source" \
+            --gate-sha "$EDGEZERO_GATE_SHA" \
+            --source-sha "$EDGEZERO_SOURCE_REVISION" \
+            --output "$RUNNER_TEMP/edgezero-build-context"
+
+      - name: build-publish-and-verify
+        id: publish
+        if: ${{ success() }}
+        shell: bash
+        env:
+          BASH_ENV: ""
+          ENV: ""
+          EDGEZERO_REGISTRY_TOKEN: ${{ github.token }}
+          EDGEZERO_REGISTRY_ACTOR: ${{ github.actor }}
+          EDGEZERO_SOURCE_REVISION: ${{ github.sha }}
+          EDGEZERO_RELEASE_TAG: ${{ github.ref_name }}
+          EDGEZERO_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          { set +x; set +a; } 2>/dev/null
+          set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/edgezero-docker-config"
+          mkdir -m 0700 "$DOCKER_CONFIG"
+          cleanup_registry() {
+            docker logout ghcr.io >/dev/null 2>&1 || true
+            rm -rf -- "$DOCKER_CONFIG"
+          }
+          trap cleanup_registry EXIT
+          printf '%s' "$EDGEZERO_REGISTRY_TOKEN" | docker login ghcr.io \
+            --username "$EDGEZERO_REGISTRY_ACTOR" --password-stdin
+          unset EDGEZERO_REGISTRY_TOKEN
+          repository=ghcr.io/stackpop/edgezero-build-app-cli
+          metadata="$RUNNER_TEMP/edgezero-build-metadata.json"
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --sbom=false \
+            --build-arg "IMAGE_SOURCE_REVISION=$EDGEZERO_SOURCE_REVISION" \
+            --tag "$repository:$EDGEZERO_RELEASE_TAG" \
+            --metadata-file "$metadata" \
+            --file "$RUNNER_TEMP/edgezero-build-context/.github/docker/build-app-cli/Dockerfile" \
+            --push \
+            "$RUNNER_TEMP/edgezero-build-context"
+          digest=$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' "$metadata")
+          docker logout ghcr.io
+          rm -rf -- "$DOCKER_CONFIG"
+          trap - EXIT
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/verify-published-image.sh" \
+            --ref "$repository@$digest" \
+            --source-sha "$EDGEZERO_SOURCE_REVISION" \
+            --protocol 1 \
+            --build-metadata "$metadata"
+          {
+            printf 'source-revision=%s\n' "$EDGEZERO_SOURCE_REVISION"
+            printf 'image-digest=%s\n' "$digest"
+            printf 'provenance-protocol=1\n'
+            printf 'release-tag=%s\n' "$EDGEZERO_RELEASE_TAG"
+            printf 'build-attempt=%s\n' "$EDGEZERO_RUN_ATTEMPT"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: generate-approval-challenge
+        id: challenge
+        if: ${{ success() }}
+        shell: bash
+        env:
+          EDGEZERO_SOURCE_REVISION: ${{ steps.publish.outputs.source-revision }}
+          EDGEZERO_IMAGE_DIGEST: ${{ steps.publish.outputs.image-digest }}
+          EDGEZERO_RELEASE_TAG: ${{ steps.publish.outputs.release-tag }}
+          EDGEZERO_RUN_ID: ${{ github.run_id }}
+          EDGEZERO_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          challenge=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+          [[ "$challenge" =~ ^[0-9a-f]{64}$ ]]
+          printf 'approval-challenge=%s\n' "$challenge" >>"$GITHUB_OUTPUT"
+          {
+            printf 'Source revision: `%s`\n' "$EDGEZERO_SOURCE_REVISION"
+            printf 'Image digest: `%s`\n' "$EDGEZERO_IMAGE_DIGEST"
+            printf 'Release tag: `%s`\n' "$EDGEZERO_RELEASE_TAG"
+            printf 'Run: `%s` attempt `%s`\n' "$EDGEZERO_RUN_ID" "$EDGEZERO_RUN_ATTEMPT"
+            printf 'Approval challenge: `%s`\n' "$challenge"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  update-pin:
+    needs: build-and-verify
+    runs-on: ubuntu-24.04
+    environment:
+      name: build-container-release
+      deployment: false
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: assert-hosted-runner-context
+        shell: bash
+        env:
+          BASH_ENV: ""
+          ENV: ""
+          EDGEZERO_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          EDGEZERO_RUNNER_OS: ${{ runner.os }}
+          EDGEZERO_RUNNER_ARCH: ${{ runner.arch }}
+          EDGEZERO_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$EDGEZERO_RUNNER_ENVIRONMENT" == github-hosted ]]
+          [[ "$EDGEZERO_RUNNER_OS" == Linux ]]
+          [[ "$EDGEZERO_RUNNER_ARCH" == X64 ]]
+          [[ "$EDGEZERO_REPOSITORY" == stackpop/edgezero ]]
+
+      - name: checkout-active-gate
+        if: ${{ success() }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/edgezero
+          ref: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          path: .edgezero-gate
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: checkout-release-source
+        if: ${{ success() }}
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: stackpop/edgezero
+          ref: ${{ needs.build-and-verify.outputs.source-revision }}
+          path: .edgezero-source
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: assert-exact-publisher-context
+        if: ${{ success() }}
+        shell: bash
+        env:
+          EDGEZERO_EVENT_NAME: ${{ github.event_name }}
+          EDGEZERO_REF: ${{ github.ref }}
+          EDGEZERO_REF_NAME: ${{ github.ref_name }}
+          EDGEZERO_REF_PROTECTED: ${{ github.ref_protected }}
+          EDGEZERO_SHA: ${{ github.sha }}
+          EDGEZERO_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EDGEZERO_SOURCE_REVISION: ${{ needs.build-and-verify.outputs.source-revision }}
+          EDGEZERO_RELEASE_TAG: ${{ needs.build-and-verify.outputs.release-tag }}
+          EDGEZERO_BUILD_ATTEMPT: ${{ needs.build-and-verify.outputs.build-attempt }}
+          EDGEZERO_RUN_ID: ${{ github.run_id }}
+          EDGEZERO_RUN_ATTEMPT: ${{ github.run_attempt }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          EDGEZERO_RELEASE_STATE: ${{ vars.EDGEZERO_BUILD_CONTAINER_RELEASE_STATE }}
+        run: |
+          set -euo pipefail
+          [[ "$EDGEZERO_EVENT_NAME" == push ]]
+          [[ "$EDGEZERO_REF" == "refs/tags/$EDGEZERO_RELEASE_TAG" ]]
+          [[ "$EDGEZERO_REF_NAME" == "$EDGEZERO_RELEASE_TAG" ]]
+          [[ "$EDGEZERO_REF_PROTECTED" == true ]]
+          [[ "$EDGEZERO_SHA" == "$EDGEZERO_WORKFLOW_SHA" ]]
+          [[ "$EDGEZERO_SHA" == "$EDGEZERO_SOURCE_REVISION" ]]
+          [[ "$EDGEZERO_BUILD_ATTEMPT" == "$EDGEZERO_RUN_ATTEMPT" ]]
+          [[ "$EDGEZERO_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EDGEZERO_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EDGEZERO_GATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EDGEZERO_RELEASE_STATE" == enabled ]]
+
+      - name: verify-rotation-prerequisite
+        id: prerequisite
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          EDGEZERO_SOURCE_REVISION: ${{ needs.build-and-verify.outputs.source-revision }}
+          EDGEZERO_PUBLISHER_PREREQUISITE: ${{ vars.EDGEZERO_BUILD_CONTAINER_PUBLISHER_PREREQUISITE }}
+        run: |
+          set -euo pipefail
+          prerequisite="$RUNNER_TEMP/edgezero-publisher-prerequisite.json"
+          printf '%s' "$EDGEZERO_PUBLISHER_PREREQUISITE" >"$prerequisite"
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/verify-gate-rotation-lock.sh" \
+            publisher \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --gate-sha "$EDGEZERO_GATE_SHA" \
+            --source-revision "$EDGEZERO_SOURCE_REVISION" \
+            --publisher-prerequisite-json "$prerequisite"
+          jq -er '
+            select(."schema-version" == 2)
+            | select(."source-revision" == $source)
+            | [ ."source-pr", ."evidence-url" ] | @tsv
+          ' --arg source "$EDGEZERO_SOURCE_REVISION" "$prerequisite" |
+            while IFS=$'\t' read -r source_pr evidence_url; do
+              printf 'source-pr=%s\n' "$source_pr"
+              printf 'evidence-url=%s\n' "$evidence_url"
+            done >>"$GITHUB_OUTPUT"
+
+      - name: verify-release-approval
+        id: approval
+        if: ${{ success() }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          EDGEZERO_SOURCE_REVISION: ${{ needs.build-and-verify.outputs.source-revision }}
+          EDGEZERO_RELEASE_TAG: ${{ needs.build-and-verify.outputs.release-tag }}
+          EDGEZERO_IMAGE_DIGEST: ${{ needs.build-and-verify.outputs.image-digest }}
+          EDGEZERO_APPROVAL_CHALLENGE: ${{ needs.build-and-verify.outputs.approval-challenge }}
+          EDGEZERO_BUILD_ATTEMPT: ${{ needs.build-and-verify.outputs.build-attempt }}
+          EDGEZERO_RUN_ID: ${{ github.run_id }}
+          EDGEZERO_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          output_dir="$RUNNER_TEMP/edgezero-approval"
+          mkdir -m 0700 "$output_dir"
+          approval="$output_dir/approval.json"
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/release-approval-gate.sh" \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --gate-sha "$EDGEZERO_GATE_SHA" \
+            --run-id "$EDGEZERO_RUN_ID" \
+            --run-attempt "$EDGEZERO_RUN_ATTEMPT" \
+            --build-attempt "$EDGEZERO_BUILD_ATTEMPT" \
+            --source-revision "$EDGEZERO_SOURCE_REVISION" \
+            --release-tag "$EDGEZERO_RELEASE_TAG" \
+            --image-digest "$EDGEZERO_IMAGE_DIGEST" \
+            --approval-challenge "$EDGEZERO_APPROVAL_CHALLENGE" \
+            --approval-out "$approval"
+          printf 'approval-json=%s\n' "$approval" >>"$GITHUB_OUTPUT"
+
+      - name: mint-publisher-token
+        id: publisher-token
+        if: ${{ success() }}
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          app-id: ${{ vars.EDGEZERO_BUILD_CONTAINER_APP_ID }}
+          private-key: ${{ secrets.EDGEZERO_BUILD_CONTAINER_APP_PRIVATE_KEY }}
+          owner: stackpop
+          repositories: edgezero
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: assert-publisher-token
+        if: ${{ success() }}
+        shell: bash
+        env:
+          EDGEZERO_APP_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          EDGEZERO_INSTALLATION_ID: ${{ steps.publisher-token.outputs.installation-id }}
+          EDGEZERO_EXPECTED_INSTALLATION_ID: ${{ vars.EDGEZERO_BUILD_CONTAINER_APP_INSTALLATION_ID }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/assert-build-container-app-token.sh"
+
+      - name: update-pin-branch
+        if: ${{ success() }}
+        shell: bash
+        env:
+          EDGEZERO_BUILD_CONTAINER_APP_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          EDGEZERO_GATE_SHA: ${{ vars.EDGEZERO_BUILD_CONTAINER_GATE_SHA }}
+          EDGEZERO_SOURCE_REVISION: ${{ needs.build-and-verify.outputs.source-revision }}
+          EDGEZERO_RELEASE_TAG: ${{ needs.build-and-verify.outputs.release-tag }}
+          EDGEZERO_IMAGE_DIGEST: ${{ needs.build-and-verify.outputs.image-digest }}
+          EDGEZERO_SOURCE_PR: ${{ steps.prerequisite.outputs.source-pr }}
+          EDGEZERO_EVIDENCE_URL: ${{ steps.prerequisite.outputs.evidence-url }}
+          EDGEZERO_APPROVAL_JSON: ${{ steps.approval.outputs.approval-json }}
+          EDGEZERO_BOT_ID: ${{ vars.EDGEZERO_BUILD_CONTAINER_PUBLISHER_BOT_ID }}
+          EDGEZERO_BOT_LOGIN: ${{ vars.EDGEZERO_BUILD_CONTAINER_PUBLISHER_BOT_LOGIN }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/.edgezero-gate/.github/docker/build-app-cli/update-image-pin-pr.sh" \
+            --gate-root "$GITHUB_WORKSPACE/.edgezero-gate" \
+            --gate-sha "$EDGEZERO_GATE_SHA" \
+            --repository-root "$GITHUB_WORKSPACE/.edgezero-source" \
+            --source-revision "$EDGEZERO_SOURCE_REVISION" \
+            --release-tag "$EDGEZERO_RELEASE_TAG" \
+            --image-digest "$EDGEZERO_IMAGE_DIGEST" \
+            --provenance-protocol 1 \
+            --approval-json "$EDGEZERO_APPROVAL_JSON" \
+            --source-pr "$EDGEZERO_SOURCE_PR" \
+            --evidence-url "$EDGEZERO_EVIDENCE_URL" \
+            --expected-bot-id "$EDGEZERO_BOT_ID" \
+            --expected-bot-login "$EDGEZERO_BOT_LOGIN"
