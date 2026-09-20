@@ -69,11 +69,17 @@ performs this ordered protocol exactly once per platform request:
    target-specific primitive, and converts that response as detached ingress egress. It skips the
    application response-egress policy and global observer but retains and terminally invokes the
    refusal's response-scoped completion. Normalized head-validation failures obtain their
-   disposition from the application's detached-egress decision factory. `Send(completion)`
-   constructs detached egress with that completion; `Abort` constructs no response. The default
-   selects `Send(ResponseEgressCompletion::empty())`. Raw parser failures and platform-to-core
-   head-conversion failures before EdgeZero captures a normalized head remain outside the
-   application lifecycle contract.
+   disposition from the application's detached-egress decision factory.
+   `Send { completion, deadline }` constructs detached egress with that completion and a mandatory
+   absolute deadline in the request's injected monotonic-clock domain. The effective bound is the
+   earlier of that deadline and the default response-egress policy: a later factory deadline cannot
+   extend the default policy, and the policy cannot extend an earlier factory deadline. The default
+   selects `Send` with an empty completion and `DEFAULT_RESPONSE_WRITE_BUDGET` measured from
+   `request_start` through
+   `DetachedResponseEgressHead::write_deadline_after`. Admission-selected detached responses retain
+   their response-owned deadline path and are outside this factory contract. `Abort` constructs no
+   response. Raw parser failures and platform-to-core head-conversion failures before EdgeZero
+   captures a normalized head remain outside the application lifecycle contract.
    `Abort` is a distinct non-response outcome: it polls no body, invokes no middleware or handler,
    constructs no response-egress attempt, invokes no completion or observer, and instructs the
    adapter to terminate the request at its strongest pre-response reset/error/close boundary.
@@ -194,15 +200,27 @@ pub struct ResponseEgressCompletion { /* non-clone FnOnce callback owner */ }
 
 impl ResponseEgressCompletion {
     pub fn empty() -> Self;
+    pub fn join(self, other: Self) -> Self;
     pub fn new<Complete>(complete: Complete) -> Self
     where
         Complete: FnOnce(&ResponseEgressReport) + Send + 'static;
 }
 
+pub struct DetachedResponseEgressHead<'head> {
+    /* request method, request start, status, and stable error kind */
+}
+
+impl DetachedResponseEgressHead<'_> {
+    pub fn write_deadline_after(&self, duration: Duration) -> Deadline;
+}
+
 #[non_exhaustive]
 pub enum DetachedResponseEgressDecision {
     Abort,
-    Send(ResponseEgressCompletion),
+    Send {
+        completion: ResponseEgressCompletion,
+        deadline: Deadline,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -273,6 +291,13 @@ while the router consumes the request and grant. It then moves that exact comple
 envelope for whichever response dispatch produces. A response replacement therefore cannot lose
 or duplicate the resource.
 
+`ResponseEgressCompletion::join` consumes two completion owners and produces one owner. Terminal
+execution invokes the left callback and then the right callback with the same borrowed
+`ResponseEgressReport`, at most once. Abandoning the joined completion without a terminal report
+drops both child owners and releases both sets of captured resources. On unwind-capable targets,
+each child keeps an independent panic boundary, so a left-callback panic does not suppress the
+right callback. A panic-abort target may terminate before the right callback runs.
+
 `BufferedIngressResponse` is deliberately finite and transport-neutral: it cannot carry a
 streaming body or deferred provider work. `new` preserves the application-selected status,
 complete header map, and exact bytes. `text` additionally supplies UTF-8 plain-text content
@@ -301,17 +326,31 @@ normalized validation and admission-policy failures. It renders the typed error 
 default response-egress policy and a no-op observer, never the application policy or observer. The
 application's detached-egress decision factory sees the request method, captured request start,
 response status, and stable error kind, and runs exactly once without middleware, handler, or body
-polling. `Send(completion)` renders the bounded error and transfers that completion into detached
-egress. `Abort` returns `IngressDispatchOutcome::Aborted` before response construction and creates
-no envelope, completion, attempt, or observer report. Unknown future outcome variants fail closed
-through the same non-response adapter boundary. For normalized validation failures the factory runs
-before routing and admission; for an admission-policy error, route resolution and the failing
-policy invocation have already occurred, but no decision-owned completion exists. The default is
-`Send(ResponseEgressCompletion::empty())`. Raw parser failures and platform-to-core head-conversion
-failures that occur before EdgeZero can construct normalized `IngressHeadParts` remain explicitly
-outside the portable lifecycle, even when an adapter has already sampled request start. A failure
-after successful admission but before an attempt begins drops the decision-owned
-completion/resource without a report.
+polling. `Send { completion, deadline }` renders the bounded error, transfers that completion into
+detached egress, and inserts the supplied deadline into the existing response-owned deadline path.
+The deadline is mandatory, absolute in the request's injected monotonic-clock domain, and cannot be
+used to extend the default response-egress policy; the effective bound is the earlier of the two.
+`Abort` returns
+`IngressDispatchOutcome::Aborted` before response construction and creates no response, envelope,
+attempt, completion callback, observer call, handler call, middleware call, or body poll. Unknown
+future outcome variants fail closed through the same non-response adapter boundary. For normalized
+validation failures the factory runs before routing and admission; for an admission-policy error,
+route resolution and the failing policy invocation have already occurred, but no decision-owned
+completion exists. The default is:
+
+```rust
+DetachedResponseEgressDecision::Send {
+    completion: ResponseEgressCompletion::empty(),
+    deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),
+}
+```
+
+Admission-selected detached responses retain their response-owned deadline path and do not use
+this factory. Raw parser failures and platform-to-core head-conversion failures that occur before
+EdgeZero can construct normalized `IngressHeadParts` remain explicitly outside the portable
+lifecycle, even when an adapter has already sampled request start. A failure after successful
+admission but before an attempt begins drops the decision-owned completion/resource without a
+report.
 `App::admitted_error_egress(prepared, error)` consumes the single-use admission proof, releases
 its grant exactly once, and creates an application-owned envelope with the captured request,
 route metadata, and exact completion. `App::dispatch_admitted` is infallible at this boundary:
@@ -350,6 +389,9 @@ relative deadlines with `IngressHead::read_deadline_after`, which uses the captu
 and clamps to `DEADLINE_FAR_FUTURE`. Calling the global-clock `Deadline::after` from a policy
 while a custom app clock is installed is a caller error; explicit low-level APIs likewise
 cannot validate that two bare `MonotonicInstant` values came from the same source.
+`DetachedResponseEgressHead::write_deadline_after` follows the same clock-domain rule, anchors the
+duration to captured `request_start`, clamps it to `DEADLINE_FAR_FUTURE`, and fails closed to
+`request_start` if checked addition overflows.
 
 `Hooks::configure(&mut App) -> Result<(), EdgeError>` is the app-owned configuration point and
 uses a new
@@ -916,6 +958,7 @@ platform runtime or network.
 | Failed drain | Source error and initial-drain cap overflow transition to `Poisoned`; every later buffered accessor, `take_body`, and `into_request` reconstructs the same variant, status, message, and structured fields. The source is never polled again. |
 | Parser-level head limits (future acceptance criterion) | Exact-limit request targets, header bytes, and header counts pass at a raw parser boundary. One byte/field over rejects before route resolution, admission, request construction, or body polling with 414/431 and redacted diagnostics. Raw accounting includes duplicate field lines and framing syntax; checked overflow fails closed. Current host-normalized recounts never report `RawValidated` and do not satisfy this row. |
 | Admission ordering and route identity | Raw validation runs first where available. Route resolution then runs exactly once without middleware or body polling, and the callback sees the resulting stable `RouteResolution`. Admission runs exactly once before resolved dispatch/body polling. A matched dispatch uses the admitted route and path parameters without rematching; method/path mutation or a foreign token fails closed. Route class reaches matched and 405 metadata but never changes `RouteId`. Refusal polls no body, invokes no middleware/handler, terminates the native reader, preserves the chosen response, and carries its completion through detached egress. `Abort` polls no body, creates no response/attempt, invokes no middleware/handler/completion/observer, and reaches the adapter abort boundary. The default policy supplies empty grant/completion values and one finite deadline derived from `request_start`. |
+| Detached normalized-error egress | Every factory-selected `Send { completion, deadline }` carries a mandatory absolute deadline in the request's injected monotonic-clock domain. `write_deadline_after` anchors to `request_start`, clamps to `DEADLINE_FAR_FUTURE`, and fails closed to `request_start` on overflow; the default combines an empty completion with `DEFAULT_RESPONSE_WRITE_BUDGET` from request start. The effective bound is the earlier of the factory deadline and default response-egress policy, so neither can extend the other. Joined completions run left then right with the same borrowed report at most once, release both resources on abandonment, and isolate each child panic only on unwind-capable targets; panic-abort may stop before the right callback. Factory `Abort` creates no response or attempt and invokes no completion, observer, handler, middleware, or body poll. Admission-selected detached responses keep their response-owned deadline path outside this factory contract. |
 | Bounded fallback precedence | For pre-resolved 404/405 requests, ordinary `Admit` retains no-poll routing behavior. Opt-in `ReadBodyBeforeFallback` holds the application grant while draining a lengthless or chunked body to EOF under one absolute deadline: exact cap preserves the canonical 404/405, the first byte over returns the exact `on_exceeded` status/header/body response first, and expiry returns the exact `on_timeout` response first. The grant is live during every poll and drops exactly once before response conversion, when the core drain future is dropped, or when the finite deadline terminates it. The completion survives each response choice and settles exactly once at egress; it is not exposed through `RequestContext`. No path rematches or invokes middleware, a handler, or `RequestContext`; `Refuse` and `Abort` remain zero-read; selecting fallback drain for a matched route fails before body construction and drops the never-started completion without a report. Every adapter suite covers both 404 and 405 exact-cap cases plus exact custom terminal responses at its honestly reported deadline capability. |
 | Request ingress metadata | `IngressHead` and matched `RequestContext` expose the same captured `request_start`, paired app clock, and route metadata. `take_ingress_grant()` returns the non-clone grant exactly once, then `None`; untaken, refused, 404, and 405 grants each drop exactly once. The preserved low-level context constructor exposes no route and makes no admission claim. |
 | Absolute read deadline | A 1-byte-per-step under-cap stream cannot extend its lifetime: first-byte, inter-chunk, EOF, and source-error races use one absolute deadline and the admitted app clock; expiry wins simultaneous readiness, cancels native ownership, and poisons a draining cell as `request_timeout` (408). A manually advanced injected clock proves the tie behavior without wall-clock sleeps. Spin additionally proves that a timer wake interrupts a permanently pending matched or fallback source, preserves the correct terminal response, and releases source/grant ownership exactly once. Cached success is not retroactively poisoned. |

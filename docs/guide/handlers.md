@@ -308,7 +308,8 @@ Macro-driven apps can customize the generated `App` through the existing
 
 ```rust
 use edgezero_core::{
-    AdmissionDecision, EdgeError, IngressGrant, ResponseEgressCompletion,
+    AdmissionDecision, DetachedResponseEgressDecision, EdgeError, IngressGrant,
+    ResponseEgressCompletion, DEFAULT_RESPONSE_WRITE_BUDGET,
 };
 use std::time::Duration;
 
@@ -317,6 +318,12 @@ fn configure_app(app: &mut edgezero_core::app::App) -> Result<(), EdgeError> {
         completion: ResponseEgressCompletion::empty(),
         grant: IngressGrant::empty(),
         read_deadline: head.read_deadline_after(Duration::from_secs(30)),
+    });
+    app.set_detached_response_egress_decision_factory(|head| {
+        DetachedResponseEgressDecision::Send {
+            completion: ResponseEgressCompletion::empty(),
+            deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),
+        }
     });
     Ok(())
 }
@@ -340,6 +347,14 @@ acquired during admission through terminal egress, move it directly into
 It never belongs in response extensions. It follows admitted, refused, fallback, handler-error,
 and middleware-error responses into the adapter's exactly-once egress attempt.
 `AdmissionDecision::Abort` is different: it returns no response and therefore owns no completion.
+
+Use `left.join(right)` when two independently owned completion actions must follow the same
+response. The joined completion invokes the left callback and then the right callback with the
+same borrowed terminal report, at most once. Abandoning it before terminal egress releases the
+resources captured by both children. On unwind-capable targets, each child has an independent
+panic boundary, so a left-callback panic does not suppress the right callback. On panic-abort
+targets, termination may occur before the right callback runs. Joining callbacks does not
+strengthen the adapter's documented provider-completion boundary.
 
 When the handler acquires the permit later, use EdgeZero's late-bound resource owner. Put the
 non-clone installer in the typed `IngressGrant` and transfer its paired completion with the
@@ -385,11 +400,22 @@ surviving installer and releases an installed permit without fabricating a termi
 Normalized request-head rejections happen before admission; admission-policy errors can also fail
 before an admission decision transfers its completion. Configure
 `App::set_detached_response_egress_decision_factory` to return
-`DetachedResponseEgressDecision::Send(completion)` when those responses need an application-owned
-completion resource, or `DetachedResponseEgressDecision::Abort` when no bounded response resource
-is available. `Abort` creates no response or egress attempt. Raw parser failures that occur before
-EdgeZero receives a request, and platform-to-core head-conversion failures that occur before a
-normalized head exists, remain outside this hook.
+`DetachedResponseEgressDecision::Send { completion, deadline }` when those responses need an
+application-owned completion resource. Every `Send` deadline is mandatory and absolute in the
+request's injected monotonic-clock domain. Construct relative deadlines with
+`head.write_deadline_after(duration)`, which anchors to captured `request_start`, clamps to
+`DEADLINE_FAR_FUTURE`, and fails closed to `request_start` on arithmetic overflow. The default
+factory combines `ResponseEgressCompletion::empty()` with `DEFAULT_RESPONSE_WRITE_BUDGET` measured
+from request start. The effective bound is the earlier of the factory deadline and the default
+response-egress policy, so a later factory deadline cannot extend the default policy and the policy
+cannot extend an earlier factory deadline. Admission-selected detached responses retain their
+response-owned deadline path and are outside this factory contract.
+
+Return `DetachedResponseEgressDecision::Abort` when no bounded response resource is available.
+`Abort` creates no response or egress attempt and invokes no completion callback, observer,
+handler, middleware, or body poll. Raw parser failures that occur before EdgeZero receives a
+request, and platform-to-core head-conversion failures that occur before a normalized head exists,
+remain outside this hook.
 
 ## Response Types
 
