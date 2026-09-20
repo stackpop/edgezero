@@ -75,8 +75,8 @@ jobs:
         working-directory: examples/app-demo
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  adapter-wasm-clippy:
-    name: ${{ matrix.adapter }} wasm clippy (${{ matrix.features }})
+  adapter-clippy:
+    name: ${{ matrix.check_name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -84,31 +84,32 @@ jobs:
         include:
           - adapter: cloudflare
             target: wasm32-unknown-unknown
-            features: cloudflare
-          - adapter: cloudflare
-            target: wasm32-unknown-unknown
-            features: cloudflare test-utils
+            check_name: cloudflare wasm clippy
+            feature_sets: |-
+              cloudflare
+              cloudflare,test-utils
           - adapter: fastly
             target: wasm32-wasip1
-            features: fastly
-          # The `cli` feature is a valid wasip1 build combination (the CLI host
-          # code compiled for the guest target); gate it so a dead-code or
-          # portability regression there is caught, not only in the fastly-only build.
-          - adapter: fastly
-            target: wasm32-wasip1
-            features: fastly cli
-          - adapter: fastly
-            target: wasm32-wasip1
-            features: fastly test-utils
-          - adapter: fastly
-            target: wasm32-wasip1
-            features: fastly cli test-utils
+            check_name: fastly wasm clippy
+            # The `cli` feature is valid on wasip1. Lint it independently so
+            # feature unification cannot mask target-specific cfg mistakes.
+            feature_sets: |-
+              fastly
+              fastly,cli
+              fastly,test-utils
+              fastly,cli,test-utils
           - adapter: spin
             target: wasm32-wasip2
-            features: spin
-          - adapter: spin
-            target: wasm32-wasip2
-            features: spin test-utils
+            check_name: spin wasm clippy
+            feature_sets: |-
+              spin
+              spin,test-utils
+          - adapter: axum
+            target: native
+            check_name: axum native clippy
+            feature_sets: |-
+              axum
+              axum,test-utils
     steps:
       - uses: actions/checkout@v6
 
@@ -136,13 +137,34 @@ jobs:
           components: clippy
 
       - name: Add wasm target
+        if: matrix.target != 'native'
         run: rustup target add ${{ matrix.target }}
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
 
-      - name: Clippy ${{ matrix.adapter }} (${{ matrix.features }}) on ${{ matrix.target }}
-        run: cargo clippy -p edgezero-adapter-${{ matrix.adapter }} --features "${{ matrix.features }}" --target ${{ matrix.target }} --all-targets -- -D warnings
+      - name: Clippy ${{ matrix.adapter }} feature combinations on ${{ matrix.target }}
+        env:
+          ADAPTER: ${{ matrix.adapter }}
+          FEATURE_SETS: ${{ matrix.feature_sets }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          target_args=()
+          if [[ "${TARGET}" != "native" ]]; then
+            target_args=(--target "${TARGET}")
+          fi
+
+          while IFS= read -r features; do
+            echo "==> edgezero-adapter-${ADAPTER} ${TARGET} features=[${features}]"
+            cargo clippy \
+              --package "edgezero-adapter-${ADAPTER}" \
+              --no-default-features \
+              --features "${features}" \
+              "${target_args[@]}" \
+              --all-targets \
+              -- \
+              -D warnings
+          done <<<"${FEATURE_SETS}"
 
   format-docs:
     runs-on: ubuntu-latest
