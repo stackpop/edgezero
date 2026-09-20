@@ -56,12 +56,15 @@ provider error or detached response after this boundary.
 
 An admission refusal uses detached ingress policy and a no-op global observer, but carries the
 response-scoped completion supplied by that refusal. Normalized head-validation failures and
-admission-policy errors use the same detached transport path with the completion returned by the
-application's detached-egress completion factory. The default factory returns
-`ResponseEgressCompletion::empty()`. The factory receives only bounded failure metadata and runs
-exactly once before the envelope is created; it does not run middleware, the handler, the
-application egress policy, or the global observer. Normalized validation invokes it before routing
-and admission; a policy error invokes it after route resolution and the failing policy callback.
+admission-policy errors invoke the application's detached-egress decision factory. The default
+factory returns `DetachedResponseEgressDecision::Send(ResponseEgressCompletion::empty())`. The
+factory receives only bounded failure metadata and runs exactly once before any envelope is
+created; it does not run middleware, the handler, the application egress policy, or the global
+observer. `Send(completion)` uses the same detached transport path with that completion. `Abort`
+creates no response, envelope, attempt, completion, or observer report and reaches the adapter's
+existing non-response abort/error boundary. Normalized validation invokes the factory before
+routing and admission; a policy error invokes it after route resolution and the failing policy
+callback.
 `AdmissionDecision::Abort` produces no response, starts no egress attempt, and invokes neither
 completion nor observer. Host/parser-generated responses and platform-to-core head-conversion
 failures emitted before EdgeZero can construct a normalized head remain outside this lifecycle,
@@ -178,6 +181,12 @@ pub struct DetachedResponseEgressHead<'head> {
     /* request method, request start, status, and stable error kind */
 }
 
+#[non_exhaustive]
+pub enum DetachedResponseEgressDecision {
+    Abort,
+    Send(ResponseEgressCompletion),
+}
+
 impl ResponseEgressCompletion {
     pub fn empty() -> Self;
 
@@ -220,8 +229,9 @@ before handing the remaining ingress state to the router and attaches it to whic
 dispatch produces. That includes handler success, handler error, canonical 404/405, fallback exact
 cap, fallback overflow, fallback timeout, and post-admission adapter failure. `Refuse` transfers its
 completion directly into detached egress. Normalized pre-admission failures obtain one completion
-from the application-configured detached-egress factory; the default factory supplies an empty
-completion. Raw parser failures for which EdgeZero cannot construct
+when the application-configured detached-egress decision factory selects `Send`, or no response
+when it selects `Abort`; the default supplies an empty completion through `Send`. Raw parser
+failures for which EdgeZero cannot construct
 `DetachedResponseEgressHead` remain outside this lifecycle and must not be counted as covered.
 
 A resource may be acquired after admission. The application calls
@@ -663,7 +673,7 @@ Every adapter gets deterministic lifecycle tests before provider integration:
 | Surface      | Required proof                                                                                                                                                                                                     |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Timing       | One absolute deadline covers conversion, first byte, source waits, writes, backpressure, and finish. Equality expiry wins; no chunk resets the budget. Frozen/backward clocks still settle exactly once.           |
-| Completion   | Empty, buffered, streamed EOF, source failure, transport failure, timeout, disconnect, conversion failure, never-polled body, and guard drop each notify once. Competing terminal events still produce one report. The exact decision-owned completion survives normal dispatch, handler/routing errors, canonical 404/405, bounded fallback outcomes, refusal, policy/framing failure, adapter fallback, and guard drop; it runs before the global observer and remains independent when either callback panics on unwind targets. A dropped pre-begin envelope releases its resource without fabricating a report. Normalized pre-admission validation obtains exactly one completion from the detached-egress factory, whose default is empty; raw parser failures remain outside the lifecycle contract. Explicit ingress abort starts no attempt and invokes no callback. Compile-time tests prove the completion is non-clone and cannot be stored in response extensions. |
+| Completion   | Empty, buffered, streamed EOF, source failure, transport failure, timeout, disconnect, conversion failure, never-polled body, and guard drop each notify once. Competing terminal events still produce one report. The exact decision-owned completion survives normal dispatch, handler/routing errors, canonical 404/405, bounded fallback outcomes, refusal, policy/framing failure, adapter fallback, and guard drop; it runs before the global observer and remains independent when either callback panics on unwind targets. A dropped pre-begin envelope releases its resource without fabricating a report. Normalized pre-admission validation invokes the detached-egress decision factory exactly once: `Send` supplies exactly one completion, whose default is empty, while `Abort` constructs no response or attempt and invokes no callback. Raw parser failures remain outside the lifecycle contract. Explicit ingress abort likewise starts no attempt and invokes no callback. Compile-time tests prove the completion is non-clone and cannot be stored in response extensions. |
 | Accounting   | Exact payload totals, zero-byte response, checked overflow, short/partial writes, cancellation prefixes, and no headers/framing in the count.                                                                      |
 | Commit       | Pre-commit failure may synthesize a bounded fallback; post-commit failure aborts without rewriting status or appending a body.                                                                                     |
 | Backpressure | Holding one platform write prevents the next source poll and bounds EdgeZero staging to one chunk.                                                                                                                 |

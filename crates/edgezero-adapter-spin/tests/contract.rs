@@ -567,8 +567,8 @@ mod tests {
         use edgezero_core::middleware::{Middleware, Next};
         use edgezero_core::outbound::{OutboundHttpClient as _, OutboundRequest};
         use edgezero_core::response_egress::{
-            ResponseEgressCompletion, ResponseEgressEnvelope, ResponseEgressObserver,
-            ResponseEgressOutcome, ResponseEgressReport,
+            DetachedResponseEgressDecision, ResponseEgressCompletion, ResponseEgressEnvelope,
+            ResponseEgressObserver, ResponseEgressOutcome, ResponseEgressReport,
         };
         use edgezero_core::router::{RouteMetadata, RouteResolution};
         use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
@@ -1106,12 +1106,14 @@ mod tests {
             app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
             let observed_factory_calls = Arc::clone(&factory_calls);
             let observed_completion_calls = Arc::clone(&completion_calls);
-            app.set_detached_response_egress_completion_factory(move |_head| {
+            app.set_detached_response_egress_decision_factory(move |_head| {
                 observed_factory_calls.fetch_add(1, Ordering::SeqCst);
                 let terminal_calls = Arc::clone(&observed_completion_calls);
-                ResponseEgressCompletion::new(move |_report| {
-                    terminal_calls.fetch_add(1, Ordering::SeqCst);
-                })
+                DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(
+                    move |_report| {
+                        terminal_calls.fetch_add(1, Ordering::SeqCst);
+                    },
+                ))
             });
 
             let egress = block_on(dispatch_ingress_stream_for_test(
@@ -1130,7 +1132,51 @@ mod tests {
         }
 
         #[test]
-        fn admission_policy_error_uses_detached_completion_factory() {
+        fn normalized_ingress_error_decision_abort_uses_provider_error() {
+            let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+            app.set_ingress_head_limits(
+                IngressHeadLimits::default()
+                    .with_max_request_target_bytes(4)
+                    .expect("target limit"),
+            );
+            let reports = Arc::new(Mutex::new(Vec::new()));
+            app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let observed_factory_calls = Arc::clone(&factory_calls);
+            app.set_detached_response_egress_decision_factory(move |_head| {
+                observed_factory_calls.fetch_add(1, Ordering::SeqCst);
+                DetachedResponseEgressDecision::Abort
+            });
+            let source_calls = Arc::new(AtomicUsize::new(0));
+            let observed_source_calls = Arc::clone(&source_calls);
+            let delivery_calls = Arc::new(AtomicUsize::new(0));
+            let observed_delivery_calls = Arc::clone(&delivery_calls);
+
+            let error = block_on(dispatch_ingress_with_for_test(
+                &app,
+                Method::GET,
+                "/too-long".parse().expect("URI"),
+                move || {
+                    observed_source_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(empty::<Result<Bytes, io::Error>>())
+                },
+                move |_egress| {
+                    observed_delivery_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            ))
+            .expect_err("detached abort must return a platform error");
+
+            assert!(error.to_string().contains("ingress admission aborted"));
+            assert_eq!(source_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(delivery_calls.load(Ordering::SeqCst), 0);
+            assert_no_route_dispatch(&handler_calls, &middleware_calls);
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+            assert!(reports.lock().expect("reports lock").is_empty());
+        }
+
+        #[test]
+        fn admission_policy_error_decision_send_uses_detached_completion() {
             let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
             let decision_completion_calls = Arc::new(AtomicUsize::new(0));
             let decision_resource_drops = Arc::new(AtomicUsize::new(0));
@@ -1169,12 +1215,14 @@ mod tests {
             let completion_calls = Arc::new(AtomicUsize::new(0));
             let observed_factory_calls = Arc::clone(&factory_calls);
             let observed_completion_calls = Arc::clone(&completion_calls);
-            app.set_detached_response_egress_completion_factory(move |_head| {
+            app.set_detached_response_egress_decision_factory(move |_head| {
                 observed_factory_calls.fetch_add(1, Ordering::SeqCst);
                 let terminal_calls = Arc::clone(&observed_completion_calls);
-                ResponseEgressCompletion::new(move |_report| {
-                    terminal_calls.fetch_add(1, Ordering::SeqCst);
-                })
+                DetachedResponseEgressDecision::Send(ResponseEgressCompletion::new(
+                    move |_report| {
+                        terminal_calls.fetch_add(1, Ordering::SeqCst);
+                    },
+                ))
             });
             let source_calls = Arc::new(AtomicUsize::new(0));
             let observed_source_calls = Arc::clone(&source_calls);
@@ -1199,6 +1247,70 @@ mod tests {
             assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
             assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
             assert_eq!(completion_calls.load(Ordering::SeqCst), 1);
+            assert!(reports.lock().expect("reports lock").is_empty());
+        }
+
+        #[test]
+        fn admission_policy_error_decision_abort_uses_provider_error() {
+            let (mut app, handler_calls, middleware_calls) = guarded_fallback_app();
+            let decision_resource_drops = Arc::new(AtomicUsize::new(0));
+            let grant_drops = Arc::new(AtomicUsize::new(0));
+            let observed_decision_resource_drops = Arc::clone(&decision_resource_drops);
+            let observed_grant_drops = Arc::clone(&grant_drops);
+            app.set_ingress_admission_policy(move |head| {
+                AdmissionDecision::ReadBodyBeforeFallback {
+                    completion: ResponseEgressCompletion::new({
+                        let resource = DropSignal(Arc::clone(&observed_decision_resource_drops));
+                        move |_report| drop(resource)
+                    }),
+                    grant: IngressGrant::new(DropSignal(Arc::clone(&observed_grant_drops))),
+                    max_body_bytes: 1,
+                    read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+                    on_exceeded: BufferedIngressResponse::text(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "too large",
+                    ),
+                    on_timeout: BufferedIngressResponse::text(
+                        StatusCode::REQUEST_TIMEOUT,
+                        "timeout",
+                    ),
+                }
+            });
+            let reports = Arc::new(Mutex::new(Vec::new()));
+            app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let observed_factory_calls = Arc::clone(&factory_calls);
+            app.set_detached_response_egress_decision_factory(move |_head| {
+                observed_factory_calls.fetch_add(1, Ordering::SeqCst);
+                DetachedResponseEgressDecision::Abort
+            });
+            let source_calls = Arc::new(AtomicUsize::new(0));
+            let observed_source_calls = Arc::clone(&source_calls);
+            let delivery_calls = Arc::new(AtomicUsize::new(0));
+            let observed_delivery_calls = Arc::clone(&delivery_calls);
+
+            let error = block_on(dispatch_ingress_with_for_test(
+                &app,
+                Method::GET,
+                "/known".parse().expect("URI"),
+                move || {
+                    observed_source_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(empty::<Result<Bytes, io::Error>>())
+                },
+                move |_egress| {
+                    observed_delivery_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            ))
+            .expect_err("detached abort must return a platform error");
+
+            assert!(error.to_string().contains("ingress admission aborted"));
+            assert_eq!(source_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(delivery_calls.load(Ordering::SeqCst), 0);
+            assert_no_route_dispatch(&handler_calls, &middleware_calls);
+            assert_eq!(decision_resource_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
             assert!(reports.lock().expect("reports lock").is_empty());
         }
 

@@ -1561,7 +1561,9 @@ mod tests {
         );
         assert!(
             core_lib.contains("ResponseEgressCompletion::new")
-                && core_lib.contains("set_detached_response_egress_completion_factory")
+                && core_lib.contains("DetachedResponseEgressDecision::Send")
+                && core_lib.contains("set_detached_response_egress_decision_factory")
+                && !core_lib.contains("set_detached_response_egress_completion_factory")
                 && core_lib.contains("fn response_lifecycle(")
                 && core_lib.contains("let (lease, completion) = response_lifecycle(route_class);")
                 && core_lib.contains("grant: IngressGrant::new(lease)")

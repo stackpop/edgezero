@@ -69,9 +69,11 @@ performs this ordered protocol exactly once per platform request:
    target-specific primitive, and converts that response as detached ingress egress. It skips the
    application response-egress policy and global observer but retains and terminally invokes the
    refusal's response-scoped completion. Normalized head-validation failures obtain their
-   completion from the application's detached-egress completion factory; its default returns an
-   empty completion. Raw parser failures and platform-to-core head-conversion failures before
-   EdgeZero captures a normalized head remain outside the application lifecycle contract.
+   disposition from the application's detached-egress decision factory. `Send(completion)`
+   constructs detached egress with that completion; `Abort` constructs no response. The default
+   selects `Send(ResponseEgressCompletion::empty())`. Raw parser failures and platform-to-core
+   head-conversion failures before EdgeZero captures a normalized head remain outside the
+   application lifecycle contract.
    `Abort` is a distinct non-response outcome: it polls no body, invokes no middleware or handler,
    constructs no response-egress attempt, invokes no completion or observer, and instructs the
    adapter to terminate the request at its strongest pre-response reset/error/close boundary.
@@ -197,6 +199,12 @@ impl ResponseEgressCompletion {
         Complete: FnOnce(&ResponseEgressReport) + Send + 'static;
 }
 
+#[non_exhaustive]
+pub enum DetachedResponseEgressDecision {
+    Abort,
+    Send(ResponseEgressCompletion),
+}
+
 #[derive(Clone, Debug)]
 pub struct BufferedIngressResponse { /* exact status + HeaderMap + Bytes */ }
 
@@ -290,16 +298,19 @@ admission. `IngressHead::route_resolution()` exposes the value above, and a matc
 
 `App::detached_ingress_error_egress(error, method, request_start)` is the adapter boundary for
 normalized validation and admission-policy failures. It renders the typed error using a bounded
-default response-egress policy, the completion returned by the application's detached-egress
-completion factory, and a no-op observer, never the application policy or observer. The factory
-sees the request method, captured request start, response status, and stable error kind, and runs
-once without middleware, handler, or body polling. For normalized validation failures it also runs
+default response-egress policy and a no-op observer, never the application policy or observer. The
+application's detached-egress decision factory sees the request method, captured request start,
+response status, and stable error kind, and runs exactly once without middleware, handler, or body
+polling. `Send(completion)` renders the bounded error and transfers that completion into detached
+egress. `Abort` returns `IngressDispatchOutcome::Aborted` before response construction and creates
+no envelope, completion, attempt, or observer report. Unknown future outcome variants fail closed
+through the same non-response adapter boundary. For normalized validation failures the factory runs
 before routing and admission; for an admission-policy error, route resolution and the failing
-policy invocation have already occurred, but no decision-owned completion exists. Its default
-returns `ResponseEgressCompletion::empty()`. Raw parser failures and platform-to-core
-head-conversion failures that occur before EdgeZero can construct normalized `IngressHeadParts`
-remain explicitly outside the portable lifecycle, even when an adapter has already sampled request
-start. A failure after successful admission but before an attempt begins drops the decision-owned
+policy invocation have already occurred, but no decision-owned completion exists. The default is
+`Send(ResponseEgressCompletion::empty())`. Raw parser failures and platform-to-core head-conversion
+failures that occur before EdgeZero can construct normalized `IngressHeadParts` remain explicitly
+outside the portable lifecycle, even when an adapter has already sampled request start. A failure
+after successful admission but before an attempt begins drops the decision-owned
 completion/resource without a report.
 `App::admitted_error_egress(prepared, error)` consumes the single-use admission proof, releases
 its grant exactly once, and creates an application-owned envelope with the captured request,
@@ -525,6 +536,11 @@ bytes. Cloudflare, Fastly, and Spin return the strongest fixed platform error av
 request-body construction, but remain `BestEffort` until deployed evidence proves that the host
 does not synthesize a response or retain the request. No adapter is permitted to translate `Abort`
 into EdgeZero's ordinary JSON error response or invoke response-egress callbacks.
+
+The same adapter rule applies when the detached-egress decision factory selects `Abort` for a
+normalized validation or admission-policy failure. Axum proves zero response bytes at its owned
+connection boundary. Cloudflare, Fastly, and Spin expose only their fixed pre-response provider
+error boundaries and make no transport-observed reset claim.
 
 BestEffort deadline implementations still use pre-read/post-ready checks and release ownership when
 expiry is observed; they do not claim a finite bound around an uninterruptible or opaque host

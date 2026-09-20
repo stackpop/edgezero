@@ -29,10 +29,11 @@ use edgezero_core::error::EdgeError;
 #[cfg(feature = "test-utils")]
 use edgezero_core::http::Uri;
 #[cfg(any(test, feature = "test-utils"))]
-use edgezero_core::http::{Method, request_builder};
-use edgezero_core::http::{Request, RequestParts};
+use edgezero_core::http::request_builder;
+use edgezero_core::http::{Method, Request, RequestParts};
 use edgezero_core::ingress::{
-    IngressBeginOutcome, IngressFraming, IngressHeadAccounting, IngressHeadParts, PreparedIngress,
+    IngressBeginOutcome, IngressDispatchOutcome, IngressFraming, IngressHeadAccounting,
+    IngressHeadParts, PreparedIngress,
 };
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::outbound::HttpClient;
@@ -78,6 +79,18 @@ struct DropSignal(Arc<AtomicUsize>);
 impl Drop for DropSignal {
     fn drop(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn detached_error_envelope(
+    app: &App,
+    error: EdgeError,
+    request_method: Method,
+    request_start: MonotonicInstant,
+) -> anyhow::Result<ResponseEgressEnvelope> {
+    match app.detached_ingress_error_egress(error, request_method, request_start) {
+        IngressDispatchOutcome::Response(envelope) => Ok(*envelope),
+        IngressDispatchOutcome::Aborted | _ => Err(anyhow::anyhow!("ingress admission aborted")),
     }
 }
 
@@ -524,11 +537,8 @@ where
         IngressFraming::HostManaged,
     );
     if let Err(error) = head_parts.validate_normalized(app.ingress_head_limits()) {
-        return Ok(deliver(app.detached_ingress_error_egress(
-            error,
-            request_method,
-            request_start,
-        ))?);
+        let egress = detached_error_envelope(app, error, request_method, request_start)?;
+        return Ok(deliver(egress)?);
     }
     let prepared = match app.begin_ingress(head_parts, request_start) {
         Ok(outcome) => match outcome {
@@ -540,19 +550,18 @@ where
                 return Err(anyhow::anyhow!("ingress admission aborted"));
             }
             _ => {
-                return Ok(deliver(app.detached_ingress_error_egress(
+                let egress = detached_error_envelope(
+                    app,
                     EdgeError::internal(anyhow::anyhow!("unsupported ingress admission outcome")),
                     request_method,
                     request_start,
-                ))?);
+                )?;
+                return Ok(deliver(egress)?);
             }
         },
         Err(error) => {
-            return Ok(deliver(app.detached_ingress_error_egress(
-                error,
-                request_method,
-                request_start,
-            ))?);
+            let egress = detached_error_envelope(app, error, request_method, request_start)?;
+            return Ok(deliver(egress)?);
         }
     };
     let source = match make_source() {

@@ -75,4 +75,11 @@ scan \
   crates examples/app-demo docs/guide README.md \
   ':(exclude)crates/edgezero-core/src/response_egress.rs' || failed=1
 
+# Normalized ingress errors use one typed send-or-abort decision. The generator
+# keeps the retired setter spelling only in a negative assertion.
+scan \
+  'DetachedResponseEgressCompletionFactory|set_detached_response_egress_completion_factory' \
+  crates examples/app-demo docs/guide docs/superpowers/specs README.md \
+  ':(exclude)crates/edgezero-cli/src/generator.rs' || failed=1
+
 exit "$failed"

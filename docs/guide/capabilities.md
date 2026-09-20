@@ -53,6 +53,12 @@ Cloudflare, Fastly, and Spin convert the outcome to a fixed provider error befor
 delivery; their hosts decide the transport effect, so those cells remain `BestEffort` pending
 deployed proof of a reset or close.
 
+The detached-egress decision factory can select the same non-response outcome for normalized
+request-head validation or admission-policy failures when an application cannot reserve a bounded
+response resource. Axum routes that decision through its proven connection-owned abort path.
+Cloudflare, Fastly, and Spin route it through their fixed pre-response provider error boundaries;
+this does not promote their `BestEffort` capability cells.
+
 All current adapters expose `IngressHeadAccounting::HostManaged` and
 `IngressFraming::HostManaged`. They perform defensive checks on the normalized request
 information they receive, but those checks do not prove parser-boundary accounting or

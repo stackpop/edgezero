@@ -16,7 +16,7 @@ pub const DEFAULT_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(30);
 /// Internal safety budget used only when transmitting a bounded precommit fallback.
 pub const RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET: Duration = Duration::from_secs(1);
 
-/// Bounded error metadata visible to the detached-egress completion factory.
+/// Bounded error metadata visible to the detached-egress decision factory.
 ///
 /// Raw parser failures that occur before `EdgeZero` captures this metadata remain outside the
 /// portable response-egress lifecycle.
@@ -72,6 +72,15 @@ impl<'head> DetachedResponseEgressHead<'head> {
     pub const fn status(&self) -> StatusCode {
         self.status
     }
+}
+
+/// Application decision for a normalized ingress error before response construction.
+#[non_exhaustive]
+pub enum DetachedResponseEgressDecision {
+    /// Terminates the request through the adapter's non-response abort/error boundary.
+    Abort,
+    /// Constructs detached egress and retains the supplied completion until terminal delivery.
+    Send(ResponseEgressCompletion),
 }
 
 /// Application-selected absolute upper bound for one response's egress lifetime.
@@ -425,9 +434,9 @@ impl ResponseEgressCompletion {
     }
 }
 
-/// Synchronous factory for one detached ingress-error response completion.
-pub type DetachedResponseEgressCompletionFactory = Arc<
-    dyn for<'head> Fn(&DetachedResponseEgressHead<'head>) -> ResponseEgressCompletion
+/// Synchronous factory for one detached normalized-ingress-error disposition.
+pub type DetachedResponseEgressDecisionFactory = Arc<
+    dyn for<'head> Fn(&DetachedResponseEgressHead<'head>) -> DetachedResponseEgressDecision
         + Send
         + Sync
         + 'static,
