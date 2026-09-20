@@ -248,7 +248,8 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   In `dispatch_admitted`, split the completion from `PreparedIngress` before awaiting router
   dispatch, retain it while the router consumes `AdmittedIngress`, and move it into the resulting
   envelope regardless of the selected response. Make refusal egress use detached policy/no-op
-  observer plus the refusal completion; pre-admission errors use an empty completion.
+  observer plus the refusal completion. This original phase used an empty completion for
+  pre-admission errors; the later detached-egress completion factory supersedes that behavior.
 
 - [x] **Step 6: Migrate all core admission constructors and response-inspection tests**
 

@@ -1425,9 +1425,9 @@ mod tests {
         let fallback = normalize_source_whitespace(fallback_initializer_block(core_lib));
         assert!(
             core_lib.contains("FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024")
-                && fallback.contains("completion: ResponseEgressCompletion::empty()")
-                && fallback
-                    .contains("grant: IngressGrant::new(AdmissionLease { route_class: None })")
+                && core_lib.contains("let (lease, completion) = response_lifecycle(None);")
+                && fallback.contains("completion,")
+                && fallback.contains("grant: IngressGrant::new(lease)")
                 && fallback.contains("max_body_bytes: FALLBACK_INGRESS_BODY_BYTES")
                 && fallback.contains(concat!(
                     "on_exceeded: BufferedIngressResponse::text( ",
@@ -1449,9 +1449,10 @@ mod tests {
     )]
     fn generated_fallback_policy_rejects_swapped_terminal_mappings() {
         assert_generated_fallback_policy(
-            r#"AdmissionDecision::ReadBodyBeforeFallback {
-                completion: ResponseEgressCompletion::empty(),
-                grant: IngressGrant::new(AdmissionLease { route_class: None }),
+            r#"let (lease, completion) = response_lifecycle(None);
+            AdmissionDecision::ReadBodyBeforeFallback {
+                completion,
+                grant: IngressGrant::new(lease),
                 max_body_bytes: FALLBACK_INGRESS_BODY_BYTES,
                 on_exceeded: BufferedIngressResponse::text(
                     StatusCode::REQUEST_TIMEOUT,
@@ -1560,11 +1561,19 @@ mod tests {
         );
         assert!(
             core_lib.contains("ResponseEgressCompletion::new")
-                && core_lib.contains("ResponseEgressCompletion::empty()")
-                && core_lib.contains("completion: response_completion(route_class.clone())")
-                && core_lib.contains("drop(response_scoped_lease)")
-                && core_lib.contains("completion:"),
-            "generated admission decisions must own an explicit response completion resource",
+                && core_lib.contains("set_detached_response_egress_completion_factory")
+                && core_lib.contains("fn response_lifecycle(")
+                && core_lib.contains("let (lease, completion) = response_lifecycle(route_class);")
+                && core_lib.contains("grant: IngressGrant::new(lease)")
+                && core_lib.contains("ResponseEgressCompletion::late_bound")
+                && core_lib.contains("ResponseEgressResource<ResponsePermit>"),
+            "generated admission decisions must pair grants with explicit response completions",
+        );
+        assert!(
+            !core_lib.contains("struct ResponsePermitSlot")
+                && !core_lib.contains("struct ResponsePermitState")
+                && !core_lib.contains("Mutex<ResponsePermitState>"),
+            "generated apps must use EdgeZero's reusable late-bound resource owner",
         );
         assert!(
             core_lib.contains("super::App::build_app().expect(\"configured app\")"),
@@ -1576,6 +1585,11 @@ mod tests {
     fn assert_generated_outbound_handler(project_dir: &Path) {
         let handlers = fs::read_to_string(project_dir.join("crates/demo-app-core/src/handlers.rs"))
             .expect("read handlers.rs");
+        assert!(
+            handlers.contains("install_response_permit()\n        .map_err(EdgeError::internal)?")
+                && !handlers.contains("install_response_permit().is_err()"),
+            "generated admission handler must install the late-bound resource with its typed error",
+        );
         assert!(
             handlers.contains("pub async fn stream() -> Result<Response, EdgeError>"),
             "stream handler must be fallible, not panic via expect()",

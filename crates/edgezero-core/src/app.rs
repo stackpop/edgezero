@@ -13,7 +13,8 @@ use crate::ingress::{
 use crate::manifest::BakedManifest;
 use crate::response::IntoResponse as _;
 use crate::response_egress::{
-    ResponseEgressCompletion, ResponseEgressEnvelope, ResponseEgressHead, ResponseEgressObserver,
+    DetachedResponseEgressCompletionFactory, DetachedResponseEgressHead, ResponseEgressCompletion,
+    ResponseEgressEnvelope, ResponseEgressHead, ResponseEgressObserver,
     ResponseEgressObserverHandle, ResponseEgressPolicy, ResponseEgressPolicyCallback,
     ResponseEgressRequestMetadata, default_response_egress_policy,
 };
@@ -33,6 +34,7 @@ pub const SPIN_ADAPTER: &str = "spin";
 /// Lightweight container around a `RouterService` that can be extended via hook implementations.
 pub struct App {
     config_extraction_limits: ConfigExtractionLimits,
+    detached_response_egress_completion_factory: DetachedResponseEgressCompletionFactory,
     ingress_head_limits: IngressHeadLimits,
     ingress_policy: IngressAdmissionPolicy,
     monotonic_clock: MonotonicClock,
@@ -145,7 +147,7 @@ impl App {
         DEFAULT_APP_NAME
     }
 
-    /// Converts a normalized failure that occurred before admission into detached egress.
+    /// Converts a failure that occurred before successful admission into detached egress.
     ///
     /// Detached ingress responses use the adapter response converter but do not invoke the
     /// application's response-egress policy or observer.
@@ -158,11 +160,18 @@ impl App {
         request_method: Method,
         request_start: MonotonicInstant,
     ) -> ResponseEgressEnvelope {
+        let head = DetachedResponseEgressHead::new(
+            &request_method,
+            request_start,
+            error.status(),
+            error.kind(),
+        );
+        let completion = (self.detached_response_egress_completion_factory)(&head);
         self.detached_response_egress(
             render_error_response(error),
             request_method,
             request_start,
-            ResponseEgressCompletion::empty(),
+            completion,
         )
     }
 
@@ -328,6 +337,18 @@ impl App {
         Ok(())
     }
 
+    /// Installs the synchronous factory for detached ingress-error response completions.
+    #[inline]
+    pub fn set_detached_response_egress_completion_factory<Factory>(&mut self, factory: Factory)
+    where
+        Factory: for<'head> Fn(&DetachedResponseEgressHead<'head>) -> ResponseEgressCompletion
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.detached_response_egress_completion_factory = Arc::new(factory);
+    }
+
     /// Installs the synchronous body-blind ingress admission callback.
     #[inline]
     pub fn set_ingress_admission_policy<Policy>(&mut self, policy: Policy)
@@ -387,6 +408,9 @@ impl App {
     {
         Self {
             config_extraction_limits: ConfigExtractionLimits::default(),
+            detached_response_egress_completion_factory: Arc::new(|_| {
+                ResponseEgressCompletion::empty()
+            }),
             ingress_head_limits: IngressHeadLimits::default(),
             ingress_policy: default_admission_policy(),
             monotonic_clock: MonotonicClock::default(),
@@ -1238,6 +1262,83 @@ mod tests {
 
         assert_eq!(policy_calls.load(Ordering::SeqCst), 0);
         assert!(reports.lock().expect("reports lock").is_empty());
+    }
+
+    #[test]
+    fn detached_ingress_error_uses_application_completion_factory() {
+        let router = RouterService::builder().build();
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let completion_calls = Arc::new(AtomicUsize::new(0));
+        let observed_heads = Arc::new(Mutex::new(Vec::new()));
+        let mut app = App::new(router);
+        let observed_factory_calls = Arc::clone(&factory_calls);
+        let observed_completion_calls = Arc::clone(&completion_calls);
+        let captured_heads = Arc::clone(&observed_heads);
+        app.set_detached_response_egress_completion_factory(move |head| {
+            observed_factory_calls.fetch_add(1, Ordering::SeqCst);
+            captured_heads.lock().expect("heads lock").push((
+                head.request_method().clone(),
+                head.request_start(),
+                head.status(),
+                head.error_kind(),
+            ));
+            let terminal_calls = Arc::clone(&observed_completion_calls);
+            ResponseEgressCompletion::new(move |_report| {
+                terminal_calls.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        let request_start = MonotonicInstant::now();
+
+        let egress = app.detached_ingress_error_egress(
+            EdgeError::uri_too_long("request target exceeded configured limit"),
+            Method::POST,
+            request_start,
+        );
+
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(completion_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            observed_heads.lock().expect("heads lock").as_slice(),
+            &[(
+                Method::POST,
+                request_start,
+                StatusCode::URI_TOO_LONG,
+                "uri_too_long",
+            )]
+        );
+        let Ok((prepared, _, mut attempt, clock)) = egress.begin() else {
+            panic!("begin detached egress");
+        };
+        assert_eq!(prepared.into_response().status(), StatusCode::URI_TOO_LONG);
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(clock.now()));
+        assert_eq!(completion_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn abandoned_detached_ingress_error_releases_factory_resource_without_report() {
+        let resource_drops = Arc::new(AtomicUsize::new(0));
+        let completion_calls = Arc::new(AtomicUsize::new(0));
+        let mut app = App::new(RouterService::builder().build());
+        let observed_resource_drops = Arc::clone(&resource_drops);
+        let observed_completion_calls = Arc::clone(&completion_calls);
+        app.set_detached_response_egress_completion_factory(move |_head| {
+            let resource = GrantDropProbe(Arc::clone(&observed_resource_drops));
+            let terminal_calls = Arc::clone(&observed_completion_calls);
+            ResponseEgressCompletion::new(move |_report| {
+                let _resource = resource;
+                terminal_calls.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        drop(app.detached_ingress_error_egress(
+            EdgeError::bad_request("invalid request head"),
+            Method::GET,
+            MonotonicInstant::now(),
+        ));
+
+        assert_eq!(completion_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resource_drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

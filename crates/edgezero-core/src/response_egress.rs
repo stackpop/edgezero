@@ -1,7 +1,8 @@
 //! Portable response-egress policy and exactly-once lifecycle reporting.
 
+use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::http::{HeaderMap, Method, Response, StatusCode, Version};
@@ -14,6 +15,64 @@ pub const DEFAULT_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(30);
 
 /// Internal safety budget used only when transmitting a bounded precommit fallback.
 pub const RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET: Duration = Duration::from_secs(1);
+
+/// Bounded error metadata visible to the detached-egress completion factory.
+///
+/// Raw parser failures that occur before `EdgeZero` captures this metadata remain outside the
+/// portable response-egress lifecycle.
+#[derive(Clone, Copy, Debug)]
+pub struct DetachedResponseEgressHead<'head> {
+    error_kind: &'static str,
+    request_method: &'head Method,
+    request_start: MonotonicInstant,
+    status: StatusCode,
+}
+
+impl<'head> DetachedResponseEgressHead<'head> {
+    /// Returns the stable public error category without diagnostic text.
+    #[must_use]
+    #[inline]
+    pub const fn error_kind(&self) -> &'static str {
+        self.error_kind
+    }
+
+    #[must_use]
+    #[inline]
+    pub(crate) const fn new(
+        request_method: &'head Method,
+        request_start: MonotonicInstant,
+        status: StatusCode,
+        error_kind: &'static str,
+    ) -> Self {
+        Self {
+            error_kind,
+            request_method,
+            request_start,
+            status,
+        }
+    }
+
+    /// Returns the request method captured before body polling.
+    #[must_use]
+    #[inline]
+    pub const fn request_method(&self) -> &'head Method {
+        self.request_method
+    }
+
+    /// Returns the request start in the application's monotonic clock domain.
+    #[must_use]
+    #[inline]
+    pub const fn request_start(&self) -> MonotonicInstant {
+        self.request_start
+    }
+
+    /// Returns the status of the bounded error response.
+    #[must_use]
+    #[inline]
+    pub const fn status(&self) -> StatusCode {
+        self.status
+    }
+}
 
 /// Application-selected absolute upper bound for one response's egress lifetime.
 ///
@@ -213,6 +272,106 @@ pub struct ResponseEgressCompletion {
     callback: Option<ResponseEgressCompletionCallback>,
 }
 
+/// Non-clone installer for one application resource retained through response egress.
+///
+/// Create a paired installer and completion with [`ResponseEgressCompletion::late_bound`]. The
+/// installer remains usable after the completion closes only to report [`ResponseEgressResourceInstallError::Closed`].
+///
+/// ```compile_fail
+/// use edgezero_core::ResponseEgressCompletion;
+///
+/// let (resource, _completion) = ResponseEgressCompletion::late_bound::<Vec<u8>>();
+/// let _duplicate = resource.clone();
+/// ```
+pub struct ResponseEgressResource<T> {
+    state: Arc<Mutex<ResponseEgressResourceState<T>>>,
+}
+
+impl<T> fmt::Debug for ResponseEgressResource<T> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResponseEgressResource")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> ResponseEgressResource<T>
+where
+    T: Send + 'static,
+{
+    /// Installs the response-scoped resource exactly once.
+    ///
+    /// A rejected resource is dropped before this method returns and is never returned to the
+    /// caller. `Closed` covers both terminal completion and completion abandonment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResponseEgressResourceInstallError::AlreadyInstalled`] when the slot already
+    /// owns a resource, or [`ResponseEgressResourceInstallError::Closed`] after terminal egress or
+    /// completion abandonment.
+    #[inline]
+    pub fn install(&self, resource: T) -> Result<(), ResponseEgressResourceInstallError> {
+        let mut candidate = Some(resource);
+        let install_error = {
+            let mut state = self.state();
+            if state.closed {
+                Some(ResponseEgressResourceInstallError::Closed)
+            } else if state.resource.is_some() {
+                Some(ResponseEgressResourceInstallError::AlreadyInstalled)
+            } else {
+                state.resource = candidate.take();
+                None
+            }
+        };
+        drop(candidate);
+        match install_error {
+            Some(rejection) => Err(rejection),
+            None => Ok(()),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, ResponseEgressResourceState<T>> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Stable reason a late-bound response-egress resource was rejected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ResponseEgressResourceInstallError {
+    #[error("a response-egress resource is already installed")]
+    AlreadyInstalled,
+    #[error("the response-egress resource owner is closed")]
+    Closed,
+}
+
+struct ResponseEgressResourceOwner<T> {
+    state: Option<Arc<Mutex<ResponseEgressResourceState<T>>>>,
+}
+
+impl<T> ResponseEgressResourceOwner<T> {
+    fn close(mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        close_response_egress_resource(&state);
+    }
+}
+
+impl<T> Drop for ResponseEgressResourceOwner<T> {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        close_response_egress_resource(&state);
+    }
+}
+
+struct ResponseEgressResourceState<T> {
+    closed: bool,
+    resource: Option<T>,
+}
+
 impl ResponseEgressCompletion {
     fn complete(&mut self, report: &ResponseEgressReport) {
         let Some(callback) = self.callback.take() else {
@@ -231,6 +390,28 @@ impl ResponseEgressCompletion {
         Self { callback: None }
     }
 
+    /// Creates one late-bound application-resource installer and its paired completion.
+    ///
+    /// The completion closes the installer at terminal egress or when abandoned. An installed
+    /// resource remains live until that close operation and is then dropped exactly once.
+    #[must_use]
+    #[inline]
+    pub fn late_bound<T>() -> (ResponseEgressResource<T>, Self)
+    where
+        T: Send + 'static,
+    {
+        let state = Arc::new(Mutex::new(ResponseEgressResourceState {
+            closed: false,
+            resource: None,
+        }));
+        let resource = ResponseEgressResource {
+            state: Arc::clone(&state),
+        };
+        let owner = ResponseEgressResourceOwner { state: Some(state) };
+        let completion = Self::new(move |_report| owner.close());
+        (resource, completion)
+    }
+
     /// Retains one response-scoped callback until terminal egress.
     #[must_use]
     #[inline]
@@ -243,6 +424,14 @@ impl ResponseEgressCompletion {
         }
     }
 }
+
+/// Synchronous factory for one detached ingress-error response completion.
+pub type DetachedResponseEgressCompletionFactory = Arc<
+    dyn for<'head> Fn(&DetachedResponseEgressHead<'head>) -> ResponseEgressCompletion
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// Synchronous observer for terminal response-egress reports.
 pub trait ResponseEgressObserver: Send + Sync + 'static {
@@ -703,6 +892,15 @@ impl Drop for ResponseEgressAttempt {
     }
 }
 
+fn close_response_egress_resource<T>(shared: &Mutex<ResponseEgressResourceState<T>>) {
+    let resource = {
+        let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        state.closed = true;
+        state.resource.take()
+    };
+    drop(resource);
+}
+
 /// Selects the portable default response-write policy.
 #[must_use]
 #[inline]
@@ -720,8 +918,12 @@ pub fn default_response_egress_policy(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::error::Error;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
     use std::time::Duration;
 
     use super::*;
@@ -776,6 +978,14 @@ mod tests {
         }
     }
 
+    struct ResourceDropProbe(Arc<AtomicUsize>);
+
+    impl Drop for ResourceDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     fn head<'head>(
         headers: &'head HeaderMap,
         request_start: MonotonicInstant,
@@ -789,6 +999,18 @@ mod tests {
             request_start,
             route,
         )
+    }
+
+    fn completed_report(request_start: MonotonicInstant) -> ResponseEgressReport {
+        ResponseEgressReport {
+            body_kind: ResponseEgressBodyKind::Application,
+            bytes_written: 0,
+            elapsed: Duration::ZERO,
+            fallback_disposition: None,
+            outcome: ResponseEgressOutcome::Completed,
+            request_start,
+            route: None,
+        }
     }
 
     fn attempt(
@@ -868,6 +1090,196 @@ mod tests {
         let observer = RecordingObserver::default();
         assert_object_safe(&observer);
         let _: ResponseEgressObserverHandle = ResponseEgressObserverHandle::default();
+    }
+
+    #[test]
+    fn late_bound_resource_is_send_and_sync_for_send_not_sync_values() {
+        fn assert_error<T: Error>() {}
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_error::<ResponseEgressResourceInstallError>();
+        assert_send_sync::<ResponseEgressResource<Cell<u8>>>();
+    }
+
+    #[test]
+    fn late_bound_install_and_close_race_releases_candidate_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+        let close_barrier = Arc::clone(&barrier);
+        let (resource, completion) = ResponseEgressCompletion::late_bound();
+
+        let install_result = thread::scope(|scope| {
+            let close = scope.spawn(move || {
+                close_barrier.wait();
+                drop(completion);
+            });
+            barrier.wait();
+            let result = resource.install(ResourceDropProbe(Arc::clone(&drops)));
+            close.join().expect("close thread");
+            result
+        });
+
+        assert!(matches!(
+            install_result,
+            Ok(()) | Err(ResponseEgressResourceInstallError::Closed)
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn late_bound_poisoned_state_recovers_and_releases_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (resource, completion) = ResponseEgressCompletion::late_bound();
+        let poisoned_state = Arc::clone(&resource.state);
+        let poison_result = catch_unwind(AssertUnwindSafe(move || {
+            let _guard = poisoned_state.lock().expect("unpoisoned state");
+            panic!("poison response resource state");
+        }));
+        assert!(poison_result.is_err());
+
+        resource
+            .install(ResourceDropProbe(Arc::clone(&drops)))
+            .expect("poison recovery installation");
+        drop(completion);
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn late_bound_install_before_terminal_releases_at_terminal_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (resource, mut completion) = ResponseEgressCompletion::late_bound();
+        resource
+            .install(ResourceDropProbe(Arc::clone(&drops)))
+            .expect("first installation");
+
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        completion.complete(&completed_report(MonotonicInstant::now()));
+        completion.complete(&completed_report(MonotonicInstant::now()));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        drop(completion);
+        drop(resource);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn late_bound_terminal_before_install_rejects_and_releases_candidate() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (resource, mut completion) = ResponseEgressCompletion::late_bound();
+        completion.complete(&completed_report(MonotonicInstant::now()));
+
+        assert_eq!(
+            resource.install(ResourceDropProbe(Arc::clone(&drops))),
+            Err(ResponseEgressResourceInstallError::Closed)
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn late_bound_duplicate_install_rejects_and_releases_only_candidate() {
+        let installed_drops = Arc::new(AtomicUsize::new(0));
+        let rejected_drops = Arc::new(AtomicUsize::new(0));
+        let (resource, completion) = ResponseEgressCompletion::late_bound();
+        resource
+            .install(ResourceDropProbe(Arc::clone(&installed_drops)))
+            .expect("first installation");
+
+        assert_eq!(
+            resource.install(ResourceDropProbe(Arc::clone(&rejected_drops))),
+            Err(ResponseEgressResourceInstallError::AlreadyInstalled)
+        );
+        assert_eq!(installed_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(rejected_drops.load(Ordering::SeqCst), 1);
+
+        drop(completion);
+        assert_eq!(installed_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn late_bound_abandonment_before_install_closes_surviving_installer() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (resource, completion) = ResponseEgressCompletion::late_bound();
+        drop(completion);
+
+        assert_eq!(
+            resource.install(ResourceDropProbe(Arc::clone(&drops))),
+            Err(ResponseEgressResourceInstallError::Closed)
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn late_bound_abandonment_after_install_releases_with_surviving_installer() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (resource, completion) = ResponseEgressCompletion::late_bound();
+        resource
+            .install(ResourceDropProbe(Arc::clone(&drops)))
+            .expect("first installation");
+
+        drop(completion);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resource.install(ResourceDropProbe(Arc::clone(&drops))),
+            Err(ResponseEgressResourceInstallError::Closed)
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn late_bound_competing_terminal_signals_release_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let observer = RecordingObserver::default();
+        let started_at = MonotonicInstant::now();
+        let headers = HeaderMap::new();
+        let head = head(&headers, started_at, None);
+        let (resource, completion) = ResponseEgressCompletion::late_bound();
+        resource
+            .install(ResourceDropProbe(Arc::clone(&drops)))
+            .expect("first installation");
+        let mut attempt = ResponseEgressAttempt::new(
+            &head,
+            started_at,
+            completion,
+            ResponseEgressObserverHandle::new(observer.clone()),
+            MonotonicClock::default(),
+        );
+
+        assert!(attempt.begin_writing());
+        assert!(attempt.complete(started_at));
+        assert!(!attempt.complete(started_at));
+        assert!(!attempt.terminate(ResponseEgressOutcome::TransportError, started_at));
+        drop(attempt);
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.reports().len(), 1);
+    }
+
+    #[test]
+    fn late_bound_unbegun_envelope_releases_without_reporting() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let observer = RecordingObserver::default();
+        let started_at = MonotonicInstant::now();
+        let response = response_builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .expect("response");
+        let (resource, completion) = ResponseEgressCompletion::late_bound();
+        resource
+            .install(ResourceDropProbe(Arc::clone(&drops)))
+            .expect("first installation");
+
+        drop(ResponseEgressEnvelope::new(
+            response,
+            ResponseEgressRequestMetadata::new(Method::GET, started_at, None),
+            completion,
+            Arc::new(default_response_egress_policy),
+            ResponseEgressObserverHandle::new(observer.clone()),
+            MonotonicClock::default(),
+        ));
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(observer.reports().is_empty());
     }
 
     #[test]

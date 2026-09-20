@@ -8,6 +8,8 @@ pub mod config;
 // internally; pub visibility is purely additive.
 pub mod handlers;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -15,7 +17,8 @@ use edgezero_core::app::App as EdgeZeroApp;
 use edgezero_core::http::StatusCode;
 use edgezero_core::{
     AdmissionDecision, BufferedIngressResponse, ConfigExtractionLimits, EdgeError, IngressGrant,
-    ResponseEgressCompletion, RouteResolution,
+    ResponseEgressCompletion, ResponseEgressResource, ResponseEgressResourceInstallError,
+    RouteResolution,
 };
 
 const DEFAULT_INGRESS_READ_BUDGET: Duration = Duration::from_secs(30);
@@ -23,9 +26,60 @@ const FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024;
 const FALLBACK_INGRESS_READ_BUDGET: Duration = Duration::from_secs(5);
 const OUTBOUND_INGRESS_READ_BUDGET: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct AdmissionLease {
+    #[cfg(test)]
+    release_counter: Option<Arc<AtomicUsize>>,
+    response_resource: ResponseEgressResource<ResponsePermit>,
     route_class: Option<String>,
+}
+
+impl AdmissionLease {
+    fn install_response_permit(&self) -> Result<(), ResponseEgressResourceInstallError> {
+        let permit = ResponsePermit {
+            #[cfg(test)]
+            release_counter: self.release_counter.clone(),
+            route_class: self.route_class.clone(),
+        };
+        self.response_resource.install(permit)
+    }
+
+    #[cfg(test)]
+    fn observe_response_permit_releases(&mut self, counter: Arc<AtomicUsize>) {
+        self.release_counter = Some(counter);
+    }
+}
+
+/// Demonstration stand-in for an application semaphore permit.
+#[derive(Debug)]
+struct ResponsePermit {
+    #[cfg(test)]
+    release_counter: Option<Arc<AtomicUsize>>,
+    route_class: Option<String>,
+}
+
+impl ResponsePermit {
+    fn new(route_class: Option<String>) -> Self {
+        Self {
+            #[cfg(test)]
+            release_counter: None,
+            route_class,
+        }
+    }
+
+    fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for ResponsePermit {
+    fn drop(&mut self) {
+        drop(self.route_class.take());
+        #[cfg(test)]
+        if let Some(counter) = self.release_counter.take() {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// App-owned shared state for the `app!(..., state = ...)` demonstration,
@@ -39,24 +93,29 @@ pub struct DemoState {
 /// Installs request-lifecycle policy before any adapter begins polling a body.
 fn configure_app(app: &mut EdgeZeroApp) -> Result<(), EdgeError> {
     app.set_config_extraction_limits(ConfigExtractionLimits::default())?;
-    app.set_ingress_admission_policy(|head| match head.route_resolution().clone() {
-        RouteResolution::Matched(metadata) => {
+    app.set_detached_response_egress_completion_factory(|head| {
+        let permit = ResponsePermit::new(Some(format!("detached:{}", head.error_kind())));
+        ResponseEgressCompletion::new(move |_report| permit.release())
+    });
+    app.set_ingress_admission_policy(|head| {
+        if let RouteResolution::Matched(metadata) = head.route_resolution().clone() {
             let route_class = metadata.class().map(str::to_owned);
             let read_budget = if route_class.as_deref() == Some("outbound") {
                 OUTBOUND_INGRESS_READ_BUDGET
             } else {
                 DEFAULT_INGRESS_READ_BUDGET
             };
+            let (lease, completion) = response_lifecycle(route_class);
             AdmissionDecision::Admit {
-                completion: response_completion(route_class.clone()),
-                grant: IngressGrant::new(AdmissionLease { route_class }),
+                completion,
+                grant: IngressGrant::new(lease),
                 read_deadline: head.read_deadline_after(read_budget),
             }
-        }
-        RouteResolution::MethodNotAllowed { .. } | RouteResolution::NotFound | _ => {
+        } else {
+            let (lease, completion) = response_lifecycle(None);
             AdmissionDecision::ReadBodyBeforeFallback {
-                completion: ResponseEgressCompletion::empty(),
-                grant: IngressGrant::new(AdmissionLease { route_class: None }),
+                completion,
+                grant: IngressGrant::new(lease),
                 max_body_bytes: FALLBACK_INGRESS_BODY_BYTES,
                 read_deadline: head.read_deadline_after(FALLBACK_INGRESS_READ_BUDGET),
                 on_exceeded: BufferedIngressResponse::text(
@@ -73,10 +132,18 @@ fn configure_app(app: &mut EdgeZeroApp) -> Result<(), EdgeError> {
     Ok(())
 }
 
-/// Keeps an application-owned value alive until this response reaches terminal egress.
-fn response_completion(route_class: Option<String>) -> ResponseEgressCompletion {
-    let response_scoped_lease = AdmissionLease { route_class };
-    ResponseEgressCompletion::new(move |_report| drop(response_scoped_lease))
+/// Pairs a core-owned late-bound resource installer with terminal response egress.
+fn response_lifecycle(route_class: Option<String>) -> (AdmissionLease, ResponseEgressCompletion) {
+    let (response_resource, completion) = ResponseEgressCompletion::late_bound();
+    (
+        AdmissionLease {
+            #[cfg(test)]
+            release_counter: None,
+            response_resource,
+            route_class,
+        },
+        completion,
+    )
 }
 
 /// Returns the shared app state, referenced by `app!(..., state = crate::app_state())`.
@@ -107,18 +174,24 @@ edgezero_core::app!(
 
 #[cfg(test)]
 mod lifecycle_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use bytes::Bytes;
     use edgezero_core::app::{App as EdgeZeroApp, Hooks as _};
     use edgezero_core::body::Body;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{request_builder, HeaderMap, Method, Response, StatusCode, Version};
-    use edgezero_core::ingress::{IngressBeginOutcome, IngressDispatchOutcome, IngressHeadParts};
+    use edgezero_core::ingress::{
+        AdmissionDecision, IngressBeginOutcome, IngressDispatchOutcome, IngressGrant,
+        IngressHeadParts,
+    };
     use edgezero_core::response_egress::ResponseEgressEnvelope;
     use edgezero_core::router::RouteResolution;
     use edgezero_core::time::MonotonicInstant;
     use futures::executor::block_on;
     use futures::stream::iter;
-    use std::time::Duration;
 
     #[test]
     fn manifest_route_classes_reach_route_resolution() {
@@ -172,6 +245,39 @@ mod lifecycle_tests {
         let payload: serde_json::Value = response.body().to_json().expect("json");
         assert_eq!(payload["route_class"], "diagnostic");
         assert_eq!(payload["grant_consumed_once"], true);
+    }
+
+    #[test]
+    fn late_bound_permit_lives_until_terminal_egress() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let policy_releases = Arc::clone(&releases);
+        let mut app = super::App::build_app().expect("configured app");
+        app.set_ingress_admission_policy(move |head| {
+            let RouteResolution::Matched(metadata) = head.route_resolution().clone() else {
+                panic!("admission route must resolve");
+            };
+            let route_class = metadata.class().map(str::to_owned);
+            let (mut lease, completion) = super::response_lifecycle(route_class);
+            lease.observe_response_permit_releases(Arc::clone(&policy_releases));
+            AdmissionDecision::Admit {
+                completion,
+                grant: IngressGrant::new(lease),
+                read_deadline: head.read_deadline_after(Duration::from_secs(30)),
+            }
+        });
+
+        let prepared = begin_ingress(&app, "/admission", MonotonicInstant::now());
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/admission")
+            .body(Body::empty())
+            .expect("request");
+        let envelope = block_on(app.dispatch_admitted(prepared, request));
+
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        let response = complete_envelope(envelope);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 
     #[test]

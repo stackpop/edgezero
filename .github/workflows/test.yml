@@ -66,6 +66,11 @@ jobs:
       - name: Outbound documentation contract
         run: node scripts/check_outbound_docs_contract.mjs
 
+      - name: Build strict public API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --offline --locked --workspace --all-features --no-deps
+
       - name: Brotli dependency contract
         run: node scripts/check_brotli_dependency_contract.mjs
 

@@ -14,7 +14,9 @@
 use async_trait::async_trait;
 use edgezero_core::blob_envelope::BlobEnvelope;
 use edgezero_core::body::Body;
-use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+use edgezero_core::config_store::{
+    BoundedStoreRead, ConfigStore, ConfigStoreError, ConfigStoreHandle,
+};
 use edgezero_core::context::RequestContext;
 use edgezero_core::extractor::{AppConfig as AppConfigExtractor, FromRequest as _};
 use edgezero_core::http::{Method, request_builder};
@@ -23,6 +25,7 @@ use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, SecretRegistry, StoreRegistry,
 };
+use edgezero_core::time::{Deadline, MonotonicClock};
 use futures::executor::block_on;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -79,13 +82,37 @@ struct Vaulted {
 struct BlobStore(String);
 
 #[async_trait(?Send)]
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "the legacy test provider intentionally exercises the bounded-read compatibility default"
-)]
 impl ConfigStore for BlobStore {
     async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
         Ok(Some(self.0.clone()))
+    }
+
+    async fn get_bounded(
+        &self,
+        key: &str,
+        clock: &MonotonicClock,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        if deadline.is_expired_at(clock.now()) {
+            return Err(ConfigStoreError::DeadlineExceeded);
+        }
+        let value = self.get(key).await?;
+        if deadline.is_expired_at(clock.now()) {
+            return Err(ConfigStoreError::DeadlineExceeded);
+        }
+        let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+            u64::try_from(stored_value.len())
+                .map_err(|_length_error| ConfigStoreError::ValueTooLarge)
+        })?;
+        if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+            return Err(ConfigStoreError::ValueTooLarge);
+        }
+        Ok(BoundedStoreRead {
+            backend_bytes,
+            value,
+        })
     }
 }
 

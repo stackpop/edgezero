@@ -156,6 +156,9 @@ pub async fn admission(RequestContext(ctx): RequestContext) -> Result<Response, 
             "admission grant route class mismatch",
         )));
     }
+    lease
+        .install_response_permit()
+        .map_err(EdgeError::internal)?;
 
     json_response(&AdmissionView {
         grant_consumed_once: ctx.take_ingress_grant().is_none(),
@@ -504,16 +507,14 @@ pub async fn state_demo(
 
 #[cfg(test)]
 mod tests {
-    #![expect(
-        clippy::missing_trait_methods,
-        reason = "legacy config fixtures intentionally exercise the bounded-read compatibility default"
-    )]
-
     use super::*;
     use async_trait::async_trait;
     use edgezero_core::blob_envelope::BlobEnvelope;
     use edgezero_core::body::Body;
-    use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+    use edgezero_core::config_store::{
+        finish_bounded_config_read, BoundedStoreRead, ConfigStore, ConfigStoreError,
+        ConfigStoreHandle,
+    };
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::header::{HeaderName, HeaderValue};
     use edgezero_core::http::{request_builder, HeaderMap, Method, StatusCode, Uri};
@@ -528,7 +529,7 @@ mod tests {
     use edgezero_core::store_registry::{
         ConfigRegistry, ConfigStoreBinding, KvRegistry, StoreRegistry,
     };
-    use edgezero_core::{BudgetSource, OutboundBatchDriverEvent};
+    use edgezero_core::{BudgetSource, Deadline, MonotonicClock, OutboundBatchDriverEvent};
     use futures::executor::block_on;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -548,6 +549,26 @@ mod tests {
     impl ConfigStore for MapConfigStore {
         async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(self.0.get(key).cloned())
+        }
+
+        async fn get_bounded(
+            &self,
+            key: &str,
+            clock: &MonotonicClock,
+            deadline: Deadline,
+            max_backend_bytes: u64,
+            max_value_bytes: u64,
+        ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+            if deadline.is_expired_at(clock.now()) {
+                return Err(ConfigStoreError::DeadlineExceeded);
+            }
+            finish_bounded_config_read(
+                self.get(key).await,
+                clock,
+                deadline,
+                max_backend_bytes,
+                max_value_bytes,
+            )
         }
     }
 
@@ -667,6 +688,26 @@ mod tests {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Err(ConfigStoreError::unavailable("backend offline"))
         }
+
+        async fn get_bounded(
+            &self,
+            key: &str,
+            clock: &MonotonicClock,
+            deadline: Deadline,
+            max_backend_bytes: u64,
+            max_value_bytes: u64,
+        ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+            if deadline.is_expired_at(clock.now()) {
+                return Err(ConfigStoreError::DeadlineExceeded);
+            }
+            finish_bounded_config_read(
+                self.get(key).await,
+                clock,
+                deadline,
+                max_backend_bytes,
+                max_value_bytes,
+            )
+        }
     }
 
     struct FixedStore(String);
@@ -675,6 +716,26 @@ mod tests {
     impl ConfigStore for FixedStore {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(Some(self.0.clone()))
+        }
+
+        async fn get_bounded(
+            &self,
+            key: &str,
+            clock: &MonotonicClock,
+            deadline: Deadline,
+            max_backend_bytes: u64,
+            max_value_bytes: u64,
+        ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+            if deadline.is_expired_at(clock.now()) {
+                return Err(ConfigStoreError::DeadlineExceeded);
+            }
+            finish_bounded_config_read(
+                self.get(key).await,
+                clock,
+                deadline,
+                max_backend_bytes,
+                max_value_bytes,
+            )
         }
     }
 
