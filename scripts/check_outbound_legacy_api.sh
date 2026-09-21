@@ -275,6 +275,18 @@ scan \
 # and newlines, and its embedded fixtures keep those cases covered in CI.
 scan_detached_send_tuple "${active_surfaces[@]}" || failed=1
 
+# Response-owned deadlines use explicit absolute or egress-start-relative constructors. Keep the
+# removed ambiguous constructor and unresolved accessor out of active code and documentation.
+deadline_legacy_pattern='ResponseEgressDeadline::ne'
+deadline_legacy_pattern+='w[[:space:]]*\(|ResponseEgressDeadline::dead'
+deadline_legacy_pattern+='line|pub[[:space:]]+(const[[:space:]]+)?fn[[:space:]]+dead'
+deadline_legacy_pattern+='line\(self\)'
+deadline_legacy_fixture='ResponseEgressDeadline::ne'
+deadline_legacy_fixture+='w(deadline)'
+assert_active_surface_fixture_rejected \
+  docs/index.md "$deadline_legacy_pattern" "$deadline_legacy_fixture" || failed=1
+scan "$deadline_legacy_pattern" "${active_surfaces[@]}" || failed=1
+
 # Retired staging command identifiers must not return to active code or public
 # documentation. Historical plans are outside these paths, and the exact terms
 # below intentionally do not match ordinary Fastly "staged" provider-state prose.

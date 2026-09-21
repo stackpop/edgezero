@@ -101,25 +101,49 @@ pub enum DetachedResponseEgressDecision {
     },
 }
 
-/// Application-selected absolute upper bound for one response's egress lifetime.
+/// Application-selected upper bound for one response's egress lifetime.
 ///
 /// Insert this value into the response extensions before returning the response. `EdgeZero`
-/// exposes it to the egress policy callback and enforces the earlier of this deadline and the
-/// callback-selected write deadline.
+/// resolves it when egress begins, exposes the resulting absolute deadline to the egress policy
+/// callback, and enforces the earlier of that deadline and the callback-selected write deadline.
 #[derive(Clone, Copy, Debug)]
-pub struct ResponseEgressDeadline(Deadline);
+pub struct ResponseEgressDeadline(ResponseEgressDeadlineKind);
+
+#[derive(Clone, Copy, Debug)]
+enum ResponseEgressDeadlineKind {
+    After(Duration),
+    At(Deadline),
+}
 
 impl ResponseEgressDeadline {
+    /// Selects a deadline relative to the instant response egress begins.
+    ///
+    /// The duration is clamped to [`DEADLINE_FAR_FUTURE`]. Arithmetic overflow fails closed by
+    /// resolving to the sampled egress-start instant.
     #[must_use]
     #[inline]
-    pub fn deadline(self) -> Deadline {
-        self.0
+    pub const fn after(duration: Duration) -> Self {
+        Self(ResponseEgressDeadlineKind::After(duration))
+    }
+
+    /// Selects an absolute deadline in the application's monotonic clock domain.
+    #[must_use]
+    #[inline]
+    pub const fn at(deadline: Deadline) -> Self {
+        Self(ResponseEgressDeadlineKind::At(deadline))
     }
 
     #[must_use]
     #[inline]
-    pub fn new(deadline: Deadline) -> Self {
-        Self(deadline)
+    fn resolve_at(self, egress_started_at: MonotonicInstant) -> Deadline {
+        match self.0 {
+            ResponseEgressDeadlineKind::At(deadline) => deadline,
+            ResponseEgressDeadlineKind::After(duration) => Deadline::at_instant(
+                egress_started_at
+                    .checked_add(duration.min(DEADLINE_FAR_FUTURE))
+                    .unwrap_or(egress_started_at),
+            ),
+        }
     }
 }
 
@@ -166,6 +190,7 @@ pub struct ResponseEgressHead<'head> {
 }
 
 impl<'head> ResponseEgressHead<'head> {
+    /// Returns the response-owned deadline after resolving it to an absolute instant.
     #[must_use]
     #[inline]
     pub fn application_deadline(&self) -> Option<Deadline> {
@@ -572,7 +597,7 @@ impl ResponseEgressEnvelope {
             .response
             .extensions_mut()
             .remove::<ResponseEgressDeadline>()
-            .map(ResponseEgressDeadline::deadline);
+            .map(|deadline| deadline.resolve_at(egress_started_at));
         let head = ResponseEgressHead::new(
             self.response.status(),
             self.response.version(),
@@ -2023,7 +2048,7 @@ mod tests {
             .expect("response");
         response
             .extensions_mut()
-            .insert(ResponseEgressDeadline::new(application_deadline));
+            .insert(ResponseEgressDeadline::at(application_deadline));
         let envelope = ResponseEgressEnvelope::new(
             response,
             ResponseEgressRequestMetadata::new(Method::GET, request_start, None),
@@ -2058,6 +2083,93 @@ mod tests {
                 .get::<ResponseEgressDeadline>()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn response_relative_deadline_resolves_from_injected_egress_start() {
+        let request_start = MonotonicInstant::now();
+        let egress_started_at = request_start
+            .checked_add(Duration::from_millis(10))
+            .expect("egress start");
+        let expected_deadline = egress_started_at
+            .checked_add(Duration::from_millis(40))
+            .expect("relative deadline");
+        let callback_deadline = Deadline::at_instant(
+            egress_started_at
+                .checked_add(Duration::from_millis(100))
+                .expect("callback deadline"),
+        );
+        let mut response = response_builder()
+            .status(StatusCode::OK)
+            .body(Body::from("body"))
+            .expect("response");
+        response
+            .extensions_mut()
+            .insert(ResponseEgressDeadline::after(Duration::from_millis(40)));
+        let envelope = ResponseEgressEnvelope::new(
+            response,
+            ResponseEgressRequestMetadata::new(Method::GET, request_start, None),
+            ResponseEgressCompletion::empty(),
+            Arc::new(move |head, observed_start| {
+                assert_eq!(observed_start, egress_started_at);
+                assert_eq!(
+                    head.application_deadline()
+                        .map(|deadline| deadline.instant()),
+                    Some(expected_deadline)
+                );
+                ResponseEgressPolicy {
+                    write_deadline: callback_deadline,
+                }
+            }),
+            ResponseEgressObserverHandle::default(),
+            MonotonicClock::new(move || egress_started_at),
+        );
+
+        let Ok((prepared, policy, _attempt, _clock)) = envelope.begin() else {
+            panic!("egress preparation failed");
+        };
+
+        assert_eq!(policy.write_deadline.instant(), expected_deadline);
+        assert!(
+            prepared
+                .into_response()
+                .extensions()
+                .get::<ResponseEgressDeadline>()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn response_relative_deadline_zero_expires_at_egress_start() {
+        let egress_started_at = MonotonicInstant::now();
+        let deadline = ResponseEgressDeadline::after(Duration::ZERO).resolve_at(egress_started_at);
+
+        assert_eq!(deadline.instant(), egress_started_at);
+        assert!(deadline.is_expired_at(egress_started_at));
+    }
+
+    #[test]
+    fn response_relative_deadline_clamps_to_portable_far_future() {
+        let egress_started_at = MonotonicInstant::now();
+        let expected = egress_started_at
+            .checked_add(DEADLINE_FAR_FUTURE)
+            .expect("portable far-future deadline");
+        let deadline = ResponseEgressDeadline::after(Duration::MAX).resolve_at(egress_started_at);
+
+        assert_eq!(deadline.instant(), expected);
+    }
+
+    #[test]
+    fn response_absolute_deadline_is_not_reanchored_at_egress_start() {
+        let absolute = MonotonicInstant::now();
+        let egress_started_at = absolute
+            .checked_add(Duration::from_secs(1))
+            .expect("egress start");
+        let deadline = ResponseEgressDeadline::at(Deadline::at_instant(absolute))
+            .resolve_at(egress_started_at);
+
+        assert_eq!(deadline.instant(), absolute);
+        assert!(deadline.is_expired_at(egress_started_at));
     }
 
     #[test]
