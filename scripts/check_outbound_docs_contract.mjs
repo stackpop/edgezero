@@ -686,7 +686,13 @@ if (
 
 const responseEgressSpecSource = readFileSync(responseEgressSpecPath, 'utf8')
 for (const requiredFragment of [
-  'pub struct ResponseEgressDeadline(Deadline);',
+  'pub struct ResponseEgressDeadline { /* private */ }',
+  'pub const fn at(deadline: Deadline) -> Self;',
+  'pub const fn after(duration: Duration) -> Self;',
+  'egress-start-relative deadline',
+  'resolves `after(duration)` from that',
+  'exact sample before invoking the callback',
+  'retired ambiguous `new()` constructor and unresolved',
   'pub struct ResponseEgressCompletion',
   'pub enum DetachedResponseEgressDecision',
   '    Send {',

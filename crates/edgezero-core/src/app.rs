@@ -176,7 +176,7 @@ impl App {
                 let mut response = render_error_response(error);
                 response
                     .extensions_mut()
-                    .insert(ResponseEgressDeadline::new(deadline));
+                    .insert(ResponseEgressDeadline::at(deadline));
                 IngressDispatchOutcome::Response(Box::new(self.detached_response_egress(
                     response,
                     request_method,

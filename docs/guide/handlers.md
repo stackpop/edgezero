@@ -348,6 +348,25 @@ It never belongs in response extensions. It follows admitted, refused, fallback,
 and middleware-error responses into the adapter's exactly-once egress attempt.
 `AdmissionDecision::Abort` is different: it returns no response and therefore owns no completion.
 
+A handler can place a response-specific write bound in the response extensions without teaching
+the global policy callback about application response categories:
+
+```rust
+use edgezero_core::ResponseEgressDeadline;
+use std::time::Duration;
+
+response
+    .extensions_mut()
+    .insert(ResponseEgressDeadline::after(Duration::from_secs(2)));
+```
+
+`after(duration)` starts at the injected-clock instant when response egress begins. EdgeZero
+clamps the duration to seven days and fails closed to that start instant on arithmetic overflow.
+Use `ResponseEgressDeadline::at(deadline)` when the application already owns an absolute cutoff,
+such as a queue-through-egress deadline. EdgeZero removes either extension in `begin()`, exposes
+the resolved absolute value to the policy callback, and enforces the earlier application or policy
+deadline. The retired `new()` and unresolved `deadline()` APIs are not available.
+
 Use `left.join(right)` when two independently owned completion actions must follow the same
 response. The joined completion invokes the left callback and then the right callback with the
 same borrowed terminal report, at most once. Abandoning it before terminal egress releases the

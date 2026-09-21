@@ -96,7 +96,12 @@ policy, and attempt. The adapter obtains one finite absolute deadline:
 pub const DEFAULT_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug)]
-pub struct ResponseEgressDeadline(Deadline);
+pub struct ResponseEgressDeadline { /* private */ }
+
+impl ResponseEgressDeadline {
+    pub const fn after(duration: Duration) -> Self;
+    pub const fn at(deadline: Deadline) -> Self;
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ResponseEgressPolicy {
@@ -104,12 +109,17 @@ pub struct ResponseEgressPolicy {
 }
 ```
 
-An application that has already computed an absolute response deadline inserts
-`ResponseEgressDeadline` into the returned response extensions. `begin()` removes that
-extension, exposes its value through `ResponseEgressHead::application_deadline()`, and enforces
-the earlier of it and the callback-selected `write_deadline`. This carries a queue-through-egress
-budget without re-anchoring it at adapter conversion. The deadline must use the application's
-`MonotonicClock`; the demo and generated template derive it from `RequestContext::monotonic_clock()`.
+An application inserts one `ResponseEgressDeadline` into the returned response extensions.
+`ResponseEgressDeadline::at` preserves an already-computed absolute cutoff in the application's
+`MonotonicClock` domain, including a queue-through-egress budget.
+`ResponseEgressDeadline::after` selects an egress-start-relative deadline without requiring a
+response category in the global policy callback. `begin()` samples `egress_started_at` once from
+the envelope's injected clock, removes the extension, and resolves `after(duration)` from that
+exact sample before invoking the callback. The duration is clamped to `DEADLINE_FAR_FUTURE`, and
+checked-add overflow fails closed to `egress_started_at`. `begin()` exposes the resolved absolute
+value through `ResponseEgressHead::application_deadline()` and enforces the earlier of it and the
+callback-selected `write_deadline`. The retired ambiguous `new()` constructor and unresolved
+`deadline()` accessor do not exist.
 
 Every normalized-error `DetachedResponseEgressDecision::Send` carries such an absolute deadline
 as a mandatory named field. `App` inserts it into the existing `ResponseEgressDeadline` extension
@@ -718,7 +728,7 @@ Every adapter gets deterministic lifecycle tests before provider integration:
 
 | Surface      | Required proof                                                                                                                                                                                                     |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Timing       | One absolute deadline covers conversion, first byte, source waits, writes, backpressure, and finish. Equality expiry wins; no chunk resets the budget. Frozen/backward clocks still settle exactly once. Every normalized-error `Send` supplies a mandatory absolute deadline in the request's injected clock domain; relative construction anchors to `request_start`, clamps to `DEADLINE_FAR_FUTURE`, and fails closed to request start on overflow. The default uses `DEFAULT_RESPONSE_WRITE_BUDGET` from request start. The effective bound is the earlier of the factory deadline and default egress policy, so neither can extend the other. Admission-selected detached responses retain their response-owned deadline path outside the factory contract. |
+| Timing       | One resolved absolute deadline covers conversion, first byte, source waits, writes, backpressure, and finish. Equality expiry wins; no chunk resets the budget. Frozen/backward clocks still settle exactly once. A response-owned `at` cutoff remains absolute; `after` is resolved exactly once from the injected `egress_started_at` sample, clamps to `DEADLINE_FAR_FUTURE`, and fails closed to that sample on overflow. Every normalized-error `Send` supplies a mandatory absolute deadline in the request's injected clock domain; its relative construction anchors to `request_start`, clamps to `DEADLINE_FAR_FUTURE`, and fails closed to request start on overflow. The default uses `DEFAULT_RESPONSE_WRITE_BUDGET` from request start. The effective bound is the earlier of the application deadline and default egress policy, so neither can extend the other. Admission-selected detached responses retain their response-owned deadline path outside the factory contract. |
 | Completion   | Empty, buffered, streamed EOF, source failure, transport failure, timeout, disconnect, conversion failure, never-polled body, and guard drop each notify once. Competing terminal events still produce one report. The exact decision-owned completion survives normal dispatch, handler/routing errors, canonical 404/405, bounded fallback outcomes, refusal, policy/framing failure, adapter fallback, and guard drop; it runs before the global observer. Joined completions receive the same borrowed report at most once in left-to-right order and release both resources if abandoned. Child panics remain independently isolated only on unwind-capable targets; panic-abort may terminate before the right callback. A dropped pre-begin envelope releases its resource without fabricating a report. Normalized pre-admission validation invokes the detached-egress decision factory exactly once: `Send { completion, deadline }` supplies exactly one completion and one mandatory deadline, with an empty completion by default, while `Abort` constructs no response or attempt and invokes no completion, observer, handler, middleware, or body poll. Raw parser failures remain outside the lifecycle contract. Explicit ingress abort likewise starts no attempt and invokes no callback. Compile-time tests prove the completion is non-clone and cannot be stored in response extensions. |
 | Accounting   | Exact payload totals, zero-byte response, checked overflow, short/partial writes, cancellation prefixes, and no headers/framing in the count.                                                                      |
 | Commit       | Pre-commit failure may synthesize a bounded fallback; post-commit failure aborts without rewriting status or appending a body.                                                                                     |

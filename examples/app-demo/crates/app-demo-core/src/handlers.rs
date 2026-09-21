@@ -205,7 +205,7 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
     let mut response = json_response(&output)?;
     response
         .extensions_mut()
-        .insert(ResponseEgressDeadline::new(deadline));
+        .insert(ResponseEgressDeadline::at(deadline));
     Ok(response)
 }
 

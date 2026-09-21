@@ -1670,6 +1670,11 @@ mod tests {
             !handlers.contains(".send_all("),
             "generated outbound example must not retain the removed send_all API",
         );
+        assert!(
+            handlers.contains("ResponseEgressDeadline::at(deadline)")
+                && !handlers.contains(concat!("ResponseEgressDeadline::", "new(")),
+            "generated responses must use the explicit absolute deadline constructor",
+        );
     }
 
     fn assert_generated_route_and_provider_manifests(project_dir: &Path) {
