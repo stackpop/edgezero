@@ -263,6 +263,14 @@ non-zero with a one-line diagnostic on error.
 
 ### edgezero config validate
 
+Standalone validation checks every declared, registered adapter for portability.
+With `--strict`, capability limits are checked across that same adapter set.
+By contrast, `config push --adapter NAME` and `config diff --adapter NAME`
+apply provider-specific rules only to `NAME`; an unrelated adapter's manifest
+or secret-reference naming rules cannot block the selected destination. Shared
+schema and secret-presence checks still apply. Spin secret-name validation
+diagnostics name the affected fields and rules without printing their values.
+
 Validate `edgezero.toml` together with the typed `<name>.toml` app
 config (see [Application config](/guide/configuration#application-config)).
 

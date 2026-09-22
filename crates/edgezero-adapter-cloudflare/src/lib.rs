@@ -17,11 +17,13 @@ pub mod proxy;
 pub mod request;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod response;
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+mod response_headers;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod secret_store;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-use edgezero_core::app::{Hooks, StoresMetadata};
+use edgezero_core::app::{App, Hooks, StoresMetadata};
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
@@ -111,6 +113,46 @@ pub async fn run_app<A: Hooks>(
     let app = A::build_app();
     request::dispatch_with_registries(
         &app,
+        req,
+        env,
+        ctx,
+        request::RegistryInputs {
+            config_meta: stores.config,
+            kv_meta: stores.kv,
+            secret_meta: stores.secrets,
+            env_config: &env_config,
+        },
+    )
+    .await
+}
+
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+/// Dispatch a caller-owned app with explicit store metadata.
+///
+/// Resolves configuration and request resources for this invocation without
+/// building or caching an app or installing logging. Pass metadata matching
+/// the app (normally `MyApp::stores()`). Retain only application-owned values;
+/// native handles and pending work belong to the request. Shared app state
+/// must support overlapping invocations.
+///
+/// Store metadata is a caller precondition: `App` carries no store provenance,
+/// so this function cannot validate the pairing. Mismatched metadata can fail
+/// binding resolution or select unintended bindings. Keep the app and its
+/// construction metadata together; normally both come from the same `Hooks` type.
+///
+/// # Errors
+/// Returns conversion or dispatch errors from the existing adapter boundary.
+#[inline]
+pub async fn dispatch_app(
+    app: &App,
+    stores: StoresMetadata,
+    req: Request,
+    env: Env,
+    ctx: Context,
+) -> Result<Response, WorkerError> {
+    let env_config = env_config_from_worker(&env, stores);
+    request::dispatch_with_registries(
+        app,
         req,
         env,
         ctx,
