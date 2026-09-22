@@ -1527,6 +1527,14 @@ fn resolve_app_config_path(
     )
 }
 
+/// Adapter keys are matched case-insensitively everywhere else (see
+/// `Manifest::adapter_entry`), so the `--adapter` selection filter must be
+/// too: `[adapters.Spin]` with `--adapter spin` (or the reverse) selects the
+/// same entry and must not skip its validation.
+fn is_unselected_adapter(selected: Option<&str>, name: &str) -> bool {
+    selected.is_some_and(|target| !target.eq_ignore_ascii_case(name))
+}
+
 fn run_shared_checks(ctx: &ValidationContext, selected: Option<&str>) -> Result<(), String> {
     run_adapter_shared_checks(ctx, selected)?;
     if ctx.args_strict {
@@ -1561,7 +1569,7 @@ fn run_adapter_shared_checks(
     let env_config = EnvConfig::from_env();
 
     for (name, adapter_cfg) in &ctx.manifest().adapters {
-        if selected.is_some_and(|target| target != name) {
+        if is_unselected_adapter(selected, name) {
             continue;
         }
         let Some(adapter) = adapter_registry::get_adapter(name) else {
@@ -1791,7 +1799,7 @@ fn run_adapter_typed_checks<C: AppConfigMeta>(
     }
 
     for name in ctx.manifest().adapters.keys() {
-        if selected.is_some_and(|target| target != name) {
+        if is_unselected_adapter(selected, name) {
             continue;
         }
         if let Some(adapter) = adapter_registry::get_adapter(name) {
@@ -1910,7 +1918,7 @@ fn strict_capability_completeness(
     // registry (e.g. a feature-gated build that omitted some) are
     // skipped — we can't speak for what isn't linked.
     for adapter_name in manifest.adapters.keys() {
-        if selected.is_some_and(|target| target != adapter_name) {
+        if is_unselected_adapter(selected, adapter_name) {
             continue;
         }
         enforce_single_store_capability(manifest, adapter_name)?;
@@ -4142,6 +4150,36 @@ timeout_ms = 50
         for selected in [None, Some("spin")] {
             let err = run_shared_checks(&ctx, selected).unwrap_err();
             assert!(err.contains("Single") && err.contains("secrets"), "{err}");
+        }
+    }
+
+    /// The `--adapter` filter must fold case the same way
+    /// `Manifest::adapter_entry` and the adapter registry do. Pre-fix the
+    /// filters compared raw strings, so `[adapters.Spin]` + `--adapter spin`
+    /// (or the reverse) skipped the selected adapter's own checks entirely.
+    #[test]
+    fn selected_adapter_filter_matches_manifest_key_case_insensitively() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        for (manifest_key, selected) in [("Spin", "spin"), ("spin", "SPIN")] {
+            let manifest_text = format!(
+                "{}\n[adapters.{manifest_key}.adapter]\ncrate = \"unused\"\nmanifest = \"spin.toml\"\n",
+                PUSH_MANIFEST
+                    .replace("adapters.axum", "adapters.fastly")
+                    .replace(
+                        "ids = [\"default\"]",
+                        "ids = [\"default\", \"extra\"]\ndefault = \"default\""
+                    )
+            );
+            let (dir, manifest, _) = setup_project(&manifest_text, FIXTURE_APP_CONFIG);
+            fs::write(dir.path().join("spin.toml"), VALID_SPIN_TOML).unwrap();
+            let mut args = args_for(&manifest);
+            args.strict = true;
+            let ctx = load_validation_context(&args).unwrap();
+            let err = run_shared_checks(&ctx, Some(selected)).unwrap_err();
+            assert!(
+                err.contains("Single") && err.contains("secrets"),
+                "[adapters.{manifest_key}] with --adapter {selected} must still be validated: {err}"
+            );
         }
     }
 
