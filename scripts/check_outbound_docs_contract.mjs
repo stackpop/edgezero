@@ -416,6 +416,7 @@ for (const requiredFragment of [
   'Every `Send` deadline is mandatory and absolute',
   '`Abort` creates no response or egress attempt and invokes no completion callback',
   'sorted, deduplicated `Allow` field',
+  'Effective `config_out_of_date` responses retain `Retry-After: 60`',
   'status returned by the callback is ignored',
   'never belongs in response extensions',
 ]) {
@@ -564,6 +565,7 @@ for (const requiredFragment of [
   '`Vec<Method>` rather than flattening protocol data into display text',
   'custom renderer cannot reinterpret the error status',
   'the canonical `Allow` field',
+  '`Retry-After: 60` for every effective `config_out_of_date` outcome after custom rendering',
 ]) {
   if (!inboundSpecSource.includes(requiredFragment)) {
     fail(`${inboundSpecPath} is missing lifecycle contract: ${requiredFragment}`)

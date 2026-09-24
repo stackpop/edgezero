@@ -356,6 +356,7 @@ The renderer handles admitted routing/handler errors, post-admission conversion 
 detached normalized-ingress errors. EdgeZero reapplies mandatory protocol metadata after the
 callback, including the error's status, so the status returned by the callback is ignored;
 canonical 405 responses therefore retain their sorted, deduplicated `Allow` field.
+Effective `config_out_of_date` responses retain `Retry-After: 60`.
 Explicit admission refusals and fallback `on_exceeded`/`on_timeout` responses are already complete
 application responses and bypass this renderer. Avoid serializing `error.to_string()` when the
 body must remain bounded or diagnostics must remain private.

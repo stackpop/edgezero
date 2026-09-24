@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::body::Body;
 use crate::config_store::ConfigStoreError;
 use crate::http::{
-    HeaderValue, Method, Response, StatusCode,
+    HeaderMap, HeaderValue, Method, Response, StatusCode,
     header::{ALLOW, CONTENT_TYPE, RETRY_AFTER},
 };
 use crate::response::{IntoResponse, response_with_body};
@@ -370,28 +370,17 @@ impl EdgeError {
         }
     }
 
-    pub(crate) fn required_allow_header(&self) -> Result<Option<HeaderValue>, EdgeError> {
-        match self {
-            EdgeError::MethodNotAllowed { allowed, .. } => {
-                HeaderValue::from_str(&allowed_header_value(allowed))
-                    .map(Some)
-                    .map_err(EdgeError::internal)
-            }
-            EdgeError::BadGateway { .. }
-            | EdgeError::BadRequest { .. }
-            | EdgeError::ConfigOutOfDate { .. }
-            | EdgeError::GatewayTimeout { .. }
-            | EdgeError::Internal { .. }
-            | EdgeError::NotFound { .. }
-            | EdgeError::NotImplemented { .. }
-            | EdgeError::RequestHeaderFieldsTooLarge { .. }
-            | EdgeError::RequestTimeout { .. }
-            | EdgeError::ResponseTooLarge { .. }
-            | EdgeError::ServiceUnavailable { .. }
-            | EdgeError::StoreExtraction { .. }
-            | EdgeError::UriTooLong { .. }
-            | EdgeError::Validation { .. } => Ok(None),
+    pub(crate) fn required_response_headers(&self) -> Result<HeaderMap, EdgeError> {
+        let mut headers = HeaderMap::new();
+        if let EdgeError::MethodNotAllowed { allowed, .. } = self {
+            let value = HeaderValue::from_str(&allowed_header_value(allowed))
+                .map_err(EdgeError::internal)?;
+            headers.insert(ALLOW, value);
         }
+        if self.kind() == "config_out_of_date" {
+            headers.insert(RETRY_AFTER, HeaderValue::from_static("60"));
+        }
+        Ok(headers)
     }
 
     #[inline]
@@ -563,9 +552,8 @@ impl From<ConfigStoreError> for EdgeError {
 impl IntoResponse for EdgeError {
     #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
-        let required_allow = self.required_allow_header()?;
+        let required_headers = self.required_response_headers()?;
         let kind = self.kind();
-        let is_config_out_of_date = self.kind() == "config_out_of_date";
         // `ConfigOutOfDate { field_path: String::new(), .. }` (the missing-blob
         // path) must OMIT the `field_path` JSON key entirely, not emit
         // `"field_path": ""`. Per spec 6.3.1.
@@ -610,14 +598,7 @@ impl IntoResponse for EdgeError {
         response
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(value) = required_allow {
-            response.headers_mut().insert(ALLOW, value);
-        }
-        if is_config_out_of_date {
-            response
-                .headers_mut()
-                .insert(RETRY_AFTER, HeaderValue::from_static("60"));
-        }
+        response.headers_mut().extend(required_headers);
         Ok(response)
     }
 }

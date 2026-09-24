@@ -4366,7 +4366,7 @@ the client side need to update. Per §1's hard-cutoff stance,
 no compat shim.
 
 **2. Send `Retry-After: 60`** only when the effective kind is
-`config_out_of_date`. This includes `ConfigOutOfDate` and the three
+`config_out_of_date`. This includes `ConfigOutOfDate` and the four
 store-extraction reasons mapped to that kind in §6.3. Earlier drafts extended the header to all
 `ServiceUnavailable` responses; an audit of in-tree
 `ServiceUnavailable` producers shows that the variant is
@@ -4401,7 +4401,9 @@ model takes the narrower stance:
 
 Added via the centralized error response-header policy rather than a
 variant-only `matches!` check. Other outcomes (`service_unavailable`,
-`internal`, `bad_request`, etc.) do NOT set the header.
+`internal`, `bad_request`, etc.) do NOT set the header. Application custom error rendering may
+replace the response body but cannot remove this mandatory header; EdgeZero reapplies the
+effective `config_out_of_date` policy after the callback returns.
 
 **3. `field_path` for the error payload** comes from
 `serde_path_to_error::Track::path()` (or equivalent), wrapped

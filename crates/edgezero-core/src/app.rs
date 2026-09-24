@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::body::Body;
 use crate::config_store::ConfigExtractionLimits;
 use crate::error::EdgeError;
-use crate::http::header::{ALLOW, CONTENT_TYPE};
+use crate::http::header::CONTENT_TYPE;
 use crate::http::{HeaderValue, Method, Request, Response, StatusCode};
 use crate::ingress::{
     AdmissionDecision, IngressAdmissionOutcome, IngressAdmissionPolicy, IngressBeginOutcome,
@@ -301,15 +301,13 @@ impl App {
 
     fn render_error_response(&self, error: EdgeError) -> Response {
         let status = error.status();
-        let required_allow = match error.required_allow_header() {
-            Ok(value) => value,
+        let required_headers = match error.required_response_headers() {
+            Ok(headers) => headers,
             Err(header_error) => return render_default_error_response(header_error),
         };
         let mut response = (self.error_response_renderer)(error);
         *response.status_mut() = status;
-        if let Some(value) = required_allow {
-            response.headers_mut().insert(ALLOW, value);
-        }
+        response.headers_mut().extend(required_headers);
         response
     }
 
@@ -599,7 +597,7 @@ mod tests {
     use crate::body::Body;
     use crate::config_store::ConfigExtractionLimits;
     use crate::context::RequestContext;
-    use crate::error::EdgeError;
+    use crate::error::{EdgeError, StoreExtractionReason};
     use crate::http::{
         HeaderMap, HeaderValue, Method, StatusCode, Version, request_builder, response_builder,
     };
@@ -1835,6 +1833,52 @@ mod tests {
             response.body().as_bytes().expect("buffered body"),
             b"bounded error"
         );
+    }
+
+    #[test]
+    fn custom_error_response_renderer_cannot_remove_config_retry_after_header() {
+        let mut app = App::new(empty_router());
+        app.set_error_response_renderer(|_error| {
+            response_builder()
+                .header("retry-after", "1")
+                .body(Body::from("bounded error"))
+                .expect("response")
+        });
+
+        for error in [
+            EdgeError::config_out_of_date("stale config", "feature.enabled"),
+            EdgeError::StoreExtraction {
+                reason: StoreExtractionReason::MissingSecret,
+                message: "missing secret".to_owned(),
+                field_path: Some("credentials.token".to_owned()),
+            },
+        ] {
+            let response = app.render_error_response(error);
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("retry-after")
+                    .expect("Retry-After header"),
+                "60"
+            );
+            assert_eq!(
+                response.body().as_bytes().expect("buffered body"),
+                b"bounded error"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_error_response_renderer_does_not_add_retry_after_to_generic_503() {
+        let mut app = App::new(empty_router());
+        app.set_error_response_renderer(|_error| Response::new(Body::from("bounded error")));
+
+        let response = app.render_error_response(EdgeError::service_unavailable("busy"));
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get("retry-after").is_none());
     }
 
     #[test]
