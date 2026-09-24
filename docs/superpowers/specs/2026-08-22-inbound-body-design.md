@@ -153,7 +153,11 @@ is the generated-route path; existing route builders produce `class() == None`.
 pattern/method candidate sorted by method then pattern; callers derive an Allow set without
 depending on `HashMap` order. `RouteInfo` reuses `RouteMetadata` rather than defining a
 second identity. Duplicate method/pattern registration remains the existing build-time
-error.
+error. The resulting `EdgeError::MethodNotAllowed` retains a sorted, deduplicated
+`Vec<Method>` rather than flattening protocol data into display text. Its canonical response
+always emits the corresponding `Allow` field, including after a successful bounded fallback
+body drain. An empty method set emits an empty `Allow` value; normal router-produced 405s always
+contain at least one method.
 
 The resolution/dispatch split is an explicit router API, not an adapter-side reimplementation
 of matching:
@@ -737,7 +741,7 @@ the Fastly and Spin paths fully materialize the body too). This migration change
       ConfigOutOfDate    { field_path: String, message: String },
       GatewayTimeout     { cause: BudgetSource, message: String }, // preserve typed cause
       Internal           { rendered: String }, // ALREADY-rendered source; no re-prefixing
-      MethodNotAllowed   { allowed: String, method: Method }, // no fallible method parse
+      MethodNotAllowed   { allowed: Vec<Method>, method: Method },
       NotFound           { path: String },
       NotImplemented     { message: String },
       RequestTimeout     { message: String }, // admitted inbound read deadline expired
@@ -762,6 +766,18 @@ the Fastly and Spin paths fully materialize the body too). This migration change
       fn to_edge_error(&self) -> EdgeError { /* inverse of capture */ }
   }
   ```
+
+  Application-owned error rendering is installed once with
+  `App::set_error_response_renderer(Fn(EdgeError) -> Response)`. The synchronous callback runs
+  exactly once for handler/routing failures, failures converted with `admitted_error_egress`, and
+  detached normalized-ingress failures. It permits a deployment to return a fixed-size body
+  without allocating the framework's canonical JSON payload. EdgeZero applies protocol-required
+  status and metadata after the callback, so a custom renderer cannot reinterpret the error status
+  (the callback's returned status is ignored) and a custom 405 renderer cannot remove or replace
+  the canonical `Allow` field. Explicit
+  `AdmissionDecision::Refuse` responses and the `on_exceeded`/`on_timeout` fallback responses
+  bypass the renderer because the application supplied those complete responses directly. Raw
+  parser failures before EdgeZero receives a request remain outside the application lifecycle.
 
   **Decomposition happens once, at poison time.** The drain's `EdgeError` is captured
   into `StoredError` and the cell returns `stored.to_edge_error()` — so *even the first*

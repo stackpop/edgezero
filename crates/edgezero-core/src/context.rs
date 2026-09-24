@@ -54,7 +54,7 @@ enum StoredError {
     ConfigOutOfDate(String, String),
     GatewayTimeout(String, BudgetSource),
     Internal(String),
-    MethodNotAllowed(Method, String),
+    MethodNotAllowed(Method, Vec<Method>),
     NotFound(String),
     NotImplemented(String),
     RequestHeaderFieldsTooLarge(String),

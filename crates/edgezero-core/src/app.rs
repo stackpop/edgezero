@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::body::Body;
 use crate::config_store::ConfigExtractionLimits;
 use crate::error::EdgeError;
-use crate::http::header::CONTENT_TYPE;
+use crate::http::header::{ALLOW, CONTENT_TYPE};
 use crate::http::{HeaderValue, Method, Request, Response, StatusCode};
 use crate::ingress::{
     AdmissionDecision, IngressAdmissionOutcome, IngressAdmissionPolicy, IngressBeginOutcome,
@@ -31,11 +31,13 @@ const DEFAULT_APP_NAME: &str = "EdgeZero App";
 pub const FASTLY_ADAPTER: &str = "fastly";
 /// Canonical adapter name for the Spin adapter.
 pub const SPIN_ADAPTER: &str = "spin";
+type ErrorResponseRenderer = Arc<dyn Fn(EdgeError) -> Response + Send + Sync + 'static>;
 
 /// Lightweight container around a `RouterService` that can be extended via hook implementations.
 pub struct App {
     config_extraction_limits: ConfigExtractionLimits,
     detached_response_egress_decision_factory: DetachedResponseEgressDecisionFactory,
+    error_response_renderer: ErrorResponseRenderer,
     ingress_head_limits: IngressHeadLimits,
     ingress_policy: IngressAdmissionPolicy,
     monotonic_clock: MonotonicClock,
@@ -89,7 +91,7 @@ impl App {
         let route = prepared.route_metadata().cloned();
         let (_resolved, _admitted, completion) = prepared.into_parts();
         self.response_egress_envelope(
-            render_error_response(error),
+            self.render_error_response(error),
             request_method,
             request_start,
             route,
@@ -173,7 +175,7 @@ impl App {
                 completion,
                 deadline,
             } => {
-                let mut response = render_error_response(error);
+                let mut response = self.render_error_response(error);
                 response
                     .extensions_mut()
                     .insert(ResponseEgressDeadline::at(deadline));
@@ -221,7 +223,7 @@ impl App {
             .await
         {
             Ok(response) => response,
-            Err(error) => render_error_response(error),
+            Err(error) => self.render_error_response(error),
         };
         self.response_egress_envelope(response, request_method, request_start, route, completion)
     }
@@ -234,8 +236,8 @@ impl App {
     /// different route identity.
     ///
     /// # Errors
-    /// Returns an error only when admission or error rendering fails. Handler and routing errors
-    /// are rendered with the same semantics as [`RouterService::oneshot`].
+    /// Returns an error only when admission cannot begin. Handler, routing, body-read, and
+    /// post-admission conversion errors are converted with the app's error-response renderer.
     #[inline]
     pub async fn dispatch_ingress(
         &self,
@@ -295,6 +297,20 @@ impl App {
     #[inline]
     pub fn new(router: RouterService) -> Self {
         Self::with_name(router, DEFAULT_APP_NAME)
+    }
+
+    fn render_error_response(&self, error: EdgeError) -> Response {
+        let status = error.status();
+        let required_allow = match error.required_allow_header() {
+            Ok(value) => value,
+            Err(header_error) => return render_default_error_response(header_error),
+        };
+        let mut response = (self.error_response_renderer)(error);
+        *response.status_mut() = status;
+        if let Some(value) = required_allow {
+            response.headers_mut().insert(ALLOW, value);
+        }
+        response
     }
 
     fn response_egress_envelope(
@@ -359,6 +375,21 @@ impl App {
             + 'static,
     {
         self.detached_response_egress_decision_factory = Arc::new(factory);
+    }
+
+    /// Installs the synchronous renderer for app-owned framework and handler errors.
+    ///
+    /// The renderer is called exactly once for admitted dispatch errors and detached normalized
+    /// ingress errors. Applications that require a bounded wire format should return a fixed-size
+    /// response here. `EdgeZero` reapplies the error status and mandatory protocol headers after the
+    /// callback. Explicit admission-refusal and fallback terminal responses bypass this hook
+    /// because the application supplied those responses directly.
+    #[inline]
+    pub fn set_error_response_renderer<Renderer>(&mut self, renderer: Renderer)
+    where
+        Renderer: Fn(EdgeError) -> Response + Send + Sync + 'static,
+    {
+        self.error_response_renderer = Arc::new(renderer);
     }
 
     /// Installs the synchronous body-blind ingress admission callback.
@@ -426,6 +457,7 @@ impl App {
                     deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),
                 }
             }),
+            error_response_renderer: Arc::new(render_default_error_response),
             ingress_head_limits: IngressHeadLimits::default(),
             ingress_policy: default_admission_policy(),
             monotonic_clock: MonotonicClock::default(),
@@ -537,7 +569,7 @@ pub trait Hooks {
     }
 }
 
-fn render_error_response(error: EdgeError) -> Response {
+fn render_default_error_response(error: EdgeError) -> Response {
     match error.into_response() {
         Ok(response) => response,
         Err(render_error) => {
@@ -1516,6 +1548,11 @@ mod tests {
             grant: IngressGrant::new(GrantDropProbe(Arc::clone(&observed_grant_drops))),
             read_deadline: head.read_deadline_after(Duration::from_secs(1)),
         });
+        app.set_error_response_renderer(|error| {
+            let mut response = Response::new(Body::from(error.kind()));
+            *response.status_mut() = error.status();
+            response
+        });
         app.set_response_egress_observer(AppEgressObserver(Arc::clone(&reports)));
         let request_start = MonotonicInstant::now();
         let head = IngressHeadParts::new(
@@ -1538,9 +1575,11 @@ mod tests {
         let Ok((prepared_egress, _, mut attempt, clock)) = egress.begin() else {
             panic!("begin egress");
         };
+        let response = prepared_egress.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
-            prepared_egress.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
+            response.body().as_bytes().expect("buffered body"),
+            b"internal"
         );
         assert!(attempt.begin_writing());
         assert!(attempt.complete(clock.now()));
@@ -1654,6 +1693,148 @@ mod tests {
         );
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn fallback_body_exact_cap_preserves_method_not_allowed_allow_header() {
+        let router = RouterService::builder()
+            .get("/known", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("unexpected")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_ingress_admission_policy(|head| AdmissionDecision::ReadBodyBeforeFallback {
+            completion: ResponseEgressCompletion::empty(),
+            grant: IngressGrant::empty(),
+            max_body_bytes: 4,
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            on_exceeded: BufferedIngressResponse::text(StatusCode::PAYLOAD_TOO_LARGE, "too large"),
+            on_timeout: BufferedIngressResponse::text(StatusCode::REQUEST_TIMEOUT, "timeout"),
+        });
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/known")
+            .body(Body::stream(iter([
+                Bytes::from_static(b"ab"),
+                Bytes::from_static(b"cd"),
+            ])))
+            .expect("request");
+
+        let response = complete_dispatch(
+            block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("response"),
+        );
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get("allow").expect("Allow header"),
+            "GET"
+        );
+    }
+
+    #[test]
+    fn custom_error_response_renderer_handles_admitted_dispatch_errors() {
+        let router = RouterService::builder()
+            .get("/fails", |_ctx: RequestContext| async move {
+                Err::<&'static str, _>(EdgeError::bad_request("private diagnostic"))
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_error_response_renderer(|error| {
+            response_builder()
+                .status(error.status())
+                .header("x-error-renderer", "application")
+                .body(Body::from(error.kind()))
+                .expect("response")
+        });
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/fails")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = complete_dispatch(
+            block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("response"),
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.headers()["x-error-renderer"], "application");
+        assert_eq!(
+            response.body().as_bytes().expect("buffered body"),
+            b"bad_request"
+        );
+    }
+
+    #[test]
+    fn custom_error_response_renderer_handles_detached_ingress_errors() {
+        let mut app = App::new(empty_router());
+        app.set_error_response_renderer(|error| {
+            response_builder()
+                .status(error.status())
+                .header("x-error-renderer", "application")
+                .body(Body::from(error.kind()))
+                .expect("response")
+        });
+
+        let response = complete_dispatch(app.detached_ingress_error_egress(
+            EdgeError::uri_too_long("private diagnostic"),
+            Method::GET,
+            MonotonicInstant::now(),
+        ));
+
+        assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+        assert_eq!(response.headers()["x-error-renderer"], "application");
+        assert_eq!(
+            response.body().as_bytes().expect("buffered body"),
+            b"uri_too_long"
+        );
+    }
+
+    #[test]
+    fn custom_error_response_renderer_cannot_remove_required_allow_header() {
+        let router = RouterService::builder()
+            .get("/known", |_ctx: RequestContext| async move {
+                Ok::<_, EdgeError>("unexpected")
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_error_response_renderer(|_error| Response::new(Body::from("bounded error")));
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/known")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = complete_dispatch(
+            block_on(app.dispatch_ingress(
+                request,
+                MonotonicInstant::now(),
+                IngressHeadAccounting::HostManaged,
+                IngressFraming::HostManaged,
+            ))
+            .expect("response"),
+        );
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get("allow").expect("Allow header"),
+            "GET"
+        );
+        assert_eq!(
+            response.body().as_bytes().expect("buffered body"),
+            b"bounded error"
+        );
     }
 
     #[test]

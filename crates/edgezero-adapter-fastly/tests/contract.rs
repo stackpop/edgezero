@@ -963,6 +963,12 @@ mod tests {
                 );
 
                 assert_eq!(response.status(), expected_status);
+                if expected_status == StatusCode::METHOD_NOT_ALLOWED {
+                    assert_eq!(
+                        response.headers().get("allow").expect("Allow header"),
+                        "GET"
+                    );
+                }
                 assert_eq!(body_reads.load(Ordering::SeqCst), 3);
                 assert_eq!(grant_drops.load(Ordering::SeqCst), 1);
                 assert_eq!(source_drops.load(Ordering::SeqCst), 1);
