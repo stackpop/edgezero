@@ -45,7 +45,7 @@ runs:
       uses: actions/cache@v5
       with:
         path: ${{ steps.prepare.outputs['cargo-target-dir'] }}
-        key: edgezero-app-${{ steps.prepare.outputs['cache-namespace'] }}-rust-target-${{ runner.os }}-${{ runner.arch }}-${{ steps.prepare.outputs['cargo-lock-sha256'] }}-${{ github.sha }}
+        key: edgezero-app-${{ steps.prepare.outputs['cache-namespace'] }}-rust-target-${{ runner.os }}-${{ runner.arch }}-${{ steps.prepare.outputs['cargo-lock-sha256'] }}
         restore-keys: |
           edgezero-app-${{ steps.prepare.outputs['cache-namespace'] }}-rust-target-${{ runner.os }}-${{ runner.arch }}-${{ steps.prepare.outputs['cargo-lock-sha256'] }}-
 

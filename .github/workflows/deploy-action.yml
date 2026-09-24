@@ -44,6 +44,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   ACTIONLINT_VERSION: 1.7.7
   ZIZMOR_VERSION: 1.16.3
@@ -82,18 +86,7 @@ jobs:
         run: .github/actions/deploy-core/tests/check-action-pins.sh
 
       - name: Zizmor security scan
-        run: |
-          "$RUNNER_TEMP/tools/bin/zizmor" --offline \
-            .github/workflows/deploy-action.yml \
-            .github/workflows/fastly-installer-check.yml \
-            .github/actions/build-app-cli/action.yml \
-            .github/actions/setup-rust-build-cache/action.yml \
-            .github/actions/deploy-fastly/action.yml \
-            .github/actions/healthcheck-fastly/action.yml \
-            .github/actions/rollback-fastly/action.yml \
-            .github/actions/config-push-fastly/action.yml \
-            .github/actions/package-application-release-fastly/action.yml \
-            .github/actions/require-github-environment/action.yml
+        run: '"$RUNNER_TEMP/tools/bin/zizmor" --offline .github'
 
       - name: ShellCheck action scripts
         run: |
@@ -117,6 +110,53 @@ jobs:
           npm run format
           npm run lint
           npm run build
+
+  # Exercise actions/cache itself across jobs. The fixture key is stable and
+  # versioned; bump it only when this restore contract changes.
+  cache-restore-seed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Create cache restore fixture
+        run: |
+          mkdir -p cache-restore-fixture
+          printf '%s\n' '# edgezero target cache restore smoke v1' >cache-restore-fixture/Cargo.lock
+
+      - name: Seed the provider-neutral Rust target cache
+        uses: ./.github/actions/setup-rust-build-cache
+        with:
+          app-name: cache-restore-smoke-v1
+          cache-target: true
+          working-directory: cache-restore-fixture
+
+      - name: Write restore marker
+        run: printf '%s\n' 'edgezero-cache-restore-smoke-v1' >"$CARGO_TARGET_DIR/restore-marker"
+
+  cache-restore-smoke:
+    needs: cache-restore-seed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Recreate cache restore fixture
+        run: |
+          mkdir -p cache-restore-fixture
+          printf '%s\n' '# edgezero target cache restore smoke v1' >cache-restore-fixture/Cargo.lock
+
+      - name: Restore the provider-neutral Rust target cache
+        uses: ./.github/actions/setup-rust-build-cache
+        with:
+          app-name: cache-restore-smoke-v1
+          cache-target: true
+          working-directory: cache-restore-fixture
+
+      - name: Assert target cache restored across jobs
+        run: grep -Fxq 'edgezero-cache-restore-smoke-v1' "$CARGO_TARGET_DIR/restore-marker"
 
   # Build the store-aware application once. Its production/staging matrix and
   # lifecycle actions consume these exact CLI, package, and manifest bytes.
@@ -599,7 +639,7 @@ jobs:
       EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME: config-prod
       EDGEZERO__STORES__KV__CACHE__NAME: cache-prod
       EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME: credentials-prod
-      FAKE_FAIL_AFTER_VERSION: "1"
+      FAKE_FAIL_AFTER_ACTIVATION: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -611,7 +651,7 @@ jobs:
       - name: Install the stateful fake Fastly provider
         run: .github/actions/deploy-fastly/tests/make-fake-fastly-env.sh
 
-      - name: Fail after Fastly returns the recoverable draft version
+      - name: Model activation committed before a failed provider response
         id: deploy
         continue-on-error: true
         uses: ./.github/actions/deploy-fastly
@@ -630,3 +670,27 @@ jobs:
           EDGEZERO__TEST__FASTLY_VERSION: ${{ steps.deploy.outputs.fastly-version }}
           EDGEZERO__TEST__PACKAGE_DIGEST: ${{ steps.deploy.outputs.package-digest }}
         run: .github/actions/deploy-fastly/tests/assert-lost-version.sh
+
+      - name: Recover the exact live production version
+        id: recover
+        env:
+          FASTLY_API_TOKEN: dummy-token
+          FASTLY_SERVICE_ID: dummyservice
+        run: .github/actions/deploy-fastly/tests/recovery-active-version.sh fixture-release
+
+      - name: Roll back the ambiguously published version
+        id: rollback
+        uses: ./.github/actions/rollback-fastly
+        with:
+          app-release-archive: ${{ github.workspace }}/fixture-release/app-release.tar.gz
+          app-release-sha256: ${{ needs.fixture-release.outputs.app-release-sha256 }}
+          expected-source-revision: ${{ needs.fixture-release.outputs.source-revision }}
+          fastly-api-token: dummy-token
+          fastly-service-id: dummyservice
+          fastly-version: ${{ steps.recover.outputs.version }}
+          rollback-to: ${{ steps.deploy.outputs.previous-version }}
+
+      - name: Assert recovery restored the previous version
+        env:
+          EDGEZERO__TEST__ROLLED_BACK_TO: ${{ steps.rollback.outputs.rolled-back-to }}
+        run: .github/actions/deploy-fastly/tests/assert-recovery-rollback.sh

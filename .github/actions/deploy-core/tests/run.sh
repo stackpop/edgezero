@@ -2218,6 +2218,37 @@ test_fastly_smoke_release_contract() {
   local lifecycle_filter
   lifecycle_filter='select(tag == "!!map" and (.uses == "./.github/actions/deploy-fastly" or .uses == "./.github/actions/config-push-fastly" or .uses == "./.github/actions/healthcheck-fastly" or .uses == "./.github/actions/rollback-fastly"))'
 
+  # shellcheck disable=SC2016 # GitHub expressions are the literal workflow contract.
+  assert_equals "deploy-action CI serializes duplicate branch runs" \
+    '${{ github.workflow }}-${{ github.ref }}' "$(yq eval -r '.concurrency.group' "$workflow")"
+  assert_equals "deploy-action CI cancels superseded branch runs" \
+    true "$(yq eval -r '.concurrency."cancel-in-progress"' "$workflow")"
+
+  local zizmor_scan
+  zizmor_scan=$(yq eval -r \
+    '.jobs."static-checks".steps[] | select(.name == "Zizmor security scan") | .run' \
+    "$workflow")
+  assert_succeeds "Zizmor discovers every workflow and action under .github" \
+    grep -Eq 'zizmor" --offline[[:space:]]+\.github([[:space:]]|$)' <<<"$zizmor_scan"
+  assert_fails "Zizmor does not depend on an incomplete explicit target list" \
+    grep -Fq '.github/workflows/deploy-action.yml' <<<"$zizmor_scan"
+
+  local cache_seed cache_restore
+  cache_seed=$(yq eval -r '.jobs."cache-restore-seed"' "$workflow")
+  cache_restore=$(yq eval -r '.jobs."cache-restore-smoke"' "$workflow")
+  assert_succeeds "cache smoke seeds the provider-neutral target cache" \
+    grep -Fq './.github/actions/setup-rust-build-cache' <<<"$cache_seed"
+  assert_equals "cache restore waits for the save post-step" \
+    cache-restore-seed "$(yq eval -r '.jobs."cache-restore-smoke".needs' "$workflow")"
+  assert_succeeds "cache smoke performs a real second-job restore" \
+    grep -Fq './.github/actions/setup-rust-build-cache' <<<"$cache_restore"
+  assert_succeeds "cache restore verifies a marker created by the seed job" \
+    grep -Fq 'restore-marker' <<<"$cache_restore"
+  for obsolete in cache-smoke-capture.sh cache-smoke-assert.sh cache-smoke-assert-no-restore.sh; do
+    assert_fails "obsolete deploy-time cache helper is removed ($obsolete)" \
+      test -e "$ACTIONS_DIR/deploy-core/tests/$obsolete"
+  done
+
   local missing_release stale_inputs archives store_aware_digests store_aware_revisions
   missing_release=$(yq eval -r \
     ".. | $lifecycle_filter | select(.with.\"app-release-archive\" == null or .with.\"app-release-sha256\" == null or .with.\"expected-source-revision\" == null) | .name" \
@@ -2315,6 +2346,20 @@ test_fastly_smoke_release_contract() {
     grep -q 'EDGEZERO__TEST__FASTLY_VERSION' "$lost"
   assert_succeeds "failed deployment checks its verified package digest" \
     grep -q 'EDGEZERO__TEST__PACKAGE_DIGEST' "$lost"
+  assert_succeeds "recovery smoke models activation committed before an error response" \
+    grep -Fq 'FAKE_FAIL_AFTER_ACTIVATION' "$workflow"
+  assert_succeeds "recovery smoke discovers the live version through the application CLI" \
+    grep -Fq 'recovery-active-version.sh' "$workflow"
+  assert_succeeds "recovery smoke invokes the immutable-release rollback action" \
+    grep -Fq './.github/actions/rollback-fastly' "$workflow"
+  # shellcheck disable=SC2016 # GitHub expression is the literal workflow contract.
+  assert_succeeds "recovery rollback starts from the live version recovered after ambiguity" \
+    grep -Fq 'fastly-version: ${{ steps.recover.outputs.version }}' "$workflow"
+  # shellcheck disable=SC2016 # GitHub expression is the literal workflow contract.
+  assert_succeeds "recovery rollback restores the captured previous production version" \
+    grep -Fq 'rollback-to: ${{ steps.deploy.outputs.previous-version }}' "$workflow"
+  assert_succeeds "recovery smoke verifies the final provider state" \
+    grep -Fq 'assert-recovery-rollback.sh' "$workflow"
   assert_succeeds "the executable staging smoke uses the real Fastly domain" \
     grep -Fq 'domain: app.example.com' "$workflow"
   assert_succeeds "the executable staging smoke keeps a distinct GitHub Environment identifier" \
@@ -2385,7 +2430,10 @@ test_fastly_logical_link_documentation() {
   local managed_args="$WORK_DIR/managed-fastly-arguments.md"
   local deploy_flat="$WORK_DIR/deploy-github-actions-flat.md"
   local adoption_flat="$WORK_DIR/deploy-action-adoption-flat.md"
+  local adoption_consumer="$WORK_DIR/deploy-action-adoption-consumer.md"
   local managed_lifecycle_comment="$WORK_DIR/managed-lifecycle-comment.txt"
+  local migration="$WORK_DIR/deploy-action-migration.md"
+  local migration_flat="$WORK_DIR/deploy-action-migration-flat.md"
   cat "$deploy" "$fastly" "$cli" "$manifest" "$blob" "$adoption" >"$corpus"
 
   awk '
@@ -2407,10 +2455,20 @@ test_fastly_logical_link_documentation() {
   tr '\n' ' ' <"$deploy" >"$deploy_flat"
   tr '\n' ' ' <"$adoption" >"$adoption_flat"
   awk '
+    /^## Deployment consumer$/ { capture = 1 }
+    capture { print }
+  ' "$adoption" >"$adoption_consumer"
+  awk '
     /^### Managed Fastly argument contract$/ { capture = 1 }
     capture && /^::: warning$/ { exit }
     capture { print }
   ' "$cli" >"$managed_args"
+  awk '
+    /^## Migration from the previous deploy action$/ { capture = 1 }
+    capture && seen && /^## / { exit }
+    capture { print; seen = 1 }
+  ' "$adoption" >"$migration"
+  tr '\n' ' ' <"$migration" | tr -s '[:space:]' ' ' >"$migration_flat"
   awk '
     /^\/\/ Fastly lifecycle$/ { capture = 1 }
     capture && /^\/\/\/ Value that follows/ { exit }
@@ -2465,6 +2523,33 @@ test_fastly_logical_link_documentation() {
     grep -Fq '`edgezero.toml`, and Fastly manifest to every publisher' "$adoption"
   assert_succeeds "Fastly releases exclude other adapter manifests" \
     grep -Fq 'adapter manifests are not part of a Fastly application release' "$adoption"
+  assert_succeeds "release producer builds the application CLI explicitly" \
+    grep -Fq '/build-app-cli@<ref>' "$adoption"
+  assert_succeeds "release producer downloads the configurable CLI artifact" \
+    grep -Fq 'uses: actions/download-artifact@v4' "$adoption"
+  assert_succeeds "release packager consumes app-cli.tar" \
+    grep -Fq 'app-cli-archive: release-inputs/app-cli.tar' "$adoption"
+  assert_succeeds "lifecycle actions authenticate the archive before extraction" \
+    grep -Fq 'externally supplied SHA-256 before extraction' "$adoption_flat"
+  assert_succeeds "release.json hashes are described as internal consistency checks" \
+    grep -Fq 'internal member consistency and path confinement' "$adoption_flat"
+
+  local removed_input
+  for removed_input in app-cli-artifact app-cli-bin working-directory manifest rust-toolchain build-mode build-args cache; do
+    assert_succeeds "migration maps removed deploy input $removed_input" \
+      grep -Fq "\`$removed_input\`" "$migration"
+  done
+  # shellcheck disable=SC2016 # Markdown backticks are the literal documentation contract.
+  assert_succeeds "migration requires staging config under the fixed logical key" \
+    grep -Fq '`<ID>` instead of the obsolete `<ID>_staging`' "$migration_flat"
+  # shellcheck disable=SC2016 # Markdown backticks are the literal documentation contract.
+  assert_succeeds "migration separates obsolete roots from chunk garbage collection" \
+    grep -Fq '`config gc` does not delete the obsolete root key' "$migration"
+  assert_succeeds "migration verifies the selected physical store before garbage collection" \
+    grep -Fq 'verify the selected physical store' "$migration"
+  # shellcheck disable=SC2016 # Markdown backticks are the literal documentation contract.
+  assert_succeeds "migration retains the old runtime store through rollback" \
+    grep -Fq '`edgezero_runtime_env` only after no active, staged, or rollback version depends on it' "$migration_flat"
 
   assert_succeeds "application example is extracted as a workflow" \
     grep -Fxq 'name: Deploy Application' "$example_workflow"
@@ -2708,10 +2793,10 @@ test_fastly_logical_link_documentation() {
     grep -Eq '(creates|writes|links|applies).{0,80}(staging twin|staging-twin)' "$corpus"
   assert_fails "docs contain no manual unscoped selector write" \
     grep -Fq -- '--key=EDGEZERO__STORES__' "$corpus"
-  assert_fails "lifecycle docs contain no obsolete separate CLI artifact input" \
-    grep -Fq 'app-cli-artifact' "$deploy" "$adoption"
+  assert_fails "lifecycle consumer examples contain no obsolete separate CLI artifact input" \
+    grep -Fq 'app-cli-artifact' "$deploy" "$example_deploy"
   assert_fails "lifecycle docs contain no deployer build controls" \
-    grep -Eq 'build-mode|build-args' "$deploy" "$adoption"
+    grep -Eq 'build-mode|build-args' "$deploy" "$adoption_consumer"
 }
 
 workflow_duplicate_env_keys() {

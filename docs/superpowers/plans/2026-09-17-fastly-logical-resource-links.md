@@ -51,7 +51,9 @@
 - [x] Add failing reconciliation tests for declared alias replacement, undeclared-link preservation, shared physical resources, same logical IDs across store kinds, and final exact readback.
 - [x] Build desired links as `(kind, logical alias, selected physical resource ID)`, parse Fastly `resource_type`, and validate selectors with checked `EnvConfig` methods.
 - [x] Remove descriptor plan fields, reads, writes, ownership inference, orphan checks, and final descriptor revalidation.
-- [x] Reconcile declared `(kind, alias)` identities and preserve every undeclared inherited link.
+- [x] Reconcile declared `(kind, alias)` identities and preserve every
+  undeclared inherited Config, KV, and Secret Store link; fail closed on an
+  unknown provider resource type.
 - [x] Retain release verification, source snapshots, package upload/hash verification, recovery output, and stage/activate ordering; make the immediate final barrier re-read exact links, provider-visible package identity, source state, and draft state after every EdgeZero mutation, and document the caller's per-service serialization requirement and remaining provider TOCTOU risk.
 - [x] Remove automatic provisioning and setup of selector stores; keep declared physical-store provisioning.
 - [x] Run the Fastly CLI test suite after each implementation slice.

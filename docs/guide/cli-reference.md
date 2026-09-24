@@ -157,10 +157,11 @@ edgezero deploy --adapter <name>
 - `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `spin`)
 - `--service-id <id>` - Platform service id the deploy targets (Fastly). Passed
   through to the provider; adapters that don't need one ignore it.
-- `--application-release <path>` - Extracted, verified immutable application
-  release root. The generic CLI confines this path and records its exact
-  application manifest; only the selected adapter interprets provider package
-  metadata.
+- `--application-release <path>` - Extracted application release root. The
+  generic CLI verifies internal member digests and confines every recorded path;
+  the caller establishes provenance and immutability by authenticating the
+  archive before extraction. Only the selected adapter interprets provider
+  package metadata.
 - `--staging` - Deploy to a **staged** draft version instead of activating
   production (Fastly staging lifecycle). Non-Fastly adapters reject it. This is the
   same `--staging` verb `healthcheck`/`rollback`/`config push` use.
@@ -554,12 +555,12 @@ edgezero provision --adapter <name> [--manifest <path>] [--dry-run]
 
 **Per-adapter behaviour:**
 
-| `--adapter`  | Behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `axum`       | Local-only — prints one note per declared store id and exits 0 (KV in-memory; config in `.edgezero/local-config-<id>.json`).                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `cloudflare` | For each KV id + config id: shells out to `wrangler kv namespace create <platform-name>` (where `<platform-name>` resolves from `EDGEZERO__STORES__<KIND>__<ID>__NAME` or falls back to the logical `<id>`), parses the namespace id from stdout, appends `[[kv_namespaces]] binding = "<platform-name>", id = "<extracted>"` to `wrangler.toml` (idempotent on the binding name; preserves existing entries and comments). Secrets are runtime-managed via `wrangler secret put` — no-op.                                                                         |
-| `fastly`     | For each KV / config / secret id: shells out to `fastly <kind>-store create --name=<platform-name>` (using the same `<platform-name>` resolution), then appends the `[setup.<kind>_stores.<platform-name>]` table to `fastly.toml`. Provision writes only `[setup.*]`; `config push --local` writes local Config Store data. If the setup table is already present, resource creation and manifest editing are skipped. Store IDs are not persisted; config push resolves them on demand, and managed deploy links selected physical stores under logical aliases. |
-| `spin`       | Pure `spin.toml` editing — no shell-out (Spin KV stores are runtime-resolved). For each declared KV id AND each declared `[stores.config]` id (both KV-backed at runtime), appends the platform-resolved label to the resolved `[component.<component>].key_value_stores = [...]` array (idempotent on the label). Secret variables are still manual: `[stores.secrets]` ids get a `nothing to do here` status line and the operator declares `[variables].<name> = { secret = true }` + the per-component binding by hand.                                        |
+| `--adapter`  | Behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `axum`       | Local-only — prints one note per declared store id and exits 0 (KV in-memory; config in `.edgezero/local-config-<id>.json`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `cloudflare` | For each KV id + config id: shells out to `wrangler kv namespace create <platform-name>` (where `<platform-name>` resolves from `EDGEZERO__STORES__<KIND>__<ID>__NAME` or falls back to the logical `<id>`), parses the namespace id from stdout, appends `[[kv_namespaces]] binding = "<platform-name>", id = "<extracted>"` to `wrangler.toml` (idempotent on the binding name; preserves existing entries and comments). Secrets are runtime-managed via `wrangler secret put` — no-op.                                                                                                                                         |
+| `fastly`     | Creates the selected physical KV / Config / Secret Store. When physical and logical names match, it appends `[setup.<kind>_stores.<logical-id>]`. A different physical name requires an existing service because Fastly setup cannot express a physical-to-logical mapping; provision then leaves `fastly.toml` unchanged and prints the audited `service resource-link create` command with the physical resource id and logical alias. Provision writes no local-server data; `config push --local` writes local Config Store data. Managed deploy resolves physical stores and reconciles logical resource links automatically. |
+| `spin`       | Pure `spin.toml` editing — no shell-out (Spin KV stores are runtime-resolved). For each declared KV id AND each declared `[stores.config]` id (both KV-backed at runtime), appends the platform-resolved label to the resolved `[component.<component>].key_value_stores = [...]` array (idempotent on the label). Secret variables are still manual: `[stores.secrets]` ids get a `nothing to do here` status line and the operator declares `[variables].<name> = { secret = true }` + the per-component binding by hand.                                                                                                        |
 
 **`--dry-run`** prints what each adapter _would_ do without
 performing it. For `axum` the output is identical to a real run
@@ -574,11 +575,15 @@ existing `binding`s are detected and skipped.
 
 The `fastly` flow requires `fastly` on `PATH` and
 `[adapters.fastly.adapter].manifest` pointing at the project's
-`fastly.toml`. Re-running is safe: provision skips resource creation for any id
-whose `[setup.<kind>_stores.<id>]` block already exists. Managed deploy resolves
-physical store selections and reconciles version resource links under stable
-logical aliases on an unreachable draft. Production and staging therefore choose
-store names without baking them into the Wasm package.
+`fastly.toml`. Re-running a default logical/physical mapping is safe: provision
+skips an id whose `[setup.<kind>_stores.<id>]` block already exists. A selected
+physical name that differs from the logical id requires `service_id` in
+`fastly.toml` or `FASTLY_SERVICE_ID`; without a selected service, provision fails
+before creating anything. With a service, Fastly's idempotent store create is
+followed by a manual resource-link instruction because `[setup]` cannot represent
+the mapping. Managed deploy resolves the same selection and reconciles the link
+under the stable logical alias on an unreachable draft. Production and staging
+therefore choose store names without baking them into the Wasm package.
 
 The `spin` flow needs no native CLI but does require
 `[adapters.spin.adapter].manifest` pointing at the project's

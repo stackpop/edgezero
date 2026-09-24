@@ -292,7 +292,7 @@ key because it has no Fastly staging publication state:
 format = "inline-toml"
 
 [local_server.config_stores.app_config.contents]
-app_config = "hello from config store"
+greeting = "hello from config store"
 ```
 
 Handlers read values through the `Config` extractor or

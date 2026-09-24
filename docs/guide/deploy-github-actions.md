@@ -154,7 +154,8 @@ Managed deploy verifies the immutable release, including its selected source
 revision, resolves complete Config, KV, and Secret inventories, prepares an
 unreachable draft, and reconciles declared
 `(resource kind, logical ID)` links. A declared link pointing at a different
-physical resource is replaced. Undeclared inherited links are preserved.
+physical resource is replaced. Undeclared inherited Config, KV, and Secret
+Store links are preserved; an unknown provider resource type fails closed.
 Before mutation, EdgeZero records the source version's protected Compute
 configuration: domains, backends, health checks, logging endpoints, and
 settings. For a locked source, it explicitly clones and verifies that the fresh
@@ -165,8 +166,8 @@ Any lookup, malformed inventory, changed source, package mismatch, or readback
 failure stops publication.
 
 Runtime descriptors and service-scoped selector keys are unsupported. Managed
-deploy reconciles only the stores declared by the application and preserves all
-other inherited resource links.
+deploy reconciles only the stores declared by the application and preserves
+other recognized Config, KV, and Secret Store links.
 
 ## Staging, healthcheck, and rollback
 

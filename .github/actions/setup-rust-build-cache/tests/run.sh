@@ -144,7 +144,10 @@ grep -Fq "steps.prepare.outputs['cargo-target-dir']" "$action" ||
 grep -Fq "inputs['cache-target'] == 'true'" "$action" ||
   fail "Cargo target cache is not gated by the cache-target input"
 github_sha_expression="\${{ github.sha }}"
-grep -Fq "$github_sha_expression" "$action" ||
-  fail "Cargo target cache primary key is not bound to the source revision"
+if grep -Fq "$github_sha_expression" "$action"; then
+  fail "Cargo target cache creates a new full cache for every source revision"
+fi
+grep -Eq "^[[:space:]]+key: edgezero-app-.*-rust-target-.*cargo-lock-sha256.*\}\}[[:space:]]*$" "$action" ||
+  fail "Cargo target cache primary key must end at the validated Cargo.lock digest"
 
 printf 'setup-rust-build-cache action tests passed\n'

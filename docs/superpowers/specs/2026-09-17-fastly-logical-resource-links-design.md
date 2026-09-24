@@ -80,9 +80,10 @@ When the source version already contains that resource kind and logical alias:
 - a different physical resource causes the inherited link to be deleted and
   the selected link to be created before publication.
 
-Links whose identities are not declared by the current manifest are preserved.
-EdgeZero does not infer ownership from account inventories and does not delete
-undeclared Config, KV, or Secret Store links.
+Recognized Config, KV, or Secret Store links whose identities are not declared
+by the current manifest are preserved. EdgeZero does not infer ownership from
+account inventories. An unknown `resource_type` fails closed before mutation
+rather than being treated as safely understood provider state.
 
 During preflight, EdgeZero records the source version's Compute configuration
 from the versioned domain, backend, health-check, logging, and settings
@@ -171,9 +172,11 @@ Staging rollback first reads the exact requested version state:
 This makes a recovery step safe both before and after staging publication.
 After deactivating a first deployment, the highest locked version with no
 environment record is a retired staging source. A subsequent deployment clones
-that source. If a failed retry already left one highest editable draft beside a
-staged source, the next deployment revalidates and reuses that draft rather than
-creating an ambiguous chain of clones.
+that source. If a failed retry leaves an editable draft beside a staged source,
+EdgeZero cannot prove the draft's ownership and fails closed. The diagnostic
+names both versions and instructs the operator to lock the orphan with
+`fastly service version lock`; the next deployment can then clone the staged
+source without creating an ambiguous chain of editable drafts.
 
 ## Action compatibility
 
@@ -226,7 +229,8 @@ Tests must prove:
   stable logical aliases on their respective versions;
 - the same logical ID can be reconciled independently for Config, KV, and
   Secret Store links by using resource kind as part of the identity;
-- declared aliases are replaced while undeclared inherited links survive;
+- declared aliases are replaced while undeclared inherited Config, KV, and
+  Secret Store links survive;
 - invalid present selectors fail push and deploy before mutation;
 - optional secrets continue to work;
 - Fastly logging is sourced from baked application-manifest metadata and does

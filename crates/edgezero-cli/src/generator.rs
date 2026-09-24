@@ -1020,6 +1020,16 @@ mod tests {
         assert!(project_dir.join(".gitignore").exists());
         assert!(project_dir.join(".tool-versions").exists());
         assert!(project_dir.join("README.md").exists());
+        let readme = fs::read_to_string(project_dir.join("README.md")).expect("read README");
+        assert!(
+            readme.contains("Fastly uses the logical key")
+                && readme.contains("`app_config` for production, staging, and local Viceroy"),
+            "generated README must document the one Fastly logical config key"
+        );
+        assert!(
+            !readme.contains("app_config_staging"),
+            "generated README must not advertise the removed staging key"
+        );
         assert!(project_dir.join("crates/demo-app-core/src/lib.rs").exists());
         assert!(
             project_dir.join("crates/demo-app-cli/Cargo.toml").exists(),

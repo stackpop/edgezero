@@ -105,9 +105,9 @@ JSON
   'service version')
     case "\${3:-}" in
       update)
-        [[ "\$#" -eq 7 && "\$4" == --service-id=dummyservice && "\$5" == --version=42 &&
-          "\$6" == --comment ]] || exit 94
-        case "\$7" in
+        [[ "\$#" -eq 6 && "\$4" == --service-id=dummyservice && "\$5" == --version=42 &&
+          "\$6" == --comment=* ]] || exit 94
+        case "\${6#--comment=}" in
           'production smoke' | 'staged smoke' | 'store-free managed smoke') ;;
           *) exit 94;;
         esac
@@ -196,7 +196,12 @@ if [[ "$*" == *--config* ]]; then
         exit 0 ;;
       */service/dummyservice/version/42/activate)
         [[ -s "$FAKE_PACKAGE_DIGEST_FILE" && -f "$FAKE_LINK_DIR/version-42.tsv" ]] || { printf 'version not prepared\n400'; exit 0; }
-        printf '42\n' >"$FAKE_ACTIVE_VERSION_FILE" ;;
+        printf '42\n' >"$FAKE_ACTIVE_VERSION_FILE"
+        if [[ -n "${FAKE_FAIL_AFTER_ACTIVATION:-}" ]]; then
+          printf 'activation committed but response failed\n500'
+          exit 0
+        fi
+        ;;
       */service/dummyservice/version/40/activate)
         grep -qx 40 "$FAKE_VERSION_FILE" || { printf 'version not prepared\n400'; exit 0; }
         printf '40\n' >"$FAKE_ACTIVE_VERSION_FILE" ;;
@@ -225,8 +230,6 @@ if [[ "$*" == *--config* ]]; then
       printf '[{"name":"origin","hostname":"origin.example.com","service_id":"dummyservice","version":40}]\n200' ;;
     */service/dummyservice/version/*/healthcheck)
       printf '[]\n200' ;;
-    */service/dummyservice/version/*/logging/googlepubsub)
-      printf 'unknown logging provider\n404' ;;
     */service/dummyservice/version/*/logging/*)
       printf '[]\n200' ;;
     */service/dummyservice/version/*/settings)

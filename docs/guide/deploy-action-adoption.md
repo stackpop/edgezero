@@ -43,10 +43,30 @@ for every later native or WASM Rust build in the job. With `cache-target: true`,
 it also restores an application-scoped Cargo target directory containing Cargo
 fingerprints, build-script outputs, generated code, libraries, and linking
 inputs. Cargo keeps target triples, profiles, features, and compiler fingerprints
-separate inside that directory. The source revision completes the primary target
-cache key, while the restore prefix can reuse the preceding cache for the same
-application and lockfile. Existing build, package, release, adapter, and
-deployment commands remain unchanged.
+separate inside that directory. The target cache key is scoped by application,
+runner OS and architecture, and the committed `Cargo.lock`. Cargo fingerprints
+and `sccache` determine which source, toolchain, feature, and build-script outputs
+can be reused safely. Existing build, package, release, adapter, and deployment
+commands remain unchanged.
+
+Build and download the configurable application CLI artifact before assembling
+the release:
+
+```yaml
+- id: app-cli
+  uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
+  with:
+    app-cli-package: example-app-cli
+    app-cli-bin: example-app-cli
+    app-cli-artifact: example-app-cli-${{ github.sha }}
+    working-directory: application
+
+- name: Download the application CLI archive
+  uses: actions/download-artifact@v4
+  with:
+    name: ${{ steps.app-cli.outputs.app-cli-artifact }}
+    path: release-inputs
+```
 
 Use the release packager after the application CLI and Fastly package have been
 built in the credential-free producer job:
@@ -56,9 +76,9 @@ built in the credential-free producer job:
   uses: stackpop/edgezero/.github/actions/package-application-release-fastly@<ref>
   with:
     app-cli-archive: release-inputs/app-cli.tar
-    fastly-package: pkg/app.tar.gz
-    application-manifest: edgezero.toml
-    adapter-manifest: adapters/fastly/fastly.toml
+    fastly-package: application/pkg/app.tar.gz
+    application-manifest: application/edgezero.toml
+    adapter-manifest: application/adapters/fastly/fastly.toml
     source-revision: ${{ github.sha }}
     artifact-name: application-release-${{ github.sha }}
 ```
@@ -71,6 +91,47 @@ beneath `github.workspace` and receives no provider credentials. The explicit
 `adapter-manifest` input must be the Fastly manifest referenced by
 `edgezero.toml`; the packager stores it at that declared relative path. Other
 adapter manifests are not part of a Fastly application release.
+
+The lifecycle actions authenticate the archive with the externally supplied SHA-256 before extraction.
+The hashes in `release.json` then prove internal
+member consistency and path confinement; `release.json` is not a signature or
+an independent source of provenance.
+
+## Migration from the previous deploy action
+
+The lifecycle action no longer builds application source. Move every build input
+to the credential-free producer and give the consumer the one immutable release:
+
+| Previous `deploy-fastly` input | Replacement                                                                                                                                                                            |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `app-cli-artifact`             | Build the configurable artifact with `build-app-cli`, bundle its `app-cli.tar`, then pass `app-release-archive`, `app-release-sha256`, and `expected-source-revision` to the consumer. |
+| `app-cli-bin`                  | Set it on producer `build-app-cli`; the release metadata records the resulting binary.                                                                                                 |
+| `working-directory`            | Use it only in producer build/cache steps.                                                                                                                                             |
+| `manifest`                     | Pass the producer path as `application-manifest` to the release packager.                                                                                                              |
+| `rust-toolchain`               | Select it in the producer build.                                                                                                                                                       |
+| `build-mode`                   | Remove it; the producer builds once before packaging.                                                                                                                                  |
+| `build-args`                   | Apply package build arguments in the producer.                                                                                                                                         |
+| `cache`                        | Use `setup-rust-build-cache` with `cache-target` in the producer.                                                                                                                      |
+
+The runtime-descriptor architecture has no compatibility fallback. Cut over in
+this order:
+
+1. Set and verify the selected physical store for every canonical `__NAME`
+   variable in each production and staging Environment.
+2. Before staging the new release, run staging config push so the staging-selected
+   physical Config Store contains `<ID>` instead of the obsolete `<ID>_staging`
+   root.
+3. Deploy and verify the new logical resource links, then keep the old stores
+   through the rollback window. Remove `edgezero_runtime_env` only after no
+   active, staged, or rollback version depends on it.
+4. Remove the obsolete `<ID>_staging` root manually after proving no deployed
+   version reads it. `config gc` does not delete the obsolete root key. If that
+   root referenced chunks, verify the selected physical store, serialize GC
+   against config pushes, run a dry-run, and then use a reviewed nonzero
+   `--older-than` with `--yes` to reclaim the unreferenced chunks.
+
+Custom application CLI entry points also need the
+[Fastly entry-point migration](./adapters/fastly.md#migrating-a-custom-entry-point).
 
 ## Deployment consumer
 

@@ -1,23 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Lost-version recovery, run the way an operator would: extract the CLI from the
-# downloaded build-app-cli artifact and ask the provider what version is live NOW
-# (the one the failed deploy activated). Emits `version=<N>` as a step output for
-# the rollback that follows.
+# Ambiguous-publication recovery, run the way an operator would: extract the
+# application CLI recorded by the already authenticated immutable release and
+# ask the provider what version is live now. Emits `version=<N>` for rollback.
 #
-# Reads (env): FASTLY_SERVICE_ID, GITHUB_OUTPUT. Arg 1: the artifact download dir.
+# Reads (env): FASTLY_SERVICE_ID, GITHUB_OUTPUT, RUNNER_TEMP.
+# Arg 1: directory containing app-release.tar.gz.
 
-dir="${1:?usage: recovery-active-version.sh <artifact-dir>}"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../../deploy-core/scripts/common.sh
+source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
+
+dir="${1:?usage: recovery-active-version.sh <application-release-dir>}"
 service_id="${FASTLY_SERVICE_ID:?FASTLY_SERVICE_ID is required}"
+archive="$dir/app-release.tar.gz"
+[[ -f "$archive" && ! -L "$archive" ]] || fail "application release archive is missing"
+assert_safe_tarball "$archive"
 
-# The transient provider failure that lost the deploy's version has passed: clear the
-# fake API-break sentinel so active-version can read the live version.
-[[ -n "${FAKE_API_BREAK_FILE:-}" ]] && rm -f "$FAKE_API_BREAK_FILE"
+work=$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is required}/edgezero-recovery.XXXXXX")
+trap 'rm -rf -- "$work"' EXIT
+tar -xOf "$archive" cli/app-cli.tar >"$work/app-cli.tar"
+[[ -s "$work/app-cli.tar" ]] || fail "application release has no cli/app-cli.tar member"
 
-tar -C "$dir" -xf "$dir"/*.tar
-bin="$dir/$(jq -r '."app-cli-bin"' "$dir/app-cli-meta.json")"
-[[ -x "$bin" ]] || { echo "::error::recovered CLI binary not found or not executable: $bin" >&2; exit 1; }
+cli_output="$work/cli-output"
+: >"$cli_output"
+GITHUB_OUTPUT="$cli_output" \
+EDGEZERO__APP__CLI__ARCHIVE="$work/app-cli.tar" \
+EDGEZERO__ACTION__TOOL_ROOT="$work/tools" \
+  "$SCRIPT_DIR/../../deploy-core/scripts/download-app-cli.sh"
+bin=$(awk -F= '$1 == "app-cli-path" { print substr($0, index($0, "=") + 1); found=1; exit } END { if (!found) exit 1 }' "$cli_output") ||
+  fail "application CLI extraction did not publish app-cli-path"
+[[ -x "$bin" ]] || fail "recovered application CLI is not executable"
 
 # Capture the CLI's output AND its exit status: a bare `out=$(…)` under `set -e`
 # would abort with an untraced error on a non-zero exit, never reaching the

@@ -85,25 +85,20 @@ pub struct AdapterDeployContext {
     pub variable_defaults: BTreeMap<String, String>,
 }
 
-/// A single declared store id, paired with the platform name the
-/// runtime will resolve via `EDGEZERO__STORES__<KIND>__<ID>__NAME`.
+/// A declared logical store id paired with the selected provider resource name.
 ///
-/// The CLI's `provision` and `push` paths resolve the env override
-/// once (against `std::env`) and pass both names through, so the
-/// adapter writes the PLATFORM name into wrangler.toml /
-/// spin.toml / fastly.toml. Without the platform name on this
-/// side, `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config`
-/// would be silently ignored at provision time and the runtime
-/// would later look up a binding named `prod_config` that
-/// provision never created.
+/// The CLI resolves `EDGEZERO__STORES__<KIND>__<ID>__NAME` once before a
+/// provider operation. Adapters decide how the selected resource is exposed to
+/// package code: some runtimes open the selected platform binding directly,
+/// while Fastly links the selected physical resource under the logical id.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedStoreId {
     /// The logical id declared in `[stores.<kind>].ids`. Used for
     /// human-facing messages and for the validate/strict checks.
     pub logical: String,
-    /// The platform name the runtime resolves at request time --
-    /// `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME` or, when unset,
-    /// the logical id itself.
+    /// The provider resource or binding selected by
+    /// `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME`, falling back to the logical
+    /// id when unset. This is not necessarily the alias opened by package code.
     pub platform: String,
 }
 

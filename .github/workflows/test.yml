@@ -23,6 +23,8 @@ jobs:
         suite: [workspace, cli, axum, app-demo]
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v5
@@ -124,6 +126,8 @@ jobs:
             runner_value: wasmtime run
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v5
@@ -175,7 +179,9 @@ jobs:
       # by default. Force-overwriting is safe — `--locked` pins the version.
       - name: Install wasm-bindgen test runner
         if: matrix.adapter == 'cloudflare'
-        run: cargo install wasm-bindgen-cli --version "${{ steps.wasm-bindgen-version.outputs.version }}" --locked --force
+        env:
+          WASM_BINDGEN_VERSION: ${{ steps.wasm-bindgen-version.outputs.version }}
+        run: cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked --force
 
       - name: Resolve Viceroy version
         if: matrix.adapter == 'fastly'
@@ -187,7 +193,9 @@ jobs:
         if: matrix.adapter == 'fastly'
         # Version comes from .tool-versions (single source of truth shared with
         # local dev).
-        run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.version }}" --locked --force
+        env:
+          VICEROY_VERSION: ${{ steps.viceroy-version.outputs.version }}
+        run: cargo install viceroy --version "$VICEROY_VERSION" --locked --force
 
       - name: Resolve Wasmtime version
         if: matrix.adapter == 'spin'
@@ -210,11 +218,13 @@ jobs:
         # explicitly compare `wasmtime --version` against the pin
         # — without that a runner-provided wasmtime or a stale
         # cache hit would silently shadow the pinned version.
+        env:
+          WASMTIME_VERSION: ${{ steps.wasmtime-version.outputs.version }}
         run: |
           install_dir="$HOME/.wasmtime/bin"
           echo "$install_dir" >> "$GITHUB_PATH"
           export PATH="$install_dir:$PATH"
-          version="${{ steps.wasmtime-version.outputs.version }}"
+          version="$WASMTIME_VERSION"
           # Compare exact versions so a pin like `44.0.1` does not silently
           # accept `wasmtime 44.0.10` from a stale cache or runner-provided
           # binary.

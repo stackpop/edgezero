@@ -108,10 +108,13 @@ Per-adapter behaviour:
   fastly <kind>-store create --name=<platform-name>
   ```
 
-  using the same `<platform-name>` resolution, then appends the
-  `[setup.<kind>_stores.<platform-name>]` table to `fastly.toml`. Provision writes
-  ONLY `[setup.*]`; the `[local_server.*]` seeding is written later by
-  `config push --local` (config stores only). Idempotent on the `[setup.*]` block presence.
+  using the same `<platform-name>` resolution. When that name equals the logical
+  id, provision appends `[setup.<kind>_stores.<logical-id>]` to `fastly.toml`.
+  A distinct physical name requires an existing service; provision does not
+  write an unrepresentable setup block and instead prints the exact resource-link
+  command using the logical alias. Without a selected service it fails before
+  provider mutation. Provision writes only `[setup.*]`; `config push --local`
+  writes local Config Store data.
 
 - **spin** — pure `spin.toml` editing (no shell-out — Spin KV stores are runtime-resolved
   by the Fermyon stack). For each KV id AND each `[stores.config]` id (both KV-backed

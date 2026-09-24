@@ -36,7 +36,7 @@ main() {
     store-free) expected_comment='store-free managed smoke' ;;
     *) fail "unknown production fixture mode '$fixture_mode'" ;;
   esac
-  grep -Fqx "fastly service version update --service-id=dummyservice --version=42 --comment $expected_comment" "$log" || fail "production did not apply the exact version comment"
+  grep -Fqx "fastly service version update --service-id=dummyservice --version=42 --comment=$expected_comment" "$log" || fail "production did not apply the exact version comment"
 
   jq -Rn '
     [inputs | split("\t") | {alias: .[1], resource: .[2], type: .[3]}] |

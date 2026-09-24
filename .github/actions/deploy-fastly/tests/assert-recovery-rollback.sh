@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# After recovery: active-version found the live version (7), and rollback-fastly
+# After recovery: active-version found the live version (42), and rollback-fastly
 # re-activated the captured previous version (40). Assert the rollback threaded that
 # target back out, and that the fake service is now actually at 40.
 #

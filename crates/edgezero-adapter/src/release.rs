@@ -1,11 +1,13 @@
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 const RELEASE_METADATA_NAME: &str = "release.json";
+const RELEASE_HASH_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,8 +73,10 @@ impl VerifiedApplicationRelease {
     }
 }
 
-/// Verifies an extracted immutable application release and returns its trusted
-/// member paths and package identity.
+/// Verifies the internal consistency and path confinement of an extracted
+/// application release and returns its recorded member paths and package
+/// identity. A caller that needs provenance or immutability must authenticate
+/// the release archive before extraction, for example with a pinned digest.
 ///
 /// # Errors
 ///
@@ -101,10 +105,10 @@ pub fn verify_application_release(
     }
 
     let metadata_path = canonical_root.join(RELEASE_METADATA_NAME);
-    let metadata_bytes = fs::read(&metadata_path).map_err(|error| {
+    let metadata_file = File::open(&metadata_path).map_err(|error| {
         format!("application release is missing {RELEASE_METADATA_NAME}: {error}")
     })?;
-    let metadata: ApplicationReleaseMetadata = serde_json::from_slice(&metadata_bytes)
+    let metadata: ApplicationReleaseMetadata = serde_json::from_reader(metadata_file)
         .map_err(|error| format!("invalid application release release.json: {error}"))?;
     validate_metadata(&metadata, expected_adapter, expected_lifecycle_protocol)?;
 
@@ -305,13 +309,18 @@ fn verify_member(
             relative.display()
         ));
     }
-    let bytes = fs::read(&canonical).map_err(|error| {
+    let member = File::open(&canonical).map_err(|error| {
         format!(
             "could not read application release {label} {}: {error}",
             relative.display()
         )
     })?;
-    let actual = format!("{:x}", Sha256::digest(bytes));
+    let actual = sha256_reader(member).map_err(|error| {
+        format!(
+            "could not read application release {label} {}: {error}",
+            relative.display()
+        )
+    })?;
     if actual != expected_digest {
         return Err(format!(
             "application release {label} {} digest does not match release.json",
@@ -319,6 +328,25 @@ fn verify_member(
         ));
     }
     Ok(canonical)
+}
+
+fn sha256_reader(mut reader: impl Read) -> io::Result<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; RELEASE_HASH_BUFFER_SIZE].into_boxed_slice();
+    loop {
+        let count = reader.read(buffer.as_mut())?;
+        if count == 0 {
+            break;
+        }
+        let chunk = buffer.get(..count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "release reader returned more bytes than requested",
+            )
+        })?;
+        digest.update(chunk);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn canonical_regular_file(path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -409,6 +437,7 @@ mod tests {
     use super::*;
     use sha2::Sha256;
     use std::fs;
+    use std::io::{self, Read};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -416,6 +445,53 @@ mod tests {
         root: TempDir,
         application_manifest: PathBuf,
         adapter_manifest: PathBuf,
+    }
+
+    struct BoundedReader {
+        bytes: Vec<u8>,
+        offset: usize,
+    }
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the test reader intentionally overrides only the required primitive"
+    )]
+    impl Read for BoundedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.len() > RELEASE_HASH_BUFFER_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "release hashing requested an unbounded read buffer",
+                ));
+            }
+            let remaining = self.bytes.get(self.offset..).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "reader offset exceeds input")
+            })?;
+            let count = remaining.len().min(buf.len());
+            let source = remaining.get(..count).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "reader source range is invalid")
+            })?;
+            let target = buf.get_mut(..count).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "reader target range is invalid")
+            })?;
+            target.copy_from_slice(source);
+            self.offset = self.offset.checked_add(count).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "reader offset overflowed")
+            })?;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn application_release_member_hashing_uses_bounded_reads() {
+        const TEST_BYTES_LEN: usize = 256 * 1024;
+        let bytes = vec![0x5A_u8; TEST_BYTES_LEN];
+        let actual = sha256_reader(BoundedReader {
+            bytes: bytes.clone(),
+            offset: 0,
+        })
+        .expect("stream digest");
+        assert_eq!(actual, format!("{:x}", Sha256::digest(bytes)));
     }
 
     impl ReleaseFixture {

@@ -394,9 +394,9 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
     let env_config = if args.no_env {
         EnvConfig::from_vars(iter::empty::<(String, String)>())
     } else {
-        EnvConfig::from_env()
+        effective_manifest_environment(manifest, &args.adapter, env::vars())
     };
-    let platform = env_config.store_name("config", &logical);
+    let platform = env_config.store_name_checked("config", &logical)?;
     let store = ResolvedStoreId::new(logical, platform);
 
     let manifest_root = args
@@ -1386,7 +1386,7 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
     })
 }
 
-fn effective_manifest_environment<I, K, V>(
+pub(crate) fn effective_manifest_environment<I, K, V>(
     manifest: &Manifest,
     adapter: &str,
     parent: I,
@@ -2254,6 +2254,29 @@ serve = "echo"
 ids = ["app_config"]
 "#;
 
+    const GC_MANIFEST_WITH_STORE_DEFAULT: &str = r#"
+[app]
+name = "demo-app"
+
+[[environment.variables]]
+name = "CONFIG_STORE"
+env = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"
+value = "manifest_config"
+adapters = ["fastly"]
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+"#;
+
     /// COMMAND-LEVEL GC: a dry-run drives the whole wrapper — manifest load, store
     /// resolution, adapter-registry dispatch, listing, classification, and
     /// reporting — end to end. A store with only a live root and a foreign sibling
@@ -2395,6 +2418,119 @@ ids = ["app_config"]
         assert!(
             log.contains("--store-id=store-42"),
             "the entry listing must run against the ENV-derived store id: {log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_gc_command_selects_the_manifest_default_store() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+        let (dir, manifest, _) = setup_project(GC_MANIFEST_WITH_STORE_DEFAULT, FIXTURE_APP_CONFIG);
+        let live = serde_json::to_string(&BlobEnvelope::new(
+            json!({ "greeting": "hi" }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        let entries = json!([
+            { "item_key": "app_config", "item_value": live, "created_at": "2026-07-01T00:00:00Z" },
+        ])
+        .to_string();
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_gc_list(
+            r#"[{"name":"manifest_config","id":"store-default"}]"#,
+            &entries,
+            &oplog,
+        );
+        let _prepend = PathPrepend::new(fake.path());
+
+        run_config_gc(&ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest,
+            store: None,
+            no_env: false,
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        })
+        .expect("manifest store default must be applied");
+
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            log.contains("--store-id=store-default"),
+            "gc must use the adapter-scoped manifest default: {log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_gc_rejects_an_empty_store_selector_before_provider_io() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+        let _selector = EnvOverride::set("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "");
+        let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_gc_list(
+            r#"[{"name":"app_config","id":"store-logical"}]"#,
+            "[]",
+            &oplog,
+        );
+        let _prepend = PathPrepend::new(fake.path());
+
+        let error = run_config_gc(&ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest,
+            store: None,
+            no_env: false,
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        })
+        .expect_err("an explicitly empty store selector must be rejected");
+
+        assert!(
+            error.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"),
+            "error must identify the invalid selector without its value: {error}"
+        );
+        assert!(!oplog.exists(), "provider must not be called: {oplog:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_gc_no_env_ignores_manifest_and_parent_store_selectors() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
+        let _selector = EnvOverride::set(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME",
+            "parent_config",
+        );
+        let (dir, manifest, _) = setup_project(GC_MANIFEST_WITH_STORE_DEFAULT, FIXTURE_APP_CONFIG);
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_gc_list(
+            r#"[{"name":"app_config","id":"store-logical"}]"#,
+            "[]",
+            &oplog,
+        );
+        let _prepend = PathPrepend::new(fake.path());
+
+        run_config_gc(&ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest,
+            store: None,
+            no_env: true,
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        })
+        .expect("--no-env must select the logical store");
+
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            log.contains("--store-id=store-logical"),
+            "--no-env must suppress manifest and parent selectors: {log}"
         );
     }
 
