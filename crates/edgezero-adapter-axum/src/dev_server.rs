@@ -840,6 +840,7 @@ mod integration_tests {
     use edgezero_core::extractor::Secrets;
     use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::SecretHandle as CoreSecretHandle;
+    use reqwest::header::ALLOW;
     use std::time::{Duration, Instant};
     use tokio::task::{JoinHandle, spawn_blocking};
     use tokio::time::sleep;
@@ -950,6 +951,7 @@ mod integration_tests {
         let response = send_with_retry(&client, |http_client| http_client.get(url.as_str())).await;
 
         assert_eq!(response.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers().get(ALLOW).expect("Allow header"), "POST");
 
         server.handle.abort();
     }

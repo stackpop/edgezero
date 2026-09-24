@@ -116,7 +116,9 @@ RouterService::builder()
     .build()
 ```
 
-EdgeZero automatically returns `405 Method Not Allowed` for requests that match a path but use an unsupported method.
+EdgeZero automatically returns `405 Method Not Allowed` for requests that match a path but use an
+unsupported method. The response includes an `Allow` header containing the sorted, deduplicated
+method set registered for that path.
 
 ## Introspection Routes
 

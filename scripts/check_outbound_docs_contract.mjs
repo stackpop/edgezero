@@ -411,9 +411,12 @@ for (const requiredFragment of [
   'Use `left.join(right)`',
   '`AdmissionDecision::Abort`',
   '`App::set_detached_response_egress_decision_factory`',
+  'app.set_error_response_renderer(|error|',
   '`DetachedResponseEgressDecision::Abort`',
   'Every `Send` deadline is mandatory and absolute',
   '`Abort` creates no response or egress attempt and invokes no completion callback',
+  'sorted, deduplicated `Allow` field',
+  'status returned by the callback is ignored',
   'never belongs in response extensions',
 ]) {
   if (!handlersGuideSource.includes(requiredFragment)) {
@@ -557,6 +560,10 @@ for (const requiredFragment of [
   'make no transport-observed reset claim',
   'ResponseEgressCompletion::empty()',
   'Hooks::configure(&mut App) -> Result<(), EdgeError>',
+  '`App::set_error_response_renderer(Fn(EdgeError) -> Response)`',
+  '`Vec<Method>` rather than flattening protocol data into display text',
+  'custom renderer cannot reinterpret the error status',
+  'the canonical `Allow` field',
 ]) {
   if (!inboundSpecSource.includes(requiredFragment)) {
     fail(`${inboundSpecPath} is missing lifecycle contract: ${requiredFragment}`)
@@ -565,6 +572,7 @@ for (const requiredFragment of [
 for (const staleFragment of [
   'current Tower adapter nevertheless drives',
   'block_in_place` plus a nested runtime `block_on',
+  'MethodNotAllowed   { allowed: String',
   'Tokio cannot cancel that blocking closure',
 ]) {
   if (inboundSpecSource.includes(staleFragment)) {

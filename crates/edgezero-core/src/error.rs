@@ -8,7 +8,7 @@ use crate::body::Body;
 use crate::config_store::ConfigStoreError;
 use crate::http::{
     HeaderValue, Method, Response, StatusCode,
-    header::{CONTENT_TYPE, RETRY_AFTER},
+    header::{ALLOW, CONTENT_TYPE, RETRY_AFTER},
 };
 use crate::response::{IntoResponse, response_with_body};
 
@@ -151,8 +151,15 @@ pub enum EdgeError {
         #[from]
         source: AnyError,
     },
-    #[error("method {method} not allowed; allowed: {allowed}")]
-    MethodNotAllowed { method: Method, allowed: String },
+    #[error(
+        "method {method} not allowed; allowed: {}",
+        allowed_method_names(.allowed)
+    )]
+    #[non_exhaustive]
+    MethodNotAllowed {
+        method: Method,
+        allowed: Vec<Method>,
+    },
     #[error("no route matched path: {path}")]
     NotFound { path: String },
     #[error("not implemented: {message}")]
@@ -316,7 +323,10 @@ impl EdgeError {
             | EdgeError::ServiceUnavailable { message } => message.clone(),
             EdgeError::NotFound { path } => format!("no route matched path: {path}"),
             EdgeError::MethodNotAllowed { method, allowed } => {
-                format!("method {method} not allowed; allowed: {allowed}")
+                format!(
+                    "method {method} not allowed; allowed: {}",
+                    allowed_method_names(allowed)
+                )
             }
             EdgeError::Internal { source } => format!("internal error: {source}"),
         }
@@ -325,19 +335,12 @@ impl EdgeError {
     #[must_use]
     #[inline]
     pub fn method_not_allowed(method: &Method, allowed: &[Method]) -> Self {
-        let mut names = allowed
-            .iter()
-            .map(|name| name.as_str().to_owned())
-            .collect::<Vec<_>>();
-        names.sort();
-        let allowed_list = if names.is_empty() {
-            "(none)".to_owned()
-        } else {
-            names.join(", ")
-        };
+        let mut sorted_allowed = allowed.to_vec();
+        sorted_allowed.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        sorted_allowed.dedup();
         EdgeError::MethodNotAllowed {
             method: method.clone(),
-            allowed: allowed_list,
+            allowed: sorted_allowed,
         }
     }
 
@@ -364,6 +367,30 @@ impl EdgeError {
     pub fn request_timeout<S: Into<String>>(message: S) -> Self {
         Self::RequestTimeout {
             message: message.into(),
+        }
+    }
+
+    pub(crate) fn required_allow_header(&self) -> Result<Option<HeaderValue>, EdgeError> {
+        match self {
+            EdgeError::MethodNotAllowed { allowed, .. } => {
+                HeaderValue::from_str(&allowed_header_value(allowed))
+                    .map(Some)
+                    .map_err(EdgeError::internal)
+            }
+            EdgeError::BadGateway { .. }
+            | EdgeError::BadRequest { .. }
+            | EdgeError::ConfigOutOfDate { .. }
+            | EdgeError::GatewayTimeout { .. }
+            | EdgeError::Internal { .. }
+            | EdgeError::NotFound { .. }
+            | EdgeError::NotImplemented { .. }
+            | EdgeError::RequestHeaderFieldsTooLarge { .. }
+            | EdgeError::RequestTimeout { .. }
+            | EdgeError::ResponseTooLarge { .. }
+            | EdgeError::ServiceUnavailable { .. }
+            | EdgeError::StoreExtraction { .. }
+            | EdgeError::UriTooLong { .. }
+            | EdgeError::Validation { .. } => Ok(None),
         }
     }
 
@@ -536,6 +563,7 @@ impl From<ConfigStoreError> for EdgeError {
 impl IntoResponse for EdgeError {
     #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
+        let required_allow = self.required_allow_header()?;
         let kind = self.kind();
         let is_config_out_of_date = self.kind() == "config_out_of_date";
         // `ConfigOutOfDate { field_path: String::new(), .. }` (the missing-blob
@@ -582,12 +610,31 @@ impl IntoResponse for EdgeError {
         response
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Some(value) = required_allow {
+            response.headers_mut().insert(ALLOW, value);
+        }
         if is_config_out_of_date {
             response
                 .headers_mut()
                 .insert(RETRY_AFTER, HeaderValue::from_static("60"));
         }
         Ok(response)
+    }
+}
+
+fn allowed_header_value(allowed: &[Method]) -> String {
+    allowed
+        .iter()
+        .map(Method::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn allowed_method_names(allowed: &[Method]) -> String {
+    if allowed.is_empty() {
+        "(none)".to_owned()
+    } else {
+        allowed_header_value(allowed)
     }
 }
 
@@ -1138,9 +1185,36 @@ mod tests {
 
     #[test]
     fn method_not_allowed_lists_methods_sorted() {
-        let err = EdgeError::method_not_allowed(&Method::POST, &[Method::GET, Method::DELETE]);
+        let err = EdgeError::method_not_allowed(
+            &Method::POST,
+            &[Method::GET, Method::DELETE, Method::GET],
+        );
         assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert!(err.message().contains("allowed: DELETE, GET"));
+        assert_eq!(
+            err.to_string(),
+            "method POST not allowed; allowed: DELETE, GET"
+        );
+        let EdgeError::MethodNotAllowed { allowed, .. } = err else {
+            panic!("expected MethodNotAllowed");
+        };
+        assert_eq!(allowed, vec![Method::DELETE, Method::GET]);
+    }
+
+    #[test]
+    fn method_not_allowed_response_emits_sorted_deduplicated_allow_header() {
+        let response = EdgeError::method_not_allowed(
+            &Method::POST,
+            &[Method::GET, Method::DELETE, Method::GET],
+        )
+        .into_response()
+        .expect("response");
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get(ALLOW).expect("Allow header"),
+            "DELETE, GET"
+        );
     }
 
     #[test]

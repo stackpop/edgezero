@@ -335,10 +335,30 @@ edgezero_core::app!("edgezero.toml", configure = crate::configure_app);
 `Result<(), EdgeError>`. It is
 invoked after the manifest router is built and before the app begins serving, so
 it can install ingress admission, request-head limits, config extraction limits,
-the monotonic clock, and response-egress policy or observation hooks. Keep the
+the monotonic clock, an error-response renderer, and response-egress policy or observation hooks. Keep the
 callback cheap for the same adapter-lifecycle reasons as `state = <expr>` above. A configuration
 error prevents EdgeZero request conversion, body polling, and dispatch; Axum also fails before
 binding its listener.
+
+Use the synchronous error renderer when framework and handler errors must use an application-owned,
+fixed-size wire body:
+
+```rust
+use edgezero_core::{Body, EdgeError, Response};
+
+fn configure_app(app: &mut edgezero_core::app::App) -> Result<(), EdgeError> {
+    app.set_error_response_renderer(|error| Response::new(Body::from(error.kind())));
+    Ok(())
+}
+```
+
+The renderer handles admitted routing/handler errors, post-admission conversion errors, and
+detached normalized-ingress errors. EdgeZero reapplies mandatory protocol metadata after the
+callback, including the error's status, so the status returned by the callback is ignored;
+canonical 405 responses therefore retain their sorted, deduplicated `Allow` field.
+Explicit admission refusals and fallback `on_exceeded`/`on_timeout` responses are already complete
+application responses and bypass this renderer. Avoid serializing `error.to_string()` when the
+body must remain bounded or diagnostics must remain private.
 
 Every response-producing admission decision owns one explicit `ResponseEgressCompletion`. Use
 `ResponseEgressCompletion::empty()` when there is no response-scoped resource. To hold a permit
@@ -565,6 +585,9 @@ EdgeError::validation("Field too short")          // 422
 EdgeError::internal("Unexpected failure")         // 500
 EdgeError::internal(some_error)                   // 500 (from any error type)
 ```
+
+`method_not_allowed` sorts and deduplicates the structured method list. Its response includes the
+required `Allow` header; this remains true when an application error renderer supplies the body.
 
 ## Custom Extractors
 
