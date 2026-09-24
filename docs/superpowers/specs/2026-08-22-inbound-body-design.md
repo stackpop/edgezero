@@ -774,7 +774,9 @@ the Fastly and Spin paths fully materialize the body too). This migration change
   without allocating the framework's canonical JSON payload. EdgeZero applies protocol-required
   status and metadata after the callback, so a custom renderer cannot reinterpret the error status
   (the callback's returned status is ignored) and a custom 405 renderer cannot remove or replace
-  the canonical `Allow` field. Explicit
+  the canonical `Allow` field. The same centralized mandatory-header policy preserves
+  `Retry-After: 60` for every effective `config_out_of_date` outcome after custom rendering.
+  Explicit
   `AdmissionDecision::Refuse` responses and the `on_exceeded`/`on_timeout` fallback responses
   bypass the renderer because the application supplied those complete responses directly. Raw
   parser failures before EdgeZero receives a request remain outside the application lifecycle.
