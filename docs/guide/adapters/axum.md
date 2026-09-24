@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-`run_app` installs `simple_logger`, builds the app, and reads bind /
+`run_app` installs `simple_logger` (unless `owns_logging = true`), builds the app, and reads bind /
 store / logging config at runtime from `EDGEZERO__*` environment
 variables (see [the migration guide](../manifest-store-migration.md)).
 The portable store metadata baked into `App` by the `app!` macro

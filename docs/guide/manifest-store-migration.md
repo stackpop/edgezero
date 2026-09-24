@@ -140,8 +140,9 @@ single-arg — the platform store name is bound by the
 dispatcher, not passed at the call site).
 
 Adapter setup code still has `with_*_handle` convenience
-constructors that take a single bare handle, and the public
-dispatch entry point is `dispatch_with_registries`.
+constructors that take a single bare handle, and Fastly
+additionally exposes `dispatch_with_registries` for custom
+entry points.
 Internally each dispatcher synthesises a one-id `KvRegistry` / `ConfigRegistry` / `SecretRegistry`
 under the conventional `"default"` id from that handle before
 the request reaches the router — so the registry-aware

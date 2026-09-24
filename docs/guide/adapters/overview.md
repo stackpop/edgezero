@@ -32,7 +32,7 @@ Adapters also expose `from_core_response` (or equivalent) to transform an `edgez
 
 ## Dispatch Helper
 
-Adapters surface a `dispatch` function that bridges from the provider event loop into the shared router (`App::router().oneshot(...)`). It should:
+Adapters surface a dispatch entry point, either a free function or a service builder's `dispatch` method, that bridges from the provider event loop into the shared router (`App::router().oneshot(...)`). It should:
 
 1. Convert the incoming provider request with `into_core_request`
 2. Await the router future
@@ -122,7 +122,7 @@ When bringing up another adapter:
 
 1. **Implement request/response conversion functions** that follow the rules above
 2. **Provide a context type** exposing the adapter's metadata and insert it in `into_core_request`
-3. **Implement a `dispatch` wrapper** plus logging helper
+3. **Implement a dispatch entry point** (free function or service builder) plus logging helper
 4. **Wire up a `ProxyClient`** that streams bodies and normalises encodings
 5. **Copy the contract test suite**, swapping in the new adapter types. Ensure the tests are gated to the target architecture if the adapter SDK does not compile for native hosts
 6. **Register the adapter** with `edgezero-adapter::register_adapter` (typically in a `cli` module using the `ctor` crate) so the CLI can discover it dynamically. To take part in `provision` and `config push`, override the relevant `Adapter` trait hooks: `single_store_kinds` and `merged_id_kinds` declare the platform's store shape, `validate_adapter_manifest` checks the adapter's own manifest, `provision` creates platform resources, and `push_config_entries` plus `read_config_entry` move config blobs. `single_store_kinds` and `merged_id_kinds` default to empty, `validate_adapter_manifest` defaults to accepting, `provision` defaults to a no-op, and the config push and read hooks default to reporting the operation as unsupported

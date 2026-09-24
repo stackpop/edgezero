@@ -447,5 +447,5 @@ after push B reconstructs envelope B, not A.
 - Extractor source: `crates/edgezero-core/src/extractor.rs`
 - CLI push entry point: `crates/edgezero-cli/src/config.rs::run_config_push_typed`
 - CLI diff entry point: `crates/edgezero-cli/src/config.rs::run_config_diff_typed`
-  (`diff.rs` holds only the format renderers)
+  (`diff.rs` holds the change collection and the format renderers)
 - Fastly chunk-pointer helper: `crates/edgezero-adapter-fastly/src/chunked_config.rs`

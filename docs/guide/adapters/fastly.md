@@ -220,14 +220,16 @@ let response = ProxyService::new(client).forward(request).await?;
 
 ## Logging
 
-Fastly uses endpoint-based logging. Configure logging in `edgezero.toml`:
-
-```toml
-[adapters.fastly.logging]
-endpoint = "stdout"
-level = "info"
-echo_stdout = true
-```
+Fastly uses endpoint-based logging. The runtime reads its logging settings from
+`EDGEZERO__LOGGING__LEVEL` and `EDGEZERO__LOGGING__ENDPOINT` in the
+`edgezero_runtime_env` Config Store (see
+[Custom entry points](#custom-entry-points)), not from `edgezero.toml`. Setting
+`ENDPOINT` is what enables the Fastly logger; with it unset, no platform logger
+is installed. `EDGEZERO__LOGGING__ECHO_STDOUT` and
+`EDGEZERO__LOGGING__USE_FASTLY_LOGGER` are resolved into `EnvConfig` but not
+applied on this path: stdout echo is always on, and logger use is derived from
+`ENDPOINT` alone. An `[adapters.fastly.logging]` table in `edgezero.toml` is
+consumed only by `edgezero new` when scaffolding.
 
 To initialize logging manually, call `init_logger` with explicit settings:
 
@@ -241,7 +243,7 @@ fn main() {
 ```
 
 ::: tip Logging status
-Fastly logging is wired when you call `init_logger` (or `run_app`); otherwise no logger is installed.
+Fastly logging is wired when you call `init_logger`, or when `run_app` finds `EDGEZERO__LOGGING__ENDPOINT` set; otherwise no logger is installed.
 :::
 
 ## Config Store

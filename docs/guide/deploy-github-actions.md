@@ -25,8 +25,9 @@ provider-neutral behavior; the wrappers above are thin.
 
 **Runner support:** Linux x86-64 only (`ubuntu-latest` is tested). On **self-hosted**
 runners you must run **Actions Runner 2.327.1 or newer**: these actions use
-Node 24 dependencies (`actions/download-artifact@v8`, `actions/cache/restore@v6`,
-`actions/cache/save@v6`, `actions/upload-artifact@v7`), and the Node 24 runtime they
+Node 24 dependencies such as `actions/download-artifact@v8`, `actions/cache/restore@v6`,
+`actions/cache/save@v6`, `actions/upload-artifact@v7`, and
+`actions-rust-lang/setup-rust-toolchain@v1`, and the Node 24 runtime they
 require ships only in runner 2.327.1+. Hosted runners already meet this; older
 self-hosted runners fail to launch the actions.
 
@@ -354,7 +355,7 @@ rollback has a real target (Fastly cannot infer one — see `rollback-fastly`).
 
 The action always writes a GitHub job summary, including on failure: adapter,
 working directory, source revision, manifest, toolchain, target, CLI version,
-effective build mode, cache status, and result.
+effective build mode, whether caching was enabled, and result.
 
 **If a _production_ deploy fails with `mutation-attempted=true` but no
 `fastly-version`** (the CLI almost certainly ran and may have activated a version,

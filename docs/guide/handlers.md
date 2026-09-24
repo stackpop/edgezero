@@ -227,16 +227,23 @@ and extracted by id:
 | `AppConfig<C>` | Your typed app config, deserialised from the blob and with `#[secret]` fields resolved. See [Configuration](/guide/configuration). |
 
 ```rust
+use edgezero_core::extractor::{AppConfig, Kv};
+use edgezero_core::{EdgeError, Text};
+
 #[action]
 async fn handler(
     AppConfig(cfg): AppConfig<MyAppConfig>,
     kv: Kv,
-) -> Result<Response, EdgeError> {
+) -> Result<Text<String>, EdgeError> {
     let store = kv.default().ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no kv")))?;
     let hits: u64 = store.get_or("hits", 0).await?;
-    Ok(text(format!("{} {hits}", cfg.greeting)))
+    Ok(Text::new(format!("{} {hits}", cfg.greeting)))
 }
 ```
+
+`AppConfig`, `Kv`, `Config`, and `Secrets` live in `edgezero_core::extractor`.
+`edgezero_core::AppConfig` at the crate root is the derive macro, not the
+extractor.
 
 ## Sharing app state
 

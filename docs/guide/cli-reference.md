@@ -40,7 +40,7 @@ edgezero new my-app --dir /path/to/projects
 my-app/
 ├── Cargo.toml
 ├── edgezero.toml
-├── my-app.toml          # typed app config read by `config validate` / `config push`
+├── my-app.toml          # typed app config read by `config validate` / `push` / `diff`
 ├── crates/
 │   ├── my-app-core/
 │   ├── my-app-cli/
@@ -138,12 +138,15 @@ edgezero serve --adapter spin
 edgezero serve --adapter axum
 ```
 
-**Provider behavior:**
+**Provider behavior:** a scaffolded project's `[adapters.<name>.commands].serve`
+wins; these are the built-in fallbacks used when that table is absent.
 
-- **Fastly**: Runs `fastly compute serve -C <adapter-crate-dir>`
-- **Cloudflare**: Runs `wrangler dev`
-- **Spin**: Runs `spin up`
-- **Axum**: Runs `cargo run --manifest-path <adapter-crate-dir>/Cargo.toml`
+- **Fastly**: `fastly compute serve` (run from the `fastly.toml` directory).
+  Scaffolded manifests declare `fastly compute serve -C <adapter-crate-dir>`.
+- **Cloudflare**: `wrangler dev --config <wrangler.toml>`
+- **Spin**: `spin up`
+- **Axum**: `cargo run --manifest-path <adapter-crate-dir>/Cargo.toml`.
+  Scaffolded manifests declare `cargo run -p <adapter-crate>`.
 
 ### edgezero deploy
 
@@ -182,14 +185,17 @@ edgezero deploy --adapter cloudflare
 edgezero deploy --adapter spin
 ```
 
-**Provider behavior:**
+**Provider behavior:** a scaffolded project's `[adapters.<name>.commands].deploy`
+wins; these are the built-in fallbacks used when that table is absent.
 
-- **Fastly**: Runs `fastly compute deploy -C <adapter-crate-dir>`
-- **Cloudflare**: Runs `wrangler deploy`
-- **Spin**: Runs `spin deploy`
+- **Fastly**: `fastly compute deploy --non-interactive` (run from the `fastly.toml`
+  directory). Scaffolded manifests declare `fastly compute deploy -C <adapter-crate-dir>`.
+- **Cloudflare**: `wrangler deploy`
+- **Spin**: `spin deploy`
 
 ::: warning
 The `axum` adapter doesn't support `deploy` - use standard container/binary deployment instead.
+The scaffold emits a placeholder `# configure deployment for Axum` rather than a command.
 :::
 
 ### edgezero active-version
@@ -369,8 +375,8 @@ app-demo-cli config push --adapter axum --dry-run
 ```
 
 **Exit codes:** `0` on success, non-zero with a one-line diagnostic on the first failure.
-A successful non-dry-run push also emits `pushed-key=<key>` and `pushed-store=<id>`
-for wrappers to capture.
+A successful non-dry-run push also emits `pushed-key=<key>` and
+`pushed-store=<logical-store-id>` for wrappers to capture.
 
 ### edgezero config diff
 
@@ -604,17 +610,19 @@ not from a remote auth provider.
 
 The CLI respects these environment variables:
 
-| Variable            | Description                                                                                                                                                                                                                                  |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `EDGEZERO_MANIFEST` | Path to manifest (default: `edgezero.toml`). Honoured by `build`, `deploy`, `serve`, and `auth` (which has no `--manifest` flag, so this is its only manifest selector); `provision` and the `config` subcommands take `--manifest` instead. |
-| `FASTLY_API_TOKEN`  | Fastly API token. Required by the Fastly lifecycle commands (`deploy`, `active-version`, `rollback`, and a **staging** `healthcheck`); they fail closed without it.                                                                          |
-| `FASTLY_SERVICE_ID` | Default Fastly service id, used when `--service-id` is not passed. The lifecycle commands need a service id from one source or the other.                                                                                                    |
+| Variable            | Description                                                                                                                                                                                                                                                                                                                  |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `EDGEZERO_MANIFEST` | Path to manifest (default: `edgezero.toml`). Honoured by `build`, `deploy`, `serve`, and `auth` (which has no `--manifest` flag, so this is its only manifest selector); `provision` and the `config` subcommands take `--manifest` instead; `active-version`, `healthcheck`, and `rollback` load no manifest and ignore it. |
+| `FASTLY_API_TOKEN`  | Fastly API token. Required by the Fastly lifecycle commands (`deploy`, `active-version`, `rollback`, and a **staging** `healthcheck`); they fail closed without it.                                                                                                                                                          |
+| `FASTLY_SERVICE_ID` | Default Fastly service id, used when `--service-id` is not passed. Only `deploy` makes the flag optional; `active-version`, `healthcheck`, and `rollback` require it.                                                                                                                                                        |
 
 ## Working Directory
 
-All commands expect to run from the project root where `edgezero.toml` is located. If the file is
-missing, `build`, `deploy`, `serve`, and `auth` fall back to built-in adapters (when compiled in)
-instead of manifest-driven commands; `provision` and the `config` subcommands error instead.
+Manifest-driven commands expect to run from the project root where `edgezero.toml` is located. If
+the file is missing, `build`, `deploy`, `serve`, and `auth` fall back to built-in adapters (when
+compiled in) instead of manifest-driven commands; `provision` and the `config` subcommands error
+instead. `active-version`, `healthcheck`, and `rollback` load no manifest at all and can run from
+any directory.
 
 ## Adapter Discovery
 

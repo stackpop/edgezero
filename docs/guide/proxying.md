@@ -60,4 +60,4 @@ async fn proxy_with_auth(RequestContext(ctx): RequestContext) -> Result<Response
 
 ## Next Steps
 
-- Learn about [Fastly](/guide/adapters/fastly) and [Cloudflare](/guide/adapters/cloudflare) adapter specifics
+- Learn about [Fastly](/guide/adapters/fastly), [Cloudflare](/guide/adapters/cloudflare), and [Spin](/guide/adapters/spin) adapter specifics

@@ -39,9 +39,10 @@ chunks progressively depends on the adapter:
 1. Your handler returns `Body::stream(...)` with a `Stream` of chunks
 2. Cloudflare wraps the stream in a `ReadableStream` (`Response::from_stream`), so
    chunks reach the client as they are produced
-3. Fastly, Spin, and Axum drain the stream into a buffer before writing the
-   provider response (Spin rejects streamed bodies over 16 MiB), so the client
-   receives the whole body at once
+3. Spin and Axum collect the stream into a buffer, and Fastly writes each chunk
+   into a host-side body that is only sent once complete (Spin rejects streamed
+   bodies over 16 MiB), so on all three the client receives the whole body at
+   once
 
 On Cloudflare, streaming also keeps memory flat, because each chunk is forwarded as
 it is produced. On the buffering adapters a streamed body is collected in full
@@ -100,7 +101,8 @@ body-mode = "buffered"  # or "stream"
 
 ## Transparent Decompression
 
-EdgeZero automatically decompresses gzip and brotli responses from upstream services:
+On Fastly, Cloudflare, and Spin, EdgeZero automatically decompresses gzip and brotli
+responses from upstream services (the Axum proxy client has no decode path):
 
 ```rust
 // Proxied response with Content-Encoding: gzip is automatically decoded
@@ -112,7 +114,9 @@ This happens transparently in the adapter layer using shared decoders from `edge
 
 ## Memory Considerations
 
-Streaming is essential for:
+On Cloudflare, the one adapter that forwards chunks as they are produced (see
+[How Streaming Works](#how-streaming-works)), streaming is what makes these
+workloads fit:
 
 - Large file downloads
 - Video/audio content
@@ -120,12 +124,14 @@ Streaming is essential for:
 - Responses larger than available memory
 
 ::: warning Platform Limits
-Edge platforms have memory constraints. A Fastly Compute instance has ~128MB by default. Always stream large responses rather than buffering.
+Edge platforms have memory constraints. A Fastly Compute instance has ~128MB by default. On Cloudflare, stream large responses rather than buffering. On Fastly, Spin, and Axum a streamed body is still collected in full before it is sent, so keep responses within the instance's memory (and under 16 MiB on Spin) regardless of how you build the body.
 :::
 
 ## Chunked Transfer
 
-When the response size is unknown, EdgeZero uses chunked transfer encoding:
+When the response size is unknown, `Body::stream` lets the adapter send without a
+`Content-Length`. Cloudflare delivers this as chunked transfer; the buffering
+adapters compute the length once the body is collected:
 
 ```rust
 #[action]
@@ -144,4 +150,4 @@ async fn dynamic_content() -> Response {
 ## Next Steps
 
 - Learn about [Proxying](/guide/proxying) for forwarding requests upstream
-- Explore adapter-specific streaming in [Fastly](/guide/adapters/fastly) and [Cloudflare](/guide/adapters/cloudflare) guides
+- Explore adapter-specific streaming in the [Fastly](/guide/adapters/fastly), [Cloudflare](/guide/adapters/cloudflare), and [Spin](/guide/adapters/spin) guides

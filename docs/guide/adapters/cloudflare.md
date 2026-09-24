@@ -73,8 +73,8 @@ use worker::*;
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
     let app = App::build_app();
     CloudflareService::new(&app)
-        .with_config("APP_CONFIG")
-        .with_kv("APP_KV")
+        .with_config("app_config")
+        .with_kv("sessions")
         .dispatch(req, env, ctx)
         .await
 }
@@ -163,19 +163,18 @@ async fn handler(ctx: RequestContext) -> Result<Response, EdgeError> {
 }
 ```
 
-## Environment Variables & Secrets
+## Environment Variables
 
-Define variables in `wrangler.toml`:
+Define non-secret variables in `wrangler.toml`; the adapter reads the
+`EDGEZERO__*` selectors from the same `[vars]` table:
 
 ```toml
 [vars]
 API_URL = "https://api.example.com"
-
-# Secrets are set via wrangler CLI
-# wrangler secret put API_KEY
 ```
 
-Access in handlers via the Cloudflare context or environment bindings.
+Secrets go through the Worker secret store instead; see
+[Secret Store](#secret-store).
 
 ## Config Store
 
@@ -232,16 +231,28 @@ wrangler secret put API_KEY
 
 ## KV Storage
 
-Use Cloudflare KV for edge storage:
+Each declared `[stores.kv]` id maps to a KV namespace binding, exactly like a
+config id:
+
+```toml
+# edgezero.toml
+[stores.kv]
+ids = ["sessions"]
+```
 
 ```toml
 # wrangler.toml
 [[kv_namespaces]]
-binding = "MY_KV"
-id = "abc123"
+binding = "sessions"
+id      = "abc123…"
 ```
 
-Access via the Cloudflare environment bindings in your handler.
+The binding name comes from `EDGEZERO__STORES__KV__SESSIONS__NAME`, defaulting
+to the logical id. `edgezero provision --adapter cloudflare` creates the
+namespace and appends the binding for you. Handlers reach the store through the
+portable `Kv` extractor or `ctx.kv_store(id)`; a hand-picked binding that is not
+declared under `[stores.kv]` is never opened. See [KV Storage](/guide/kv) for
+the API.
 
 ## Durable Objects
 
@@ -257,7 +268,7 @@ bindings = [
 
 ## Streaming
 
-Cloudflare Workers support streaming via `ReadableStream`. The adapter automatically converts `Body::stream` to Cloudflare's streaming format.
+Cloudflare Workers support streaming via `ReadableStream`. The adapter automatically converts `Body::Stream` to Cloudflare's streaming format.
 
 See the [Streaming guide](/guide/streaming) for examples and patterns.
 

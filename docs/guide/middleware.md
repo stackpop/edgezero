@@ -220,10 +220,10 @@ impl Middleware for RateLimiter {
 
 EdgeZero provides these middleware out of the box:
 
-| Middleware      | Purpose                                                                              |
-| --------------- | ------------------------------------------------------------------------------------ |
-| `RequestLogger` | Logs request method, path, and response status                                       |
-| `FnMiddleware`  | Wraps an `async Fn(RequestContext, Next<'_>) -> Result<Response, EdgeError>` closure |
+| Middleware      | Purpose                                                                                                                                                              |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RequestLogger` | Logs request method, path, and response status                                                                                                                       |
+| `FnMiddleware`  | Wraps a closure `Fn(RequestContext, Next<'_>) -> impl Future<Output = Result<Response, EdgeError>>`; build one with `middleware_fn(...)` or `FnMiddleware::new(...)` |
 
 If you already hold an `Arc<dyn Middleware>` (`BoxMiddleware`), register it with
 `.middleware_arc(...)` instead of `.middleware(...)`.
