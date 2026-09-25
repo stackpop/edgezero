@@ -40,7 +40,7 @@ authors = ["you@example.com"]
 `[setup.secret_stores]` and `[setup.config_stores]` entries into `fastly.toml`,
 keyed by each store's env-resolved platform name. It deliberately leaves the
 Viceroy-only `[local_server.*]` tables alone: the config-store stanzas there are
-written by `edgezero config push --adapter fastly --local`, and KV / secret
+written by your generated app CLI, `<app-cli> config push --adapter fastly --local` (the bundled `edgezero` binary has no typed app config and exits 2), and KV / secret
 local-server seeding is hand-edited.
 
 ### Entrypoint

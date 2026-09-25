@@ -124,7 +124,7 @@ workloads fit:
 - Responses larger than available memory
 
 ::: warning Platform Limits
-Edge platforms have memory constraints. A Fastly Compute instance has ~128MB by default. On Cloudflare, stream large responses rather than buffering. On Fastly, Spin, and Axum a streamed body is still collected in full before it is sent, so keep responses within the instance's memory (and under 16 MiB on Spin) regardless of how you build the body.
+Edge platforms have memory constraints. A Fastly Compute instance has ~128MB by default. On Cloudflare, stream large responses rather than buffering. On Fastly, Spin, and Axum a streamed body is still collected in full before it is sent, so keep responses within the instance's memory regardless of how you build the body. Spin additionally caps streamed-body collection at 16 MiB; an already-buffered `Body::Once` bypasses that cap.
 :::
 
 ## Chunked Transfer

@@ -53,7 +53,7 @@ async fn proxy_with_auth(RequestContext(ctx): RequestContext) -> Result<Response
 
 ## Notes
 
-- Fastly and Cloudflare stream outbound request bodies; Axum buffers them before sending, and Spin buffers them with a 16 MiB cap (larger bodies error).
+- Fastly and Cloudflare stream outbound request bodies; Axum buffers them before sending, and Spin buffers them too, capping streamed-body collection at 16 MiB (larger streams error) while an already-buffered `Body::Once` bypasses that cap.
 - Fastly, Cloudflare, and Spin automatically decode `gzip`/`br` responses for you.
 - If you need a direct client (for tests or custom wiring), use the adapter clients
   (`FastlyProxyClient`, `CloudflareProxyClient`, `SpinProxyClient`, `AxumProxyClient::try_new()?`).
