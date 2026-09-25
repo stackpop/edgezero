@@ -159,70 +159,10 @@ TOML
   git commit -q -m fixture
 }
 
-package_release() {
-  local cli_archive="$1"
-  local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
-  local app_dir="$workspace/fixture-app"
-  local output_dir="$workspace/fixture-release"
-  local stage="$output_dir/root"
-
-  [[ -f "$cli_archive" && ! -L "$cli_archive" ]] ||
-    fail "application CLI archive is missing or is not a regular file"
-  [[ -f "$app_dir/edgezero.toml" && -f "$app_dir/adapter/fastly.toml" ]] ||
-    fail "run the source fixture mode before packaging its release"
-
-  mkdir -p "$stage/cli" "$stage/package" "$stage/adapter"
-  cp "$cli_archive" "$stage/cli/app-cli.tar"
-  cp "$app_dir/edgezero.toml" "$stage/edgezero.toml"
-  cp "$app_dir/adapter/fastly.toml" "$stage/adapter/fastly.toml"
-  printf 'immutable fixture Fastly package\n' >"$stage/package/app.tar.gz"
-
-  local cli_digest package_digest edgezero_digest fastly_digest revision
-  cli_digest=$(sha256_file "$stage/cli/app-cli.tar")
-  package_digest=$(sha256_file "$stage/package/app.tar.gz")
-  edgezero_digest=$(sha256_file "$stage/edgezero.toml")
-  fastly_digest=$(sha256_file "$stage/adapter/fastly.toml")
-  revision=$(git -C "$app_dir" rev-parse HEAD)
-
-  jq -n \
-    --arg revision "$revision" \
-    --arg cli "$cli_digest" \
-    --arg package "$package_digest" \
-    --arg edgezero "$edgezero_digest" \
-    --arg fastly "$fastly_digest" \
-    '{
-      format: 1,
-      lifecycle_protocol: 1,
-      source_revision: $revision,
-      adapter: "fastly",
-      app_cli: {path: "cli/app-cli.tar", sha256: $cli},
-      package: {path: "package/app.tar.gz", sha256: $package},
-      manifests: {
-        edgezero: {path: "edgezero.toml", sha256: $edgezero},
-        adapter: {path: "adapter/fastly.toml", sha256: $fastly}
-      }
-    }' >"$stage/release.json"
-
-  tar -C "$stage" -czf "$output_dir/app-release.tar.gz" \
-    release.json cli/app-cli.tar package/app.tar.gz edgezero.toml \
-    adapter/fastly.toml
-  local release_digest
-  release_digest=$(sha256_file "$output_dir/app-release.tar.gz")
-  printf '%s\n' "$release_digest" >"$output_dir/app-release.sha256"
-  printf '%s\n' "$package_digest" >"$output_dir/package.sha256"
-  append_output app-release-sha256 "$release_digest"
-  append_output package-digest "$package_digest"
-  append_output source-revision "$revision"
-}
-
 main() {
   case "${1:-source}" in
     source) write_source_fixture "${2:-store-aware}" ;;
-    release)
-      [[ $# -eq 2 ]] || fail "usage: make-smoke-fixture.sh release <app-cli.tar>"
-      package_release "$2"
-      ;;
-    *) fail "usage: make-smoke-fixture.sh source <store-free|store-aware> | release <app-cli.tar>" ;;
+    *) fail "usage: make-smoke-fixture.sh source <store-free|store-aware>" ;;
   esac
 }
 

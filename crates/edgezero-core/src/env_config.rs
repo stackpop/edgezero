@@ -214,9 +214,13 @@ impl EnvConfig {
 
 /// Merge manifest environment-variable defaults with parent-process values.
 ///
-/// Entries from `parent` are applied last and therefore override defaults with
-/// the same exact environment-variable name. The returned map is intentionally
-/// provider-neutral; callers may validate it or pass it to [`EnvConfig::from_vars`].
+/// Entries from `parent` are applied last and therefore override defaults.
+/// Recognised `EDGEZERO__` keys are normalised before the layers are merged so
+/// segment casing cannot let a manifest default override the parent value that
+/// [`EnvConfig::from_vars`] would resolve to the same path. Other environment
+/// variable names retain their ordinary case-sensitive semantics. The returned
+/// map is provider-neutral; callers may validate it or pass it to
+/// [`EnvConfig::from_vars`].
 #[must_use]
 #[inline]
 pub fn merge_env_defaults<DI, DK, DV, PI, PK, PV>(
@@ -233,14 +237,28 @@ where
 {
     let mut merged = defaults
         .into_iter()
-        .map(|(key, value)| (key.as_ref().to_owned(), value.as_ref().to_owned()))
+        .map(|(key, value)| {
+            (
+                normalized_merge_key(key.as_ref()),
+                value.as_ref().to_owned(),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
-    merged.extend(
-        parent
-            .into_iter()
-            .map(|(key, value)| (key.as_ref().to_owned(), value.as_ref().to_owned())),
-    );
+    merged.extend(parent.into_iter().map(|(key, value)| {
+        (
+            normalized_merge_key(key.as_ref()),
+            value.as_ref().to_owned(),
+        )
+    }));
     merged
+}
+
+fn normalized_merge_key(key: &str) -> String {
+    if key.starts_with(PREFIX) {
+        key.to_ascii_uppercase()
+    } else {
+        key.to_owned()
+    }
 }
 
 /// `true` if `value` is empty, made entirely of whitespace, or
@@ -280,6 +298,23 @@ mod tests {
         assert_eq!(
             merged.get("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"),
             Some(&"parent-key".to_owned())
+        );
+    }
+
+    #[test]
+    fn merge_env_defaults_applies_parent_precedence_after_selector_normalization() {
+        let merged = merge_env_defaults(
+            [(
+                "EDGEZERO__stores__config__app_config__name",
+                "manifest-name",
+            )],
+            [("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "parent-name")],
+        );
+        let config = EnvConfig::from_vars(merged);
+
+        assert_eq!(
+            config.store_name_checked("config", "app_config"),
+            Ok("parent-name".to_owned())
         );
     }
 

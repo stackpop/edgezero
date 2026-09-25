@@ -95,7 +95,7 @@ logical aliases; it does not add a service ID to any canonical variable name.
 | `EDGEZERO__STORES__<KIND>__<ID>__<SUFFIX>` | free-form per-adapter tuning (e.g. spin's `MAX_LIST_KEYS`)                                     | —               |
 | `EDGEZERO__ADAPTER__HOST`                  | bind host (axum)                                                                               | `127.0.0.1`     |
 | `EDGEZERO__ADAPTER__PORT`                  | bind port (axum)                                                                               | `8787`          |
-| `EDGEZERO__LOGGING__LEVEL`                 | log level                                                                                      | adapter default |
+| `EDGEZERO__LOGGING__LEVEL`                 | runtime log level for Axum; Fastly logging is fixed in the built application                   | adapter default |
 
 `<KIND>` ∈ `KV` / `CONFIG` / `SECRETS`; `<ID>` is the upper-case logical
 id. On adapters that support runtime key selection, the config-only `__KEY`

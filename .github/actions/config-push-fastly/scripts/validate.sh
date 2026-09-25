@@ -20,7 +20,7 @@ main() {
   require_present app-release-sha256 "${EDGEZERO__APP__RELEASE__SHA256_PRESENT:-}"
   require_present fastly-api-token "${EDGEZERO__FASTLY__API_TOKEN_PRESENT:-}"
   if [[ -n "${EDGEZERO__CONFIG_PUSH__KEY:-}" ]]; then
-    fail "input 'key' is deprecated and unsupported; use EDGEZERO__STORES__CONFIG__<ID>__KEY"
+    fail "input 'key' is deprecated and unsupported; select the environment's physical store with EDGEZERO__STORES__CONFIG__<ID>__NAME"
   fi
   local has_file="${EDGEZERO__CONFIG_PUSH__APP_CONFIG_PRESENT:-false}"
   local has_inline="${EDGEZERO__CONFIG_PUSH__APP_CONFIG_INLINE_PRESENT:-false}"

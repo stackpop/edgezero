@@ -244,11 +244,11 @@ store under that logical alias. Production and staging both read key
 
 ```bash
 # Production environment
-EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-prod
+export EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-prod
 <app-cli> config push --adapter fastly --store app_config --yes
 
 # Staging environment
-EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-stage
+export EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-stage
 <app-cli> config push --adapter fastly --store app_config --staging --yes
 ```
 

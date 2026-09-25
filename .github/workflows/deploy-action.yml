@@ -163,8 +163,8 @@ jobs:
   fixture-release:
     runs-on: ubuntu-latest
     outputs:
-      app-release-sha256: ${{ steps.release.outputs.app-release-sha256 }}
-      package-digest: ${{ steps.release.outputs.package-digest }}
+      app-release-sha256: ${{ steps.release.outputs.archive-sha256 }}
+      package-digest: ${{ steps.release.outputs.package-sha256 }}
       source-revision: ${{ steps.release.outputs.source-revision }}
     steps:
       - uses: actions/checkout@v7
@@ -173,6 +173,18 @@ jobs:
 
       - name: Create the store-aware fixture application
         run: .github/actions/deploy-fastly/tests/make-smoke-fixture.sh source store-aware
+
+      - name: Record fixture revision and prebuilt package
+        id: fixture
+        run: |
+          printf 'immutable fixture Fastly package\n' >fixture-app/package.tar.gz
+          printf 'revision=%s\n' "$(git -C fixture-app rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+      - name: Install pinned yq
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools/bin"
+          INSTALL_DIR="$RUNNER_TEMP/tools/bin" scripts/install-yq.sh "$YQ_VERSION"
+          printf '%s\n' "$RUNNER_TEMP/tools/bin" >>"$GITHUB_PATH"
 
       - name: Set up Rust build cache
         uses: ./.github/actions/setup-rust-build-cache
@@ -196,26 +208,22 @@ jobs:
 
       - name: Assemble the immutable application release
         id: release
-        run: .github/actions/deploy-fastly/tests/make-smoke-fixture.sh release fixture-cli/app-cli.tar
-
-      - name: Upload the immutable application release
-        uses: actions/upload-artifact@v7
+        uses: ./.github/actions/package-application-release-fastly
         with:
-          name: edgezero-fastly-release
-          path: |
-            fixture-release/app-release.tar.gz
-            fixture-release/app-release.sha256
-            fixture-release/package.sha256
-          if-no-files-found: error
-          retention-days: 14
+          app-cli-archive: fixture-cli/app-cli.tar
+          fastly-package: fixture-app/package.tar.gz
+          application-manifest: fixture-app/edgezero.toml
+          adapter-manifest: fixture-app/adapter/fastly.toml
+          source-revision: ${{ steps.fixture.outputs.revision }}
+          artifact-name: edgezero-fastly-release
 
   # This is a separate application release because its bundled edgezero.toml
   # declares no stores. It is built once and is never varied by a deployer.
   store-free-release:
     runs-on: ubuntu-latest
     outputs:
-      app-release-sha256: ${{ steps.release.outputs.app-release-sha256 }}
-      package-digest: ${{ steps.release.outputs.package-digest }}
+      app-release-sha256: ${{ steps.release.outputs.archive-sha256 }}
+      package-digest: ${{ steps.release.outputs.package-sha256 }}
       source-revision: ${{ steps.release.outputs.source-revision }}
     steps:
       - uses: actions/checkout@v7
@@ -224,6 +232,18 @@ jobs:
 
       - name: Create the store-free fixture application
         run: .github/actions/deploy-fastly/tests/make-smoke-fixture.sh source store-free
+
+      - name: Record fixture revision and prebuilt package
+        id: fixture
+        run: |
+          printf 'immutable fixture Fastly package\n' >fixture-app/package.tar.gz
+          printf 'revision=%s\n' "$(git -C fixture-app rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+      - name: Install pinned yq
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools/bin"
+          INSTALL_DIR="$RUNNER_TEMP/tools/bin" scripts/install-yq.sh "$YQ_VERSION"
+          printf '%s\n' "$RUNNER_TEMP/tools/bin" >>"$GITHUB_PATH"
 
       - name: Set up Rust build cache
         uses: ./.github/actions/setup-rust-build-cache
@@ -247,18 +267,14 @@ jobs:
 
       - name: Assemble the immutable store-free application release
         id: release
-        run: .github/actions/deploy-fastly/tests/make-smoke-fixture.sh release fixture-cli/app-cli.tar
-
-      - name: Upload the immutable store-free application release
-        uses: actions/upload-artifact@v7
+        uses: ./.github/actions/package-application-release-fastly
         with:
-          name: edgezero-fastly-store-free-release
-          path: |
-            fixture-release/app-release.tar.gz
-            fixture-release/app-release.sha256
-            fixture-release/package.sha256
-          if-no-files-found: error
-          retention-days: 14
+          app-cli-archive: fixture-cli/app-cli.tar
+          fastly-package: fixture-app/package.tar.gz
+          application-manifest: fixture-app/edgezero.toml
+          adapter-manifest: fixture-app/adapter/fastly.toml
+          source-revision: ${{ steps.fixture.outputs.revision }}
+          artifact-name: edgezero-fastly-store-free-release
 
   production-smoke:
     needs: fixture-release

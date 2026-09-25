@@ -108,11 +108,20 @@ pub(crate) fn manifest_guard() -> &'static Mutex<()> {
     GUARD.get_or_init(|| Mutex::new(()))
 }
 
-/// Process-wide mutex serialising tests that mutate `PATH`.
-///
-/// A separate guard in each test module is insufficient because environment
-/// variables are shared by every test thread in this crate.
+/// Alias for [`manifest_guard`] used by tests whose only explicit mutation is
+/// `PATH`. Every process-environment read and write in this test binary must use
+/// the same mutex; separate locks do not make `setenv` and `env::vars` safe.
 pub(crate) fn path_mutation_guard() -> &'static Mutex<()> {
-    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    GUARD.get_or_init(|| Mutex::new(()))
+    manifest_guard()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{manifest_guard, path_mutation_guard};
+    use std::ptr;
+
+    #[test]
+    fn every_process_environment_mutation_uses_one_mutex() {
+        assert!(ptr::eq(manifest_guard(), path_mutation_guard()));
+    }
 }

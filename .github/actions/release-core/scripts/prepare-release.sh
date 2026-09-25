@@ -129,9 +129,6 @@ main() {
   require_cmd tar
   require_yq_v4
 
-  local actual_digest
-  actual_digest=$(sha256_file "$archive")
-  [[ "$actual_digest" == "$expected_digest" ]] || fail "application release archive digest mismatch"
   [[ ! -e "$release_root" ]] || fail "application release root already exists"
   mkdir -p "$(dirname -- "$release_root")"
 
@@ -140,8 +137,16 @@ main() {
   # shellcheck disable=SC2064 # expand the action-owned path while the local exists
   trap "rm -rf -- '$scratch'" EXIT
 
+  # Authenticate and inspect one action-owned copy. The caller's path is never
+  # reopened after this copy, so replacing it cannot change bytes between the
+  # digest check, archive inspection, and extraction.
+  local trusted_archive="$scratch/app-release.tar.gz" actual_digest
+  cp -- "$archive" "$trusted_archive"
+  actual_digest=$(sha256_file "$trusted_archive")
+  [[ "$actual_digest" == "$expected_digest" ]] || fail "application release archive digest mismatch"
+
   local listing
-  listing=$(tar -tzf "$archive") || fail "could not list application release archive"
+  listing=$(tar -tzf "$trusted_archive") || fail "could not list application release archive"
   [[ -n "$listing" ]] || fail "application release archive is empty"
   if [[ -n "$(printf '%s\n' "$listing" | sort | uniq -d)" ]]; then
     fail "application release archive contains duplicate members"
@@ -154,7 +159,7 @@ main() {
   fi
 
   local release_json="$scratch/release.json"
-  tar -xOzf "$archive" release.json >"$release_json" 2>/dev/null || fail "application release archive is missing release.json"
+  tar -xOzf "$trusted_archive" release.json >"$release_json" 2>/dev/null || fail "application release archive is missing release.json"
   validate_release_json_syntax "$release_json" "$expected_protocol"
 
   assert_exact_keys "$release_json" 'type == "object" and (keys == ["adapter","app_cli","format","lifecycle_protocol","manifests","package","source_revision"])' root
@@ -210,7 +215,7 @@ main() {
       [[ "$candidate" == "$member" ]] && allowed=regular
     done
     if [[ "$allowed" == regular ]]; then
-      verbose=$(tar -tvzf "$archive" -- "$member") || fail "could not inspect release member"
+      verbose=$(tar -tvzf "$trusted_archive" -- "$member") || fail "could not inspect release member"
       [[ "$(printf '%s\n' "$verbose" | wc -l | tr -d ' ')" == 1 ]] || fail "release member is ambiguous"
       kind=${verbose:0:1}
       [[ "$kind" == "-" ]] || fail "release member '$member' is not a regular file"
@@ -221,7 +226,7 @@ main() {
       [[ "$candidate" == "$member" ]] && allowed=true
     done
     if [[ "$allowed" == true ]]; then
-      verbose=$(tar -tvzf "$archive" -- "$member") || fail "could not inspect release directory"
+      verbose=$(tar -tvzf "$trusted_archive" -- "$member") || fail "could not inspect release directory"
       kind=${verbose:0:1}
       [[ "$kind" == "d" ]] || fail "release member '$member' is not a directory"
     else
@@ -234,7 +239,7 @@ main() {
   done
 
   rm -f "$release_json"
-  tar -xzf "$archive" -C "$scratch" || fail "could not extract application release archive"
+  tar -xzf "$trusted_archive" -C "$scratch" || fail "could not extract application release archive"
   local scratch_real target_real
   scratch_real=$(canonical_path "$scratch")
   for expected_file in "${ALLOWED_FILES[@]}"; do
@@ -249,6 +254,7 @@ main() {
   validate_manifest_reference "$scratch/release.json" "$scratch/$edgezero_path" "$expected_adapter" ||
     fail "release.json adapter manifest does not match edgezero.toml"
 
+  rm -f "$trusted_archive"
   mv "$scratch" "$release_root"
   trap - EXIT
   local root_real

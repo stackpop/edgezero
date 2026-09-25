@@ -158,10 +158,10 @@ edgezero deploy --adapter <name>
 - `--service-id <id>` - Platform service id the deploy targets (Fastly). Passed
   through to the provider; adapters that don't need one ignore it.
 - `--application-release <path>` - Extracted application release root. The
-  generic CLI verifies internal member digests and confines every recorded path;
-  the caller establishes provenance and immutability by authenticating the
-  archive before extraction. Only the selected adapter interprets provider
-  package metadata.
+  loaded `edgezero.toml` must be inside this root, so set `EDGEZERO_MANIFEST` to
+  that member. The Fastly adapter verifies internal member digests, path
+  confinement, lifecycle identity, and package metadata. Adapters without an
+  immutable-release implementation reject this flag.
 - `--staging` - Deploy to a **staged** draft version instead of activating
   production (Fastly staging lifecycle). Non-Fastly adapters reject it. This is the
   same `--staging` verb `healthcheck`/`rollback`/`config push` use.
@@ -172,11 +172,13 @@ edgezero deploy --adapter <name>
 
 ```bash
 # Deploy a verified Fastly application release
+EDGEZERO_MANIFEST="$RELEASE_ROOT/edgezero.toml" \
 edgezero deploy --adapter fastly \
   --service-id "$FASTLY_SERVICE_ID" \
   --application-release "$RELEASE_ROOT"
 
 # Stage the same release (no production activation)
+EDGEZERO_MANIFEST="$RELEASE_ROOT/edgezero.toml" \
 edgezero deploy --adapter fastly \
   --service-id "$FASTLY_SERVICE_ID" \
   --application-release "$RELEASE_ROOT" \

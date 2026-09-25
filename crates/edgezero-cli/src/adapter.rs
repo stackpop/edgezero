@@ -177,6 +177,12 @@ pub fn deploy(
             registered.preflight_deploy(context, adapter_args)
         })?;
 
+    if ownership != DeployOwnership::AdapterManaged && context.application_release_root.is_some() {
+        return Err(format!(
+            "adapter `{adapter_name}` does not support immutable application releases; omit --application-release"
+        ));
+    }
+
     if ownership == DeployOwnership::AdapterManaged {
         if let Some(err) = adapter_manifest_path_error {
             return Err(err.to_owned());
@@ -467,11 +473,27 @@ fn shell_join(args: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedEnvironment, apply_environment};
+    use super::{AdapterDeployContext, ResolvedEnvironment, apply_environment, deploy};
     use crate::test_support::manifest_guard;
     use edgezero_core::manifest::ResolvedEnvironmentBinding;
     use edgezero_core::test_env::EnvOverride;
+    use std::path::PathBuf;
     use std::process::Command;
+
+    #[test]
+    fn deploy_rejects_application_release_for_non_managed_adapter() {
+        let context = AdapterDeployContext {
+            application_release_root: Some(PathBuf::from("/verified/release")),
+            ..AdapterDeployContext::default()
+        };
+
+        let error = deploy("unregistered", &context, None, None, &[])
+            .expect_err("a manifest-owned adapter must not ignore the release contract");
+        assert_eq!(
+            error,
+            "adapter `unregistered` does not support immutable application releases; omit --application-release"
+        );
+    }
 
     #[test]
     fn apply_environment_sets_defaults_and_checks_secrets() {

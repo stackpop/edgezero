@@ -1422,11 +1422,7 @@ fn revalidate_active_source(
         plan.token.as_str(),
     )?;
     let versions = parse_service_versions(&versions_raw)?;
-    let source_versions = versions
-        .iter()
-        .filter(|version| Some(version.number) != excluded_target)
-        .cloned()
-        .collect::<Vec<_>>();
+    let source_versions = source_versions_excluding(&versions, excluded_target);
     if select_version_source(&source_versions)? != VersionSource::Active(active_version) {
         return Err("Fastly active source selection changed after preflight".to_owned());
     }
@@ -1467,11 +1463,7 @@ fn revalidate_inactive_source(
         plan.token.as_str(),
     )?;
     let versions = parse_service_versions(&versions_raw)?;
-    let source_versions = versions
-        .iter()
-        .filter(|version| Some(version.number) != excluded_target)
-        .cloned()
-        .collect::<Vec<_>>();
+    let source_versions = source_versions_excluding(&versions, excluded_target);
     let expected = match &plan.version_source {
         EditableVersionSource::CloneRetired(_) => VersionSource::Retired(snapshot.version.number),
         EditableVersionSource::CloneStaging(_) => VersionSource::Staging(snapshot.version.number),
@@ -1523,50 +1515,27 @@ fn revalidate_managed_draft(
         plan.token.as_str(),
     )?;
     let versions = parse_service_versions(&versions_raw)?;
-    let draft = versions
-        .iter()
-        .find(|candidate| candidate.number == version)
-        .ok_or_else(|| format!("Fastly draft version {version} disappeared before publication"))?;
-    if draft.active || draft.locked || !draft.environments.is_empty() {
-        return Err(format!(
-            "Fastly version {version} is no longer an unpublished editable draft"
-        ));
-    }
-    let active_versions = versions
-        .iter()
-        .filter(|candidate| candidate.active)
-        .map(|candidate| candidate.number)
-        .collect::<Vec<_>>();
-    if !matches!(
-        plan.version_source,
-        EditableVersionSource::CloneActive { .. }
-    ) && !active_versions.is_empty()
-    {
-        return Err("Fastly active version appeared before publication".to_owned());
-    }
-    match &plan.version_source {
+    let source_state = match &plan.version_source {
         EditableVersionSource::CloneActive { active_version } => {
-            if active_versions != [*active_version] {
-                return Err("Fastly active version changed before publication".to_owned());
-            }
+            VersionSource::Active(*active_version)
         }
         EditableVersionSource::CloneRetired(snapshot) => {
-            if version == snapshot.version.number {
-                return Err("managed Fastly retired clone version did not advance".to_owned());
-            }
-            revalidate_inactive_source(plan, snapshot, cwd, Some(version))?;
+            VersionSource::Retired(snapshot.version.number)
         }
         EditableVersionSource::CloneStaging(snapshot) => {
-            if version == snapshot.version.number {
-                return Err("managed Fastly staged clone version did not advance".to_owned());
-            }
-            revalidate_inactive_source(plan, snapshot, cwd, Some(version))?;
+            VersionSource::Staging(snapshot.version.number)
         }
         EditableVersionSource::InitialDraft(snapshot) => {
-            if version != snapshot.version.number {
-                return Err("managed Fastly initial draft version changed".to_owned());
-            }
+            VersionSource::InitialDraft(snapshot.version.number)
         }
+    };
+    require_managed_draft_state(source_state, &versions, version)?;
+    match &plan.version_source {
+        EditableVersionSource::CloneRetired(snapshot)
+        | EditableVersionSource::CloneStaging(snapshot) => {
+            revalidate_inactive_source(plan, snapshot, cwd, Some(version))?;
+        }
+        EditableVersionSource::CloneActive { .. } | EditableVersionSource::InitialDraft(_) => {}
     }
     let links = read_version_links(&plan.service_id, version, cwd)?;
     require_exact_link_resources(expected_links, &links, "final draft")?;
@@ -1576,18 +1545,86 @@ fn revalidate_managed_draft(
     )?;
     let package_files_hash =
         parse_package_metadata_files_hash(&package_raw, &plan.service_id, version)?;
-    if package_files_hash != plan.package_files_hash {
+    require_package_identity(&plan.package_files_hash, &package_files_hash, version)?;
+    let current_configuration = read_version_configuration_snapshot(plan, version)?;
+    require_draft_configuration(expected_configuration, &current_configuration, version)
+}
+
+fn source_versions_excluding(
+    versions: &[ServiceVersionRecord],
+    excluded_target: Option<u64>,
+) -> Vec<ServiceVersionRecord> {
+    versions
+        .iter()
+        .filter(|version| Some(version.number) != excluded_target)
+        .cloned()
+        .collect()
+}
+
+fn require_managed_draft_state(
+    source: VersionSource,
+    versions: &[ServiceVersionRecord],
+    version: u64,
+) -> Result<(), String> {
+    let draft = versions
+        .iter()
+        .find(|candidate| candidate.number == version)
+        .ok_or_else(|| format!("Fastly draft version {version} disappeared before publication"))?;
+    if draft.active || draft.locked || !draft.environments.is_empty() {
         return Err(format!(
-            "Fastly version {version} package identity changed before publication"
+            "Fastly version {version} is no longer an unpublished editable draft"
         ));
     }
-    let current_configuration = read_version_configuration_snapshot(plan, version)?;
-    if &current_configuration != expected_configuration {
-        return Err(format!(
-            "Fastly version {version} protected Compute configuration changed before publication"
-        ));
+
+    let active_versions = versions
+        .iter()
+        .filter(|candidate| candidate.active)
+        .map(|candidate| candidate.number)
+        .collect::<Vec<_>>();
+    match source {
+        VersionSource::Active(active_version) if active_versions != [active_version] => {
+            return Err("Fastly active version changed before publication".to_owned());
+        }
+        VersionSource::Active(_) => {}
+        _ if !active_versions.is_empty() => {
+            return Err("Fastly active version appeared before publication".to_owned());
+        }
+        VersionSource::Retired(source_version) if version == source_version => {
+            return Err("managed Fastly retired clone version did not advance".to_owned());
+        }
+        VersionSource::Staging(source_version) if version == source_version => {
+            return Err("managed Fastly staged clone version did not advance".to_owned());
+        }
+        VersionSource::InitialDraft(source_version) if version != source_version => {
+            return Err("managed Fastly initial draft version changed".to_owned());
+        }
+        VersionSource::Retired(_) | VersionSource::Staging(_) | VersionSource::InitialDraft(_) => {}
     }
     Ok(())
+}
+
+fn require_package_identity(expected: &str, actual: &str, version: u64) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "Fastly version {version} package identity changed before publication"
+        ))
+    }
+}
+
+fn require_draft_configuration(
+    expected: &VersionConfigurationSnapshot,
+    actual: &VersionConfigurationSnapshot,
+    version: u64,
+) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "Fastly version {version} protected Compute configuration changed before publication"
+        ))
+    }
 }
 
 fn read_version_configuration_snapshot(
@@ -3192,7 +3229,8 @@ fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
     let svc = doc
         .get("service_id")
         .and_then(|item| item.as_str())
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .filter(|service_id| !service_id.is_empty());
     Ok(svc)
 }
 
@@ -5846,6 +5884,17 @@ fn parse_service_versions(json: &str) -> Result<Vec<ServiceVersionRecord>, Strin
 }
 
 fn select_version_source(versions: &[ServiceVersionRecord]) -> Result<VersionSource, String> {
+    let staging_record_count = versions
+        .iter()
+        .flat_map(|version| &version.environments)
+        .filter(|environment| environment.name == "staging")
+        .count();
+    if staging_record_count > 1 {
+        return Err(format!(
+            "the Fastly version list reports more than one staging environment record ({staging_record_count}); the response is ambiguous"
+        ));
+    }
+
     let active_versions = versions
         .iter()
         .filter(|version| version.active)
@@ -5881,8 +5930,14 @@ fn select_version_source(versions: &[ServiceVersionRecord]) -> Result<VersionSou
         .filter(|version| !version.active && version.locked && version.environments.is_empty())
         .collect::<Vec<_>>();
     match (drafts.as_slice(), staging_versions.as_slice()) {
-        ([draft], []) if draft.number == highest => {
+        ([draft], []) if draft.number == highest && retired.is_empty() => {
             return Ok(VersionSource::InitialDraft(draft.number));
+        }
+        ([draft], []) if !retired.is_empty() => {
+            return Err(format!(
+                "editable Fastly draft {} exists beside retired version(s); EdgeZero cannot prove the draft belongs to a retired source. Restore a single unambiguous source version before retrying",
+                draft.number
+            ));
         }
         ([], [staging_version]) => return Ok(VersionSource::Staging(staging_version.number)),
         ([draft], [staging_version]) => {
@@ -7874,7 +7929,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_plan_version_source_selects_unique_initialized_draft() {
+    fn deploy_plan_version_source_rejects_orphan_draft_beside_retired_source() {
         let versions = parse_service_versions(
             r#"[
                 {"number":1,"active":false,"locked":true,"staging":false,"deployed":false,"environments":[]},
@@ -7882,9 +7937,13 @@ mod tests {
             ]"#,
         )
         .expect("typed version list");
-        assert_eq!(
-            select_version_source(&versions),
-            Ok(VersionSource::InitialDraft(2))
+        let error = select_version_source(&versions)
+            .expect_err("an editable draft beside a retired source has no provable owner");
+        assert!(
+            error.contains("editable Fastly draft 2")
+                && error.contains("retired version")
+                && error.contains("cannot prove"),
+            "error must identify the orphan draft and retired source: {error}"
         );
     }
 
@@ -7948,6 +8007,24 @@ mod tests {
     }
 
     #[test]
+    fn deploy_plan_version_source_rejects_duplicate_global_staging_records() {
+        let versions = parse_service_versions(
+            r#"[
+                {"number":3,"active":false,"locked":true,"environments":[{"active_version":3,"name":"staging","service_id":"shadow-staging-service"}]},
+                {"number":4,"active":false,"locked":true,"environments":[{"active_version":3,"name":"staging","service_id":"shadow-staging-service"}]}
+            ]"#,
+        )
+        .expect("well-formed but ambiguous version list");
+
+        let error = select_version_source(&versions)
+            .expect_err("more than one staging environment record must fail closed");
+        assert!(
+            error.contains("more than one staging environment record"),
+            "error must identify the provider-state ambiguity: {error}"
+        );
+    }
+
+    #[test]
     fn deploy_plan_version_source_rejects_missing_duplicate_and_malformed_versions() {
         for invalid in [
             "[]",
@@ -7991,6 +8068,82 @@ mod tests {
                 "unsafe first-deploy source must fail: {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn publication_barrier_rejects_draft_that_is_no_longer_editable() {
+        let versions = parse_service_versions(
+            r#"[{"number":7,"active":false,"locked":true,"environments":[]}]"#,
+        )
+        .expect("locked draft record");
+
+        let error = require_managed_draft_state(VersionSource::InitialDraft(7), &versions, 7)
+            .expect_err("publication must reject a locked target");
+        assert!(error.contains("no longer an unpublished editable draft"));
+    }
+
+    #[test]
+    fn publication_barrier_rejects_active_version_appearing_for_initial_draft() {
+        let versions = parse_service_versions(
+            r#"[
+                {"number":6,"active":true,"locked":true,"environments":[{"active_version":6,"name":"production","service_id":"production-service"}]},
+                {"number":7,"active":false,"locked":false,"environments":[]}
+            ]"#,
+        )
+        .expect("draft plus foreign active version");
+
+        let error = require_managed_draft_state(VersionSource::InitialDraft(7), &versions, 7)
+            .expect_err("publication must reject a newly active version");
+        assert!(error.contains("active version appeared before publication"));
+    }
+
+    #[test]
+    fn publication_barrier_excludes_the_new_clone_when_revalidating_its_source() {
+        let versions = parse_service_versions(
+            r#"[
+                {"number":3,"active":false,"locked":true,"environments":[{"active_version":3,"name":"staging","service_id":"shadow-staging-service"}]},
+                {"number":4,"active":false,"locked":false,"environments":[]}
+            ]"#,
+        )
+        .expect("staged source plus cloned target");
+
+        let source_versions = source_versions_excluding(&versions, Some(4));
+        assert_eq!(
+            select_version_source(&source_versions),
+            Ok(VersionSource::Staging(3))
+        );
+        assert!(
+            select_version_source(&versions).is_err(),
+            "including the target would misclassify the provider state as ambiguous"
+        );
+    }
+
+    #[test]
+    fn publication_barrier_rejects_package_identity_mismatch() {
+        let error = require_package_identity("expected-hash", "foreign-hash", 42)
+            .expect_err("publication must reject a replaced package");
+        assert!(error.contains("version 42 package identity changed"));
+    }
+
+    #[test]
+    fn publication_barrier_rejects_protected_configuration_mismatch() {
+        fn snapshot(domain: &str) -> VersionConfigurationSnapshot {
+            VersionConfigurationSnapshot {
+                backends: serde_json::json!([]),
+                domains: serde_json::json!([{ "name": domain }]),
+                healthchecks: serde_json::json!([]),
+                logging: Vec::new(),
+                settings: serde_json::json!({}),
+            }
+        }
+
+        let error = require_draft_configuration(
+            &snapshot("expected.example"),
+            &snapshot("foreign.example"),
+            42,
+        )
+        .expect_err("publication must reject protected configuration drift");
+        assert!(error.contains("protected Compute configuration changed"));
     }
 
     fn deploy_plan_inventories() -> ResourceInventories {
@@ -9466,6 +9619,19 @@ build = \"cargo build --release\"
         assert!(
             note.is_none(),
             "no service_id => no resource-link prompt: {note:?}"
+        );
+    }
+
+    #[test]
+    fn scaffold_empty_service_id_is_treated_as_unselected() {
+        let dir = tempdir().expect("tempdir");
+        let manifest = dir.path().join("fastly.toml");
+        fs::write(&manifest, "name = \"demo\"\nservice_id = \"\"\n").expect("write manifest");
+
+        assert!(
+            effective_fastly_service_id(&manifest)
+                .expect("read scaffold manifest")
+                .is_none()
         );
     }
 

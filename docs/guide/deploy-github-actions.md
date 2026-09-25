@@ -34,6 +34,11 @@ lifecycle action. It does not check out or rebuild application source. A publish
 GitHub Environment supplies runtime values and credentials; it must never supply
 the release reference or release digest.
 
+The supplied producer actions retain GitHub Artifacts for 14 days. Deploy,
+healthcheck, and rollback all require the same archive and digest. Copy them to
+durable immutable storage when deployments must remain recoverable after that
+retention window.
+
 A typical application release layout is:
 
 ```text
@@ -269,7 +274,7 @@ config source:
 selected by that Environment. A conflicting canonical `__KEY` fails before
 mutation. The
 deprecated action `key` input is retained only to fail with migration guidance
-when nonempty. Config push changes typed runtime data; it does not change the
+to the physical-store `__NAME` selector when nonempty. Config push changes typed runtime data; it does not change the
 application release, package, or manifests.
 Config pushed before deployment must remain backward-compatible with the current
 published release until deploy and healthcheck complete. If either later step
@@ -293,19 +298,19 @@ stores when compatibility cannot be guaranteed.
 
 ### `config-push-fastly`
 
-| Input                      | Required | Default      | Meaning                                               |
-| -------------------------- | -------- | ------------ | ----------------------------------------------------- |
-| `app-release-archive`      | Yes      | —            | The same pinned release archive.                      |
-| `app-release-sha256`       | Yes      | —            | Expected archive SHA-256.                             |
-| `expected-source-revision` | Yes      | —            | Source revision selected by the deployer.             |
-| `fastly-api-token`         | Yes      | —            | Token for the Config Store write.                     |
-| `working-directory`        | No       | `.`          | Publisher-owned typed-config directory.               |
-| `app-config`               | No\*     | empty        | Typed config file under `working-directory`.          |
-| `app-config-inline`        | No\*     | empty        | Inline typed config.                                  |
-| `no-env`                   | No       | `false`      | Skip the typed runtime environment overlay.           |
-| `store`                    | No       | manifest     | Logical Config Store ID.                              |
-| `key`                      | No       | empty        | Deprecated; any nonempty value fails before mutation. |
-| `deploy-to`                | No       | `production` | Validate the Environment key for the selected target. |
+| Input                      | Required | Default      | Meaning                                                               |
+| -------------------------- | -------- | ------------ | --------------------------------------------------------------------- |
+| `app-release-archive`      | Yes      | —            | The same pinned release archive.                                      |
+| `app-release-sha256`       | Yes      | —            | Expected archive SHA-256.                                             |
+| `expected-source-revision` | Yes      | —            | Source revision selected by the deployer.                             |
+| `fastly-api-token`         | Yes      | —            | Token for the Config Store write.                                     |
+| `working-directory`        | No       | `.`          | Publisher-owned typed-config directory.                               |
+| `app-config`               | No\*     | empty        | Typed config file under `working-directory`.                          |
+| `app-config-inline`        | No\*     | empty        | Inline typed config.                                                  |
+| `no-env`                   | No       | `false`      | Skip the typed runtime environment overlay.                           |
+| `store`                    | No       | manifest     | Logical Config Store ID.                                              |
+| `key`                      | No       | empty        | Deprecated; any nonempty value fails before mutation.                 |
+| `deploy-to`                | No       | `production` | Publication target whose selected physical store receives the config. |
 
 \* Exactly one typed config input is required.
 

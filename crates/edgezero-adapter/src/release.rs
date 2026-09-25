@@ -105,7 +105,14 @@ pub fn verify_application_release(
     }
 
     let metadata_path = canonical_root.join(RELEASE_METADATA_NAME);
-    let metadata_file = File::open(&metadata_path).map_err(|error| {
+    let canonical_metadata =
+        canonical_regular_file(&metadata_path, "application release release.json")?;
+    if !canonical_metadata.starts_with(&canonical_root) {
+        return Err(
+            "application release release.json resolves outside the release root".to_owned(),
+        );
+    }
+    let metadata_file = File::open(&canonical_metadata).map_err(|error| {
         format!("application release is missing {RELEASE_METADATA_NAME}: {error}")
     })?;
     let metadata: ApplicationReleaseMetadata = serde_json::from_reader(metadata_file)
@@ -756,6 +763,26 @@ mod tests {
     fn application_release_rejects_symlinks_and_canonical_root_escapes() {
         use std::os::unix::fs::symlink;
 
+        let metadata_symlink_fixture = ReleaseFixture::new();
+        let metadata_outside = TempDir::new().expect("outside metadata root");
+        let outside_metadata = metadata_outside.path().join("release.json");
+        fs::write(&outside_metadata, b"not json").expect("outside metadata");
+        fs::remove_file(metadata_symlink_fixture.root.path().join("release.json"))
+            .expect("remove metadata");
+        symlink(
+            &outside_metadata,
+            metadata_symlink_fixture.root.path().join("release.json"),
+        )
+        .expect("metadata symlink");
+        let metadata_error = metadata_symlink_fixture
+            .verify()
+            .expect_err("release metadata symlink must be rejected before it is opened");
+        assert!(
+            metadata_error.contains("release.json")
+                && metadata_error.contains("not a regular file"),
+            "metadata must receive the same file-type guard as members: {metadata_error}"
+        );
+
         let file_symlink_fixture = ReleaseFixture::new();
         fs::remove_file(file_symlink_fixture.root.path().join("pkg/app.tar.gz")).unwrap();
         symlink(
@@ -771,18 +798,22 @@ mod tests {
         );
 
         let directory_symlink_fixture = ReleaseFixture::new();
-        let outside = TempDir::new().unwrap();
-        fs::write(outside.path().join("app.tar.gz"), b"immutable package").unwrap();
+        let package_outside = TempDir::new().unwrap();
+        fs::write(
+            package_outside.path().join("app.tar.gz"),
+            b"immutable package",
+        )
+        .unwrap();
         fs::remove_dir_all(directory_symlink_fixture.root.path().join("pkg")).unwrap();
         symlink(
-            outside.path(),
+            package_outside.path(),
             directory_symlink_fixture.root.path().join("pkg"),
         )
         .unwrap();
-        let error = directory_symlink_fixture.verify().unwrap_err();
+        let directory_error = directory_symlink_fixture.verify().unwrap_err();
         assert!(
-            error.contains("outside") || error.contains("symlink"),
-            "{error}"
+            directory_error.contains("outside") || directory_error.contains("symlink"),
+            "{directory_error}"
         );
     }
 

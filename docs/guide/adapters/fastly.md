@@ -56,10 +56,11 @@ and links each selected Fastly resource under its logical ID; no
 `edgezero.toml` or deployment environment is read by the runtime. See
 [the migration guide](../manifest-store-migration.md).
 
-The low-level `dispatch()` helper remains available only for fully manual wiring and does not inject
-store metadata. Prefer `run_app` or `dispatch_with_config` for normal use.
-`dispatch_with_config_handle` exists for advanced/manual cases where you already have a prepared
-`ConfigStoreHandle`.
+For fully manual wiring, `FastlyService::new(&app)` builds a dispatcher one
+store at a time: `.with_config(name)`, `.with_config_handle(handle)`,
+`.with_kv(name)`, `.with_secrets()`, the matching `.require_kv()` /
+`.require_secrets()` flags, and finally `.dispatch(req)`. Prefer `run_app` when
+the entrypoint should use the store and logging metadata baked into the app.
 
 ### Migrating a custom entrypoint
 
@@ -79,11 +80,19 @@ edgezero_adapter_fastly::request::dispatch_with_registries(
 )
 ```
 
-Remove the `runtime_env_config` call, any use of
-`RUNTIME_ENV_STORE_NAME`, and the `env` argument:
+Remove the `runtime_env_config` call, any use of `RUNTIME_ENV_STORE_NAME`, and
+the `env` argument. Initialize logging from the app's baked Fastly settings:
 
 ```rust
+use edgezero_adapter_fastly::{FastlyLogging, init_logger};
+use edgezero_core::app::Hooks as _;
+
 let stores = MyHooks::stores();
+let logging = FastlyLogging::from(MyHooks::logging_for("fastly"));
+if logging.use_fastly_logger && !MyHooks::owns_logging() {
+    let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
+    init_logger(endpoint, logging.level, logging.echo_stdout)?;
+}
 edgezero_adapter_fastly::request::dispatch_with_registries(
     &app,
     req,
@@ -97,6 +106,11 @@ resolves it before provider mutation and binds that physical resource to the
 version under the stable logical `<ID>` alias. The runtime opens the alias
 directly. Fastly Config Stores always use `<ID>` as the entry key, so remove
 Fastly `__KEY` selectors as well.
+
+Fastly logging endpoint, level, and stdout behavior now come from
+`[adapters.fastly.logging]` when the immutable application is built. Runtime
+`EDGEZERO__LOGGING__*` values cannot vary those settings between production and
+staging for the same release.
 
 ### Capturing raw-request signals (JA4, H2 fingerprint)
 
@@ -175,6 +189,7 @@ This starts a local server at `http://127.0.0.1:7676`.
 Deploy a verified application release with the adapter-managed lifecycle:
 
 ```bash
+EDGEZERO_MANIFEST="$RELEASE_ROOT/edgezero.toml" \
 edgezero deploy --adapter fastly \
   --service-id "$FASTLY_SERVICE_ID" \
   --application-release "$RELEASE_ROOT"

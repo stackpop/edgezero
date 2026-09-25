@@ -49,6 +49,10 @@ jobs:
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
 
+      - name: Install wasm targets for generated-project checks
+        if: matrix.suite == 'cli'
+        run: rustup target add wasm32-wasip1 wasm32-wasip2 wasm32-unknown-unknown
+
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
 
@@ -104,6 +108,17 @@ jobs:
         if: matrix.suite == 'app-demo'
         working-directory: examples/app-demo
         run: cargo test --locked --workspace --all-targets
+
+  cargo-test:
+    name: cargo test
+    needs: host-tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every host test suite
+        env:
+          HOST_TESTS_RESULT: ${{ needs.host-tests.result }}
+        run: test "$HOST_TESTS_RESULT" = success
 
   adapter-wasm-tests:
     name: ${{ matrix.adapter }} wasm tests

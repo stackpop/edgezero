@@ -603,7 +603,7 @@ fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
 #[cfg(feature = "cli")]
 mod tests {
     use super::*;
-    use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard, path_mutation_guard};
+    use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard};
     use edgezero_adapter::registry::{
         self as adapter_registry, Adapter, AdapterAction, DeployOwnership,
     };
@@ -757,7 +757,6 @@ mod tests {
         // The EdgeZero-internal `--manifest-path` must NOT: the shell
         // command's own CLI has no such flag.
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
 
         let temp = TempDir::new().expect("temp dir");
         let curl = temp.path().join("curl");

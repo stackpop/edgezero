@@ -21,6 +21,11 @@ release supplies a byte-identical application CLI, Fastly package,
 and staging. Different applications or later releases can have different
 manifests. A deployer or runtime environment cannot replace them.
 
+`build-app-cli` and `package-application-release-fastly` retain their GitHub
+Artifacts for 14 days. Every lifecycle action, including rollback, needs the
+release archive and digest. Copy both to durable immutable storage, such as a
+GitHub Release asset, when the required rollback window exceeds 14 days.
+
 ### Optional Rust build caching
 
 Call the provider-neutral cache action once after checking out the application
@@ -324,10 +329,6 @@ jobs:
     needs: preflight
     runs-on: ubuntu-latest
     environment: ${{ needs.preflight.outputs.environment }}
-    env:
-      EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME: ${{ vars.EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME }}
-      EDGEZERO__STORES__KV__CACHE__NAME: ${{ vars.EDGEZERO__STORES__KV__CACHE__NAME }}
-      EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME: ${{ vars.EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME }}
     concurrency:
       group: application-${{ needs.preflight.outputs.concurrency-key }}
       cancel-in-progress: false
@@ -347,6 +348,25 @@ jobs:
           run-id: ${{ needs.preflight.outputs.release-run-id }}
           repository: ${{ needs.preflight.outputs.producer-repository }}
           github-token: ${{ secrets.APPLICATION_RELEASE_TOKEN }}
+
+      - name: Export configured store selectors
+        env:
+          CONFIG_NAME: ${{ vars.EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME }}
+          KV_NAME: ${{ vars.EDGEZERO__STORES__KV__CACHE__NAME }}
+          SECRET_NAME: ${{ vars.EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME }}
+        run: |
+          export_selector() {
+            name="$1"
+            value="$2"
+            [[ -z "$value" ]] && return
+            case "$value" in
+              *$'\n'* | *$'\r'*) echo "::error::$name contains a newline"; exit 1 ;;
+            esac
+            printf '%s=%s\n' "$name" "$value" >>"$GITHUB_ENV"
+          }
+          export_selector EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME "$CONFIG_NAME"
+          export_selector EDGEZERO__STORES__KV__CACHE__NAME "$KV_NAME"
+          export_selector EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME "$SECRET_NAME"
 
       - id: config
         uses: stackpop/edgezero/.github/actions/config-push-fastly@<ref>

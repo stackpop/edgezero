@@ -76,9 +76,10 @@ import_provider_env() {
 PUBLIC_NAMES=()
 PUBLIC_VALUES=()
 capture_public_env() {
-  local allow_file="$1" name allowed
+  local allow_file="$1" name allowed upper_name
   while IFS= read -r name; do
     allowed=false
+    upper_name=""
     if [[ "$name" == "EDGEZERO__ADAPTER__HOST" ]] ||
       [[ "$name" == "EDGEZERO__ADAPTER__PORT" ]] ||
       [[ "$name" == "EDGEZERO__LOGGING__ENDPOINT" ]] ||
@@ -91,6 +92,11 @@ capture_public_env() {
     if [[ "$allowed" == true ]]; then
       PUBLIC_NAMES+=("$name")
       PUBLIC_VALUES+=("${!name}")
+    else
+      upper_name=$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')
+    fi
+    if [[ "$allowed" != true && "$upper_name" == EDGEZERO__STORES__* ]]; then
+      fail "store selector $name must use the canonical upper-case form"
     fi
   done < <(compgen -e)
 }

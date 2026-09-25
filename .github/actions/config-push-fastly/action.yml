@@ -35,7 +35,7 @@ inputs:
     required: false
     default: ""
   key:
-    description: "Deprecated and rejected when nonempty; use EDGEZERO__STORES__CONFIG__<ID>__KEY."
+    description: "Deprecated and rejected when nonempty; select the environment's physical store with EDGEZERO__STORES__CONFIG__<ID>__NAME."
     required: false
     default: ""
   deploy-to:

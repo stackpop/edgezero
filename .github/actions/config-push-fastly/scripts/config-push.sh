@@ -55,6 +55,20 @@ confine_to_app() {
   relative_to "$app_dir" "$real"
 }
 
+# Prove that one publisher-owned config file is tracked and unchanged. Release
+# downloads and other unrelated files in the checkout do not affect this guard.
+assert_committed_config_file() {
+  local git_root="$1" app_dir="$2" relative="$3" absolute repo_relative
+  absolute=$(canonical_path "$app_dir/$relative")
+  repo_relative=$(relative_to "$git_root" "$absolute")
+  git -C "$git_root" ls-files --error-unmatch -- "$repo_relative" >/dev/null 2>&1 ||
+    fail "config push requires a tracked app-config file: '$relative'"
+  git -C "$git_root" diff --quiet -- "$repo_relative" ||
+    fail "config push requires an unchanged app-config file: '$relative'"
+  git -C "$git_root" diff --cached --quiet -- "$repo_relative" ||
+    fail "config push requires a committed app-config file: '$relative'"
+}
+
 main() {
   local cli_bin
   cli_bin=$(resolve_app_cli)
@@ -71,7 +85,7 @@ main() {
   local token="${EDGEZERO__FASTLY__API_TOKEN:-}"
 
   if [[ -n "$deprecated_key" ]]; then
-    fail "input 'key' is deprecated and unsupported; use EDGEZERO__STORES__CONFIG__<ID>__KEY"
+    fail "input 'key' is deprecated and unsupported; select the environment's physical store with EDGEZERO__STORES__CONFIG__<ID>__NAME"
   fi
   require_input fastly-api-token "$token"
   require_input application-manifest "$manifest"
@@ -108,19 +122,19 @@ main() {
   app_dir=$(canonical_path "$workspace/$working_directory")
   is_under "$workspace_real" "$app_dir" ||
     fail "input 'working-directory' must resolve inside github.workspace"
-  # Committed-source guard: config pushed from a checked-out app-config FILE must
-  # come from committed source, so the store the live service
-  # reads always corresponds to a revision that can be reconciled later — the same
-  # guarantee deploy gets from resolve-project.sh. Inline config is caller-supplied
-  # CONTENT (a workflow variable), not the tree, so it is exempt.
+  # A checked-out app-config file must itself be committed and unchanged. The
+  # downloaded immutable release is intentionally allowed to remain untracked in
+  # the same checkout; it is authenticated independently by its archive digest.
+  # Inline config is caller-supplied content and is exempt.
   if [[ -z "$app_config_inline" ]]; then
+    app_config=$(confine_to_app "$app_config" "$app_dir" app-config)
     local git_root
     git_root=$(git -C "$app_dir" rev-parse --show-toplevel 2>/dev/null) ||
       fail "config push requires committed source, but working-directory '$working_directory' is not a Git checkout"
     git_root=$(canonical_path "$git_root")
     # Never climb above github.workspace when checking dirtiness.
     is_under "$workspace_real" "$git_root" || git_root="$workspace_real"
-    assert_committed_source "$git_root" "$working_directory"
+    assert_committed_config_file "$git_root" "$app_dir" "$app_config"
   fi
 
   # Open the private log and install the sensitive-temp cleanup FIRST, so there is
@@ -149,8 +163,6 @@ main() {
       printf '%s' "$app_config_inline" >"$inline_file"
     )
     app_config="$inline_file"
-  elif [[ -n "$app_config" ]]; then
-    app_config=$(confine_to_app "$app_config" "$app_dir" app-config)
   fi
 
   # Build the argv through a Bash array — never eval. --yes and --no-diff make the

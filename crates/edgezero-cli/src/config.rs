@@ -2083,7 +2083,7 @@ fn format_app_config_error(err: &AppConfigError) -> String {
 )]
 mod tests {
     use super::*;
-    use crate::test_support::{EnvOverride, manifest_guard, path_mutation_guard};
+    use crate::test_support::{EnvOverride, manifest_guard};
     #[cfg(unix)]
     use edgezero_core::test_env::PathPrepend;
     use serde::{Deserialize, Serialize};
@@ -2288,7 +2288,6 @@ ids = ["app_config"]
         use serde_json::json;
 
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
 
         let live = serde_json::to_string(&BlobEnvelope::new(
@@ -2332,7 +2331,6 @@ ids = ["app_config"]
         use serde_json::json;
 
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
 
         let list = json!([
@@ -2381,7 +2379,6 @@ ids = ["app_config"]
         use serde_json::json;
 
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let _env = EnvOverride::set(
             "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME",
             "shared_config",
@@ -2428,7 +2425,6 @@ ids = ["app_config"]
         use serde_json::json;
 
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let (dir, manifest, _) = setup_project(GC_MANIFEST_WITH_STORE_DEFAULT, FIXTURE_APP_CONFIG);
         let live = serde_json::to_string(&BlobEnvelope::new(
             json!({ "greeting": "hi" }),
@@ -2469,7 +2465,6 @@ ids = ["app_config"]
     #[test]
     fn config_gc_rejects_an_empty_store_selector_before_provider_io() {
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let _selector = EnvOverride::set("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "");
         let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
         let oplog = dir.path().join("fastly-ops.log");
@@ -2502,7 +2497,6 @@ ids = ["app_config"]
     #[test]
     fn config_gc_no_env_ignores_manifest_and_parent_store_selectors() {
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let _selector = EnvOverride::set(
             "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME",
             "parent_config",
@@ -4074,7 +4068,6 @@ ids = ["app_config"]
 ids = ["default"]
 "#;
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
         // A fake `fastly` on PATH records any invocation, so an ordering
         // regression shows up as a logged call rather than a real shell-out.
@@ -4123,7 +4116,6 @@ serve = "echo"
 ids = ["app_config"]
 "#;
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
         let oplog = dir.path().join("fastly-ops.log");
         let fake = fake_fastly_logging(&oplog);
@@ -4184,7 +4176,6 @@ ids = ["app_config"]
 ids = ["default"]
 "#;
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let logical = "r".repeat(200);
         let long_id_manifest = FASTLY_ONLY_MANIFEST.replace("app_config", &logical);
         let (dir, manifest, _) = setup_project(&long_id_manifest, FIXTURE_APP_CONFIG);
@@ -5080,7 +5071,6 @@ ids = ["default"]
     #[test]
     fn c4_unsupported_yes_flag_passes_consent_reaches_write() {
         let _manifest = manifest_guard().lock().expect("manifest guard");
-        let _path = path_mutation_guard().lock().expect("path mutation guard");
         let (dir, manifest_path, _) = setup_project(&spin_cloud_manifest(), FIXTURE_APP_CONFIG);
         write_minimal_spin_toml(dir.path());
         // Inject a fake `spin` that returns exit 1 immediately so the
