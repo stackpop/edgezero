@@ -30,6 +30,7 @@ edgezero/
 - **Middleware** - Composable middleware chain with async support
 - **Manifest** - `edgezero.toml` parsing and validation
 - **Compression** - Shared gzip/brotli stream decoders
+- **Outbound HTTP** - Typed requests, responses, limits, deadlines, batching, and capability contracts
 
 Handlers in your core crate only depend on `edgezero-core`, keeping them portable.
 
@@ -58,26 +59,27 @@ Adapters translate between provider-specific types and the portable core model:
 - Converts Fastly `Request` to `edgezero_core::http::Request`
 - Maps core responses back to Fastly `Response`
 - Provides `FastlyRequestContext` for accessing Fastly-specific APIs
-- Implements `FastlyProxyClient` for upstream requests
+- Injects `FastlyOutboundClient` for upstream requests
 
 ### edgezero-adapter-cloudflare
 
 - Converts Workers `Request` to core request
 - Maps responses to Workers `Response`
 - Provides `CloudflareRequestContext` for Workers APIs
-- Implements `CloudflareProxyClient` for fetch operations
-
-### edgezero-adapter-spin
-
-- Converts `spin_sdk::http::Request` to core request and back
-- Provides `SpinRequestContext` for Spin-specific APIs
-- Implements `SpinProxyClient` for outbound requests
+- Injects `CloudflareOutboundClient` for fetch operations
 
 ### edgezero-adapter-axum
 
 - Wraps `RouterService` in Axum/Tokio services
 - Powers the local development server
 - Supports native container deployments
+- Injects `AxumOutboundClient` backed by `reqwest`
+
+### edgezero-adapter-spin
+
+- Converts Spin/WASI HTTP requests and responses
+- Resolves component-scoped KV, config, and secret bindings
+- Injects `SpinOutboundClient` backed by WASI HTTP 0.3
 
 ## CLI Crate
 
@@ -93,16 +95,16 @@ Adapters translate between provider-specific types and the portable core model:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                     Provider Runtime                         │
-│  (Fastly Compute / Cloudflare Workers / Axum Server)        │
+│  (Fastly Compute / Cloudflare Workers / Spin / Axum)        │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                        Adapter                               │
 │  - into_core_request(): Provider Request → Core Request     │
-│  - from_core_response(): Core Response → Provider Response  │
-│  - run_app(): Canonical lifecycle                           │
-│  - dispatch(): Low-level manual lifecycle                   │
+│  - response coordinator: Core envelope → owned delivery     │
+│  - run_app(): Canonical request and response lifecycle      │
+│  - adapter service: Optional low-level send-owning wiring    │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼

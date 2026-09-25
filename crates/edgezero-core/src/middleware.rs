@@ -77,8 +77,8 @@ pub struct RequestLogger;
 impl Middleware for RequestLogger {
     #[inline]
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        let method = ctx.request().method().clone();
-        let path = ctx.request().uri().path().to_owned();
+        let method = ctx.method().clone();
+        let path = ctx.uri().path().to_owned();
         let start = Instant::now();
 
         match next.run(ctx).await {

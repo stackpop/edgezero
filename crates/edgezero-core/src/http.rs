@@ -12,8 +12,9 @@ pub mod header {
 use std::future::Future;
 use std::pin::Pin;
 
-use http::request::Builder as HttpRequestBuilder;
+use http::request::{Builder as HttpRequestBuilder, Parts as HttpRequestParts};
 use http::response::Builder as HttpResponseBuilder;
+use http::uri::Authority as HttpAuthority;
 
 use crate::body::Body;
 use crate::error::EdgeError;
@@ -23,6 +24,7 @@ use crate::error::EdgeError;
 // `Builder` types are exposed via `pub type` aliases (not `pub use`) so
 // only the `header` re-export remains, scoped to its own child module.
 pub type Extensions = http::Extensions;
+pub type Authority = HttpAuthority;
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Response, EdgeError>> + 'static>>;
 pub type HeaderMap = http::HeaderMap;
 pub type HeaderName = header::HeaderName;
@@ -30,6 +32,7 @@ pub type HeaderValue = http::HeaderValue;
 pub type Method = http::Method;
 pub type Request = http::Request<Body>;
 pub type RequestBuilder = HttpRequestBuilder;
+pub type RequestParts = HttpRequestParts;
 pub type Response = http::Response<Body>;
 pub type ResponseBuilder = HttpResponseBuilder;
 pub type StatusCode = http::StatusCode;

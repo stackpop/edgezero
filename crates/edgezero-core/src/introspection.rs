@@ -117,7 +117,9 @@ pub async fn config(ctx: RequestContext) -> Result<Response, EdgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+    use crate::config_store::{
+        ConfigStore, ConfigStoreError, ConfigStoreHandle, ready_config_store_bounded_read,
+    };
     use crate::http::{Method, Response, request_builder};
     use crate::router::RouterService;
     use crate::store_registry::{ConfigRegistry, ConfigStoreBinding, StoreRegistry};
@@ -144,6 +146,8 @@ mod tests {
                 Err(_) => Err(ConfigStoreError::internal(anyhow::anyhow!("boom"))),
             }
         }
+
+        ready_config_store_bounded_read!();
     }
 
     // Collect a buffered response body into JSON (introspection responses are

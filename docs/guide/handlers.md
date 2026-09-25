@@ -202,17 +202,17 @@ async fn inspect(ctx: RequestContext) -> Result<Text<String>, EdgeError> {
 
 `RequestContext` provides these methods:
 
-| Method           | Returns                                    |
-| ---------------- | ------------------------------------------ |
-| `request()`      | `&Request` - full HTTP request             |
-| `path_params()`  | `&PathParams` - raw path parameters        |
-| `path::<T>()`    | Deserialize path params to `T`             |
-| `query::<T>()`   | Deserialize query string to `T`            |
-| `json::<T>()`    | Deserialize JSON body to `T`               |
-| `form::<T>()`    | Deserialize form body to `T`               |
-| `body()`         | `&Body` - raw request body                 |
-| `into_request()` | `Request` - consume context, take request  |
-| `proxy_handle()` | `Option<ProxyHandle>` - adapter proxy hook |
+| Method           | Returns                                             |
+| ---------------- | --------------------------------------------------- |
+| `request()`      | `&Request` - full HTTP request                      |
+| `path_params()`  | `&PathParams` - raw path parameters                 |
+| `path::<T>()`    | Deserialize path params to `T`                      |
+| `query::<T>()`   | Deserialize query string to `T`                     |
+| `json::<T>()`    | Deserialize JSON body to `T`                        |
+| `form::<T>()`    | Deserialize form body to `T`                        |
+| `body()`         | `&Body` - raw request body                          |
+| `into_request()` | `Request` - consume context, take request           |
+| `http_client()`  | `Option<HttpClient>` - adapter outbound HTTP client |
 
 ### Store Extractors
 
@@ -331,6 +331,162 @@ app-state struct and register that.
 > So the `state` expression runs on that cadence: build heavy state **once** and
 > hand out clones (e.g. a `OnceLock<Arc<AppState>>` as above, or a `static`), and
 > let `T = Arc<AppState>` so each call is just a refcount bump. Do **not** `Arc::new(HeavyThing::build())` directly in the `state` expression.
+
+### Configuring the application lifecycle
+
+Macro-driven apps can customize the generated `App` through the existing
+`Hooks::configure` seam without replacing manifest-driven routing:
+
+```rust
+use edgezero_core::{
+    AdmissionDecision, DetachedResponseEgressDecision, EdgeError, IngressGrant,
+    ResponseEgressCompletion, DEFAULT_RESPONSE_WRITE_BUDGET,
+};
+use std::time::Duration;
+
+fn configure_app(app: &mut edgezero_core::app::App) -> Result<(), EdgeError> {
+    app.set_ingress_admission_policy(|head| AdmissionDecision::Admit {
+        completion: ResponseEgressCompletion::empty(),
+        grant: IngressGrant::empty(),
+        read_deadline: head.read_deadline_after(Duration::from_secs(30)),
+    });
+    app.set_detached_response_egress_decision_factory(|head| {
+        DetachedResponseEgressDecision::Send {
+            completion: ResponseEgressCompletion::empty(),
+            deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),
+        }
+    });
+    Ok(())
+}
+
+edgezero_core::app!("edgezero.toml", configure = crate::configure_app);
+```
+
+`configure = <expr>` must evaluate to a callable that accepts `&mut App` and returns
+`Result<(), EdgeError>`. It is
+invoked after the manifest router is built and before the app begins serving, so
+it can install ingress admission, request-head limits, config extraction limits,
+the monotonic clock, an error-response renderer, and response-egress policy or observation hooks. Keep the
+callback cheap for the same adapter-lifecycle reasons as `state = <expr>` above. A configuration
+error prevents EdgeZero request conversion, body polling, and dispatch; Axum also fails before
+binding its listener.
+
+Use the synchronous error renderer when framework and handler errors must use an application-owned,
+fixed-size wire body:
+
+```rust
+use edgezero_core::{Body, EdgeError, Response};
+
+fn configure_app(app: &mut edgezero_core::app::App) -> Result<(), EdgeError> {
+    app.set_error_response_renderer(|error| Response::new(Body::from(error.kind())));
+    Ok(())
+}
+```
+
+The renderer handles admitted routing/handler errors, post-admission conversion errors, and
+detached normalized-ingress errors. EdgeZero reapplies mandatory protocol metadata after the
+callback, including the error's status, so the status returned by the callback is ignored;
+canonical 405 responses therefore retain their sorted, deduplicated `Allow` field.
+Effective `config_out_of_date` responses retain `Retry-After: 60`.
+Explicit admission refusals and fallback `on_exceeded`/`on_timeout` responses are already complete
+application responses and bypass this renderer. Avoid serializing `error.to_string()` when the
+body must remain bounded or diagnostics must remain private.
+
+Every response-producing admission decision owns one explicit `ResponseEgressCompletion`. Use
+`ResponseEgressCompletion::empty()` when there is no response-scoped resource. To hold a permit
+acquired during admission through terminal egress, move it directly into
+`ResponseEgressCompletion::new(move |report| ... )`. The completion is non-clone.
+It never belongs in response extensions. It follows admitted, refused, fallback, handler-error,
+and middleware-error responses into the adapter's exactly-once egress attempt.
+`AdmissionDecision::Abort` is different: it returns no response and therefore owns no completion.
+
+A handler can place a response-specific write bound in the response extensions without teaching
+the global policy callback about application response categories:
+
+```rust
+use edgezero_core::ResponseEgressDeadline;
+use std::time::Duration;
+
+response
+    .extensions_mut()
+    .insert(ResponseEgressDeadline::after(Duration::from_secs(2)));
+```
+
+`after(duration)` starts at the injected-clock instant when response egress begins. EdgeZero
+clamps the duration to seven days and fails closed to that start instant on arithmetic overflow.
+Use `ResponseEgressDeadline::at(deadline)` when the application already owns an absolute cutoff,
+such as a queue-through-egress deadline. EdgeZero removes either extension in `begin()`, exposes
+the resolved absolute value to the policy callback, and enforces the earlier application or policy
+deadline. The retired `new()` and unresolved `deadline()` APIs are not available.
+
+Use `left.join(right)` when two independently owned completion actions must follow the same
+response. The joined completion invokes the left callback and then the right callback with the
+same borrowed terminal report, at most once. Abandoning it before terminal egress releases the
+resources captured by both children. On unwind-capable targets, each child has an independent
+panic boundary, so a left-callback panic does not suppress the right callback. On panic-abort
+targets, termination may occur before the right callback runs. Joining callbacks does not
+strengthen the adapter's documented provider-completion boundary.
+
+When the handler acquires the permit later, use EdgeZero's late-bound resource owner. Put the
+non-clone installer in the typed `IngressGrant` and transfer its paired completion with the
+admission decision. The handler consumes the grant and installs the permit; terminal completion
+takes and drops it:
+
+```rust
+use edgezero_core::{
+    IngressGrant, ResponseEgressCompletion, ResponseEgressResource,
+    ResponseEgressResourceInstallError,
+};
+
+struct Permit;
+
+struct AdmissionLease {
+    response_resource: ResponseEgressResource<Permit>,
+}
+
+impl AdmissionLease {
+    fn install(&self, permit: Permit) -> Result<(), ResponseEgressResourceInstallError> {
+        self.response_resource.install(permit)
+    }
+}
+
+fn response_lifecycle() -> (IngressGrant, ResponseEgressCompletion) {
+    let (response_resource, completion) = ResponseEgressCompletion::late_bound();
+    (
+        IngressGrant::new(AdmissionLease { response_resource }),
+        completion,
+    )
+}
+```
+
+`install` consumes the permit. A second install returns `AlreadyInstalled`; an install after
+terminal completion or pre-egress abandonment returns `Closed`. Both failures release the rejected
+permit before returning. `ResponseEgressResourceInstallError` implements `std::error::Error`, so a
+handler returning `Result<_, EdgeError>` can use
+`lease.install(permit).map_err(EdgeError::internal)?`. Do not keep the permit only in a
+handler-local guard: that releases it when the handler returns, before response transmission. If
+the response envelope is abandoned before egress begins, dropping the completion closes the
+surviving installer and releases an installed permit without fabricating a terminal report.
+
+Normalized request-head rejections happen before admission; admission-policy errors can also fail
+before an admission decision transfers its completion. Configure
+`App::set_detached_response_egress_decision_factory` to return
+`DetachedResponseEgressDecision::Send { completion, deadline }` when those responses need an
+application-owned completion resource. Every `Send` deadline is mandatory and absolute in the
+request's injected monotonic-clock domain. Construct relative deadlines with
+`head.write_deadline_after(duration)`, which anchors to captured `request_start`, clamps to
+`DEADLINE_FAR_FUTURE`, and fails closed to `request_start` on arithmetic overflow. The default
+factory combines `ResponseEgressCompletion::empty()` with `DEFAULT_RESPONSE_WRITE_BUDGET` measured
+from request start. The effective bound is the earlier of the factory deadline and the default
+response-egress policy, so a later factory deadline cannot extend the default policy and the policy
+cannot extend an earlier factory deadline. Admission-selected detached responses retain their
+response-owned deadline path and are outside this factory contract.
+
+Return `DetachedResponseEgressDecision::Abort` when no bounded response resource is available.
+`Abort` creates no response or egress attempt and invokes no completion callback, observer,
+handler, middleware, or body poll. Raw parser failures that occur before EdgeZero receives a
+request, and platform-to-core head-conversion failures that occur before a normalized head exists,
+remain outside this hook.
 
 ## Response Types
 
@@ -461,6 +617,9 @@ EdgeError::validation("Field too short")          // 422
 EdgeError::internal("Unexpected failure")         // 500
 EdgeError::internal(some_error)                   // 500 (from any error type)
 ```
+
+`method_not_allowed` sorts and deduplicates the structured method list. Its response includes the
+required `Allow` header; this remains true when an application error renderer supplies the body.
 
 ## Custom Extractors
 

@@ -6,10 +6,14 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Error as AnyError;
 use async_trait::async_trait;
 use thiserror::Error;
+
+use crate::error::EdgeError;
+use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock};
 
 // ---------------------------------------------------------------------------
 // Contract test macro
@@ -153,6 +157,65 @@ macro_rules! config_store_contract_tests {
     };
 }
 
+pub const DEFAULT_CONFIG_BACKEND_BYTES: u64 = 0x0100_0000;
+pub const DEFAULT_CONFIG_BLOB_BYTES: u64 = 0x0080_0000;
+pub const DEFAULT_CONFIG_EXTRACTION_BYTES: u64 = 0x0100_0000;
+pub const DEFAULT_CONFIG_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_CONFIG_SECRET_BYTES: u64 = 0x0010_0000;
+
+/// Per-extraction limits shared by the root config blob and every referenced secret.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigExtractionLimits {
+    pub max_backend_bytes: u64,
+    pub max_blob_bytes: u64,
+    pub max_secret_bytes: u64,
+    pub max_total_bytes: u64,
+    pub timeout: Duration,
+}
+
+impl ConfigExtractionLimits {
+    /// Validates this startup policy before an adapter begins serving.
+    ///
+    /// # Errors
+    /// Returns an internal policy error for zero, inconsistent, or unbounded values.
+    #[inline]
+    pub fn validate(self) -> Result<Self, EdgeError> {
+        if self.max_backend_bytes == 0
+            || self.max_blob_bytes == 0
+            || self.max_secret_bytes == 0
+            || self.max_total_bytes == 0
+        {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "config extraction byte limits must be nonzero"
+            )));
+        }
+        if self.max_total_bytes < self.max_blob_bytes.max(self.max_secret_bytes) {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "config extraction total byte limit is below a per-value limit"
+            )));
+        }
+        if self.timeout.is_zero() || self.timeout > DEADLINE_FAR_FUTURE {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "config extraction timeout must be finite and nonzero"
+            )));
+        }
+        Ok(self)
+    }
+}
+
+impl Default for ConfigExtractionLimits {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            max_backend_bytes: DEFAULT_CONFIG_BACKEND_BYTES,
+            max_blob_bytes: DEFAULT_CONFIG_BLOB_BYTES,
+            max_secret_bytes: DEFAULT_CONFIG_SECRET_BYTES,
+            max_total_bytes: DEFAULT_CONFIG_EXTRACTION_BYTES,
+            timeout: DEFAULT_CONFIG_EXTRACTION_TIMEOUT,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -163,6 +226,9 @@ macro_rules! config_store_contract_tests {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConfigStoreError {
+    /// The absolute read deadline expired before a complete value was available.
+    #[error("config store read deadline exceeded")]
+    DeadlineExceeded,
     /// An unexpected backend or provider failure occurred.
     #[error("config store error: {source}")]
     Internal { source: AnyError },
@@ -172,6 +238,9 @@ pub enum ConfigStoreError {
     /// The configured backend cannot currently serve requests.
     #[error("config store unavailable: {message}")]
     Unavailable { message: String },
+    /// The value or guest-visible backend read exceeded its supplied allowance.
+    #[error("config store value exceeds configured byte limit")]
+    ValueTooLarge,
 }
 
 impl ConfigStoreError {
@@ -203,6 +272,13 @@ impl ConfigStoreError {
     }
 }
 
+/// Result of one bounded store lookup, including all bytes exposed to guest code.
+#[derive(Debug)]
+pub struct BoundedStoreRead<T> {
+    pub backend_bytes: u64,
+    pub value: Option<T>,
+}
+
 /// Object-safe interface for read-only configuration store backends.
 ///
 /// Implementations exist per adapter:
@@ -217,7 +293,80 @@ pub trait ConfigStore: Send + Sync {
     /// # Errors
     /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
     async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;
+
+    /// Retrieves one value under an absolute deadline and independent backend/value caps.
+    ///
+    /// Implementations must define their deadline and allocation behavior explicitly. There is
+    /// no compatibility default because awaiting an unbounded provider call can hide a
+    /// never-ready future.
+    async fn get_bounded(
+        &self,
+        key: &str,
+        clock: &MonotonicClock,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError>;
 }
+
+#[cfg(test)]
+macro_rules! ready_config_store_bounded_read {
+    () => {
+        fn get_bounded<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            key: &'life1 str,
+            clock: &'life2 $crate::time::MonotonicClock,
+            deadline: $crate::time::Deadline,
+            max_backend_bytes: u64,
+            max_value_bytes: u64,
+        ) -> ::std::pin::Pin<
+            Box<
+                dyn ::std::future::Future<
+                        Output = Result<
+                            $crate::config_store::BoundedStoreRead<String>,
+                            $crate::config_store::ConfigStoreError,
+                        >,
+                    > + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                if deadline.is_expired_at(clock.now()) {
+                    return Err($crate::config_store::ConfigStoreError::DeadlineExceeded);
+                }
+                let Some(result) = ::futures_util::FutureExt::now_or_never(self.get(key)) else {
+                    return Err($crate::config_store::ConfigStoreError::internal(
+                        ::anyhow::anyhow!("ready config-store test fixture returned pending"),
+                    ));
+                };
+                if deadline.is_expired_at(clock.now()) {
+                    return Err($crate::config_store::ConfigStoreError::DeadlineExceeded);
+                }
+                let value = result?;
+                let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+                    u64::try_from(stored_value.len()).map_err(|_length_error| {
+                        $crate::config_store::ConfigStoreError::ValueTooLarge
+                    })
+                })?;
+                if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+                    return Err($crate::config_store::ConfigStoreError::ValueTooLarge);
+                }
+                Ok($crate::config_store::BoundedStoreRead {
+                    backend_bytes,
+                    value,
+                })
+            })
+        }
+    };
+}
+
+#[cfg(test)]
+pub(crate) use ready_config_store_bounded_read;
 
 // ---------------------------------------------------------------------------
 // Handle
@@ -246,11 +395,62 @@ impl ConfigStoreHandle {
         self.store.get(key).await
     }
 
+    /// Get a config value under one absolute deadline and two byte limits.
+    ///
+    /// # Errors
+    /// Preserves the provider's typed bounded-read error.
+    #[inline]
+    pub async fn get_bounded(
+        &self,
+        key: &str,
+        clock: &MonotonicClock,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        self.store
+            .get_bounded(key, clock, deadline, max_backend_bytes, max_value_bytes)
+            .await
+    }
+
     /// Create a new handle wrapping a config store implementation.
     #[inline]
     pub fn new(store: Arc<dyn ConfigStore>) -> Self {
         Self { store }
     }
+}
+
+/// Applies post-read deadline precedence and byte caps to one materialized config result.
+///
+/// This helper does not dispatch, await, cancel, or time out the provider operation. A
+/// [`ConfigStore::get_bounded`] implementation must still reject an already-expired deadline and
+/// arrange any target-specific timer race before calling it.
+///
+/// # Errors
+/// Returns the provider error, [`ConfigStoreError::DeadlineExceeded`], or
+/// [`ConfigStoreError::ValueTooLarge`] according to post-read precedence.
+#[inline]
+pub fn finish_bounded_config_read(
+    result: Result<Option<String>, ConfigStoreError>,
+    clock: &MonotonicClock,
+    deadline: Deadline,
+    max_backend_bytes: u64,
+    max_value_bytes: u64,
+) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+    if deadline.is_expired_at(clock.now()) {
+        return Err(ConfigStoreError::DeadlineExceeded);
+    }
+    let value = result?;
+    let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+        u64::try_from(stored_value.len()).map_err(|_length_error| ConfigStoreError::ValueTooLarge)
+    })?;
+    if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+        return Err(ConfigStoreError::ValueTooLarge);
+    }
+    Ok(BoundedStoreRead {
+        backend_bytes,
+        value,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -266,8 +466,11 @@ mod tests {
     );
 
     use super::*;
+    use crate::time::{Deadline, MonotonicClock, MonotonicInstant};
     use futures::executor::block_on;
     use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     struct FailingConfigStore;
 
@@ -280,6 +483,8 @@ mod tests {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Err(ConfigStoreError::unavailable("backend offline"))
         }
+
+        ready_config_store_bounded_read!();
     }
 
     #[async_trait(?Send)]
@@ -287,6 +492,8 @@ mod tests {
         async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(self.data.get(key).cloned())
         }
+
+        ready_config_store_bounded_read!();
     }
 
     impl TestConfigStore {
@@ -320,6 +527,115 @@ mod tests {
             block_on(store_handle.get("feature.checkout")).expect("config value"),
             Some("true".to_owned())
         );
+    }
+
+    #[test]
+    fn bounded_exact_cap_succeeds_and_over_cap_discards_value() {
+        let store_handle = handle(&[("feature.checkout", "true")]);
+        let clock = MonotonicClock::default();
+        let exact = block_on(store_handle.get_bounded(
+            "feature.checkout",
+            &clock,
+            Deadline::after(Duration::from_secs(1)),
+            4,
+            4,
+        ))
+        .expect("exact bounded read");
+        assert_eq!(exact.backend_bytes, 4);
+        assert_eq!(exact.value.as_deref(), Some("true"));
+
+        let error = block_on(store_handle.get_bounded(
+            "feature.checkout",
+            &clock,
+            Deadline::after(Duration::from_secs(1)),
+            3,
+            4,
+        ))
+        .expect_err("backend cap");
+        assert!(matches!(error, ConfigStoreError::ValueTooLarge));
+    }
+
+    #[test]
+    fn bounded_read_uses_injected_clock() {
+        let store_handle = handle(&[("feature.checkout", "true")]);
+        let process_now = MonotonicInstant::now();
+        let injected_now = process_now
+            .checked_sub(Duration::from_mins(1))
+            .expect("injected instant");
+        let deadline = Deadline::at_instant(
+            injected_now
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+        let clock = MonotonicClock::new(move || injected_now);
+
+        let read = block_on(store_handle.get_bounded("feature.checkout", &clock, deadline, 4, 4))
+            .expect("the application clock is still before its deadline");
+
+        assert_eq!(read.value.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn bounded_read_deadline_wins_ready_provider_error() {
+        struct AdvancingErrorStore {
+            now: Arc<Mutex<MonotonicInstant>>,
+            terminal: MonotonicInstant,
+        }
+
+        #[async_trait(?Send)]
+        impl ConfigStore for AdvancingErrorStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                *self.now.lock().expect("clock lock") = self.terminal;
+                Err(ConfigStoreError::unavailable("provider failed at expiry"))
+            }
+
+            ready_config_store_bounded_read!();
+        }
+
+        let start = MonotonicInstant::now();
+        let terminal = start
+            .checked_add(Duration::from_secs(1))
+            .expect("terminal instant");
+        let now = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&now);
+        let clock = MonotonicClock::new(move || *clock_now.lock().expect("clock lock"));
+        let store_handle = ConfigStoreHandle::new(Arc::new(AdvancingErrorStore { now, terminal }));
+
+        let error = block_on(store_handle.get_bounded(
+            "feature.checkout",
+            &clock,
+            Deadline::at_instant(terminal),
+            4,
+            4,
+        ))
+        .expect_err("equality expiry must beat a ready provider error");
+
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+    }
+
+    #[test]
+    fn bounded_limit_defaults_are_finite_and_validation_rejects_invalid_relationships() {
+        let limits = ConfigExtractionLimits::default();
+        assert_eq!(limits.max_blob_bytes, DEFAULT_CONFIG_BLOB_BYTES);
+        assert_eq!(limits.max_backend_bytes, DEFAULT_CONFIG_BACKEND_BYTES);
+        assert_eq!(limits.max_secret_bytes, DEFAULT_CONFIG_SECRET_BYTES);
+        assert_eq!(limits.max_total_bytes, DEFAULT_CONFIG_EXTRACTION_BYTES);
+        assert_eq!(limits.timeout, DEFAULT_CONFIG_EXTRACTION_TIMEOUT);
+        limits.validate().expect("valid defaults");
+
+        let invalid_total = ConfigExtractionLimits {
+            max_total_bytes: 1,
+            ..limits
+        };
+        invalid_total
+            .validate()
+            .expect_err("total below per-value cap");
+
+        let invalid_timeout = ConfigExtractionLimits {
+            timeout: Duration::ZERO,
+            ..limits
+        };
+        invalid_timeout.validate().expect_err("zero timeout");
     }
 
     #[test]

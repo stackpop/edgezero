@@ -269,10 +269,10 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     );
     deps.insert(
         "worker".to_owned(),
-        "worker = { version = \"0.8\", default-features = false, features = [\"http\"] }"
+        "worker = { version = \"0.8.5\", default-features = false, features = [\"http\"] }"
             .to_owned(),
     );
-    deps.insert("fastly".to_owned(), "fastly = \"0.12\"".to_owned());
+    deps.insert("fastly".to_owned(), "fastly = \"0.13\"".to_owned());
     deps.insert("once_cell".to_owned(), "once_cell = \"1\"".to_owned());
     deps.insert(
         "tokio".to_owned(),
@@ -281,7 +281,7 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     deps.insert("tracing".to_owned(), "tracing = \"0.1\"".to_owned());
     deps.insert(
         "spin-sdk".to_owned(),
-        "spin-sdk = { version = \"6\", default-features = false }".to_owned(),
+        "spin-sdk = { version = \"7\", default-features = false }".to_owned(),
     );
     // Core depends on `validator` for `#[derive(Validate)]` on the
     // generated `<Name>Config` struct. Pinned to the same
@@ -642,10 +642,7 @@ fn build_base_data(
 /// - `fastly` → `fastly` (the Fastly CLI we shell out to for
 ///   provision + config push) plus `viceroy` (what
 ///   `fastly compute serve` uses for local emulation).
-/// - `spin` → no asdf pin; the Spin CLI is install-flow-managed
-///   (<https://spinframework.dev/install>). A header comment points
-///   the operator at the URL when `spin` is in the adapter set so
-///   they don't wonder why everything else is pinned but spin.
+/// - `spin` → `spin` (the runtime used by `spin build` and `spin up`).
 /// - `axum` → no extra pin (uses the host Rust toolchain only).
 ///
 /// Versions are pulled from this repo's own `.tool-versions` (see
@@ -658,7 +655,10 @@ fn build_tool_versions(adapter_ids: &[String]) -> String {
     }
     if has("fastly") {
         lines.push("fastly 15.1.0".to_owned());
-        lines.push("viceroy 0.17.0".to_owned());
+        lines.push("viceroy 0.21.0".to_owned());
+    }
+    if has("spin") {
+        lines.push("spin 4.1.0".to_owned());
     }
     lines.push("rust 1.95.0".to_owned());
     // Sort + dedup so the file is stable regardless of adapter
@@ -666,13 +666,7 @@ fn build_tool_versions(adapter_ids: &[String]) -> String {
     lines.sort();
     lines.dedup();
     let mut body = lines.join("\n");
-    if has("spin") {
-        body.push_str(
-            "\n\n# Spin is not asdf-managed in this scaffold; install via\n# https://spinframework.dev/install\n",
-        );
-    } else {
-        body.push('\n');
-    }
+    body.push('\n');
     body
 }
 
@@ -805,8 +799,11 @@ fn initialize_git_repo(out_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_adapter::cli_support::validate_spin_outbound_host_contract;
+    use edgezero_core::Capability;
     use edgezero_core::app_config::app_name_prefix;
-    use edgezero_core::test_env::PathPrepend as PathOverride;
+    use edgezero_core::manifest::ManifestLoader;
+    use edgezero_core::test_env::{PathPrepend as PathOverride, env_lock};
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -902,7 +899,7 @@ mod tests {
         // requirement.
         let out = build_tool_versions(&["fastly".to_owned()]);
         assert!(out.contains("fastly 15.1.0"), "must pin fastly: {out}");
-        assert!(out.contains("viceroy 0.17.0"), "must pin viceroy: {out}");
+        assert!(out.contains("viceroy 0.21.0"), "must pin viceroy: {out}");
         assert!(out.contains("rust 1.95.0"));
         assert!(
             !out.contains("nodejs"),
@@ -920,20 +917,12 @@ mod tests {
     }
 
     #[test]
-    fn build_tool_versions_spin_adds_install_hint_comment_not_asdf_pin() {
-        // Spin is install-flow-managed (not consistently asdf-
-        // managed in our toolchain), so don't write a brittle pin
-        // we can't honour — explain why with an inline hint so the
-        // operator isn't left guessing.
+    fn build_tool_versions_pins_spin_runtime() {
         let out = build_tool_versions(&["spin".to_owned()]);
         assert!(out.contains("rust 1.95.0"));
         assert!(
-            !out.contains("spin "),
-            "must NOT pin spin via asdf shape: {out}"
-        );
-        assert!(
-            out.contains("spinframework.dev/install"),
-            "must point operators at the spin install URL: {out}"
+            out.contains("spin 4.1.0"),
+            "must pin the verified Spin runtime: {out}"
         );
     }
 
@@ -955,7 +944,8 @@ mod tests {
         for pin in [
             "nodejs 24.12.0",
             "fastly 15.1.0",
-            "viceroy 0.17.0",
+            "spin 4.1.0",
+            "viceroy 0.21.0",
             "rust 1.95.0",
         ] {
             assert_eq!(
@@ -964,8 +954,6 @@ mod tests {
                 "`{pin}` must appear exactly once in: {out}"
             );
         }
-        // Spin install hint present.
-        assert!(out.contains("spinframework.dev/install"));
         // Stable order (alphabetical).
         let pin_block = out.split("\n\n").next().expect("pin block").to_owned();
         let lines: Vec<&str> = pin_block.lines().collect();
@@ -1010,6 +998,86 @@ mod tests {
             perms.set_mode(0o755);
             fs::set_permissions(&git_path, perms).expect("chmod");
         }
+    }
+
+    fn with_generated_demo_app(assertions: impl FnOnce(&Path)) {
+        let _lock = env_lock().lock().expect("env lock");
+        let temp = TempDir::new().expect("temp dir");
+        let bin_dir = temp.path().join("bin");
+        write_git_stub(&bin_dir);
+        let _path_guard = PathOverride::new(&bin_dir);
+
+        let args = NewArgs {
+            name: "demo-app".into(),
+            dir: Some(temp.path().to_string_lossy().into_owned()),
+        };
+        generate_new(&args).expect("scaffold succeeds");
+        assertions(&temp.path().join("demo-app"));
+    }
+
+    #[test]
+    fn generated_manifest_declares_outbound_http_optional() {
+        with_generated_demo_app(|project_dir| {
+            let source =
+                fs::read_to_string(project_dir.join("edgezero.toml")).expect("read manifest");
+            let manifest = ManifestLoader::load_from_str(&source);
+            assert_eq!(
+                manifest.manifest().capabilities.optional,
+                [Capability::OutboundHttp]
+            );
+            let hosts = manifest
+                .manifest()
+                .capabilities
+                .outbound
+                .hosts
+                .as_deref()
+                .expect("generated outbound hosts");
+            assert_eq!(hosts, ["https://*:*"]);
+
+            let readme = fs::read_to_string(project_dir.join("README.md")).expect("read README.md");
+            assert!(
+                readme.contains("may fail at runtime"),
+                "generated README must explain optional capability behavior"
+            );
+            assert!(
+                readme.contains("promote `outbound-http` to `required`"),
+                "generated README must explain how to require outbound success"
+            );
+        });
+    }
+
+    #[test]
+    fn generated_spin_hosts_default_to_https_only() {
+        with_generated_demo_app(|project_dir| {
+            let app_manifest_path = project_dir.join("edgezero.toml");
+            let spin_manifest_path = project_dir.join("crates/demo-app-adapter-spin/spin.toml");
+            let source = fs::read_to_string(&spin_manifest_path).expect("read spin.toml");
+            let manifest: toml::Value = toml::from_str(&source).expect("parse spin.toml");
+            let hosts = manifest
+                .get("component")
+                .and_then(|components| components.get("demo-app-adapter-spin"))
+                .and_then(|component| component.get("allowed_outbound_hosts"))
+                .and_then(toml::Value::as_array)
+                .expect("allowed outbound hosts");
+            assert_eq!(hosts.len(), 1);
+            assert_eq!(hosts[0].as_str(), Some("https://*:*"));
+            assert!(
+                hosts.iter().all(|host| {
+                    host.as_str()
+                        .is_some_and(|value| !value.starts_with("http://"))
+                }),
+                "generated Spin manifest must not grant cleartext implicitly"
+            );
+            let app_manifest = ManifestLoader::from_path(&app_manifest_path)
+                .expect("parse generated edgezero.toml");
+            validate_spin_outbound_host_contract(
+                app_manifest.manifest(),
+                &app_manifest_path,
+                &spin_manifest_path,
+                None,
+            )
+            .expect("generated application and selected Spin component must remain aligned");
+        });
     }
 
     fn assert_scaffold_files(project_dir: &Path) {
@@ -1124,6 +1192,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the scaffold contract is clearest as one exhaustive generated-workspace assertion"
+    )]
     fn assert_scaffold_workspace(project_dir: &Path) {
         let cargo_toml =
             fs::read_to_string(project_dir.join("Cargo.toml")).expect("read Cargo.toml");
@@ -1141,6 +1213,7 @@ mod tests {
         }
         assert!(cargo_toml.contains("[workspace.lints.clippy]"));
         assert!(cargo_toml.contains("blanket_clippy_restriction_lints = \"allow\""));
+        assert_scaffold_sdk_dependencies(&cargo_toml);
 
         // Generated from a checkout: edgezero crates must resolve to local
         // path dependencies, not the Git fallback (whose `edgezero-cli` has
@@ -1156,6 +1229,27 @@ mod tests {
 
         let manifest =
             fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
+        let manifest_value: toml::Value = toml::from_str(&manifest).expect("parse edgezero.toml");
+        assert_eq!(
+            manifest_value
+                .get("capabilities")
+                .and_then(|capabilities| capabilities.get("optional"))
+                .and_then(toml::Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(toml::Value::as_str),
+            Some("outbound-http"),
+            "generated manifest must explicitly opt into portable outbound HTTP"
+        );
+        assert_eq!(
+            manifest_value
+                .get("capabilities")
+                .and_then(|capabilities| capabilities.get("outbound"))
+                .and_then(|outbound| outbound.get("hosts"))
+                .and_then(toml::Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(toml::Value::as_str),
+            Some("https://*:*")
+        );
         assert!(manifest.contains("[adapters.cloudflare.adapter]"));
         assert!(manifest.contains("[adapters.fastly.adapter]"));
         assert!(
@@ -1240,6 +1334,24 @@ mod tests {
         }
     }
 
+    fn assert_scaffold_sdk_dependencies(cargo_toml: &str) {
+        assert!(
+            cargo_toml.contains("fastly = \"0.13\""),
+            "generated Fastly adapter must use the current SDK release line"
+        );
+        assert!(
+            cargo_toml.contains(concat!(
+                "worker = { version = \"0.8.5\", default-features = false, ",
+                "features = [\"http\"] }",
+            )),
+            "generated Cloudflare adapter must use the current SDK release"
+        );
+        assert!(
+            cargo_toml.contains("spin-sdk = { version = \"7\", default-features = false }"),
+            "generated Spin adapter must use the current SDK major"
+        );
+    }
+
     fn assert_scaffold_crate_lints(project_dir: &Path) {
         for crate_dir in [
             "crates/demo-app-core",
@@ -1266,9 +1378,246 @@ mod tests {
     /// templates shipped a production `.expect(...)` in the `stream` handler,
     /// infallible `IntoResponse` test usage, and adapter host stubs that
     /// tripped `print_stderr` / `exit`.
-    fn assert_generated_sources_are_lint_clean(project_dir: &Path) {
+    fn fallback_initializer_block(core_lib: &str) -> &str {
+        const VARIANT: &str = "AdmissionDecision::ReadBodyBeforeFallback";
+        let variant_start = core_lib
+            .find(VARIANT)
+            .expect("fallback decision initializer");
+        let after_variant = core_lib
+            .get(variant_start..)
+            .expect("fallback decision start boundary");
+        let open_brace = after_variant
+            .find('{')
+            .and_then(|offset| variant_start.checked_add(offset))
+            .expect("fallback decision opening brace");
+        let mut depth = 0_usize;
+
+        let after_open_brace = core_lib
+            .get(open_brace..)
+            .expect("fallback opening brace boundary");
+        for (offset, character) in after_open_brace.char_indices() {
+            match character {
+                '{' => depth = depth.checked_add(1).expect("fallback brace depth"),
+                '}' => {
+                    depth = depth.checked_sub(1).expect("balanced fallback braces");
+                    if depth == 0 {
+                        let block_end = open_brace
+                            .checked_add(offset)
+                            .and_then(|end| end.checked_add(character.len_utf8()))
+                            .expect("fallback initializer end");
+                        return core_lib
+                            .get(variant_start..block_end)
+                            .expect("fallback initializer boundaries");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        panic!("fallback decision closing brace");
+    }
+
+    fn normalize_source_whitespace(source: &str) -> String {
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn assert_generated_fallback_policy(core_lib: &str) {
+        let fallback = normalize_source_whitespace(fallback_initializer_block(core_lib));
+        assert!(
+            core_lib.contains("FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024")
+                && core_lib.contains(
+                    "let (lease, completion) = response_lifecycle(None, ResponsePermit::new(None));",
+                )
+                && fallback.contains("completion,")
+                && fallback.contains("grant: IngressGrant::new(lease)")
+                && fallback.contains("max_body_bytes: FALLBACK_INGRESS_BODY_BYTES")
+                && fallback.contains(concat!(
+                    "on_exceeded: BufferedIngressResponse::text( ",
+                    "StatusCode::BAD_REQUEST, ",
+                    "\"request body too large\\n\", ),",
+                ))
+                && fallback.contains(concat!(
+                    "on_timeout: BufferedIngressResponse::text( ",
+                    "StatusCode::REQUEST_TIMEOUT, ",
+                    "\"request timeout\\n\", ),",
+                )),
+            "generated admission policy must own the fallback lease and exact terminal responses",
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "generated admission policy must own the fallback lease and exact terminal responses"
+    )]
+    fn generated_fallback_policy_rejects_swapped_terminal_mappings() {
+        assert_generated_fallback_policy(
+            r#"let (lease, completion) = response_lifecycle(None);
+            AdmissionDecision::ReadBodyBeforeFallback {
+                completion,
+                grant: IngressGrant::new(lease),
+                max_body_bytes: FALLBACK_INGRESS_BODY_BYTES,
+                on_exceeded: BufferedIngressResponse::text(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request timeout\n",
+                ),
+                on_timeout: BufferedIngressResponse::text(
+                    StatusCode::BAD_REQUEST,
+                    "request body too large\n",
+                ),
+            }
+            const FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024;
+            on_exceeded: BufferedIngressResponse::text(
+                    StatusCode::BAD_REQUEST,
+                    "request body too large\n",
+                ),
+            on_timeout: BufferedIngressResponse::text(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request timeout\n",
+                ),"#,
+        );
+    }
+
+    fn assert_generated_axum_entrypoint(project_dir: &Path) {
+        let axum_main =
+            fs::read_to_string(project_dir.join("crates/demo-app-adapter-axum/src/main.rs"))
+                .expect("read axum main.rs");
+        assert!(
+            !axum_main.contains("process::exit")
+                && !axum_main.contains("EdgeZeroAxumService")
+                && !axum_main.contains("into_axum_response")
+                && axum_main.contains("run_app::<demo_app_core::App>()"),
+            "generated Axum entrypoint must use the connection-owning runner",
+        );
+    }
+
+    fn assert_generated_cloudflare_entrypoint(project_dir: &Path) {
+        let entrypoint =
+            fs::read_to_string(project_dir.join("crates/demo-app-adapter-cloudflare/src/lib.rs"))
+                .expect("read Cloudflare lib.rs");
+        assert!(
+            entrypoint.contains("run_app::<demo_app_core::App>(req, env, ctx).await")
+                && !entrypoint.contains("from_core_response"),
+            "generated Cloudflare entrypoint must use the context-owning runner",
+        );
+        let manifest = fs::read_to_string(
+            project_dir.join("crates/demo-app-adapter-cloudflare/wrangler.toml"),
+        )
+        .expect("read Cloudflare wrangler.toml");
+        assert!(
+            manifest.contains("compatibility_flags = [\"enable_request_signal\"]"),
+            "generated Cloudflare manifest must expose the request abort signal",
+        );
+    }
+
+    fn assert_generated_fastly_entrypoint(project_dir: &Path) {
+        let entrypoint =
+            fs::read_to_string(project_dir.join("crates/demo-app-adapter-fastly/src/main.rs"))
+                .expect("read fastly main.rs");
+        assert!(
+            entrypoint.contains("reason ="),
+            "adapter attributes must carry a reason for allow_attributes_without_reason",
+        );
+        assert!(
+            !entrypoint.contains("#[fastly::main]")
+                && !entrypoint.contains("Request")
+                && !entrypoint.contains("Response")
+                && entrypoint.contains("pub fn main() -> Result<(), fastly::Error>")
+                && entrypoint.contains("run_app::<demo_app_core::App>()"),
+            "generated Fastly entrypoint must let EdgeZero own request receipt and response delivery",
+        );
+    }
+
+    fn assert_generated_spin_entrypoint(project_dir: &Path) {
+        let entrypoint =
+            fs::read_to_string(project_dir.join("crates/demo-app-adapter-spin/src/lib.rs"))
+                .expect("read Spin lib.rs");
+        assert!(
+            !entrypoint.contains("IntoResponse")
+                && !entrypoint.contains("SpinFullResponse")
+                && !entrypoint.contains("FullBody")
+                && entrypoint.contains("anyhow::Result<edgezero_adapter_spin::SpinResponse>")
+                && entrypoint.contains("run_app::<demo_app_core::App>(req)"),
+            "generated Spin entrypoint must return EdgeZero's raw WASIp3 response type",
+        );
+    }
+
+    fn assert_generated_core_lifecycle(project_dir: &Path) {
+        let core_lib = fs::read_to_string(project_dir.join("crates/demo-app-core/src/lib.rs"))
+            .expect("read core lib.rs");
+        assert!(
+            core_lib.contains("configure = crate::configure_app"),
+            "generated app macro must install the lifecycle configuration callback",
+        );
+        assert!(
+            core_lib.contains("fn configure_app(app: &mut EdgeZeroApp) -> Result<(), EdgeError>")
+                && core_lib.contains("Ok(())"),
+            "generated lifecycle configuration must propagate initialization failures",
+        );
+        assert!(
+            core_lib.contains("set_ingress_admission_policy"),
+            "generated app must configure ingress admission",
+        );
+        assert!(
+            core_lib.contains("IngressGrant::new"),
+            "generated admission policy must issue an app-owned grant",
+        );
+        assert!(
+            core_lib.contains("ResponseEgressCompletion::new")
+                && core_lib.contains("DetachedResponseEgressDecision::Send")
+                && core_lib.contains("set_detached_response_egress_decision_factory")
+                && !core_lib.contains("set_detached_response_egress_completion_factory")
+                && core_lib.contains("fn response_lifecycle(")
+                && core_lib.contains("let permit = ResponsePermit::new(route_class.clone());")
+                && core_lib
+                    .contains("let (lease, completion) = response_lifecycle(route_class, permit);")
+                && core_lib.contains("grant: IngressGrant::new(lease)")
+                && core_lib.contains("ResponseEgressCompletion::late_bound")
+                && core_lib.contains("ResponseEgressResource<ResponsePermit>"),
+            "generated admission decisions must pair grants with explicit response completions",
+        );
+        let detached_send_fields = core_lib
+            .split_once("DetachedResponseEgressDecision::Send {")
+            .and_then(|(_, suffix)| suffix.split_once('}'))
+            .map(|(fields, _)| normalize_source_whitespace(fields))
+            .expect("generated detached response egress must use the named Send variant");
+        assert!(
+            !core_lib.contains(concat!("DetachedResponseEgressDecision::", "Send(")),
+            "generated detached response egress must not use the tuple Send variant",
+        );
+        assert!(
+            detached_send_fields.contains("completion,"),
+            "generated detached response egress must name its completion field",
+        );
+        assert!(
+            detached_send_fields
+                .contains("deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),"),
+            "generated detached response egress must name its mandatory default deadline",
+        );
+        assert!(
+            core_lib.contains("static_completion.join(late_bound_completion)"),
+            "generated response lifecycle must compose static and late-bound completions",
+        );
+        assert!(
+            !core_lib.contains("struct ResponsePermitSlot")
+                && !core_lib.contains("struct ResponsePermitState")
+                && !core_lib.contains("Mutex<ResponsePermitState>"),
+            "generated apps must use EdgeZero's reusable late-bound resource owner",
+        );
+        assert!(
+            core_lib.contains("super::App::build_app().expect(\"configured app\")"),
+            "generated tests must handle fallible application assembly",
+        );
+        assert_generated_fallback_policy(&core_lib);
+    }
+
+    fn assert_generated_outbound_handler(project_dir: &Path) {
         let handlers = fs::read_to_string(project_dir.join("crates/demo-app-core/src/handlers.rs"))
             .expect("read handlers.rs");
+        assert!(
+            handlers.contains("install_response_permit()\n        .map_err(EdgeError::internal)?")
+                && !handlers.contains("install_response_permit().is_err()"),
+            "generated admission handler must install the late-bound resource with its typed error",
+        );
         assert!(
             handlers.contains("pub async fn stream() -> Result<Response, EdgeError>"),
             "stream handler must be fallible, not panic via expect()",
@@ -1281,44 +1630,94 @@ mod tests {
             handlers.contains(".into_response()"),
             "handler tests must use the fallible IntoResponse pattern",
         );
-
-        let axum_main =
-            fs::read_to_string(project_dir.join("crates/demo-app-adapter-axum/src/main.rs"))
-                .expect("read axum main.rs");
         assert!(
-            !axum_main.contains("process::exit"),
-            "axum host entrypoint must return Result, not call process::exit",
+            handlers.contains("HttpClient::with_client(TestOutboundClient)"),
+            "generated tests must execute the portable outbound client",
+        );
+        assert!(
+            handlers.contains("fn generated_outbound_http_smoke()"),
+            "generated core must contain the outbound smoke sentinel",
+        );
+        for required in [
+            ".cache_policy(",
+            ".max_request_body_bytes(",
+            ".max_encoded_response_bytes(",
+            ".max_decoded_response_bytes(",
+            ".max_response_bytes(",
+            ".max_response_header_bytes(",
+            ".max_response_header_count(",
+            ".max_chunk_bytes(",
+            ".max_brotli_window_bits(",
+            ".max_brotli_decoder_bytes(",
+            ".timeout(",
+            "send_all_until(",
+            "map_err(|failure| failure.error)",
+            "OutboundBatchTermination::Completed",
+            "OutboundBatchTermination::Cutoff",
+            "OutboundBatch::from_driver",
+            "OutboundBatchDriverEvent::Item",
+            "use edgezero_core::{BudgetSource, OutboundBatchDriverEvent};",
+            "FanoutSlotOutcome::Unresolved",
+            "OutboundCachePolicy::Bypass",
+            "slot.elapsed",
+        ] {
+            assert!(
+                handlers.contains(required),
+                "generated outbound example must contain `{required}`",
+            );
+        }
+        assert!(
+            !handlers.contains(".send_all("),
+            "generated outbound example must not retain the removed send_all API",
+        );
+        assert!(
+            handlers.contains("ResponseEgressDeadline::at(deadline)")
+                && !handlers.contains(concat!("ResponseEgressDeadline::", "new(")),
+            "generated responses must use the explicit absolute deadline constructor",
+        );
+    }
+
+    fn assert_generated_route_and_provider_manifests(project_dir: &Path) {
+        let manifest =
+            fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
+        assert!(
+            manifest.contains("path = \"/admission\"")
+                && manifest.contains("class = \"diagnostic\""),
+            "generated manifest must wire the admission diagnostic class",
+        );
+        assert!(
+            manifest.contains("path = \"/fanout\"") && manifest.contains("class = \"outbound\""),
+            "generated manifest must wire the outbound fanout class",
         );
 
-        let fastly_main =
-            fs::read_to_string(project_dir.join("crates/demo-app-adapter-fastly/src/main.rs"))
-                .expect("read fastly main.rs");
+        let spin_manifest =
+            fs::read_to_string(project_dir.join("crates/demo-app-adapter-spin/spin.toml"))
+                .expect("read spin.toml");
         assert!(
-            fastly_main.contains("reason ="),
-            "adapter attributes must carry a reason for allow_attributes_without_reason",
+            spin_manifest.contains("allowed_outbound_hosts = [\"https://*:*\"]"),
+            "generated Spin hosts must default to HTTPS only",
         );
+    }
+
+    fn assert_generated_sources_are_lint_clean(project_dir: &Path) {
+        assert_generated_core_lifecycle(project_dir);
+        assert_generated_outbound_handler(project_dir);
+        assert_generated_route_and_provider_manifests(project_dir);
+        assert_generated_axum_entrypoint(project_dir);
+        assert_generated_cloudflare_entrypoint(project_dir);
+        assert_generated_fastly_entrypoint(project_dir);
+        assert_generated_spin_entrypoint(project_dir);
     }
 
     #[test]
     fn generate_new_scaffolds_workspace_layout() {
-        let temp = TempDir::new().expect("temp dir");
-        let bin_dir = temp.path().join("bin");
-        write_git_stub(&bin_dir);
-        let _path_guard = PathOverride::new(&bin_dir);
-
-        let args = NewArgs {
-            name: "demo-app".into(),
-            dir: Some(temp.path().to_string_lossy().into_owned()),
-        };
-
-        generate_new(&args).expect("scaffold succeeds");
-
-        let project_dir = temp.path().join("demo-app");
-        assert_scaffold_files(&project_dir);
-        assert_scaffold_workspace(&project_dir);
-        assert_scaffold_app_config(&project_dir);
-        assert_scaffold_crate_lints(&project_dir);
-        assert_scaffold_cli_full_command_set(&project_dir);
+        with_generated_demo_app(|project_dir| {
+            assert_scaffold_files(project_dir);
+            assert_scaffold_workspace(project_dir);
+            assert_scaffold_app_config(project_dir);
+            assert_scaffold_crate_lints(project_dir);
+            assert_scaffold_cli_full_command_set(project_dir);
+        });
     }
 
     /// The scaffolded `<name>-cli` must
