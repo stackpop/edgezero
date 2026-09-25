@@ -25,7 +25,7 @@ crates/my-app-adapter-fastly/
 The Fastly manifest configures your service:
 
 ```toml
-manifest_version = 2
+manifest_version = 3
 name = "my-app"
 language = "rust"
 authors = ["you@example.com"]
@@ -35,6 +35,13 @@ authors = ["you@example.com"]
     [local_server.backends."origin"]
     url = "https://your-origin.example.com"
 ```
+
+`edgezero provision --adapter fastly` writes `[setup.kv_stores]`,
+`[setup.secret_stores]` and `[setup.config_stores]` entries into `fastly.toml`,
+keyed by each store's env-resolved platform name. It deliberately leaves the
+Viceroy-only `[local_server.*]` tables alone: the config-store stanzas there are
+written by your generated app CLI, `<app-cli> config push --adapter fastly --local` (the bundled `edgezero` binary has no typed app config and exits 2), and KV / secret
+local-server seeding is hand-edited.
 
 ### Entrypoint
 
@@ -116,6 +123,30 @@ edgezero_core::app!("edgezero.toml", owns_logging = true);
 or on a hand-written `Hooks` impl (`fn owns_logging() -> bool { true }`). Every
 adapter's `run_app` honors it, so the app is responsible for logger setup.
 
+### Custom entry points
+
+Compute@Edge has no process environment, so the `EDGEZERO__*` runtime overrides
+(logging settings, per-store platform names, the config-store `__KEY` selector)
+are read from a Fastly Config Store named `edgezero_runtime_env`, exported as
+`RUNTIME_ENV_STORE_NAME`. Entries in that store are service-scoped
+(`EDGEZERO__SERVICES__<SERVICE_ID>__…`, see [Config Store](#config-store));
+`runtime_env_config` translates them back to the canonical unscoped keys the
+rest of the runtime reads. The name is fixed because staging deploys rely on it:
+a staging deploy creates a per-service twin and links it into the staging version
+under that same name. `run_app` and `run_app_with_hooks` read the store for you.
+
+Use `run_app_with_hooks` when custom request preparation or routed-response finalization is needed;
+the adapter retains response ownership and returns finalizer state only after terminal delivery.
+`run_app_with_config` and a hand-built `FastlyService` do **not** apply the env overlay, so staging
+and overridden `__NAME` / `__KEY` selectors fall back to baked-in defaults. A fully manual
+entrypoint must call `runtime_env_config` and use `send_with_registries_and_hooks` for parity with
+`run_app`. A hand-written `Hooks` implementation must also override `stores()` or pass explicit
+`StoresMetadata`; the trait default declares no stores.
+
+`FastlyLogging::from(&EnvConfig)` derives `use_fastly_logger` from
+`endpoint.is_some()`, which is what keeps a local Viceroy run off the reserved
+`stdout` endpoint when no endpoint is configured.
+
 ## Building
 
 Build for Fastly's Wasm target:
@@ -124,8 +155,8 @@ Build for Fastly's Wasm target:
 # Using the CLI
 edgezero build --adapter fastly
 
-# Or directly with cargo
-cargo build -p my-app-adapter-fastly --target wasm32-wasip1 --release
+# Or directly
+fastly compute build -C crates/my-app-adapter-fastly
 ```
 
 The compiled Wasm binary is placed in `target/wasm32-wasip1/release/`.
@@ -139,7 +170,7 @@ Run locally with Viceroy (Fastly's local simulator):
 edgezero serve --adapter fastly
 
 # Or directly
-fastly compute serve --skip-build
+fastly compute serve -C crates/my-app-adapter-fastly
 ```
 
 This starts a local server at `http://127.0.0.1:7676`.
@@ -153,7 +184,7 @@ Deploy to Fastly Compute@Edge:
 edgezero deploy --adapter fastly
 
 # Or directly
-fastly compute deploy
+fastly compute deploy -C crates/my-app-adapter-fastly
 ```
 
 ## Backends
@@ -172,14 +203,16 @@ preempted, so downstream streaming and response-egress guarantees remain BestEff
 
 ## Logging
 
-Fastly uses endpoint-based logging. Configure logging in `edgezero.toml`:
-
-```toml
-[adapters.fastly.logging]
-endpoint = "stdout"
-level = "info"
-echo_stdout = true
-```
+Fastly uses endpoint-based logging. The runtime reads its logging settings from
+`EDGEZERO__LOGGING__LEVEL` and `EDGEZERO__LOGGING__ENDPOINT` in the
+`edgezero_runtime_env` Config Store (see
+[Custom entry points](#custom-entry-points)), not from `edgezero.toml`. Setting
+`ENDPOINT` is what enables the Fastly logger; with it unset, no platform logger
+is installed. `EDGEZERO__LOGGING__ECHO_STDOUT` and
+`EDGEZERO__LOGGING__USE_FASTLY_LOGGER` are resolved into `EnvConfig` but not
+applied on this path: stdout echo is always on, and logger use is derived from
+`ENDPOINT` alone. An `[adapters.fastly.logging]` table in `edgezero.toml` is
+consumed only by `edgezero new` when scaffolding.
 
 To initialize logging manually, call `init_logger` with explicit settings:
 
@@ -193,7 +226,7 @@ fn main() {
 ```
 
 ::: tip Logging status
-Fastly logging is wired when you call `init_logger` (or `run_app`); otherwise no logger is installed.
+Fastly logging is wired when you call `init_logger`, or when `run_app` finds `EDGEZERO__LOGGING__ENDPOINT` set; otherwise no logger is installed.
 :::
 
 ## Config Store

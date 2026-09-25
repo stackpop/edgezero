@@ -80,7 +80,8 @@ exclusions.
 ## Logging Initialisation
 
 Each adapter exports an `init_logger` helper for platform-specific logging backends. Fastly wires
-`log_fastly`, Cloudflare currently no-ops, and Axum uses `simple_logger` in its `run_app` helper.
+`log_fastly`, Cloudflare currently no-ops, Spin no-ops because Spin manages its own logging
+internally, and Axum uses `simple_logger` in its `run_app` helper.
 New adapters should provide a comparable helper so apps consistently opt into logging.
 
 ## Contract Tests
@@ -120,6 +121,18 @@ cargo test -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-
 Install a `wasm-bindgen-cli` version that matches the workspace's `wasm-bindgen`
 entry in `Cargo.lock` before running the Cloudflare tests.
 
+### Spin Tests
+
+Spin's adapter targets `wasm32-wasip2` and its contract suite runs under Wasmtime:
+
+```bash
+rustup target add wasm32-wasip2
+export CARGO_TARGET_WASM32_WASIP2_RUNNER="wasmtime run"
+cargo test -p edgezero-adapter-spin --features spin --target wasm32-wasip2 --test contract
+```
+
+The `wasmtime` version CI uses is pinned in `.tool-versions`.
+
 ## Onboarding New Adapters
 
 When bringing up another adapter:
@@ -129,7 +142,7 @@ When bringing up another adapter:
 3. **Implement a send-owning runner** plus logging helper
 4. **Wire up an `OutboundHttpClient`** with limits, deadlines, batching, and typed errors
 5. **Copy the contract test suite**, swapping in the new adapter types. Ensure the tests are gated to the target architecture if the adapter SDK does not compile for native hosts
-6. **Register the adapter** with `edgezero-adapter::register_adapter` (typically in a `cli` module using the `ctor` crate) so the CLI can discover it dynamically
+6. **Register the adapter** with `edgezero-adapter::register_adapter` (typically in a `cli` module using the `ctor` crate) so the CLI can discover it dynamically. To take part in `provision` and `config push`, override the relevant `Adapter` trait hooks: `single_store_kinds` and `merged_id_kinds` declare the platform's store shape, `validate_adapter_manifest` checks the adapter's own manifest, `provision` creates platform resources, and `push_config_entries` plus `read_config_entry` move config blobs. `single_store_kinds` and `merged_id_kinds` default to empty, `validate_adapter_manifest` defaults to accepting, `provision` defaults to a no-op, and the config push and read hooks default to reporting the operation as unsupported
 
 Adapters that fulfil these steps can be dropped into the EdgeZero CLI without requiring changes to application code.
 
@@ -141,3 +154,20 @@ Adapters that fulfil these steps can be dropped into the EdgeZero CLI without re
 | [Cloudflare](/guide/adapters/cloudflare) | Cloudflare Workers  | `wasm32-unknown-unknown` | Stable |
 | [Spin](/guide/adapters/spin)             | Fermyon Spin        | `wasm32-wasip2`          | Stable |
 | [Axum](/guide/adapters/axum)             | Native (Tokio)      | Host                     | Stable |
+
+### Store Capabilities
+
+`single_store_kinds` lists the kinds that allow only one declared id; `merged_id_kinds`
+lists the kinds that share one underlying platform resource, so declaring the same
+logical id under both is a collision that `config validate` rejects.
+
+| Adapter    | Single-store kinds | Merged kinds   | Config GC | Staging lifecycle |
+| ---------- | ------------------ | -------------- | --------- | ----------------- |
+| Fastly     | none               | none           | Yes       | Yes               |
+| Cloudflare | `secrets`          | `kv`, `config` | No        | No                |
+| Spin       | `secrets`          | `kv`, `config` | No        | No                |
+| Axum       | `secrets`          | none           | No        | No                |
+
+Fastly is the only adapter implementing `gc_config_entries` and the staging lifecycle
+actions (`DeployStaging`, `EmitVersion`, `Healthcheck`, `Rollback`); the others return
+an unsupported error for those.

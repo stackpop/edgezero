@@ -157,4 +157,4 @@ adapter writes body bytes.
 ## Next Steps
 
 - Learn about [Outbound HTTP](/guide/proxying) for upstream requests
-- Explore adapter-specific streaming in [Fastly](/guide/adapters/fastly) and [Cloudflare](/guide/adapters/cloudflare) guides
+- Explore adapter-specific streaming in the [Fastly](/guide/adapters/fastly), [Cloudflare](/guide/adapters/cloudflare), [Spin](/guide/adapters/spin), and [Axum](/guide/adapters/axum) guides

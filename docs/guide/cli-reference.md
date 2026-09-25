@@ -40,6 +40,7 @@ edgezero new my-app --dir /path/to/projects
 my-app/
 ├── Cargo.toml
 ├── edgezero.toml
+├── my-app.toml          # typed app config read by `config validate` / `push` / `diff`
 ├── crates/
 │   ├── my-app-core/
 │   ├── my-app-cli/
@@ -137,12 +138,15 @@ edgezero serve --adapter spin
 edgezero serve --adapter axum
 ```
 
-**Provider behavior:**
+**Provider behavior:** a scaffolded project's `[adapters.<name>.commands].serve`
+wins; these are the built-in fallbacks used when that table is absent.
 
-- **Fastly**: Runs `fastly compute serve`
-- **Cloudflare**: Runs `wrangler dev`
-- **Spin**: Runs `spin up`
-- **Axum**: Runs `cargo run -p <adapter-crate>`
+- **Fastly**: `fastly compute serve` (run from the `fastly.toml` directory).
+  Scaffolded manifests declare `fastly compute serve -C <adapter-crate-dir>`.
+- **Cloudflare**: `wrangler dev --config <wrangler.toml>`
+- **Spin**: `spin up`
+- **Axum**: `cargo run --manifest-path <adapter-crate-dir>/Cargo.toml`.
+  Scaffolded manifests declare `cargo run -p <adapter-crate>`.
 
 ### edgezero deploy
 
@@ -181,14 +185,17 @@ edgezero deploy --adapter cloudflare
 edgezero deploy --adapter spin
 ```
 
-**Provider behavior:**
+**Provider behavior:** a scaffolded project's `[adapters.<name>.commands].deploy`
+wins; these are the built-in fallbacks used when that table is absent.
 
-- **Fastly**: Runs `fastly compute deploy`
-- **Cloudflare**: Runs `wrangler deploy`
-- **Spin**: Runs `spin deploy`
+- **Fastly**: `fastly compute deploy --non-interactive` (run from the `fastly.toml`
+  directory). Scaffolded manifests declare `fastly compute deploy -C <adapter-crate-dir>`.
+- **Cloudflare**: `wrangler deploy`
+- **Spin**: `spin deploy`
 
 ::: warning
 The `axum` adapter doesn't support `deploy` - use standard container/binary deployment instead.
+The scaffold emits a placeholder `# configure deployment for Axum` rather than a command.
 :::
 
 ### edgezero active-version
@@ -236,9 +243,13 @@ edgezero healthcheck --adapter <name> --service-id <id> --version <n> --domain <
 - `--retry-delay <secs>` — seconds to wait between attempts. Default: `5`.
 - `--timeout <secs>` — per-attempt connect/read timeout in seconds. Default: `10`.
 
-Only a **staging** probe needs `FASTLY_API_TOKEN` (to resolve the staging IP); a
-production probe just curls the domain and needs no token. Emits `healthy=<bool>`
-and `status-code=<code>`. Exits `0` only when the probe succeeds.
+Only a **staging** probe needs `FASTLY_API_TOKEN` (to resolve the staging IP). A
+production probe curls the domain; with the token present it also verifies that
+`--version` is the active version before and after probing, and without it the
+probe degrades to a service-level check that does not confirm which version
+answered. Emits `healthy=<bool>`, plus `status-code=<code>` whenever an HTTP status
+was received (a transport failure such as DNS or a timeout emits `healthy=false`
+alone). Exits `0` only when the probe succeeds.
 
 ### edgezero rollback
 
@@ -347,7 +358,7 @@ The store-resolution and shell mechanics below are unchanged; see [the blob migr
 | `--adapter`  | Behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `axum`       | Writes the envelope JSON to `.edgezero/local-config-<id>.json` (the file `AxumConfigStore` reads back). Creates `.edgezero/` on first use. No shell-out.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `cloudflare` | Reads the namespace id from `wrangler.toml` (matched by `binding = <platform-name>`, where `<platform-name>` resolves from `EDGEZERO__STORES__CONFIG__<ID>__NAME` or falls back to the logical `<id>`), writes the single-entry bulk file (`[{"key": "<key>", "value": "<envelope_json>"}]`), and runs `wrangler kv bulk put <tempfile> --namespace-id=<id>` (`--remote` live, `--local` against `.wrangler/state`). Errors with "did you run `provision`?" if the binding is absent.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `cloudflare` | Reads the namespace id from `wrangler.toml` (matched by `binding = <platform-name>`, where `<platform-name>` resolves from `EDGEZERO__STORES__CONFIG__<ID>__NAME` or falls back to the logical `<id>`), writes the single-entry bulk file (`[{"key": "<key>", "value": "<envelope_json>"}]`), and runs `wrangler kv bulk put <tempfile> --namespace-id=<id> --remote` (live) or `wrangler kv bulk put <tempfile> --binding <platform-name> --local` (against `.wrangler/state`). Errors with "did you run `provision`?" if the binding is absent.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `fastly`     | Resolves the platform config-store id on demand via `fastly config-store list --json` (matched by `name = <platform-name>`, where `<platform-name>` resolves from `EDGEZERO__STORES__CONFIG__<ID>__NAME` or falls back to the logical `<id>`), then upserts the envelope with `fastly config-store-entry update --store-id=<id> --key=<key> --upsert --stdin`. `--upsert` makes re-runs idempotent. Errors with "did you run `provision`?" if the store name isn't found. Oversized envelopes are auto-chunked (see [the blob migration guide](./blob-app-config-migration.md#fastly)).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `spin`       | Reads `runtime-config.toml` (default: next to `spin.toml`, override with `--runtime-config <path>`) to dispatch per-backend. **`--local` forces SQLite-direct** writes into `<spin.toml dir>/.spin/sqlite_key_value.db` (Spin's local KV file) regardless of manifest deploy config; non-`default` labels still require a `[key_value_store.<label>]` stanza or the dispatcher refuses to write a file Spin can't read. Otherwise, if `[adapters.spin.commands].deploy` shells to `spin deploy` / `spin cloud deploy`, push writes the single envelope entry via `spin cloud key-value set --app <APP> --label <LABEL> <KEY>=<envelope_json>`. `<APP>` from `[application].name` in spin.toml; `<LABEL>` is the env-resolved platform label that must be pre-linked to a cloud KV store (`spin cloud link key-value`); auth via `spin cloud login`. Otherwise dispatches on `runtime-config.toml`'s `[key_value_store.<label>].type`: `type = "spin"` → SQLite-direct (still requires the stanza for non-`default` labels); `type = "redis"` / `azure_cosmos` / unknown → error pointing at the backend's native CLI. SQLite writer uses Spin's vendored `spin_key_value(store, key, value)` schema (drift-tested at build time). |
 
@@ -364,6 +375,8 @@ app-demo-cli config push --adapter axum --dry-run
 ```
 
 **Exit codes:** `0` on success, non-zero with a one-line diagnostic on the first failure.
+A successful non-dry-run push also emits `pushed-key=<key>` and
+`pushed-store=<logical-store-id>` for wrappers to capture.
 
 ### edgezero config diff
 
@@ -597,17 +610,19 @@ not from a remote auth provider.
 
 The CLI respects these environment variables:
 
-| Variable            | Description                                                                                                                                                         |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `EDGEZERO_MANIFEST` | Path to manifest (default: `edgezero.toml`)                                                                                                                         |
-| `FASTLY_API_TOKEN`  | Fastly API token. Required by the Fastly lifecycle commands (`deploy`, `active-version`, `rollback`, and a **staging** `healthcheck`); they fail closed without it. |
-| `FASTLY_SERVICE_ID` | Default Fastly service id, used when `--service-id` is not passed. The lifecycle commands need a service id from one source or the other.                           |
+| Variable            | Description                                                                                                                                                                                                                                                                                                                  |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `EDGEZERO_MANIFEST` | Path to manifest (default: `edgezero.toml`). Honoured by `build`, `deploy`, `serve`, and `auth` (which has no `--manifest` flag, so this is its only manifest selector); `provision` and the `config` subcommands take `--manifest` instead; `active-version`, `healthcheck`, and `rollback` load no manifest and ignore it. |
+| `FASTLY_API_TOKEN`  | Fastly API token. Required by the Fastly lifecycle commands (`deploy`, `active-version`, `rollback`, and a **staging** `healthcheck`); they fail closed without it.                                                                                                                                                          |
+| `FASTLY_SERVICE_ID` | Default Fastly service id, used when `--service-id` is not passed. Only `deploy` makes the flag optional; `active-version`, `healthcheck`, and `rollback` require it.                                                                                                                                                        |
 
 ## Working Directory
 
-All commands expect to run from the project root where `edgezero.toml` is located. If the file is
-missing, the CLI falls back to built-in adapters (when compiled in) instead of manifest-driven
-commands.
+Manifest-driven commands expect to run from the project root where `edgezero.toml` is located. If
+the file is missing, `build`, `deploy`, `serve`, and `auth` fall back to built-in adapters (when
+compiled in) instead of manifest-driven commands; `provision` and the `config` subcommands error
+instead. `active-version`, `healthcheck`, and `rollback` load no manifest at all and can run from
+any directory.
 
 ## Adapter Discovery
 
