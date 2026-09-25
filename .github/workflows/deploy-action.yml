@@ -294,6 +294,8 @@ jobs:
           name: edgezero-fastly-release
           path: fixture-release
       - name: Install the stateful fake Fastly provider
+        env:
+          FAKE_EXPECTED_PACKAGE_DIGEST: ${{ needs.fixture-release.outputs.package-digest }}
         run: .github/actions/deploy-fastly/tests/make-fake-fastly-env.sh
 
       - name: Deploy the immutable release to production
@@ -357,6 +359,8 @@ jobs:
           name: edgezero-fastly-store-free-release
           path: fixture-release
       - name: Install the stateful fake Fastly provider
+        env:
+          FAKE_EXPECTED_PACKAGE_DIGEST: ${{ needs.store-free-release.outputs.package-digest }}
         run: .github/actions/deploy-fastly/tests/make-fake-fastly-env.sh
 
       - name: Deploy the immutable store-free release through the adapter
@@ -395,6 +399,8 @@ jobs:
           name: edgezero-fastly-release
           path: fixture-release
       - name: Install the stateful fake Fastly provider
+        env:
+          FAKE_EXPECTED_PACKAGE_DIGEST: ${{ needs.fixture-release.outputs.package-digest }}
         run: .github/actions/deploy-fastly/tests/make-fake-fastly-env.sh
 
       - name: Deploy the same immutable release to staging
@@ -665,6 +671,8 @@ jobs:
           name: edgezero-fastly-release
           path: fixture-release
       - name: Install the stateful fake Fastly provider
+        env:
+          FAKE_EXPECTED_PACKAGE_DIGEST: ${{ needs.fixture-release.outputs.package-digest }}
         run: .github/actions/deploy-fastly/tests/make-fake-fastly-env.sh
 
       - name: Model activation committed before a failed provider response

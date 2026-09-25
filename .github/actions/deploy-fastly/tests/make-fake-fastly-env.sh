@@ -281,7 +281,7 @@ main() {
   mv "$patched" "$action_dir/versions.json"
   write_fake_curl "$path_dir/curl"
 
-  expected_digest=''
+  expected_digest="${FAKE_EXPECTED_PACKAGE_DIGEST:-}"
   [[ ! -f "$workspace/fixture-release/package.sha256" ]] || expected_digest=$(cat "$workspace/fixture-release/package.sha256")
   append_env FAKE_CALL_LOG "$log"
   append_env FAKE_ACTIVE_VERSION_FILE "$state/active-version"

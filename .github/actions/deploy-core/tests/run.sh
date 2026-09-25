@@ -2384,6 +2384,23 @@ test_fastly_smoke_release_contract() {
     grep -Fq 'adapter-manifest: fixture-app/adapter/fastly.toml' <<<"$store_aware_packager"
   assert_fails "the smoke fixture does not hand-write release metadata" \
     grep -Fq 'release.json' "$fixture"
+  local smoke_job expected_package_digest actual_package_digest
+  for smoke_job in production-smoke staging-smoke recovery-smoke; do
+    actual_package_digest=$(yq eval -r \
+      ".jobs.\"$smoke_job\".steps[] | select(.name == \"Install the stateful fake Fastly provider\") | .env.FAKE_EXPECTED_PACKAGE_DIGEST" \
+      "$workflow")
+    # shellcheck disable=SC2016 # GitHub expression is the literal workflow contract.
+    expected_package_digest='${{ needs.fixture-release.outputs.package-digest }}'
+    assert_equals "$smoke_job seeds the fake with the packaged Fastly digest" \
+      "$expected_package_digest" "$actual_package_digest"
+  done
+  actual_package_digest=$(yq eval -r \
+    '.jobs."store-free-deploy-smoke".steps[] | select(.name == "Install the stateful fake Fastly provider") | .env.FAKE_EXPECTED_PACKAGE_DIGEST' \
+    "$workflow")
+  # shellcheck disable=SC2016 # GitHub expression is the literal workflow contract.
+  expected_package_digest='${{ needs.store-free-release.outputs.package-digest }}'
+  assert_equals "store-free deploy seeds the fake with its packaged Fastly digest" \
+    "$expected_package_digest" "$actual_package_digest"
   assert_succeeds "the fake seeds active v40 with logical Config, KV, and Secret aliases" \
     grep -Fq 'LINK_CONFIG_PROD\tapp_config\tCONFIGPROD\tconfig\nLINK_KV_PROD\tcache\tKVPROD\tkv-store\nLINK_SECRET_PROD\tcredentials\tSECRETPROD\tsecret-store' "$fake"
   assert_succeeds "the staged assertion checks staging resources under logical aliases" \
