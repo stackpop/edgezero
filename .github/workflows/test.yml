@@ -74,6 +74,9 @@ jobs:
       - name: Brotli dependency contract
         run: node scripts/check_brotli_dependency_contract.mjs
 
+      - name: Serde JSON map contract
+        run: node scripts/check_serde_json_map_contract.mjs
+
       - name: Nested AppConfig audit
         run: cargo run -q --bin check_no_nested_app_config --features nested-app-config-check -- examples/app-demo crates/edgezero-cli/src/templates
 
