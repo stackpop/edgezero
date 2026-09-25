@@ -7,10 +7,13 @@ use std::process::Command;
 
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
-    find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
+    find_manifest_upwards, find_workspace_root, native_auth_status, path_distance,
+    read_package_name, run_native_cli,
 };
+use edgezero_adapter::process;
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    ActionOutcome, Adapter, AdapterAction, AdapterPushContext, BuildOutcome, ProvisionAction,
+    ProvisionEntry, ProvisionReport, ProvisionStores, ReadConfigEntry, ResolvedStoreId, StoreKind,
     register_adapter,
 };
 use edgezero_adapter::scaffold::{
@@ -134,28 +137,34 @@ struct CloudflareCliAdapter;
     reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` and `read_config_entry_local` are both overridden below (wrangler kv key get --remote / --local). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for CloudflareCliAdapter {
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
+    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<ActionOutcome, String> {
         match action {
             // `wrangler` is the native sign-in surface for Cloudflare
             // Workers. EdgeZero stores no credentials — this is a thin
             // shell-out.
             AdapterAction::AuthLogin => {
                 run_native_cli("wrangler", &["login"], WRANGLER_INSTALL_HINT)
+                    .map(|()| ActionOutcome::Empty)
             }
             AdapterAction::AuthLogout => {
                 run_native_cli("wrangler", &["logout"], WRANGLER_INSTALL_HINT)
+                    .map(|()| ActionOutcome::Empty)
             }
             AdapterAction::AuthStatus => {
-                run_native_cli("wrangler", &["whoami"], WRANGLER_INSTALL_HINT)
+                native_auth_status("wrangler", &["whoami"], WRANGLER_INSTALL_HINT)
+                    .map(ActionOutcome::AuthStatus)
             }
             AdapterAction::Build => build(args).map(|artifact| {
                 log::info!(
                     "[edgezero] Cloudflare build artifact -> {}",
                     artifact.display()
                 );
+                ActionOutcome::Build(BuildOutcome {
+                    artifact: Some(artifact),
+                })
             }),
-            AdapterAction::Deploy => deploy(args),
-            AdapterAction::Serve => serve(args),
+            AdapterAction::Deploy => deploy(args).map(|()| ActionOutcome::Empty),
+            AdapterAction::Serve => serve(args).map(|()| ActionOutcome::Empty),
             // The Fastly staging lifecycle is Fastly-only.
             AdapterAction::DeployStaging
             | AdapterAction::EmitVersion
@@ -196,7 +205,7 @@ impl Adapter for CloudflareCliAdapter {
         _component_selector: Option<&str>,
         stores: &ProvisionStores<'_>,
         dry_run: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<ProvisionReport, String> {
         //: KV ids and config ids both back to Cloudflare KV
         // namespaces. Secrets are runtime-managed via
         // `wrangler secret put` — provision is a no-op for them.
@@ -208,8 +217,13 @@ impl Adapter for CloudflareCliAdapter {
         };
         let wrangler_path = manifest_root.join(rel);
 
-        let mut out = Vec::new();
-        for store in stores.kv.iter().chain(stores.config.iter()) {
+        let mut entries = Vec::new();
+        for (kind, store) in stores
+            .kv
+            .iter()
+            .map(|store| (StoreKind::Kv, store))
+            .chain(stores.config.iter().map(|store| (StoreKind::Config, store)))
+        {
             let logical = &store.logical;
             // The Cloudflare KV binding name is what the runtime
             // calls `env.kv(...)` with -- it's resolved at request
@@ -243,10 +257,10 @@ impl Adapter for CloudflareCliAdapter {
             // entry by hand before re-running provision.
             let existing = existing_real_namespace_id(&wrangler_path, binding)?;
             if let Some(existing_id) = existing {
-                out.push(format!(
+                entries.push(ProvisionEntry::for_store(ProvisionAction::AlreadyPresent, kind, store, format!(
                     "binding `{binding}` (logical id `{logical}`) already provisioned (id={existing_id} in {}); skipping. To force a fresh namespace: delete the [[kv_namespaces]] entry for binding `{binding}` AND run `wrangler kv namespace delete --namespace-id={existing_id}` (the old remote namespace lingers otherwise), then re-run provision.",
                     wrangler_path.display()
-                ));
+                )));
                 continue;
             }
             // Pre-flight the writeback shape BEFORE shelling
@@ -266,30 +280,32 @@ impl Adapter for CloudflareCliAdapter {
             // BEFORE any account-side mutation.
             check_kv_namespaces_writeback_shape(&wrangler_path)?;
             if dry_run {
-                out.push(format!(
+                entries.push(ProvisionEntry::for_store(ProvisionAction::WouldCreate, kind, store, format!(
                     "would run `wrangler kv namespace create {binding}` and append [[kv_namespaces]] binding = \"{binding}\" to {} (logical id `{logical}`)",
                     wrangler_path.display()
-                ));
+                )));
                 continue;
             }
             let namespace_id = create_kv_namespace(binding)?;
             upsert_kv_namespace(&wrangler_path, binding, &namespace_id)?;
-            out.push(format!(
+            entries.push(ProvisionEntry::for_store(ProvisionAction::Created, kind, store, format!(
                 "created KV namespace `{binding}` (logical id `{logical}`, namespace id={namespace_id}); written to {}",
                 wrangler_path.display()
-            ));
+            )));
         }
         for store in stores.secrets {
             let logical = &store.logical;
             let platform = &store.platform;
-            out.push(format!(
+            entries.push(ProvisionEntry::for_store(ProvisionAction::NotApplicable, StoreKind::Secrets, store, format!(
                 "cloudflare secret `{platform}` (logical id `{logical}`) is runtime-managed via `wrangler secret put`; nothing to provision"
+            )));
+        }
+        if entries.is_empty() {
+            entries.push(ProvisionEntry::note(
+                "cloudflare has no declared stores to provision".to_owned(),
             ));
         }
-        if out.is_empty() {
-            out.push("cloudflare has no declared stores to provision".to_owned());
-        }
-        Ok(out)
+        Ok(ProvisionReport { entries })
     }
 
     fn push_config_entries(
@@ -935,20 +951,21 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let cargo_manifest = manifest_dir.join("Cargo.toml");
     let crate_name = read_package_name(&cargo_manifest)?;
 
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--target",
-            TARGET_TRIPLE,
-            "--manifest-path",
-            cargo_manifest
-                .to_str()
-                .ok_or("invalid Cargo manifest path")?,
-        ])
-        .args(extra_args)
-        .status()
-        .map_err(|err| format!("failed to run cargo build: {err}"))?;
+    let status = process::status(
+        Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--target",
+                TARGET_TRIPLE,
+                "--manifest-path",
+                cargo_manifest
+                    .to_str()
+                    .ok_or("invalid Cargo manifest path")?,
+            ])
+            .args(extra_args),
+    )
+    .map_err(|err| format!("failed to run cargo build: {err}"))?;
     if !status.success() {
         return Err(format!("cargo build failed with status {status}"));
     }
@@ -978,12 +995,13 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
         .to_str()
         .ok_or_else(|| "invalid wrangler config path".to_owned())?;
 
-    let status = Command::new("wrangler")
-        .args(["deploy", "--config", config])
-        .args(extra_args)
-        .current_dir(manifest_dir)
-        .status()
-        .map_err(|err| format!("failed to run wrangler CLI: {err}"))?;
+    let status = process::status(
+        Command::new("wrangler")
+            .args(["deploy", "--config", config])
+            .args(extra_args)
+            .current_dir(manifest_dir),
+    )
+    .map_err(|err| format!("failed to run wrangler CLI: {err}"))?;
     if !status.success() {
         return Err(format!("wrangler deploy failed with status {status}"));
     }
@@ -1119,12 +1137,13 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
         .to_str()
         .ok_or_else(|| "invalid wrangler config path".to_owned())?;
 
-    let status = Command::new("wrangler")
-        .args(["dev", "--config", config])
-        .args(extra_args)
-        .current_dir(manifest_dir)
-        .status()
-        .map_err(|err| format!("failed to run wrangler CLI: {err}"))?;
+    let status = process::status(
+        Command::new("wrangler")
+            .args(["dev", "--config", config])
+            .args(extra_args)
+            .current_dir(manifest_dir),
+    )
+    .map_err(|err| format!("failed to run wrangler CLI: {err}"))?;
     if !status.success() {
         return Err(format!("wrangler dev failed with status {status}"));
     }
@@ -1544,7 +1563,8 @@ id = "00112233445566778899aabbccddeeff"
         };
         let out = CloudflareCliAdapter
             .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
-            .expect("dry-run succeeds");
+            .expect("dry-run succeeds")
+            .into_messages();
         // 2 KV + 1 config + 1 secret = 4 status lines.
         assert_eq!(out.len(), 4);
         assert!(out[0].contains("would run `wrangler kv namespace create sessions`"));
@@ -1575,7 +1595,8 @@ id = "00112233445566778899aabbccddeeff"
         };
         let out = CloudflareCliAdapter
             .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
-            .expect("dry-run succeeds");
+            .expect("dry-run succeeds")
+            .into_messages();
         assert_eq!(out.len(), 1);
         assert!(
             out[0].contains("wrangler kv namespace create prod_config"),
@@ -1625,7 +1646,8 @@ id = "00112233445566778899aabbccddeeff"
         };
         let out = CloudflareCliAdapter
             .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
-            .expect("dry-run succeeds");
+            .expect("dry-run succeeds")
+            .into_messages();
         assert_eq!(out.len(), 1);
         assert!(
             out[0].contains("already provisioned")
@@ -1658,7 +1680,8 @@ id = "00112233445566778899aabbccddeeff"
         };
         let out = CloudflareCliAdapter
             .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
-            .expect("dry-run succeeds");
+            .expect("dry-run succeeds")
+            .into_messages();
         assert_eq!(out.len(), 1);
         assert!(
             out[0].contains("would run `wrangler kv namespace create sessions`"),
@@ -1677,8 +1700,65 @@ id = "00112233445566778899aabbccddeeff"
         };
         let out = CloudflareCliAdapter
             .provision(dir.path(), Some("wrangler.toml"), None, &stores, false)
-            .expect("no-store provision is fine");
+            .expect("no-store provision is fine")
+            .into_messages();
         assert_eq!(out, vec!["cloudflare has no declared stores to provision"]);
+    }
+
+    #[test]
+    fn provision_report_classifies_each_store() {
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"00112233445566778899aabbccddeeff\"\n",
+        );
+        let kv_ids = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "prod_config")];
+        let secret_ids = ResolvedStoreId::from_logicals(&[TEST_SECRET_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &secret_ids,
+        };
+        let report = CloudflareCliAdapter
+            .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
+            .expect("dry-run succeeds");
+        let summary: Vec<_> = report
+            .entries
+            .iter()
+            .map(|entry| {
+                let store = entry.store.as_ref().expect("every entry names a store");
+                (
+                    entry.action,
+                    store.kind,
+                    store.logical.as_deref(),
+                    store.platform.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    ProvisionAction::AlreadyPresent,
+                    StoreKind::Kv,
+                    Some(TEST_KV_ID),
+                    TEST_KV_ID
+                ),
+                (
+                    ProvisionAction::WouldCreate,
+                    StoreKind::Config,
+                    Some(TEST_CONFIG_ID),
+                    "prod_config"
+                ),
+                (
+                    ProvisionAction::NotApplicable,
+                    StoreKind::Secrets,
+                    Some(TEST_SECRET_ID),
+                    TEST_SECRET_ID
+                ),
+            ]
+        );
     }
 
     // ---------- find_namespace_id ----------
