@@ -3,6 +3,7 @@ use crate::scaffold::{
     ResolvedDependency, ScaffoldError, register_templates, resolve_dep_line, sanitize_crate_name,
     write_tmpl,
 };
+use edgezero_adapter::process;
 use edgezero_adapter::scaffold;
 use edgezero_adapter::scaffold::AdapterBlueprint;
 use handlebars::Handlebars;
@@ -781,12 +782,12 @@ fn render_templates(
 
 fn initialize_git_repo(out_dir: &Path) {
     log::info!("[edgezero] initializing git repository");
-    match Command::new("git")
-        .arg("init")
-        .arg("--quiet")
-        .current_dir(out_dir)
-        .status()
-    {
+    match process::status(
+        Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(out_dir),
+    ) {
         Ok(status) if status.success() => {
             log::info!(
                 "[edgezero] initialized empty Git repository in {}/.git/",

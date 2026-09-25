@@ -7,5 +7,5 @@ node_modules
 # these handwritten documents (e.g. lines starting with `[[...]]` get
 # treated as link references), so leave them un-reformatted. They sit
 # under `docs/` only because the path is convenient for note-taking;
-# they're gitignored and not part of the published site.
+# they're tracked in git but excluded from the published site.
 superpowers

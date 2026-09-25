@@ -1,4 +1,7 @@
-use edgezero_adapter::registry::{self as adapter_registry, AdapterAction};
+use edgezero_adapter::process;
+use edgezero_adapter::registry::{
+    self as adapter_registry, ActionOutcome, AdapterAction, AuthState, AuthStatusOutcome,
+};
 use edgezero_core::manifest::{Manifest, ManifestLoader, ResolvedEnvironment};
 
 use std::env;
@@ -112,7 +115,7 @@ pub fn execute(
     action: Action,
     manifest_loader: Option<&ManifestLoader>,
     adapter_args: &[String],
-) -> Result<(), String> {
+) -> Result<ActionOutcome, String> {
     if let Some(loader) = manifest_loader
         && let Some(command) = manifest_command(loader.manifest(), adapter_name, action)
     {
@@ -162,7 +165,8 @@ pub fn execute(
 /// adapter's built-in `execute` instead — that path writes straight to
 /// the inherited stdio, so there is nothing for us to capture and the
 /// caller must fall back to another source of truth (for Fastly deploy:
-/// the Fastly API).
+/// the Fastly API). The built-in outcome carries no version for a
+/// production deploy, so it is not returned.
 pub fn execute_capture(
     adapter_name: &str,
     action: Action,
@@ -306,6 +310,12 @@ fn build_shell_command(
     Ok(cmd)
 }
 
+/// Run a manifest-declared adapter command with inherited stdio (stdout
+/// routed to stderr under `--format json`, see [`process::status`]).
+///
+/// A manifest `auth_status` command is a session probe: its non-zero exit
+/// is an `Unauthenticated` outcome (carrying the usual message), not an
+/// error. Every other command reports no structured outcome.
 fn run_shell(
     command: &str,
     cwd: &Path,
@@ -314,7 +324,7 @@ fn run_shell(
     environment: Option<ResolvedEnvironment>,
     adapter_bind: (Option<String>, Option<u16>),
     adapter_args: &[String],
-) -> Result<(), String> {
+) -> Result<ActionOutcome, String> {
     let mut cmd = build_shell_command(
         command,
         cwd,
@@ -324,16 +334,22 @@ fn run_shell(
         adapter_args,
     )?;
 
-    let status = cmd
-        .status()
+    let status = process::status(&mut cmd)
         .map_err(|err| format!("failed to run {action} command `{command}`: {err}"))?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{action} command `{command}` exited with status {status}"
-        ))
+    let exit_failure = (!status.success())
+        .then(|| format!("{action} command `{command}` exited with status {status}"));
+    match (action, exit_failure) {
+        (Action::AuthStatus, failure) => Ok(ActionOutcome::AuthStatus(AuthStatusOutcome {
+            state: if failure.is_some() {
+                AuthState::Unauthenticated
+            } else {
+                AuthState::Authenticated
+            },
+            failure,
+        })),
+        (_, Some(message)) => Err(message),
+        (_, None) => Ok(ActionOutcome::Empty),
     }
 }
 
@@ -367,8 +383,8 @@ fn tee_stream<R: Read, W: Write>(reader: R, mut writer: W) -> String {
 }
 
 /// Same dispatch as [`run_shell`], but the child's stdout/stderr are
-/// piped, echoed through to our own stdout/stderr as they arrive, AND
-/// captured. Returns the captured `stdout + stderr` text so the caller
+/// piped, echoed through to our own stdout/stderr as they arrive (stdout
+/// is echoed to OUR stderr under `--format json`), AND captured. Returns the captured `stdout + stderr` text so the caller
 /// can parse machine-readable lines (e.g. Fastly's activated
 /// `version=<N>`) out of a command it does not otherwise control.
 fn run_shell_tee(
@@ -390,6 +406,10 @@ fn run_shell_tee(
     )?;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "stdout/stderr are piped above; the echo target below honours the stdout policy"
+    )]
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("failed to run {action} command `{command}`: {err}"))?;
@@ -405,7 +425,11 @@ fn run_shell_tee(
     // stderr is drained on a worker thread so a chatty child cannot
     // deadlock by filling the stderr pipe while we block on stdout.
     let stderr_worker = thread::spawn(move || tee_stream(child_stderr, io::stderr()));
-    let captured_stdout = tee_stream(child_stdout, io::stdout());
+    let captured_stdout = if process::child_stdout_to_stderr() {
+        tee_stream(child_stdout, io::stderr())
+    } else {
+        tee_stream(child_stdout, io::stdout())
+    };
     let captured_stderr = stderr_worker.join().unwrap_or_default();
 
     let status = child

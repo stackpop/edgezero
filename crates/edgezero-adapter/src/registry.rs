@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, PoisonError, RwLock};
 
 static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
@@ -39,6 +39,102 @@ pub enum AdapterAction {
     /// adapters return "unsupported".
     Rollback,
     Serve,
+}
+
+/// What an [`Adapter::execute`] action produced. The CLI renders it as the
+/// pre-existing text output or, under `--format json`, as a JSON result, so
+/// adapters report data here instead of printing it.
+///
+/// A negative result the action still measured (an unhealthy probe, an
+/// unauthenticated session) is an `Ok` outcome carrying a `failure` message;
+/// the CLI turns it into a non-zero exit. `Err` is reserved for "no result
+/// could be determined".
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ActionOutcome {
+    ActiveVersion(ActiveVersionOutcome),
+    AuthStatus(AuthStatusOutcome),
+    Build(BuildOutcome),
+    Deploy(DeployOutcome),
+    /// Nothing structured to report (login, logout, serve).
+    Empty,
+    Healthcheck(HealthcheckOutcome),
+    Rollback(RollbackOutcome),
+}
+
+/// Result of [`AdapterAction::EmitVersion`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveVersionOutcome {
+    pub service_id: String,
+    /// `None` when the service has no active version yet.
+    pub version: Option<u64>,
+}
+
+/// Result of [`AdapterAction::AuthStatus`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthStatusOutcome {
+    /// Why the session is not authenticated (`Some` exactly when `state` is
+    /// [`AuthState::Unauthenticated`]).
+    pub failure: Option<String>,
+    pub state: AuthState,
+}
+
+/// Session state reported by `auth status`.
+///
+/// Deliberately exhaustive (like [`ProvisionAction`] and [`StoreKind`]): the
+/// CLI maps each variant onto its versioned JSON schema, so a new variant must
+/// fail to compile there until the schema covers it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthState {
+    Authenticated,
+    /// The adapter has no remote auth surface (axum).
+    NotApplicable,
+    Unauthenticated,
+}
+
+/// Result of [`AdapterAction::Build`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuildOutcome {
+    /// The built artifact, when the adapter knows it.
+    pub artifact: Option<PathBuf>,
+}
+
+/// Result of [`AdapterAction::Deploy`] / [`AdapterAction::DeployStaging`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeployOutcome {
+    /// The staged (or activated) platform version, when known.
+    pub version: Option<u64>,
+}
+
+/// Result of [`AdapterAction::Healthcheck`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthcheckOutcome {
+    /// Probes actually made.
+    pub attempts: u32,
+    pub domain: String,
+    /// Why the probe is unhealthy (`Some` exactly when `healthy` is false).
+    pub failure: Option<String>,
+    pub healthy: bool,
+    pub path: String,
+    pub service_id: String,
+    pub staging: bool,
+    pub staging_ip: Option<String>,
+    /// The last HTTP status observed, if any probe got a response.
+    pub status_code: Option<u16>,
+    pub version: u64,
+    /// Whether `version` was verified ACTIVE before and after the probe.
+    pub version_verified: bool,
+}
+
+/// Result of [`AdapterAction::Rollback`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RollbackOutcome {
+    /// The re-activated version (`None` for a staging rollback).
+    pub rolled_back_to: Option<u64>,
+    pub service_id: String,
+    pub staging: bool,
+    /// The version rolled back from, or the staged version deactivated.
+    pub version: u64,
 }
 
 /// A single declared store id, paired with the platform name the
@@ -112,6 +208,138 @@ pub struct ProvisionStores<'stores> {
     pub config: &'stores [ResolvedStoreId],
     pub kv: &'stores [ResolvedStoreId],
     pub secrets: &'stores [ResolvedStoreId],
+}
+
+/// What [`Adapter::provision`] did, one entry per status line, in order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProvisionReport {
+    pub entries: Vec<ProvisionEntry>,
+}
+
+impl ProvisionReport {
+    /// The entries' text-output lines, in order.
+    #[inline]
+    #[must_use]
+    pub fn into_messages(self) -> Vec<String> {
+        self.entries
+            .into_iter()
+            .map(|entry| entry.message)
+            .collect()
+    }
+}
+
+/// One provision step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProvisionEntry {
+    pub action: ProvisionAction,
+    /// The exact line the text output prints (may span several lines).
+    pub message: String,
+    /// The store the step concerns; `None` for adapter-level notes.
+    pub store: Option<ProvisionStoreRef>,
+}
+
+impl ProvisionEntry {
+    /// An entry about one declared store.
+    #[inline]
+    #[must_use]
+    pub fn for_store(
+        action: ProvisionAction,
+        kind: StoreKind,
+        store: &ResolvedStoreId,
+        message: String,
+    ) -> Self {
+        Self {
+            action,
+            message,
+            store: Some(ProvisionStoreRef {
+                kind,
+                logical: Some(store.logical.clone()),
+                platform: store.platform.clone(),
+            }),
+        }
+    }
+
+    /// An adapter-level note that concerns no single store.
+    #[inline]
+    #[must_use]
+    pub fn note(message: String) -> Self {
+        Self {
+            action: ProvisionAction::Note,
+            message,
+            store: None,
+        }
+    }
+}
+
+/// What a provision step did (or would do, under `dry_run`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProvisionAction {
+    AlreadyPresent,
+    Created,
+    /// The platform manages this store itself; nothing to provision.
+    NotApplicable,
+    Note,
+    Updated,
+    WouldCreate,
+    WouldUpdate,
+}
+
+/// The store a [`ProvisionEntry`] concerns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProvisionStoreRef {
+    pub kind: StoreKind,
+    /// The declared logical id; `None` for stores `EdgeZero` itself owns
+    /// (e.g. Fastly's runtime-override store).
+    pub logical: Option<String>,
+    pub platform: String,
+}
+
+/// A `[stores.<kind>]` kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreKind {
+    Config,
+    Kv,
+    Secrets,
+}
+
+/// What [`Adapter::gc_config_entries`] found and did.
+///
+/// A run whose deletes partly failed is still `Ok`: `failed` is non-empty and
+/// `failure_diagnostic` carries the operator-facing recovery text, which the
+/// CLI turns into a non-zero exit.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GcReport {
+    /// Entries deleted; `None` on a dry run.
+    pub deleted: Option<usize>,
+    /// Entries in the store.
+    pub entries: usize,
+    pub failed: Vec<String>,
+    /// `Some` exactly when `failed` is non-empty.
+    pub failure_diagnostic: Option<String>,
+    pub generations_planned: usize,
+    pub kept_roots: Vec<String>,
+    /// Orphan chunks planned for deletion, with their ages.
+    pub planned: Vec<GcCandidate>,
+    pub referenced_chunks: usize,
+    /// Orphans too recent for the `older_than` window.
+    pub retained_recent: usize,
+    pub roots: usize,
+    /// The platform's id for the swept store, when resolved.
+    pub store_id: Option<String>,
+    pub stranded: Vec<String>,
+    /// The human-readable report, rendered only by the text output.
+    pub text_lines: Vec<String>,
+    pub uncertain: Vec<String>,
+    /// Chunk-shaped entries left untouched because they could not be proved.
+    pub unprovable: usize,
+    pub warnings: Vec<String>,
+}
+
+/// One orphan chunk `config gc` would delete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GcCandidate {
+    pub age_secs: u64,
+    pub key: String,
 }
 
 /// Context passed to [`Adapter::push_config_entries`] and
@@ -286,9 +514,12 @@ pub trait Adapter: Sync + Send {
     /// typed parameter structs (e.g. `BuildArgs { manifest_root,
     /// extra_args }`) mirroring the rest of the trait.
     ///
+    /// Returns what the action produced (see [`ActionOutcome`]); the CLI
+    /// owns rendering it, so adapters report data here rather than logging it.
+    ///
     /// # Errors
     /// Returns an error string if the requested adapter action fails.
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
+    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<ActionOutcome, String>;
 
     /// Reclaim chunk entries that no LIVE config pointer references.
     ///
@@ -328,7 +559,7 @@ pub trait Adapter: Sync + Send {
         _push_ctx: &AdapterPushContext<'_>,
         _older_than_secs: u64,
         _dry_run: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<GcReport, String> {
         Err(format!(
             "adapter `{}` does not implement `config gc`",
             self.name()
@@ -376,9 +607,10 @@ pub trait Adapter: Sync + Send {
     }
 
     /// Provision the platform resources backing each store id the
-    /// user declared. Returns a list of human-readable
-    /// status lines the CLI logs verbatim — one line per resource
-    /// created, skipped, or that would be created under `dry_run`.
+    /// user declared. Returns a [`ProvisionReport`] with one entry per
+    /// resource created, skipped, or that would be created under
+    /// `dry_run`; each entry's `message` is the line the CLI's text
+    /// output prints verbatim.
     ///
     /// `manifest_root` is the directory containing the user's
     /// `edgezero.toml`. `adapter_manifest_path` and
@@ -387,7 +619,7 @@ pub trait Adapter: Sync + Send {
     /// (`wrangler.toml`, `fastly.toml`, `spin.toml`) relative to
     /// the root. `stores` carries the declared ids per kind.
     ///
-    /// Default: no-op (returns an empty `Vec`) so adapters that
+    /// Default: no-op (returns an empty report) so adapters that
     /// don't own any platform resources don't need to override.
     ///
     /// # Errors
@@ -402,8 +634,8 @@ pub trait Adapter: Sync + Send {
         _component_selector: Option<&str>,
         _stores: &ProvisionStores<'_>,
         _dry_run: bool,
-    ) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
+    ) -> Result<ProvisionReport, String> {
+        Ok(ProvisionReport::default())
     }
 
     /// Push config entries into the platform's config store backing
@@ -671,9 +903,13 @@ mod tests {
         reason = "TestAdapter only exercises register / get / execute; the validation methods inherit the trait defaults (no-ops)"
     )]
     impl Adapter for TestAdapter {
-        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+        fn execute(
+            &self,
+            _action: AdapterAction,
+            _args: &[String],
+        ) -> Result<ActionOutcome, String> {
             HIT.store(self.hit_value, Ordering::SeqCst);
-            Ok(())
+            Ok(ActionOutcome::Empty)
         }
 
         fn name(&self) -> &'static str {

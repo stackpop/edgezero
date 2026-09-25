@@ -24,11 +24,15 @@ use crate::chunked_config::{
 use crate::service_scoped_runtime_env_key;
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
-    find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
+    find_manifest_upwards, find_workspace_root, native_auth_status, path_distance,
+    read_package_name, run_native_cli,
 };
+use edgezero_adapter::process;
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
-    register_adapter,
+    ActionOutcome, ActiveVersionOutcome, Adapter, AdapterAction, AdapterPushContext, BuildOutcome,
+    DeployOutcome, GcCandidate, GcReport, HealthcheckOutcome, ProvisionAction, ProvisionEntry,
+    ProvisionReport, ProvisionStoreRef, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    RollbackOutcome, StoreKind, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
@@ -389,32 +393,47 @@ struct RuntimeStoreNameReconciliation {
     reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`)."
 )]
 impl Adapter for FastlyCliAdapter {
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
+    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<ActionOutcome, String> {
         match action {
             // `fastly profile {create|delete|list}` is the native
             // sign-in surface for Fastly Compute. EdgeZero stores no
             // credentials — this is a thin shell-out.
             AdapterAction::AuthLogin => {
                 run_native_cli("fastly", &["profile", "create"], FASTLY_INSTALL_HINT)
+                    .map(|()| ActionOutcome::Empty)
             }
             AdapterAction::AuthLogout => {
                 run_native_cli("fastly", &["profile", "delete"], FASTLY_INSTALL_HINT)
+                    .map(|()| ActionOutcome::Empty)
             }
             AdapterAction::AuthStatus => {
-                run_native_cli("fastly", &["profile", "list"], FASTLY_INSTALL_HINT)
+                native_auth_status("fastly", &["profile", "list"], FASTLY_INSTALL_HINT)
+                    .map(ActionOutcome::AuthStatus)
             }
             AdapterAction::Build => {
                 let artifact = build(args)?;
                 log::info!("[edgezero] Fastly build complete -> {}", artifact.display());
-                Ok(())
+                Ok(ActionOutcome::Build(BuildOutcome {
+                    artifact: Some(artifact),
+                }))
             }
-            AdapterAction::Deploy => deploy(args),
-            AdapterAction::Serve => serve(args),
+            // The CLI resolves the activated version (deploy output, then the
+            // Fastly API), so the built-in deploy reports none.
+            AdapterAction::Deploy => {
+                deploy(args).map(|()| ActionOutcome::Deploy(DeployOutcome { version: None }))
+            }
+            AdapterAction::Serve => serve(args).map(|()| ActionOutcome::Empty),
             // Fastly staging lifecycle.
-            AdapterAction::DeployStaging => deploy_staging(args),
-            AdapterAction::EmitVersion => emit_active_version(args),
-            AdapterAction::Healthcheck => healthcheck(args),
-            AdapterAction::Rollback => rollback(args),
+            AdapterAction::DeployStaging => deploy_staging(args).map(|version| {
+                ActionOutcome::Deploy(DeployOutcome {
+                    version: Some(version),
+                })
+            }),
+            AdapterAction::EmitVersion => {
+                emit_active_version(args).map(ActionOutcome::ActiveVersion)
+            }
+            AdapterAction::Healthcheck => healthcheck(args).map(ActionOutcome::Healthcheck),
+            AdapterAction::Rollback => rollback(args).map(ActionOutcome::Rollback),
             other => Err(format!("fastly adapter does not support {other:?}")),
         }
     }
@@ -428,7 +447,7 @@ impl Adapter for FastlyCliAdapter {
         _push_ctx: &AdapterPushContext<'_>,
         older_than_secs: u64,
         dry_run: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<GcReport, String> {
         gc_fastly_config_store(store.platform.as_str(), older_than_secs, dry_run)
     }
 
@@ -466,7 +485,7 @@ impl Adapter for FastlyCliAdapter {
         _component_selector: Option<&str>,
         stores: &ProvisionStores<'_>,
         dry_run: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<ProvisionReport, String> {
         // Fastly is Multi for every store kind. Each id maps 1:1
         // to a Fastly resource (kv-store / config-store /
         // secret-store) created via the Fastly CLI; the manifest
@@ -483,11 +502,11 @@ impl Adapter for FastlyCliAdapter {
         let runtime_env_service_id =
             provision_runtime_env_service_id_for_stores(&fastly_path, stores)?;
 
-        let mut out = Vec::new();
-        for (kind, ids) in [
-            ("kv", stores.kv),
-            ("config", stores.config),
-            ("secret", stores.secrets),
+        let mut entries = Vec::new();
+        for (kind, store_kind, ids) in [
+            ("kv", StoreKind::Kv, stores.kv),
+            ("config", StoreKind::Config, stores.config),
+            ("secret", StoreKind::Secrets, stores.secrets),
         ] {
             for store in ids {
                 // Fastly setup tables key on the resource name the
@@ -499,17 +518,22 @@ impl Adapter for FastlyCliAdapter {
                 let logical = store.logical.as_str();
                 let name = store.platform.as_str();
                 if dry_run {
-                    out.push(format!(
-                        "would run `fastly {kind}-store create --name={name}` and append [setup.{kind}_stores.{name}] to {} (logical id `{logical}`)",
-                        fastly_path.display()
+                    entries.push(ProvisionEntry::for_store(
+                        ProvisionAction::WouldCreate,
+                        store_kind,
+                        store,
+                        format!(
+                            "would run `fastly {kind}-store create --name={name}` and append [setup.{kind}_stores.{name}] to {} (logical id `{logical}`)",
+                            fastly_path.display()
+                        ),
                     ));
                     continue;
                 }
                 if setup_block_present(&fastly_path, kind, name)? {
-                    out.push(format!(
+                    entries.push(ProvisionEntry::for_store(ProvisionAction::AlreadyPresent, store_kind, store, format!(
                         "fastly {kind}-store `{name}` (logical id `{logical}`) already declared in {}; skipping. To force a fresh remote: delete the [setup.{kind}_stores.{name}] block AND run `fastly {kind}-store delete --name={name}` (the old remote store lingers otherwise), then re-run provision.",
                         fastly_path.display()
-                    ));
+                    )));
                     continue;
                 }
                 create_fastly_store_in(kind, name, manifest_dir)?;
@@ -553,66 +577,24 @@ impl Adapter for FastlyCliAdapter {
                     line.push('\n');
                     line.push_str(&note);
                 }
-                out.push(line);
+                entries.push(ProvisionEntry::for_store(
+                    ProvisionAction::Created,
+                    store_kind,
+                    store,
+                    line,
+                ));
             }
         }
-        // EdgeZero runtime overrides live in a dedicated Fastly Config
-        // Store named `edgezero_runtime_env`. Compute@Edge has no
-        // process env, so `EDGEZERO__STORES__CONFIG__<ID>__KEY` and
-        // similar overrides have to come from a platform Config Store
-        // the runtime opens by name (see `runtime_env_config` in
-        // lib.rs). Provision owns the store creation alongside the
-        // operator's declared stores so the runtime override path is
-        // wired correctly out of the box; if the store already appears
-        // in `[setup.config_stores.edgezero_runtime_env]`, skip.
-        let runtime_env_kind = "config";
-        let runtime_env_name = RUNTIME_ENV_STORE_NAME;
-        if dry_run {
-            out.push(format!(
-                "would run `fastly {runtime_env_kind}-store create --name={runtime_env_name}` and append [setup.{runtime_env_kind}_stores.{runtime_env_name}] to {} (EdgeZero runtime override store)",
-                fastly_path.display()
-            ));
-        } else if !setup_block_present(&fastly_path, runtime_env_kind, runtime_env_name)? {
-            create_fastly_store_in(runtime_env_kind, runtime_env_name, manifest_dir)?;
-            append_fastly_setup(&fastly_path, runtime_env_kind, runtime_env_name).map_err(
-                |err| {
-                    format!(
-                        "fastly {runtime_env_kind}-store `{runtime_env_name}` was created remotely, but writeback to {path} failed: {err}\n  Recover via `fastly {runtime_env_kind}-store delete --name={runtime_env_name}` then re-run `edgezero provision --adapter fastly`.",
-                        path = fastly_path.display()
-                    )
-                },
-            )?;
-            // Same already-deployed-service caveat as the declared-store
-            // path: if `service_id` is set in fastly.toml, the
-            // `[setup.config_stores.edgezero_runtime_env]` table won't
-            // be re-applied by the next `fastly compute deploy`, so the
-            // runtime can't open the store. Emit the resource-link
-            // remediation alongside the populate-keys hint.
-            let post_create_note =
-                resource_link_note(&fastly_path, runtime_env_kind, runtime_env_name)?;
-            // NB: this store is what the ACTIVE (production) service reads. The
-            // example must never point it at a staging key — following that would
-            // make production serve staged config. Staged versions get their own
-            // selector via `edgezero_runtime_env_staging`, wired automatically by
-            // a staged deploy; nothing here should be edited to stage config.
-            let production_selector_key = runtime_env_key_for(
-                runtime_env_service_id.as_deref().unwrap_or("<SERVICE_ID>"),
-                "app_config",
-            );
-            let mut line = format!(
-                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store, read by the ACTIVE version); appended setup tables to {}\n  Provision writes service-scoped non-default store-name mappings below. Config stores still select their logical id as the default key.\n  To point PRODUCTION at a different config key, and only then:\n    fastly config-store-entry update --store-id=<STORE-ID> --key={production_selector_key} --value=<production-key> --upsert\n  Do NOT set a `_staging` key here: staged config is isolated by a per-service `{RUNTIME_ENV_STAGING_STORE_PREFIX}_<service-id>` store, which a staged deploy creates and links automatically.",
-                fastly_path.display()
-            );
-            if let Some(note) = post_create_note {
-                line.push('\n');
-                line.push_str(&note);
-            }
-            out.push(line);
-        } else {
-            // Already declared; nothing to do.
-        }
+        // EdgeZero's runtime-override store; skipped when
+        // `[setup.config_stores.edgezero_runtime_env]` already declares it.
+        entries.extend(provision_runtime_env_store(
+            &fastly_path,
+            manifest_dir,
+            runtime_env_service_id.as_deref(),
+            dry_run,
+        )?);
 
-        out.extend(persist_runtime_env_store_name_entries(
+        entries.extend(persist_runtime_env_store_name_entries(
             stores,
             runtime_env_service_id.as_deref(),
             dry_run,
@@ -626,10 +608,12 @@ impl Adapter for FastlyCliAdapter {
         // touch it: a twin populated here would drift the moment an operator
         // edited a production override.
 
-        if out.is_empty() {
-            out.push("fastly has no declared stores to provision".to_owned());
+        if entries.is_empty() {
+            entries.push(ProvisionEntry::note(
+                "fastly has no declared stores to provision".to_owned(),
+            ));
         }
-        Ok(out)
+        Ok(ProvisionReport { entries })
     }
 
     fn push_config_entries(
@@ -2507,6 +2491,36 @@ fn append_kept_roots_report(out: &mut Vec<String>, kept_roots: &[String], live_c
     }
 }
 
+/// The typed `config gc` report for `plan`, before any delete runs.
+fn gc_report_for(plan: &GcPlan, entries: usize, store_id: &str) -> GcReport {
+    GcReport {
+        deleted: None,
+        entries,
+        failed: Vec::new(),
+        failure_diagnostic: None,
+        generations_planned: plan.doomed.len(),
+        kept_roots: plan.kept_roots.clone(),
+        planned: plan
+            .doomed
+            .iter()
+            .flatten()
+            .map(|(key, age)| GcCandidate {
+                age_secs: *age,
+                key: key.clone(),
+            })
+            .collect(),
+        referenced_chunks: plan.live_count,
+        retained_recent: plan.retained_recent,
+        roots: plan.roots,
+        store_id: Some(store_id.to_owned()),
+        stranded: Vec::new(),
+        text_lines: Vec::new(),
+        uncertain: Vec::new(),
+        unprovable: plan.unprovable,
+        warnings: plan.warnings.clone(),
+    }
+}
+
 /// `config gc` for Fastly: delete chunk entries that no LIVE root pointer
 /// references and that are older than the operator's `older_than_secs`.
 ///
@@ -2521,7 +2535,7 @@ fn gc_fastly_config_store(
     store_name: &str,
     older_than_secs: u64,
     dry_run: bool,
-) -> Result<Vec<String>, String> {
+) -> Result<GcReport, String> {
     // THE destructive boundary enforces its own precondition. The CLI rejects a
     // zero window too, but `gc_config_entries` is a public trait method any
     // caller can reach directly -- a safety rule that lives only in the CLI is
@@ -2540,6 +2554,7 @@ fn gc_fastly_config_store(
         .ok_or_else(|| no_matching_store_error(store_name))?;
     let items = list_config_store_entries(&resolved_id)?;
     let plan = plan_gc_reclamation(&items, unix_now_secs(), older_than_secs)?;
+    let mut report = gc_report_for(&plan, items.len(), &resolved_id);
     let GcPlan {
         doomed,
         kept_roots,
@@ -2568,7 +2583,8 @@ fn gc_fastly_config_store(
     }
     if doomed_count == 0 {
         out.push("nothing to reclaim".to_owned());
-        return Ok(out);
+        report.text_lines = out;
+        return Ok(report);
     }
     if dry_run {
         // A dry-run only PLANS: list every candidate and stop. Nothing is
@@ -2583,7 +2599,8 @@ fn gc_fastly_config_store(
             "dry-run: {doomed_count} orphan chunk(s) planned for deletion; re-run with \
              `--yes --older-than <dur>` (a non-zero window is required) to apply"
         ));
-        return Ok(out);
+        report.text_lines = out;
+        return Ok(report);
     }
     // Real run: `doomed_count` is the PLANNED count. Do NOT pre-print each key as
     // "deleting" -- execution stops at a generation's first failure, so some
@@ -2603,9 +2620,39 @@ fn gc_fastly_config_store(
     out.push(format!(
         "reclaimed {deleted} of {doomed_count} orphan chunk entries"
     ));
+    report.deleted = Some(deleted);
     if failed.is_empty() {
-        return Ok(out);
+        report.text_lines = out;
+        return Ok(report);
     }
+    // Partial/total failure is still a REPORT (what was and was not deleted);
+    // the CLI turns `failure_diagnostic` into a non-zero exit.
+    let diagnostic = gc_failure_diagnostic(
+        &out,
+        doomed_count,
+        &failed,
+        &uncertain,
+        &stranded,
+        &resolved_id,
+    )?;
+    report.failed = failed;
+    report.failure_diagnostic = Some(diagnostic);
+    report.stranded = stranded;
+    report.text_lines = out;
+    report.uncertain = uncertain;
+    Ok(report)
+}
+
+/// The operator-facing text for a `config gc` run whose deletes failed: the
+/// run's report, which deletes failed, and how to recover.
+fn gc_failure_diagnostic(
+    out: &[String],
+    doomed_count: usize,
+    failed: &[String],
+    uncertain: &[String],
+    stranded: &[String],
+    resolved_id: &str,
+) -> Result<String, String> {
     // Partial/total failure must be a non-zero exit so automation can see it.
     let mut diagnostic = format!(
         "{}\nconfig gc: {} of {doomed_count} deletes FAILED ({})",
@@ -2623,7 +2670,7 @@ fn gc_fastly_config_store(
              before returning an error. Re-run `config gc`: it reclaims each affected generation \
              if it is still whole, or reports it as an unprovable fragment (\"left untouched\") if \
              a delete did commit. If reported as a fragment, remove the survivors by hand:\n{}",
-            recovery_commands(&resolved_id, &uncertain)
+            recovery_commands(resolved_id, uncertain)
         )
         .map_err(|err| format!("failed to format the gc diagnostic: {err}"))?;
     }
@@ -2638,11 +2685,11 @@ fn gc_fastly_config_store(
              by hand once you are satisfied they are unreferenced:\n{}",
             stranded.len(),
             stranded.join(", "),
-            recovery_commands(&resolved_id, &stranded),
+            recovery_commands(resolved_id, stranded),
         )
         .map_err(|err| format!("failed to format the gc diagnostic: {err}"))?;
     }
-    Err(diagnostic)
+    Ok(diagnostic)
 }
 
 /// Render copy-pasteable `fastly config-store-entry delete` commands, one per
@@ -3391,6 +3438,10 @@ fn create_config_store_entry_with_cwd(
     if let Some(command_cwd) = cwd {
         command.current_dir(command_cwd);
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "stdio is fully piped, so the child never writes to our stdout"
+    )]
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3784,7 +3835,7 @@ fn persist_runtime_env_store_name_entries(
     service_id_hint: Option<&str>,
     dry_run: bool,
     cwd: &Path,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ProvisionEntry>, String> {
     if !has_declared_stores(stores) {
         return Ok(Vec::new());
     }
@@ -3794,10 +3845,10 @@ fn persist_runtime_env_store_name_entries(
                 "cannot persist non-default Fastly store-name mappings without top-level `service_id` or {FASTLY_SERVICE_ID_ENV}"
             ));
         }
-        return Ok(vec![
+        return Ok(vec![ProvisionEntry::note(
             "no Fastly service id and no non-default store-name mappings; skipping runtime-env reconciliation"
                 .to_owned(),
-        ]);
+        )]);
     };
     let entries = runtime_env_store_name_entries(stores, service_id);
     let declared = runtime_env_store_name_keys(stores, service_id);
@@ -3805,8 +3856,11 @@ fn persist_runtime_env_store_name_entries(
         let mut out = entries
             .iter()
             .map(|(key, value)| {
-                format!(
-                    "would upsert `{key}={value}` into fastly config-store `{RUNTIME_ENV_STORE_NAME}`"
+                runtime_env_entry(
+                    ProvisionAction::WouldUpdate,
+                    format!(
+                        "would upsert `{key}={value}` into fastly config-store `{RUNTIME_ENV_STORE_NAME}`"
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -3815,8 +3869,11 @@ fn persist_runtime_env_store_name_entries(
                 .iter()
                 .filter(|key| !entries.iter().any(|(entry_key, _)| entry_key == *key))
                 .map(|key| {
-                    format!(
-                        "would remove `{key}` from fastly config-store `{RUNTIME_ENV_STORE_NAME}` if a stale mapping is present"
+                    runtime_env_entry(
+                        ProvisionAction::WouldUpdate,
+                        format!(
+                            "would remove `{key}` from fastly config-store `{RUNTIME_ENV_STORE_NAME}` if a stale mapping is present"
+                        ),
                     )
                 }),
         );
@@ -3827,9 +3884,9 @@ fn persist_runtime_env_store_name_entries(
         resolve_remote_config_store_id_in(RUNTIME_ENV_STORE_NAME, cwd)?
     else {
         if entries.is_empty() {
-            return Ok(vec![format!(
+            return Ok(vec![ProvisionEntry::note(format!(
                 "fastly config-store `{RUNTIME_ENV_STORE_NAME}` not found; no non-default store-name mappings to write for service `{service_id}`, skipping reconciliation"
-            )]);
+            ))]);
         }
         return Err(format!(
             "cannot write non-default store-name mappings for service `{service_id}`: fastly config-store `{RUNTIME_ENV_STORE_NAME}` does not exist remotely even though its setup block is declared. Create it with `fastly config-store create --name={RUNTIME_ENV_STORE_NAME}` (and link it to an existing service when needed), then re-run provision"
@@ -3857,11 +3914,97 @@ fn persist_runtime_env_store_name_entries(
             )
         })?;
     }
-    Ok(vec![format!(
-        "reconciled store-name mappings for service `{service_id}` in fastly config-store `{RUNTIME_ENV_STORE_NAME}`: upserted {}, removed {} stale mapping(s)",
-        reconciliation.upserts.len(),
-        reconciliation.deletes.len()
+    Ok(vec![runtime_env_entry(
+        ProvisionAction::Updated,
+        format!(
+            "reconciled store-name mappings for service `{service_id}` in fastly config-store `{RUNTIME_ENV_STORE_NAME}`: upserted {}, removed {} stale mapping(s)",
+            reconciliation.upserts.len(),
+            reconciliation.deletes.len()
+        ),
     )])
+}
+
+/// Provision's step for `EdgeZero`'s runtime-override config store: create it
+/// and declare its setup table unless `fastly.toml` already declares it.
+///
+/// `EdgeZero` runtime overrides live in a dedicated Fastly Config Store named
+/// `edgezero_runtime_env`. Compute@Edge has no process env, so
+/// `EDGEZERO__STORES__CONFIG__<ID>__KEY` and similar overrides have to come
+/// from a platform Config Store the runtime opens by name (see
+/// `runtime_env_config` in lib.rs). Provision owns the store creation
+/// alongside the operator's declared stores so the runtime override path is
+/// wired correctly out of the box.
+fn provision_runtime_env_store(
+    fastly_path: &Path,
+    manifest_dir: &Path,
+    runtime_env_service_id: Option<&str>,
+    dry_run: bool,
+) -> Result<Option<ProvisionEntry>, String> {
+    let runtime_env_kind = "config";
+    let runtime_env_name = RUNTIME_ENV_STORE_NAME;
+    if dry_run {
+        return Ok(Some(runtime_env_entry(
+            ProvisionAction::WouldCreate,
+            format!(
+                "would run `fastly {runtime_env_kind}-store create --name={runtime_env_name}` and append [setup.{runtime_env_kind}_stores.{runtime_env_name}] to {} (EdgeZero runtime override store)",
+                fastly_path.display()
+            ),
+        )));
+    }
+    if setup_block_present(fastly_path, runtime_env_kind, runtime_env_name)? {
+        // Already declared; nothing to do.
+        return Ok(None);
+    }
+    {
+        create_fastly_store_in(runtime_env_kind, runtime_env_name, manifest_dir)?;
+        append_fastly_setup(fastly_path, runtime_env_kind, runtime_env_name).map_err(
+            |err| {
+                format!(
+                    "fastly {runtime_env_kind}-store `{runtime_env_name}` was created remotely, but writeback to {path} failed: {err}\n  Recover via `fastly {runtime_env_kind}-store delete --name={runtime_env_name}` then re-run `edgezero provision --adapter fastly`.",
+                    path = fastly_path.display()
+                )
+            },
+        )?;
+        // Same already-deployed-service caveat as the declared-store
+        // path: if `service_id` is set in fastly.toml, the
+        // `[setup.config_stores.edgezero_runtime_env]` table won't
+        // be re-applied by the next `fastly compute deploy`, so the
+        // runtime can't open the store. Emit the resource-link
+        // remediation alongside the populate-keys hint.
+        let post_create_note = resource_link_note(fastly_path, runtime_env_kind, runtime_env_name)?;
+        // NB: this store is what the ACTIVE (production) service reads. The
+        // example must never point it at a staging key — following that would
+        // make production serve staged config. Staged versions get their own
+        // selector via `edgezero_runtime_env_staging`, wired automatically by
+        // a staged deploy; nothing here should be edited to stage config.
+        let production_selector_key = runtime_env_key_for(
+            runtime_env_service_id.unwrap_or("<SERVICE_ID>"),
+            "app_config",
+        );
+        let mut line = format!(
+            "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store, read by the ACTIVE version); appended setup tables to {}\n  Provision writes service-scoped non-default store-name mappings below. Config stores still select their logical id as the default key.\n  To point PRODUCTION at a different config key, and only then:\n    fastly config-store-entry update --store-id=<STORE-ID> --key={production_selector_key} --value=<production-key> --upsert\n  Do NOT set a `_staging` key here: staged config is isolated by a per-service `{RUNTIME_ENV_STAGING_STORE_PREFIX}_<service-id>` store, which a staged deploy creates and links automatically.",
+            fastly_path.display()
+        );
+        if let Some(note) = post_create_note {
+            line.push('\n');
+            line.push_str(&note);
+        }
+        Ok(Some(runtime_env_entry(ProvisionAction::Created, line)))
+    }
+}
+
+/// A provision entry about `EdgeZero`'s own runtime-override config store
+/// (declared by no manifest, so it has no logical id).
+fn runtime_env_entry(action: ProvisionAction, message: String) -> ProvisionEntry {
+    ProvisionEntry {
+        action,
+        message,
+        store: Some(ProvisionStoreRef {
+            kind: StoreKind::Config,
+            logical: None,
+            platform: RUNTIME_ENV_STORE_NAME.to_owned(),
+        }),
+    }
 }
 
 fn canonical_runtime_env_key_for(logical_id: &str) -> String {
@@ -4121,20 +4264,21 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let cargo_manifest = manifest_dir.join("Cargo.toml");
     let crate_name = read_package_name(&cargo_manifest)?;
 
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--target",
-            "wasm32-wasip1",
-            "--manifest-path",
-            cargo_manifest
-                .to_str()
-                .ok_or("invalid Cargo manifest path")?,
-        ])
-        .args(extra_args)
-        .status()
-        .map_err(|err| format!("failed to run cargo build: {err}"))?;
+    let status = process::status(
+        Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--target",
+                "wasm32-wasip1",
+                "--manifest-path",
+                cargo_manifest
+                    .to_str()
+                    .ok_or("invalid Cargo manifest path")?,
+            ])
+            .args(extra_args),
+    )
+    .map_err(|err| format!("failed to run cargo build: {err}"))?;
     if !status.success() {
         return Err(format!("cargo build failed with status {status}"));
     }
@@ -4187,11 +4331,12 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     let manifest_dir = resolve_manifest_dir(extra_args)?;
     let forwarded = args_without_flag_value(extra_args, "--manifest-path");
 
-    let status = Command::new("fastly")
-        .args(build_compute_deploy_args(&forwarded))
-        .current_dir(&manifest_dir)
-        .status()
-        .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
+    let status = process::status(
+        Command::new("fastly")
+            .args(build_compute_deploy_args(&forwarded))
+            .current_dir(&manifest_dir),
+    )
+    .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
     if !status.success() {
         return Err(format!("fastly compute deploy failed with status {status}"));
     }
@@ -4294,12 +4439,13 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
 
-    let status = Command::new("fastly")
-        .args(["compute", "serve"])
-        .args(extra_args)
-        .current_dir(manifest_dir)
-        .status()
-        .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
+    let status = process::status(
+        Command::new("fastly")
+            .args(["compute", "serve"])
+            .args(extra_args)
+            .current_dir(manifest_dir),
+    )
+    .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
     if !status.success() {
         return Err(format!("fastly compute serve failed with status {status}"));
     }
@@ -4749,10 +4895,7 @@ where
 /// Run `fastly <args>` in `cwd`, inheriting stdio, and map a non-zero
 /// exit to an error.
 fn run_fastly_status(fastly_args: &[String], cwd: &Path) -> Result<(), String> {
-    let status = Command::new("fastly")
-        .args(fastly_args)
-        .current_dir(cwd)
-        .status()
+    let status = process::status(Command::new("fastly").args(fastly_args).current_dir(cwd))
         .map_err(|err| {
             if err.kind() == ErrorKind::NotFound {
                 format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
@@ -4810,6 +4953,10 @@ fn run_fastly_capture(fastly_args: &[String], cwd: &Path) -> Result<String, Stri
 fn curl_config_capture(config: &str) -> Result<String, String> {
     let connect_timeout = FASTLY_API_CONNECT_TIMEOUT_SECS.to_string();
     let max_time = FASTLY_API_MAX_TIME_SECS.to_string();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "stdio is fully piped, so the child never writes to our stdout"
+    )]
     let mut child = Command::new("curl")
         .args([
             "-q",
@@ -5042,7 +5189,7 @@ fn resolve_manifest_dir(args: &[String]) -> Result<PathBuf, String> {
 /// `deploy --adapter fastly --service-id <id> --staging`:
 /// build, upload to a new draft version (no activation), stage it, and
 /// emit `version=<N>`.
-fn deploy_staging(args: &[String]) -> Result<(), String> {
+fn deploy_staging(args: &[String]) -> Result<u64, String> {
     let service_id = resolve_service_id(args)?;
     validate_service_id(&service_id)?;
     // The Fastly CLI reads FASTLY_API_TOKEN from the env; fail fast
@@ -5161,9 +5308,8 @@ fn deploy_staging(args: &[String]) -> Result<(), String> {
         manifest_dir,
     )?;
 
-    // 6. Emit the staged version (parseable contract).
-    log::info!("version={version}");
-    Ok(())
+    // 6. Report the staged version; the CLI emits it (`version=<N>`).
+    Ok(version)
 }
 
 /// Point a staged draft's `edgezero_runtime_env` link at the STAGING selector
@@ -5288,25 +5434,20 @@ fn relink_runtime_env_for_staging(
 /// by the production-`deploy` version fallback, where a version was JUST
 /// activated, so "no active version" is not a valid first-deploy state but an
 /// operational failure the CLI must not report as success.
-fn emit_active_version(args: &[String]) -> Result<(), String> {
+fn emit_active_version(args: &[String]) -> Result<ActiveVersionOutcome, String> {
     let service_id = resolve_service_id(args)?;
     validate_service_id(&service_id)?;
     let token = require_token()?;
     let json = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
-    if let Some(version) =
-        active_version_or_require(&json, arg_flag(args, "--require-active"), &service_id)?
-    {
-        log::info!("version={version}");
-    } else {
-        // Confirmed no active version (first-ever deploy), and it was not
-        // required. Emit an explicit empty line so the caller records an empty
-        // rollback target and succeeds — distinct from a failure (`Err`).
-        log::info!("version=");
-        log::info!(
-            "service {service_id} has no active version yet; emitting an empty rollback target"
-        );
-    }
-    Ok(())
+    // `None` = confirmed no active version (first-ever deploy) and it was not
+    // required: the CLI emits an explicit empty `version=` so the caller records
+    // an empty rollback target and succeeds — distinct from a failure (`Err`).
+    let version =
+        active_version_or_require(&json, arg_flag(args, "--require-active"), &service_id)?;
+    Ok(ActiveVersionOutcome {
+        service_id,
+        version,
+    })
 }
 
 /// Resolve the active version and apply the `--require-active` policy.
@@ -5383,7 +5524,7 @@ fn version_active_verdict(
 /// On the PRODUCTION path the probe reaches whatever version is live, so when a
 /// token is available `version` is verified ACTIVE before and after the probe
 /// (see [`verify_version_active`]); without a token the check is service-level.
-fn healthcheck(args: &[String]) -> Result<(), String> {
+fn healthcheck(args: &[String]) -> Result<HealthcheckOutcome, String> {
     let domain =
         arg_value(args, "--domain").ok_or_else(|| "healthcheck requires --domain".to_owned())?;
     validate_domain(domain)?;
@@ -5457,29 +5598,48 @@ fn healthcheck(args: &[String]) -> Result<(), String> {
 
     let curl_args = build_curl_probe_args(domain, path, staging_ip.as_deref(), timeout);
     let delay = Duration::from_secs(retry_delay);
-    let outcome = probe_with_retries(retry, || curl_status(&curl_args), || thread::sleep(delay));
-    match outcome {
+    let mut attempts = 0_u32;
+    let outcome = probe_with_retries(
+        retry,
+        || {
+            attempts = attempts.saturating_add(1);
+            curl_status(&curl_args)
+        },
+        || thread::sleep(delay),
+    );
+    // The CLI emits `status-code=<N>` / `healthy=<bool>` from this outcome, and
+    // turns an unhealthy one into a non-zero exit.
+    let (healthy, status_code, failure) = match outcome {
         Ok(code) => {
             // Confirm `version` is STILL active, so a deploy that activated a newer
             // version during the probe+retries is not reported as a healthy `version`.
             if let Some(token) = production_token.as_deref() {
                 verify_version_active(&service_id, version, token, "after probing")?;
             }
-            log::info!("status-code={code}");
-            log::info!("healthy=true");
-            Ok(())
+            (true, Some(code), None)
         }
-        Err((last_code, msg)) => {
-            if let Some(code) = last_code {
-                log::info!("status-code={code}");
-            }
-            log::info!("healthy=false");
-            Err(format!(
+        Err((last_code, msg)) => (
+            false,
+            last_code,
+            Some(format!(
                 "healthcheck for {domain} failed after {} attempt(s): {msg}",
                 retry.max(1)
-            ))
-        }
-    }
+            )),
+        ),
+    };
+    Ok(HealthcheckOutcome {
+        attempts,
+        domain: domain.to_owned(),
+        failure,
+        healthy,
+        path: path.to_owned(),
+        service_id,
+        staging: is_staging,
+        staging_ip,
+        status_code,
+        version,
+        version_verified: production_token.is_some(),
+    })
 }
 
 /// Run a single `curl` health probe, returning the HTTP status. A
@@ -5512,7 +5672,7 @@ fn curl_status(args: &[String]) -> Result<u16, String> {
 /// `rollback --adapter fastly ...`: production activates the explicit
 /// `--rollback-to` version (Fastly cannot infer a previous version);
 /// staging deactivates `<version>`.
-fn rollback(args: &[String]) -> Result<(), String> {
+fn rollback(args: &[String]) -> Result<RollbackOutcome, String> {
     let service_id = resolve_service_id(args)?;
     validate_service_id(&service_id)?;
     let version_str =
@@ -5532,6 +5692,12 @@ fn rollback(args: &[String]) -> Result<(), String> {
         log::info!(
             "[edgezero] deactivated staged version {version} on Fastly service {service_id}"
         );
+        Ok(RollbackOutcome {
+            rolled_back_to: None,
+            service_id,
+            staging: true,
+            version,
+        })
     } else {
         // Production rollback re-activates an EXPLICIT target. Fastly's version
         // list has no field distinguishing a previously-live version from a
@@ -5560,9 +5726,14 @@ fn rollback(args: &[String]) -> Result<(), String> {
             &format!("/service/{service_id}/version/{previous}/activate"),
             &token,
         )?;
-        log::info!("rolled-back-to={previous}");
+        // The CLI emits `rolled-back-to=<N>`.
+        Ok(RollbackOutcome {
+            rolled_back_to: Some(previous),
+            service_id,
+            staging: false,
+            version,
+        })
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -6985,7 +7156,8 @@ build = \"cargo build --release\"
         };
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
-            .expect("dry-run succeeds");
+            .expect("dry-run succeeds")
+            .into_messages();
         // 1 KV + 1 config + 1 secret + runtime-env + 3 possible stale-mapping
         // removals = 7 status lines. The staging twin is created and populated by
         // a staged deploy, NOT by provision, so it does not appear here.
@@ -7029,7 +7201,8 @@ build = \"cargo build --release\"
 
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
-            .expect("dry-run succeeds");
+            .expect("dry-run succeeds")
+            .into_messages();
 
         assert!(out.iter().any(|line| {
             line.contains(
@@ -7091,7 +7264,8 @@ build = \"cargo build --release\"
 
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
-            .expect("default mappings need no remote runtime-env store");
+            .expect("default mappings need no remote runtime-env store")
+            .into_messages();
 
         assert!(
             out.iter()
@@ -7231,7 +7405,8 @@ build = \"cargo build --release\"
 
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
-            .expect("mapping reconciliation succeeds");
+            .expect("mapping reconciliation succeeds")
+            .into_messages();
         let log = fs::read_to_string(&oplog).expect("oplog");
         let manifest_dir = fs::canonicalize(dir.path()).expect("canonical manifest dir");
 
@@ -7398,7 +7573,8 @@ build = \"cargo build --release\"
         };
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
-            .expect("no-store provision is fine");
+            .expect("no-store provision is fine")
+            .into_messages();
         assert_eq!(out, vec!["fastly has no declared stores to provision"]);
     }
 
@@ -7429,7 +7605,8 @@ build = \"cargo build --release\"
 
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
-            .expect("skip path succeeds");
+            .expect("skip path succeeds")
+            .into_messages();
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("already declared"), "got: {out:?}");
         let manifest_dir = fs::canonicalize(dir.path()).expect("canonical manifest dir");
@@ -8156,6 +8333,80 @@ exit 1
         use std::sync::OnceLock;
         static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
         GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    /// A fake `curl` that answers every health probe with HTTP `code`.
+    #[cfg(unix)]
+    fn fake_curl(code: u16) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("curl");
+        fs::write(&script_path, format!("#!/bin/sh\necho {code}\n")).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthcheck_reports_a_structured_outcome() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        // No token: the production probe is service-level (no API calls).
+        let _token = EnvOverride::remove(FASTLY_API_TOKEN_ENV);
+        let args = |retry: &str| -> Vec<String> {
+            [
+                "--domain",
+                "app.example.com",
+                "--service-id",
+                "SVC1",
+                "--version",
+                "7",
+                "--retry",
+                retry,
+                "--retry-delay",
+                "0",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        };
+
+        let healthy_curl = fake_curl(200);
+        let healthy_path = PathPrepend::new(healthy_curl.path());
+        let healthy = healthcheck(&args("3")).expect("probe runs");
+        assert_eq!(
+            healthy,
+            HealthcheckOutcome {
+                attempts: 1,
+                domain: "app.example.com".to_owned(),
+                failure: None,
+                healthy: true,
+                path: "/".to_owned(),
+                service_id: "SVC1".to_owned(),
+                staging: false,
+                staging_ip: None,
+                status_code: Some(200),
+                version: 7,
+                version_verified: false,
+            }
+        );
+        drop(healthy_path);
+
+        let unhealthy_curl = fake_curl(503);
+        let _path = PathPrepend::new(unhealthy_curl.path());
+        let unhealthy =
+            healthcheck(&args("2")).expect("an unhealthy probe is an outcome, not an error");
+        assert!(!unhealthy.healthy);
+        assert_eq!(unhealthy.attempts, 2);
+        assert_eq!(unhealthy.status_code, Some(503));
+        let failure = unhealthy
+            .failure
+            .expect("an unhealthy outcome carries its reason");
+        assert!(
+            failure.contains("failed after 2 attempt(s)"),
+            "keeps the pre-existing message: {failure}"
+        );
     }
 
     #[cfg(unix)]
@@ -9774,7 +10025,7 @@ echo 'unexpected' >&2; exit 1
             manifest.display().to_string(),
         ];
         args.extend(extra.iter().map(|arg| (*arg).to_owned()));
-        let result = deploy_staging(&args);
+        let result = deploy_staging(&args).map(|_version| ());
 
         let recorded = fs::read_to_string(&record).unwrap_or_default();
         let lines = recorded.lines().map(str::to_owned).collect();
@@ -9839,7 +10090,8 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     fn run_gc(dir: &Path, older_than_secs: u64, dry_run: bool) -> Result<Vec<String>, String> {
-        FastlyCliAdapter.gc_config_entries(
+        // Mirror the CLI: a report carrying a failure diagnostic is an error.
+        let report = FastlyCliAdapter.gc_config_entries(
             dir,
             None,
             None,
@@ -9847,7 +10099,11 @@ echo 'unexpected' >&2; exit 1
             &AdapterPushContext::new(),
             older_than_secs,
             dry_run,
-        )
+        )?;
+        match report.failure_diagnostic {
+            Some(diagnostic) => Err(diagnostic),
+            None => Ok(report.text_lines),
+        }
     }
 
     /// gc never deletes a chunk the LIVE root pointer references, however old.
