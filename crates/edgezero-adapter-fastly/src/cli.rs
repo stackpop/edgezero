@@ -7190,6 +7190,7 @@ mod tests {
     fn deploy_environment_parent_overrides_defaults_then_falls_back_to_logical_ids() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let config_name = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME";
+        let manifest_config_name = "EDGEZERO__stores__config__app_config__name";
         let kv_name = "EDGEZERO__STORES__KV__SESSIONS__NAME";
         let config_key = "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY";
         let _parent = EnvOverride::set(config_name, "parent_config");
@@ -7202,7 +7203,10 @@ mod tests {
                 secrets: vec!["default".to_owned()],
             },
             variable_defaults: BTreeMap::from([
-                (config_name.to_owned(), "manifest_config".to_owned()),
+                (
+                    manifest_config_name.to_owned(),
+                    "manifest_config".to_owned(),
+                ),
                 (config_key.to_owned(), "manifest_key".to_owned()),
                 (kv_name.to_owned(), "manifest_sessions".to_owned()),
             ]),
