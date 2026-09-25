@@ -154,7 +154,10 @@ pub fn init_logger(
 /// Returns an error if logger setup fails or any required store cannot be opened.
 #[cfg(feature = "fastly")]
 #[inline]
-pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
+pub fn run_app<A>(req: fastly::Request) -> Result<fastly::Response, fastly::Error>
+where
+    A: Hooks,
+{
     run_app_with_request_extensions::<A, _>(req, |_req, _extensions| {})
 }
 
@@ -302,11 +305,14 @@ fn runtime_env_keys(stores: StoresMetadata) -> Vec<String> {
 /// Returns an error if logger setup fails or the underlying handler returns an error.
 #[cfg(feature = "fastly")]
 #[inline]
-pub fn run_app_with_config<A: Hooks>(
+pub fn run_app_with_config<A>(
     logging: &FastlyLogging,
     req: fastly::Request,
     config_store_name: Option<&str>,
-) -> Result<fastly::Response, fastly::Error> {
+) -> Result<fastly::Response, fastly::Error>
+where
+    A: Hooks,
+{
     if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;

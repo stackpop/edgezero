@@ -108,7 +108,10 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
 /// router, store binding, or response translation errors propagate here.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[inline]
-pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinFullResponse> {
+pub async fn run_app<A>(req: SpinRequest) -> anyhow::Result<SpinFullResponse>
+where
+    A: Hooks,
+{
     // Best-effort: every Spin `#[http_service]` re-enters this function, so a
     // second `log::set_logger` call returns Err — drop the result instead of
     // `.expect()` to avoid panicking on every subsequent request. Skipped

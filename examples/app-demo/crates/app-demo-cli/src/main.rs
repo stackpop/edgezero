@@ -12,12 +12,12 @@
 
 use app_demo_core::config::AppDemoConfig;
 use clap::{Parser, Subcommand};
+use edgezero_cli::DiffExit;
 use edgezero_cli::args::{
     ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs,
     ConfigValidateArgs, DeployArgs, HealthcheckArgs, NewArgs, ProvisionArgs, RollbackArgs,
     ServeArgs,
 };
-use edgezero_cli::DiffExit;
 
 #[derive(Parser, Debug)]
 #[command(name = "app-demo-cli", about = "app-demo edge CLI")]

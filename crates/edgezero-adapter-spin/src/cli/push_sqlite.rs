@@ -23,7 +23,7 @@
 //!    A unit test (`vendored_schema_matches_upstream_byte_for_byte`)
 //!    pins both strings; a PRAGMA-shape test pins the resulting table
 //!    columns. Drift in OUR copy fails CI.
-//! 2. **Build-time SDK pin** — `Cargo.toml` pins `spin-sdk = "~6.0"`,
+//! 2. **Build-time SDK pin** — `Cargo.toml` pins `spin-sdk = "~7.0"`,
 //!    so a Spin minor bump that touches the schema fails the build
 //!    until the operator opts in and re-verifies.
 //! 3. **Run-time CLI check** — [`verify_spin_runtime_compat`] shells
@@ -34,7 +34,7 @@
 //!    is told if their runtime is unknown.
 //!
 //! What the layered guards CANNOT catch: a Spin point-release that
-//! changes the schema WITHOUT bumping past `~6.0` AND with a
+//! changes the schema WITHOUT bumping past `~7.0` AND with a
 //! same-major CLI version. Operators must verify with `spin up`
 //! after the first push against a new Spin runtime; the warning
 //! above is a heads-up, not a guarantee.
@@ -50,14 +50,23 @@ use rusqlite::{Connection, params};
 /// `spin_key_value` schema against. Spin's `crates/key-value-spin`
 /// has used this schema since at least Spin 2.x; we last verified
 /// against Spin 3.x (CLI 3.6.3, factor-key-value 3.x on
-/// spinframework/spin main, 2026-06-04).
+/// spinframework/spin main, 2026-06-04) and re-checked against the
+/// v4.1.0 tag on 2026-09-07, where the statement is byte-identical.
 ///
-/// When Spin 4.0 (or whichever major-version-bump touches the
-/// schema) lands, expect the verification to be repeated and this
-/// constant updated. Until then, an operator running a Spin CLI
-/// outside this range gets a `log::warn!` on first SQLite-direct
-/// push.
-const VERIFIED_SPIN_MAJOR_RANGE: &[u32] = &[2, 3];
+/// When a major-version bump touches the schema, expect the
+/// verification to be repeated and this constant updated. Until then,
+/// an operator running a Spin CLI outside this range gets a
+/// `log::warn!` on first SQLite-direct push.
+///
+/// This is deliberately wider than the Spin 4.1 floor that
+/// `.tool-versions`, the adapter guide and `spin_version_guard.sh`
+/// state. Those describe what it takes to *run* a spin-sdk 7
+/// component; this describes which runtimes' on-disk KV schema we
+/// have compared ours against. `config push --adapter spin --local`
+/// only writes that file, so it stays correct on Spin 2.x/3.x even
+/// though such a runtime could never boot the component. Narrowing
+/// this to `&[4]` would warn operators whose push is fine.
+const VERIFIED_SPIN_MAJOR_RANGE: &[u32] = &[2, 3, 4];
 
 /// EXACT `CREATE TABLE IF NOT EXISTS spin_key_value (…)` statement
 /// Spin's `crates/key-value-spin/src/store.rs::KeyValueSqlite::create_connection`
@@ -169,7 +178,7 @@ fn verify_spin_runtime_compat() {
     } else {
         log::warn!(
             "Spin CLI major version {major} is outside EdgeZero's verified range {VERIFIED_SPIN_MAJOR_RANGE:?}. \
-             The local SQLite KV writer uses Spin's internal `spin_key_value` schema vendored from spinframework/spin 3.x; \
+             The local SQLite KV writer uses Spin's internal `spin_key_value` schema vendored from spinframework/spin (verified through 4.1); \
              if Spin {major}.x changed the schema, your push will write a file the runtime can't read. \
              Verify with `spin up` after the push, and consider opening an issue if you see incompatibility."
         );
@@ -248,8 +257,11 @@ pub(crate) fn write_batch(
     })?;
 
     {
+        // rusqlite 0.40 dropped `prepare_cached` from `Transaction`;
+        // `prepare` still prepares once and reuses the statement across
+        // the batch below, which is all the cache bought here.
         let mut statement = transaction
-            .prepare_cached(SPIN_KV_SET)
+            .prepare(SPIN_KV_SET)
             .map_err(|err| format!("failed to prepare INSERT in `{}`: {err}", db_path.display()))?;
 
         for (key, value) in entries {
@@ -505,6 +517,36 @@ mod tests {
     }
 
     // ---------- Spin runtime-compat parsing ----------
+
+    #[test]
+    fn verified_range_covers_the_spin_majors_the_sdk_supports() {
+        // spin-sdk ~7 needs a Spin 4.1+ runtime, so major 4 has to be
+        // inside the verified range: an operator on a supported runtime
+        // must not be told their setup is unverified. The 4.1.0 tag's
+        // `spin_key_value` statement is byte-identical to the vendored
+        // one (checked 2026-09-07), which is what makes 4 verifiable
+        // rather than merely assumed.
+        assert!(
+            VERIFIED_SPIN_MAJOR_RANGE.contains(&4),
+            "Spin 4.x is the supported runtime line and must be verified"
+        );
+        // 5.x has not been checked against the vendored schema, so it
+        // should still warn until someone repeats the comparison.
+        assert!(
+            !VERIFIED_SPIN_MAJOR_RANGE.contains(&5),
+            "unverified majors must keep warning"
+        );
+    }
+
+    #[test]
+    fn parse_spin_major_version_reads_the_supported_four_line() {
+        // Real output from `spin --version` on the 4.1.0 release, the
+        // floor spin-sdk 7 requires.
+        assert_eq!(
+            parse_spin_major_version("spin 4.1.0 (c0b3726 2026-08-25)\n"),
+            Some(4)
+        );
+    }
 
     #[test]
     fn parse_spin_major_version_handles_cli_default_format() {
