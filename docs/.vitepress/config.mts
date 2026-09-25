@@ -39,6 +39,7 @@ export default defineConfig({
           { text: 'Capabilities', link: '/guide/capabilities' },
           { text: 'Streaming', link: '/guide/streaming' },
           { text: 'Outbound HTTP', link: '/guide/proxying' },
+          { text: 'KV Storage', link: '/guide/kv' },
         ],
       },
       {
