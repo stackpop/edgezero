@@ -171,7 +171,7 @@ impl Manifest {
         for (adapter, cfg) in &self.adapters {
             if cfg.logging.is_specified() {
                 resolved.insert(
-                    adapter.clone(),
+                    adapter.to_ascii_lowercase(),
                     ResolvedLoggingConfig::from_manifest(&cfg.logging),
                 );
             }
@@ -179,7 +179,7 @@ impl Manifest {
 
         for (adapter, cfg) in &self.logging.adapters {
             resolved
-                .entry(adapter.clone())
+                .entry(adapter.to_ascii_lowercase())
                 .or_insert_with(|| ResolvedLoggingConfig::from_manifest(cfg));
         }
 
@@ -189,7 +189,7 @@ impl Manifest {
     #[must_use]
     #[inline]
     pub fn logging_for(&self, adapter: &str) -> Option<&ResolvedLoggingConfig> {
-        self.logging_resolved.get(adapter)
+        self.logging_resolved.get(&adapter.to_ascii_lowercase())
     }
 
     #[must_use]
@@ -860,8 +860,8 @@ fn validate_manifest_adapter(adapter: &ManifestAdapter) -> Result<(), Validation
     Ok(())
 }
 
-/// Reject case-fold duplicate `[adapters.*]` keys at manifest load
-/// time so the case-insensitive `adapter_entry` lookup is never
+/// Reject case-fold duplicate adapter names within `[adapters.*]` and
+/// `[logging.*]` at manifest load time so case-insensitive lookups are never
 /// ambiguous.
 ///
 /// Pre-fix, an operator could declare BOTH `[adapters.fastly]` AND
@@ -879,6 +879,21 @@ fn validate_manifest_adapter_keys_case_unique(manifest: &Manifest) -> Result<(),
             error.message = Some(
                 format!(
                     "manifest declares `[adapters.{prior}]` AND `[adapters.{key}]`, which differ only in case; adapter names are looked up case-insensitively at runtime so the two would alias to the same registry entry. Pick one spelling."
+                )
+                .into(),
+            );
+            return Err(error);
+        }
+    }
+
+    seen_ci.clear();
+    for key in manifest.logging.adapters.keys() {
+        let folded = key.to_ascii_lowercase();
+        if let Some(prior) = seen_ci.insert(folded, key) {
+            let mut error = ValidationError::new("logging_adapters_case_duplicate");
+            error.message = Some(
+                format!(
+                    "manifest declares `[logging.{prior}]` AND `[logging.{key}]`, which differ only in case; logging adapter names are matched case-insensitively. Pick one spelling."
                 )
                 .into(),
             );
@@ -1525,6 +1540,23 @@ echo_stdout = true
     }
 
     #[test]
+    fn logging_lookup_matches_adapter_case_insensitively() {
+        let manifest = r#"
+[logging.Fastly]
+level = "debug"
+endpoint = "fastly_logs"
+"#;
+        let loader = ManifestLoader::load_from_str(manifest);
+        let logging = loader
+            .manifest()
+            .logging_for("fastly")
+            .expect("lowercase adapter lookup must match mixed-case logging key");
+
+        assert_eq!(logging.level, LogLevel::Debug);
+        assert_eq!(logging.endpoint.as_deref(), Some("fastly_logs"));
+    }
+
+    #[test]
     fn adapter_logging_config_overrides_global() {
         let manifest = r#"
 [adapters.fastly.logging]
@@ -1538,6 +1570,43 @@ endpoint = "https://fastly-logs.example.com"
         assert_eq!(
             logging.endpoint.as_deref(),
             Some("https://fastly-logs.example.com")
+        );
+    }
+
+    #[test]
+    fn adapter_logging_config_overrides_differently_cased_global_config() {
+        let manifest = r#"
+[adapters.fastly.logging]
+level = "error"
+endpoint = "adapter_logs"
+
+[logging.FASTLY]
+level = "debug"
+endpoint = "global_logs"
+"#;
+        let loader = ManifestLoader::load_from_str(manifest);
+        let logging = loader
+            .manifest()
+            .logging_for("FASTLY")
+            .expect("adapter logging must resolve regardless of lookup casing");
+
+        assert_eq!(logging.level, LogLevel::Error);
+        assert_eq!(logging.endpoint.as_deref(), Some("adapter_logs"));
+    }
+
+    #[test]
+    fn manifest_rejects_case_fold_duplicate_logging_keys() {
+        let manifest: Manifest = toml::from_str(
+            "[logging.fastly]\nlevel = \"info\"\n[logging.Fastly]\nlevel = \"debug\"\n",
+        )
+        .expect("case-distinct TOML keys should parse");
+        let error = manifest
+            .validate()
+            .expect_err("case-fold duplicate logging keys must fail validation");
+
+        assert!(
+            error.to_string().contains("case"),
+            "error must call out the case collision: {error}"
         );
     }
 

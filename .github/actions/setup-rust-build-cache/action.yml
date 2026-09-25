@@ -1,0 +1,55 @@
+name: EdgeZero setup Rust build cache
+description: Cache application-scoped Cargo sources, target artifacts, and Rust compiler outputs for later build steps.
+
+inputs:
+  app-name:
+    description: Stable lowercase app name used to isolate its caches from other apps.
+    required: true
+  working-directory:
+    description: Rust workspace directory, relative to github.workspace, containing the Cargo.lock used for the cache key.
+    required: false
+    default: .
+  cache-target:
+    description: Restore and save the application's Cargo target directory in addition to compiler outputs.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Validate Rust workspace and enable compiler caching
+      id: prepare
+      shell: bash
+      env:
+        EDGEZERO__RUST_CACHE__APP_NAME: ${{ inputs['app-name'] }}
+        EDGEZERO__RUST_CACHE__CACHE_TARGET: ${{ inputs['cache-target'] }}
+        EDGEZERO__RUST_CACHE__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
+        BASH_ENV: ""
+        ENV: ""
+      run: exec "$GITHUB_ACTION_PATH/scripts/prepare.sh"
+
+    - name: Restore Cargo dependency sources
+      id: cargo-sources
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+        key: edgezero-app-${{ steps.prepare.outputs['cache-namespace'] }}-rust-sources-${{ runner.os }}-${{ runner.arch }}-${{ steps.prepare.outputs['cargo-lock-sha256'] }}
+        restore-keys: |
+          edgezero-app-${{ steps.prepare.outputs['cache-namespace'] }}-rust-sources-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Restore Cargo target artifacts
+      if: inputs['cache-target'] == 'true'
+      uses: actions/cache@v5
+      with:
+        path: ${{ steps.prepare.outputs['cargo-target-dir'] }}
+        key: edgezero-app-${{ steps.prepare.outputs['cache-namespace'] }}-rust-target-${{ runner.os }}-${{ runner.arch }}-${{ steps.prepare.outputs['cargo-lock-sha256'] }}
+        restore-keys: |
+          edgezero-app-${{ steps.prepare.outputs['cache-namespace'] }}-rust-target-${{ runner.os }}-${{ runner.arch }}-${{ steps.prepare.outputs['cargo-lock-sha256'] }}-
+
+    - name: Set up Rust compiler cache
+      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      with:
+        version: v0.16.0

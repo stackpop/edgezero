@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use edgezero_core::app::{App, StoreMetadata, StoresMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
-use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Extensions, Request, request_builder};
 use edgezero_core::key_value_store::KvHandle;
@@ -197,11 +196,9 @@ impl<'app> FastlyService<'app> {
     /// at request time, the dispatcher logs the warning once and
     /// proceeds without it.
     ///
-    /// Env-overlay limitation: this bare-handle path does not resolve
-    /// `EDGEZERO__STORES__CONFIG__*` selectors and binds the config registry's
-    /// default key to `"default"`. Use [`runtime_env_config`](crate::runtime_env_config)
-    /// with [`dispatch_with_registries`] when a custom entry point needs the
-    /// same `__NAME` / `__KEY` resolution as [`run_app`](crate::run_app).
+    /// This bare-handle path binds the config registry's default key to
+    /// `"default"`. Manifest-driven [`run_app`](crate::run_app) instead opens
+    /// the logical resource-link alias and uses its deterministic target key.
     #[must_use]
     #[inline]
     pub fn with_config<S: Into<String>>(mut self, name: S) -> Self {
@@ -213,9 +210,8 @@ impl<'app> FastlyService<'app> {
     /// caller has already opened (or mocked) the backend. Mutually
     /// exclusive with `with_config(name)` -- the last call wins.
     /// Like [`Self::with_config`], this binds the config registry's default key
-    /// to `"default"` and does not apply the [`EnvConfig`] overlay. Use
-    /// [`runtime_env_config`](crate::runtime_env_config) with
-    /// [`dispatch_with_registries`] for manifest-driven selector resolution.
+    /// to `"default"`. Manifest-driven [`run_app`](crate::run_app) derives its
+    /// binding from baked store metadata instead.
     #[must_use]
     #[inline]
     pub fn with_config_handle(mut self, handle: ConfigStoreHandle) -> Self {
@@ -318,14 +314,18 @@ where
 /// Dispatch with per-id store registries built from baked metadata — the same
 /// store wiring [`run_app`](crate::run_app) uses.
 ///
-/// Fastly is `Multi` for all three kinds, so each declared id resolves to
-/// its own platform store through the [`EnvConfig`] overlay: the
-/// `EDGEZERO__STORES__CONFIG__<ID>__NAME` selector (and its KV / secrets
-/// counterparts) picks the platform store, and the config-only `__KEY`
-/// selector picks that store's [`ConfigStoreBinding::default_key`]. Pair this
-/// with [`runtime_env_config`](crate::runtime_env_config) in a custom entry
-/// point for full parity with `run_app`. Contrast [`FastlyService`], whose
-/// bare-handle path binds `default_key: "default"` and ignores those selectors.
+/// Fastly is `Multi` for all three kinds. Each declared ID is the stable
+/// resource-link alias opened by the runtime. Config always uses the logical ID
+/// as its entry key. A custom entry point gets full parity with `run_app` by
+/// passing the baked store metadata:
+///
+/// ```rust,ignore
+/// let stores = MyHooks::stores();
+/// dispatch_with_registries(&app, req, stores, |_req, _extensions| {})
+/// ```
+///
+/// [`FastlyService`]'s bare-handle path binds `default_key: "default"` and
+/// ignores those selectors.
 ///
 /// KV failures escalate via `resolve_kv_handle`'s `kv_required=true` path;
 /// missing config / secret stores degrade silently with a one-time warning.
@@ -338,15 +338,14 @@ pub fn dispatch_with_registries<F>(
     app: &App,
     req: FastlyRequest,
     stores: StoresMetadata,
-    env: &EnvConfig,
     extend: F,
 ) -> Result<FastlyResponse, FastlyError>
 where
     F: FnOnce(&FastlyRequest, &mut Extensions),
 {
-    let kv_registry = build_kv_registry(stores.kv, env)?;
-    let config_registry = build_config_registry(stores.config, env);
-    let secret_registry = build_secret_registry(stores.secrets, env);
+    let kv_registry = build_kv_registry(stores.kv)?;
+    let config_registry = build_config_registry(stores.config);
+    let secret_registry = build_secret_registry(stores.secrets);
     dispatch_with_handles(
         app,
         req,
@@ -404,19 +403,15 @@ fn synthesise_store_registries(
     (config_registry, kv_registry, secret_registry)
 }
 
-fn build_kv_registry(
-    kv_meta: Option<StoreMetadata>,
-    env: &EnvConfig,
-) -> Result<Option<KvRegistry>, FastlyError> {
+fn build_kv_registry(kv_meta: Option<StoreMetadata>) -> Result<Option<KvRegistry>, FastlyError> {
     let Some(meta) = kv_meta else {
         return Ok(None);
     };
     let mut by_id: BTreeMap<String, KvHandle> = BTreeMap::new();
     for id in meta.ids {
-        let store_name = env.store_name("kv", id);
         // KV is required: if `[stores.kv]` is declared, an id failing to open
         // is a runtime error rather than a silent degradation.
-        let Some(handle) = resolve_kv_handle(&store_name, true)? else {
+        let Some(handle) = resolve_kv_handle(id, true)? else {
             continue;
         };
         by_id.insert((*id).to_owned(), handle);
@@ -430,25 +425,21 @@ fn build_kv_registry(
     Ok(StoreRegistry::from_parts(by_id, default_id))
 }
 
-fn build_config_registry(
-    config_meta: Option<StoreMetadata>,
-    env: &EnvConfig,
-) -> Option<ConfigRegistry> {
+fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigRegistry> {
     let meta = config_meta?;
     let mut by_id: BTreeMap<String, ConfigStoreBinding> = BTreeMap::new();
     for id in meta.ids {
-        let store_name = env.store_name("config", id);
-        match FastlyConfigStore::try_open(&store_name) {
+        match FastlyConfigStore::try_open(id) {
             Ok(store) => {
                 by_id.insert(
                     (*id).to_owned(),
                     ConfigStoreBinding {
                         handle: ConfigStoreHandle::new(Arc::new(store)),
-                        default_key: env.store_key("config", id),
+                        default_key: (*id).to_owned(),
                     },
                 );
             }
-            Err(err) => warn_missing_store_once(&store_name, &err.to_string()),
+            Err(err) => warn_missing_store_once(id, &err.to_string()),
         }
     }
     let default_id = meta.default.to_owned();
@@ -460,24 +451,19 @@ fn build_config_registry(
     StoreRegistry::from_parts(by_id, default_id)
 }
 
-fn build_secret_registry(
-    secret_meta: Option<StoreMetadata>,
-    env: &EnvConfig,
-) -> Option<SecretRegistry> {
+fn build_secret_registry(secret_meta: Option<StoreMetadata>) -> Option<SecretRegistry> {
     let meta = secret_meta?;
     // Fastly is `Multi` for secrets. The provider trait is stateless —
     // `FastlySecretStore::get_bytes(store_name, key)` opens the named Fastly
     // Secret Store per call — so we share one provider handle across all
-    // bindings, then capture the per-id platform store name in the bound
-    // wrapper. `EDGEZERO__STORES__SECRETS__<ID>__NAME` (default = the logical
-    // id) decides which Fastly store each id resolves to at runtime.
+    // bindings, then capture the logical resource-link alias in the bound
+    // wrapper.
     let handle = SecretHandle::new(Arc::new(FastlySecretStore));
     let mut by_id: BTreeMap<String, BoundSecretStore> = BTreeMap::new();
     for id in meta.ids {
-        let store_name = env.store_name("secrets", id);
         by_id.insert(
             (*id).to_owned(),
-            BoundSecretStore::new(handle.clone(), store_name),
+            BoundSecretStore::new(handle.clone(), (*id).to_owned()),
         );
     }
     // Fastly's secret-store handle wrappers are infallible to construct;
@@ -778,26 +764,5 @@ mod synthesis_tests {
     #[test]
     fn resolve_secret_handle_builds_handle_when_required_true_matches_require_secrets() {
         let _handle = resolve_secret_handle(true);
-    }
-
-    /// Spec 12.7 / plan line 1526: `EDGEZERO__STORES__CONFIG__<ID>__KEY`
-    /// must surface as `ConfigStoreBinding.default_key`.
-    ///
-    /// `build_config_registry` calls `FastlyConfigStore::try_open` which
-    /// requires live Fastly hostcalls and cannot be unit-tested here; this
-    /// test exercises the env-resolution layer that `build_config_registry`
-    /// reads from. Platform-integration coverage relies on the E2 smoke
-    /// scripts.
-    #[test]
-    fn config_default_key_env_override_resolved() {
-        let env = EnvConfig::from_vars([(
-            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
-            "app_config_staging",
-        )]);
-        assert_eq!(
-            env.store_key("config", "app_config"),
-            "app_config_staging",
-            "env override must propagate to the key resolved by build_config_registry"
-        );
     }
 }

@@ -59,13 +59,17 @@ use args::{
     ActiveVersionArgs, BuildArgs, DeployArgs, HealthcheckArgs, NewArgs, RollbackArgs, ServeArgs,
 };
 #[cfg(feature = "cli")]
-use edgezero_core::manifest::ManifestLoader;
+use edgezero_adapter::registry::{AdapterDeployContext, DeployStoreIds};
+#[cfg(feature = "cli")]
+use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
+#[cfg(feature = "cli")]
+use std::collections::BTreeMap;
 #[cfg(feature = "cli")]
 use std::env;
 #[cfg(feature = "cli")]
 use std::io::ErrorKind;
 #[cfg(feature = "cli")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// CLI output logger: prints `record.args()` verbatim with no
 /// timestamps, levels, or module prefixes — the CLI's output IS
@@ -183,194 +187,114 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
 
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
-
-    // Thread `--service-id` into the adapter invocation
-    // when provided, ahead of any operator passthrough args. Fastly
-    // consumes it; adapters that don't need a service id ignore it.
-    let action = if args.staging {
-        adapter::Action::DeployStaging
-    } else {
-        adapter::Action::Deploy
+    let manifest_stores = manifest.as_ref().map(|loader| &loader.manifest().stores);
+    let declared_ids = |declaration: Option<&StoreDeclaration>| {
+        declaration
+            .map(|store| store.ids.clone())
+            .unwrap_or_default()
+    };
+    let deploy_stores = DeployStoreIds {
+        config: declared_ids(manifest_stores.and_then(|declared| declared.config.as_ref())),
+        kv: declared_ids(manifest_stores.and_then(|declared| declared.kv.as_ref())),
+        secrets: declared_ids(manifest_stores.and_then(|declared| declared.secrets.as_ref())),
+    };
+    let variable_defaults = manifest
+        .as_ref()
+        .map(|loader| manifest_variable_defaults(loader.manifest(), &args.adapter))
+        .unwrap_or_default();
+    let (adapter_manifest_path, adapter_manifest_path_error) =
+        match resolve_adapter_manifest_path(manifest.as_ref(), &args.adapter) {
+            Ok(path) => (path.map(PathBuf::from), None),
+            Err(err) => (None, Some(err)),
+        };
+    let application_manifest_path = loaded_application_manifest_path(manifest.as_ref())?;
+    let application_release_root = resolve_application_release_root(
+        args.application_release.as_deref(),
+        application_manifest_path.as_deref(),
+    )?;
+    let context = AdapterDeployContext {
+        adapter_manifest_path,
+        application_manifest_path,
+        application_release_root,
+        service_id: args.service_id.clone(),
+        stores: deploy_stores,
+        staging: args.staging,
+        variable_defaults,
     };
 
-    let mut passthrough: Vec<String> = Vec::new();
-    // Thread the manifest-configured platform manifest path (resolved
-    // from `[adapters.<adapter>.adapter].manifest` relative to the
-    // `EDGEZERO_MANIFEST`-honoring manifest root) into BOTH the staged
-    // and the production deploy, so each targets the app the operator
-    // selected — not whichever `fastly.toml` a bare working-directory
-    // search finds first in a monorepo. The adapter falls back to a cwd
-    // search only when the manifest declares no adapter `manifest` key.
-    //
-    // `--manifest-path` is an EdgeZero-internal directive that only the
-    // built-in adapter understands, so it is threaded only when the
-    // action actually dispatches to the adapter. A manifest-declared
-    // shell `deploy` command receives the adapter args VERBATIM, and
-    // `fastly compute deploy` has no `--manifest-path` flag — such a
-    // command already runs in the manifest root and picks its own
-    // project directory. (Staged deploys are never manifest-declared
-    // commands, so they always get the flag.)
-    if !adapter::has_manifest_command(manifest.as_ref(), &args.adapter, action)
-        && let Some(manifest_path) =
-            resolve_adapter_manifest_path(manifest.as_ref(), &args.adapter)?
-    {
-        passthrough.push("--manifest-path".to_owned());
-        passthrough.push(manifest_path);
-    }
-    if let Some(service_id) = &args.service_id {
-        passthrough.push("--service-id".to_owned());
-        passthrough.push(service_id.clone());
-    }
-    passthrough.extend_from_slice(&args.adapter_args);
-
-    if args.staging {
-        // Thread the app's declared config-store logical ids so the staged
-        // relink knows which selectors to redirect to `<logical>_staging`. The
-        // adapter reads config usage from THIS list, never a remote probe —
-        // avoiding a lookup that fails open. One inline token per store; the
-        // adapter strips them before `fastly compute update`.
-        if let Some(loader) = manifest.as_ref()
-            && let Some(config) = loader.manifest().stores.config.as_ref()
-        {
-            for id in &config.ids {
-                passthrough.push(format!("--edgezero-staging-config={id}"));
-            }
-        }
-        // Staged deploy: clone the active version, upload the built
-        // package to a new draft, mark it staged, and emit the staged
-        // version. Never runs the manifest `deploy`
-        // command, which would activate production.
-        return adapter::execute(
-            &args.adapter,
-            adapter::Action::DeployStaging,
-            manifest.as_ref(),
-            &passthrough,
-        );
-    }
-
-    // Production deploy also emits the activated version
-    // so the deploy-fastly action can surface `fastly-version` and the
-    // deploy→healthcheck→rollback chain has a real version to thread.
-    //
-    // Resolution precedence (cheapest + most reliable first):
-    //   1. The deploy command's OWN output. We tee it (echoed live to
-    //      the operator, captured for us) and look for a canonical
-    //      `version=<N>` line, then for Fastly's native phrasing
-    //      ("... version 12"). The deploy command already knows the
-    //      version it activated, so this needs no API round-trip and
-    //      works under a manifest `[adapters.fastly.commands].deploy`
-    //      override (including test fixtures with dummy credentials).
-    //   2. Only when the output yields nothing: the Fastly API lookup
-    //      (`EmitVersion`), which needs a live API + a real token.
-    //   3. If BOTH fail: a clear `Err`. We never silently emit an empty
-    //      version — that was the original bug.
-    if args.service_id.is_some() && args.adapter.eq_ignore_ascii_case("fastly") {
-        let captured = adapter::execute_capture(
-            &args.adapter,
-            adapter::Action::Deploy,
-            manifest.as_ref(),
-            &passthrough,
-        )?;
-        if let Some(version) = captured.as_deref().and_then(parse_deploy_version) {
-            log::info!("version={version}");
-            return Ok(());
-        }
-        // Fallback: resolve the version the deploy just activated via the Fastly
-        // API. `--require-active` makes EmitVersion FAIL (not emit an empty
-        // `version=`) when the API reports no active version — a deploy that
-        // activated a version but resolves to none is an error, never a silent
-        // empty-version success.
-        let mut emit_args = passthrough.clone();
-        emit_args.push("--require-active".to_owned());
-        return adapter::execute(
-            &args.adapter,
-            adapter::Action::EmitVersion,
-            manifest.as_ref(),
-            &emit_args,
-        )
-        .map_err(|err| {
-            format!(
-                "deploy succeeded but the activated version could not be resolved: no `version=<N>` \
-                 (or Fastly `version <N>`) line in the deploy output, and the Fastly API fallback \
-                 failed: {err}"
-            )
-        });
-    }
-
-    adapter::execute(
+    adapter::deploy(
         &args.adapter,
-        adapter::Action::Deploy,
+        &context,
+        adapter_manifest_path_error.as_deref(),
         manifest.as_ref(),
-        &passthrough,
+        &args.adapter_args,
     )
 }
 
-/// Parse an activated service version out of a deploy command's output.
-///
-/// Precedence:
-///   1. A canonical `version=<N>` line (what a manifest
-///      `[adapters.fastly.commands].deploy` override — or a CI fixture —
-///      emits, and what `EdgeZero` itself prints).
-///   2. Fastly's native phrasing, e.g.
-///      `SUCCESS: Deployed package (service abc, version 12)`. The LAST
-///      mention wins, which is the version the deploy ended on.
-///
-/// Returns `None` when neither shape is present, which sends the caller
-/// to the Fastly API fallback.
 #[cfg(feature = "cli")]
-fn parse_deploy_version(output: &str) -> Option<u64> {
-    parse_canonical_version_line(output).or_else(|| parse_native_version_mention(output))
+fn manifest_variable_defaults(manifest: &Manifest, adapter: &str) -> BTreeMap<String, String> {
+    manifest
+        .environment_for(adapter)
+        .variables
+        .into_iter()
+        .filter_map(|binding| binding.value.map(|value| (binding.env, value)))
+        .collect()
 }
 
-/// Last `version=<N>` line in `output` (leading/trailing whitespace on
-/// the line is ignored).
-///
-/// FAIL CLOSED: the whole value after `version=` must be ASCII digits.
-/// A `take_while(is_ascii_digit)` prefix scan would read `version=15.2.0`
-/// as `15` and `version=12abc` as `12`, threading a WRONG version into
-/// healthcheck / rollback. `None` sends the caller to the Fastly API
-/// fallback (the version the deploy actually activated) instead.
 #[cfg(feature = "cli")]
-fn parse_canonical_version_line(output: &str) -> Option<u64> {
-    output.lines().rev().find_map(|line| {
-        let digits = line.trim().strip_prefix("version=")?;
-        if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
-            return None;
-        }
-        digits.parse::<u64>().ok()
-    })
-}
-
-/// Last `, version <N>)` mention in `output` (case-insensitive) — the
-/// Fastly CLI's own success line, whose Go format string is
-/// `"Deployed package (service %s, version %v)"`.
-///
-/// Deliberately narrow: it previously accepted ANY digits appearing
-/// after the word "version", so `Fastly CLI version 15.2.0` or
-/// `... service 12345, version unchanged` parsed as a service version.
-/// A misparse here emits a WRONG `version=<N>` line, which the deploy →
-/// healthcheck → rollback chain would then act on. When this returns
-/// `None`, `run_deploy` falls back to the Fastly API's *active* version
-/// (the version the deploy actually activated) rather than guessing.
-#[cfg(feature = "cli")]
-fn parse_native_version_mention(output: &str) -> Option<u64> {
-    let lower = output.to_ascii_lowercase();
-    let mut result = None;
-    for (idx, _) in lower.match_indices(", version ") {
-        let after = idx.saturating_add(", version ".len());
-        let Some(rest) = lower.get(after..) else {
-            continue;
-        };
-        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-        // The number must be closed by the success line's `)`.
-        if digits.is_empty() || rest.chars().nth(digits.len()) != Some(')') {
-            continue;
-        }
-        if let Ok(parsed) = digits.parse::<u64>() {
-            result = Some(parsed);
-        }
+fn loaded_application_manifest_path(
+    loader: Option<&ManifestLoader>,
+) -> Result<Option<PathBuf>, String> {
+    if loader.is_none() {
+        return Ok(None);
     }
-    result
+    let path = env::var("EDGEZERO_MANIFEST")
+        .map_or_else(|_| PathBuf::from("edgezero.toml"), PathBuf::from);
+    let canonical = path.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve loaded application manifest {}: {error}",
+            path.display()
+        )
+    })?;
+    if !canonical.is_file() {
+        return Err(format!(
+            "loaded application manifest {} is not a regular file",
+            canonical.display()
+        ));
+    }
+    Ok(Some(canonical))
+}
+
+#[cfg(feature = "cli")]
+fn resolve_application_release_root(
+    requested_root: Option<&Path>,
+    application_manifest: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(requested_root_path) = requested_root else {
+        return Ok(None);
+    };
+    let root = requested_root_path.canonicalize().map_err(|error| {
+        format!(
+            "could not resolve application release root {}: {error}",
+            requested_root_path.display()
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "application release root {} is not a directory",
+            root.display()
+        ));
+    }
+    let manifest = application_manifest
+        .ok_or_else(|| "--application-release requires a loaded application manifest".to_owned())?;
+    if !manifest.starts_with(&root) {
+        return Err(format!(
+            "loaded application manifest {} is outside application release root {}",
+            manifest.display(),
+            root.display()
+        ));
+    }
+    Ok(Some(root))
 }
 
 /// Resolve the absolute path of the adapter's platform manifest
@@ -680,10 +604,97 @@ fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
 mod tests {
     use super::*;
     use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard};
+    use edgezero_adapter::registry::{
+        self as adapter_registry, Adapter, AdapterAction, DeployOwnership,
+    };
     use edgezero_core::manifest::ManifestLoader;
+    #[cfg(unix)]
+    use edgezero_core::test_env::PathPrepend;
+    use std::collections::BTreeMap;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{LazyLock, Mutex};
     use tempfile::TempDir;
+
+    const PREFLIGHT_MANIFEST_COMMAND: usize = 0;
+    const PREFLIGHT_ADAPTER_MANAGED: usize = 1;
+    const PREFLIGHT_ERROR: usize = 2;
+
+    static DEPLOY_PREFLIGHT_MODE: AtomicUsize = AtomicUsize::new(PREFLIGHT_MANIFEST_COMMAND);
+    static DEPLOY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DEPLOY_CONTEXT: LazyLock<Mutex<Option<AdapterDeployContext>>> =
+        LazyLock::new(|| Mutex::new(None));
+    static DEPLOY_FINALIZE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DEPLOY_PREFLIGHT_CONTEXT: LazyLock<Mutex<Option<AdapterDeployContext>>> =
+        LazyLock::new(|| Mutex::new(None));
+    static RECORDING_DEPLOY_ADAPTER: RecordingDeployAdapter = RecordingDeployAdapter;
+
+    struct RecordingDeployAdapter;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the recording adapter exercises only deploy preflight, deploy dispatch, and finalization"
+    )]
+    impl Adapter for RecordingDeployAdapter {
+        fn deploy(&self, context: &AdapterDeployContext, _args: &[String]) -> Result<(), String> {
+            *DEPLOY_CONTEXT
+                .lock()
+                .map_err(|err| format!("deploy context lock poisoned: {err}"))? =
+                Some(context.clone());
+            DEPLOY_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn execute(&self, action: AdapterAction, _args: &[String]) -> Result<(), String> {
+            if action == AdapterAction::Deploy {
+                return Err("managed deployment must call Adapter::deploy".to_owned());
+            }
+            Err(format!("unexpected recording adapter action: {action:?}"))
+        }
+
+        fn finalize_deploy(
+            &self,
+            _context: &AdapterDeployContext,
+            _command_output: Option<&str>,
+        ) -> Result<(), String> {
+            DEPLOY_FINALIZE_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "recording_deploy_test"
+        }
+
+        fn preflight_deploy(
+            &self,
+            context: &AdapterDeployContext,
+            _args: &[String],
+        ) -> Result<DeployOwnership, String> {
+            *DEPLOY_PREFLIGHT_CONTEXT
+                .lock()
+                .map_err(|err| format!("deploy preflight context lock poisoned: {err}"))? =
+                Some(context.clone());
+            match DEPLOY_PREFLIGHT_MODE.load(Ordering::SeqCst) {
+                PREFLIGHT_ADAPTER_MANAGED => Ok(DeployOwnership::AdapterManaged),
+                PREFLIGHT_ERROR => Err("recording preflight failed".to_owned()),
+                _ => Ok(DeployOwnership::ManifestCommand),
+            }
+        }
+    }
+
+    fn reset_recording_deploy_adapter(mode: usize) {
+        adapter_registry::register_adapter(&RECORDING_DEPLOY_ADAPTER);
+        DEPLOY_PREFLIGHT_MODE.store(mode, Ordering::SeqCst);
+        DEPLOY_CALLS.store(0, Ordering::SeqCst);
+        *DEPLOY_CONTEXT.lock().expect("deploy context lock") = None;
+        DEPLOY_FINALIZE_CALLS.store(0, Ordering::SeqCst);
+        *DEPLOY_PREFLIGHT_CONTEXT
+            .lock()
+            .expect("deploy preflight context lock") = None;
+    }
 
     #[test]
     fn load_manifest_optional_hard_errors_when_explicit_env_path_missing() {
@@ -736,78 +747,6 @@ mod tests {
         assert!(manifest.manifest().adapters.contains_key("fastly"));
     }
 
-    // ── deploy-output version parsing ─────────────────────────────────
-
-    #[test]
-    fn parse_deploy_version_reads_canonical_line() {
-        // What a manifest `[adapters.fastly.commands].deploy` override
-        // (or a CI fixture running with dummy creds) emits. Must be
-        // parsed WITHOUT any Fastly API round-trip.
-        let output = "building...\nversion=7\ndone\n";
-        assert_eq!(parse_deploy_version(output), Some(7));
-    }
-
-    #[test]
-    fn parse_deploy_version_reads_fastly_native_phrasing() {
-        let output = "SUCCESS: Deployed package (service abc123, version 12)\n";
-        assert_eq!(parse_deploy_version(output), Some(12));
-    }
-
-    #[test]
-    fn parse_deploy_version_none_when_absent_triggers_fallback() {
-        // No version anywhere -> `None`, which routes run_deploy to the
-        // Fastly API fallback (and to a clear Err if that also fails).
-        let output = "Building package...\nUploading...\nAll good.\n";
-        assert_eq!(parse_deploy_version(output), None);
-        assert_eq!(parse_deploy_version(""), None);
-    }
-
-    #[test]
-    fn parse_deploy_version_prefers_canonical_over_native_mention() {
-        // A fixture that both narrates a clone AND emits the canonical
-        // line: the canonical line is authoritative.
-        let output = "Cloning version 3...\nversion=9\n";
-        assert_eq!(parse_deploy_version(output), Some(9));
-    }
-
-    #[test]
-    fn parse_deploy_version_native_takes_last_success_line() {
-        let output = "SUCCESS: Deployed package (service abc, version 3)\n\
-             SUCCESS: Deployed package (service abc, version 4)\n";
-        assert_eq!(parse_deploy_version(output), Some(4));
-    }
-
-    #[test]
-    fn parse_deploy_version_rejects_confusable_mentions() {
-        // Loose `version <N>` narration is NOT a service version. Each of
-        // these used to parse (and would have emitted a wrong `version=<N>`
-        // for healthcheck/rollback to act on). `None` routes run_deploy to
-        // the Fastly API's *active* version instead — the safe answer.
-        assert_eq!(parse_deploy_version("Fastly CLI version 15.2.0\n"), None);
-        assert_eq!(
-            parse_deploy_version("Uploaded to service 12345, version unchanged\n"),
-            None
-        );
-        assert_eq!(
-            parse_deploy_version("Cloning version 3... created version 4\n"),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_deploy_version_rejects_malformed_canonical_lines() {
-        // The canonical-line parser must be FAIL CLOSED: a prefix scan
-        // (`take_while(is_ascii_digit)`) read `version=15.2.0` as 15 and
-        // `version=12abc` as 12, threading a WRONG version into
-        // healthcheck / rollback. `None` routes run_deploy to the Fastly
-        // API fallback instead.
-        assert_eq!(parse_deploy_version("version=15.2.0\n"), None);
-        assert_eq!(parse_deploy_version("version=12abc\n"), None);
-        assert_eq!(parse_deploy_version("version=\n"), None);
-        // A well-formed line is still accepted (leading zeros included).
-        assert_eq!(parse_deploy_version("version=007\n"), Some(7));
-    }
-
     #[cfg(not(windows))]
     #[test]
     fn run_deploy_manifest_command_forwards_adapter_args_verbatim() {
@@ -818,7 +757,19 @@ mod tests {
         // The EdgeZero-internal `--manifest-path` must NOT: the shell
         // command's own CLI has no such flag.
         let _lock = manifest_guard().lock().expect("manifest guard");
+
         let temp = TempDir::new().expect("temp dir");
+        let curl = temp.path().join("curl");
+        fs::write(
+            &curl,
+            "#!/bin/sh\ncat >/dev/null\nprintf '[{\"number\":42,\"active\":true,\"locked\":true,\"staging\":false,\"deployed\":true,\"environments\":[]}]\\n200'\n",
+        )
+        .expect("write curl fake");
+        let mut permissions = fs::metadata(&curl).expect("curl metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&curl, permissions).expect("make curl fake executable");
+        let _path = PathPrepend::new(temp.path());
+        let _token = EnvOverride::set("FASTLY_API_TOKEN", "test-token");
         let args_file = temp.path().join("argv.txt");
         let script = temp.path().join("record.sh");
         fs::write(
@@ -844,6 +795,7 @@ mod tests {
 
         let args = DeployArgs {
             adapter: "fastly".to_owned(),
+            application_release: None,
             adapter_args: vec!["--non-interactive".to_owned()],
             service_id: Some("SVC1".to_owned()),
             staging: false,
@@ -858,6 +810,456 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn run_staging_deploy_resolves_explicit_manifest_even_with_custom_production_command() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            "[app]\nname = \"demo-app\"\n\n[adapters.fastly.adapter]\ncrate = \"crates/demo-fastly\"\nmanifest = \"missing/fastly.toml\"\n\n[adapters.fastly.commands]\ndeploy = \"true\"\n",
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_deploy(&DeployArgs {
+            adapter: "fastly".to_owned(),
+            application_release: None,
+            adapter_args: Vec::new(),
+            service_id: Some("SVC1".to_owned()),
+            staging: true,
+        })
+        .expect_err("staging must resolve the explicitly selected fastly.toml");
+
+        assert!(
+            err.contains("missing/fastly.toml") && err.contains("could not resolve"),
+            "staging reports the selected missing manifest before discovery: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_custom_deploy_with_stores_runs_without_registered_adapter() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let marker = temp.path().join("deploy-ran");
+        let script = temp.path().join("deploy.sh");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .expect("write deploy script");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\n\n[stores.config]\nids = [\"app_config\"]\n\n[adapters.unregistered_test.adapter]\ncrate = \"crates/demo\"\n\n[adapters.unregistered_test.commands]\ndeploy = \"sh {}\"\n",
+                script.display()
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_deploy(&DeployArgs {
+            adapter: "unregistered_test".to_owned(),
+            application_release: None,
+            adapter_args: Vec::new(),
+            service_id: None,
+            staging: false,
+        })
+        .expect("an unregistered custom adapter can run its manifest deploy command");
+
+        assert!(
+            marker.exists(),
+            "the custom deploy command should run without a registered adapter"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_preflight_adapter_managed_bypasses_manifest_command_and_receives_context() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_ADAPTER_MANAGED);
+        let temp = TempDir::new().expect("temp dir");
+        let marker = temp.path().join("manifest-deploy-ran");
+        let adapter_dir = temp.path().join("nested/adapter");
+        fs::create_dir_all(&adapter_dir).expect("adapter dir");
+        let adapter_manifest = adapter_dir.join("adapter.toml");
+        fs::write(&adapter_manifest, "name = \"recording\"\n").expect("adapter manifest");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                r#"[app]
+name = "demo-app"
+
+[[environment.variables]]
+name = "APPLICABLE_DEFAULT"
+env = "EDGEZERO_TEST_APPLICABLE"
+value = "from-manifest"
+adapters = ["recording_deploy_test"]
+
+[[environment.variables]]
+name = "OTHER_DEFAULT"
+env = "EDGEZERO_TEST_OTHER"
+value = "other-adapter"
+adapters = ["other"]
+
+[[environment.variables]]
+name = "UNSET_DEFAULT"
+env = "EDGEZERO_TEST_UNSET"
+
+[[environment.secrets]]
+name = "PRIVATE_TOKEN"
+env = "EDGEZERO_TEST_SECRET"
+value = "must-not-leak"
+adapters = ["recording_deploy_test"]
+
+[adapters.recording_deploy_test.adapter]
+crate = "crates/demo"
+manifest = "nested/adapter/adapter.toml"
+
+[adapters.recording_deploy_test.commands]
+deploy = "touch '{}'"
+"#,
+                marker.display()
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            application_release: None,
+            adapter_args: Vec::new(),
+            service_id: None,
+            staging: false,
+        })
+        .expect("adapter-managed deploy succeeds");
+
+        assert!(!marker.exists(), "adapter ownership bypasses the command");
+        assert_eq!(DEPLOY_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(DEPLOY_FINALIZE_CALLS.load(Ordering::SeqCst), 0);
+        let preflight_context = DEPLOY_PREFLIGHT_CONTEXT
+            .lock()
+            .expect("deploy preflight context lock")
+            .clone()
+            .expect("Adapter::preflight_deploy captured its context");
+        let deployed_context = DEPLOY_CONTEXT
+            .lock()
+            .expect("deploy context lock")
+            .clone()
+            .expect("Adapter::deploy captured its context");
+        let expected_adapter_manifest = adapter_manifest.canonicalize().expect("canonical path");
+        assert_eq!(
+            preflight_context.adapter_manifest_path,
+            Some(expected_adapter_manifest.clone())
+        );
+        assert_eq!(
+            deployed_context.adapter_manifest_path,
+            Some(expected_adapter_manifest)
+        );
+        assert_eq!(
+            deployed_context.variable_defaults,
+            BTreeMap::from([(
+                "EDGEZERO_TEST_APPLICABLE".to_owned(),
+                "from-manifest".to_owned()
+            )])
+        );
+        assert_eq!(
+            deployed_context.application_manifest_path,
+            Some(
+                manifest_path
+                    .canonicalize()
+                    .expect("canonical app manifest")
+            )
+        );
+        assert!(deployed_context.application_release_root.is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_preflight_receives_confined_application_release_paths() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_ADAPTER_MANAGED);
+        let release = TempDir::new().expect("release root");
+        let adapter_dir = release.path().join("adapter");
+        fs::create_dir_all(&adapter_dir).expect("adapter directory");
+        let adapter_manifest = adapter_dir.join("fastly.toml");
+        fs::write(&adapter_manifest, "name = \"recording\"\n").expect("adapter manifest");
+        let manifest_path = release.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            "[app]\nname = \"demo\"\n[adapters.recording_deploy_test.adapter]\ncrate = \"crates/demo\"\nmanifest = \"adapter/fastly.toml\"\n",
+        )
+        .expect("application manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            application_release: Some(release.path().to_path_buf()),
+            ..DeployArgs::default()
+        })
+        .expect("managed release deploy");
+
+        let context = DEPLOY_CONTEXT
+            .lock()
+            .expect("deploy context lock")
+            .clone()
+            .expect("deploy context");
+        assert_eq!(
+            context.application_release_root,
+            Some(release.path().canonicalize().unwrap())
+        );
+        assert_eq!(
+            context.application_manifest_path,
+            Some(manifest_path.canonicalize().unwrap())
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_rejects_application_manifest_outside_release_root() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_ADAPTER_MANAGED);
+        let release = TempDir::new().expect("release root");
+        let application = TempDir::new().expect("application root");
+        let manifest_path = application.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            "[app]\nname = \"demo\"\n[adapters.recording_deploy_test.adapter]\ncrate = \"crates/demo\"\n",
+        )
+        .expect("application manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let error = run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            application_release: Some(release.path().to_path_buf()),
+            ..DeployArgs::default()
+        })
+        .expect_err("application manifest must be confined to release");
+
+        assert!(error.contains("outside application release"), "{error}");
+        assert_eq!(DEPLOY_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_preflight_adapter_managed_rejects_invalid_manifest_before_deploy() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_ADAPTER_MANAGED);
+        let temp = TempDir::new().expect("temp dir");
+        let marker = temp.path().join("manifest-deploy-ran");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\n\n[adapters.recording_deploy_test.adapter]\ncrate = \"crates/demo\"\nmanifest = \"nested/missing.toml\"\n\n[adapters.recording_deploy_test.commands]\ndeploy = \"touch '{}'\"\n",
+                marker.display()
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            application_release: None,
+            adapter_args: Vec::new(),
+            service_id: None,
+            staging: false,
+        })
+        .expect_err("managed deploy requires its configured adapter manifest");
+
+        assert!(
+            err.contains("nested/missing.toml") && err.contains("could not resolve"),
+            "resolution error is preserved: {err}"
+        );
+        assert!(!marker.exists(), "managed ownership bypasses the command");
+        assert_eq!(DEPLOY_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(DEPLOY_FINALIZE_CALLS.load(Ordering::SeqCst), 0);
+        assert!(
+            DEPLOY_CONTEXT
+                .lock()
+                .expect("deploy context lock")
+                .is_none(),
+            "invalid manifest fails before Adapter::deploy"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_preflight_manifest_command_ignores_invalid_adapter_manifest() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_MANIFEST_COMMAND);
+        let temp = TempDir::new().expect("temp dir");
+        let marker = temp.path().join("manifest-deploy-ran");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\n\n[adapters.recording_deploy_test.adapter]\ncrate = \"crates/demo\"\nmanifest = \"nested/missing.toml\"\n\n[adapters.recording_deploy_test.commands]\ndeploy = \"touch '{}'\"\n",
+                marker.display()
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            application_release: None,
+            adapter_args: Vec::new(),
+            service_id: None,
+            staging: false,
+        })
+        .expect("manifest ownership does not require an adapter manifest");
+
+        assert!(marker.exists(), "the manifest deploy command runs");
+        assert_eq!(DEPLOY_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(DEPLOY_FINALIZE_CALLS.load(Ordering::SeqCst), 1);
+        assert!(
+            DEPLOY_CONTEXT
+                .lock()
+                .expect("deploy context lock")
+                .is_none()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_preflight_manifest_command_with_stores_rejects_invalid_adapter_manifest() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_MANIFEST_COMMAND);
+        let temp = TempDir::new().expect("temp dir");
+        let marker = temp.path().join("manifest-deploy-ran");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\n\n[stores.config]\nids = [\"app_config\"]\n\n[adapters.recording_deploy_test.adapter]\ncrate = \"crates/demo\"\nmanifest = \"nested/missing.toml\"\n\n[adapters.recording_deploy_test.commands]\ndeploy = \"touch '{}'\"\n",
+                marker.display()
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            application_release: None,
+            adapter_args: Vec::new(),
+            service_id: None,
+            staging: false,
+        })
+        .expect_err("registered finalization with stores requires its adapter manifest");
+
+        assert!(
+            err.contains("nested/missing.toml") && err.contains("could not resolve"),
+            "resolution error is preserved: {err}"
+        );
+        assert!(
+            !marker.exists(),
+            "manifest resolution fails before the command"
+        );
+        assert_eq!(DEPLOY_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(DEPLOY_FINALIZE_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deploy_preflight_error_prevents_manifest_command() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_recording_deploy_adapter(PREFLIGHT_ERROR);
+        let temp = TempDir::new().expect("temp dir");
+        let marker = temp.path().join("manifest-deploy-ran");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\n\n[adapters.recording_deploy_test.adapter]\ncrate = \"crates/demo\"\n\n[adapters.recording_deploy_test.commands]\ndeploy = \"touch '{}'\"\n",
+                marker.display()
+            ),
+        )
+        .expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_deploy(&DeployArgs {
+            adapter: "recording_deploy_test".to_owned(),
+            application_release: None,
+            adapter_args: Vec::new(),
+            service_id: None,
+            staging: false,
+        })
+        .expect_err("preflight failure stops deployment");
+
+        assert!(err.contains("recording preflight failed"), "{err}");
+        assert!(!marker.exists(), "preflight fails before the command runs");
+        assert_eq!(DEPLOY_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(DEPLOY_FINALIZE_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_deploy_store_backed_fastly_bypasses_manifest_command_and_requires_release() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let adapter_dir = temp.path().join("crates/demo-fastly");
+        fs::create_dir_all(&adapter_dir).expect("adapter dir");
+        fs::write(adapter_dir.join("fastly.toml"), "name = \"demo\"\n").expect("fastly manifest");
+
+        let marker = temp.path().join("manifest-command-ran");
+        let deploy_script = temp.path().join("deploy.sh");
+        fs::write(
+            &deploy_script,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .expect("deploy script");
+        let mut deploy_perms = fs::metadata(&deploy_script).expect("meta").permissions();
+        deploy_perms.set_mode(0o755);
+        fs::set_permissions(&deploy_script, deploy_perms).expect("chmod deploy");
+
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[app]\nname = \"demo-app\"\n\n[stores.secrets]\nids = [\"credentials\"]\n\n[adapters.fastly.adapter]\ncrate = \"crates/demo-fastly\"\nmanifest = \"crates/demo-fastly/fastly.toml\"\n\n[adapters.fastly.commands]\ndeploy = \"{}\"\n",
+                deploy_script.display()
+            ),
+        )
+        .expect("edgezero manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _manifest = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        let _selector = EnvOverride::set(
+            "EDGEZERO__STORES__SECRETS__CREDENTIALS__NAME",
+            "credentials-staging",
+        );
+
+        let error = run_deploy(&DeployArgs {
+            adapter: "fastly".to_owned(),
+            application_release: None,
+            adapter_args: vec!["--non-interactive".to_owned()],
+            service_id: Some("SVC1".to_owned()),
+            staging: false,
+        })
+        .expect_err("store-backed Fastly deploy requires an immutable release");
+
+        assert!(
+            error.contains("--application-release"),
+            "managed ownership reaches the release verifier: {error}"
+        );
+        assert!(!marker.exists(), "the manifest deploy command is bypassed");
+    }
+
     #[test]
     fn run_deploy_rejects_staging_spellings_in_passthrough() {
         // A reserved lifecycle spelling after `--` must FAIL CLOSED before any deploy
@@ -868,6 +1270,7 @@ mod tests {
         for flag in ["--stage", "--staging", "--stage=true", "--staging=1"] {
             let args = DeployArgs {
                 adapter: "fastly".to_owned(),
+                application_release: None,
                 adapter_args: vec![flag.to_owned()],
                 service_id: Some("SVC1".to_owned()),
                 staging: false,
@@ -927,6 +1330,7 @@ mod tests {
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
         let args = DeployArgs {
             adapter: "fastly".to_owned(),
+            application_release: None,
             adapter_args: Vec::new(),
             // No service id → the production version-emit step is
             // skipped, so this test exercises only the

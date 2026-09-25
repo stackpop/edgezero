@@ -1,5 +1,7 @@
 # Build-Cache Container Implementation Plan (sub-plan 1 of 4)
 
+**Status:** Historical plan; the deploy-time build model was withdrawn on 2026-09-17
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Publish a pinned, single-manifest `linux/amd64` build container that bakes the exact Rust toolchain + build tools, so `platform-id` for the cached-build feature is an immutable digest.
@@ -8,7 +10,7 @@
 
 **Tech Stack:** Docker (BuildKit), GitHub Actions (`docker/build-push-action`), GHCR, Bash, `jq`.
 
-**Spec:** `docs/specs/edgezero-deploy-build-caching.md` (v6.14, sccache pivot) — §2 (single-producer, hosted-only v1), §3.1 (sccache cache mechanism), §3.6 (image contract: baked Rust + `wasm32-wasip1` + **sccache** + Fastly CLI, read-only/non-root), §5 (digest pin, atomic same-SHA rollout).
+**Spec:** `docs/superpowers/specs/2026-08-17-edgezero-deploy-build-caching-design.md` (v6.14, sccache pivot) — §2 (single-producer, hosted-only v1), §3.1 (sccache cache mechanism), §3.6 (image contract: baked Rust + `wasm32-wasip1` + **sccache** + Fastly CLI, read-only/non-root), §5 (digest pin, atomic same-SHA rollout).
 
 ## Global Constraints
 

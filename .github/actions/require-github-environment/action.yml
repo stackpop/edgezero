@@ -1,0 +1,57 @@
+name: EdgeZero require GitHub Environment
+description: Fail closed unless an existing GitHub Environment exactly matches the requested name.
+
+inputs:
+  environment-name:
+    description: Exact GitHub Environment name to verify.
+    required: true
+  repository:
+    description: Repository in owner/name form.
+    required: true
+  github-token:
+    description: GitHub token with Actions read access to the repository.
+    required: true
+outputs:
+  environment-name:
+    description: The exact verified GitHub Environment name.
+    value: ${{ steps.verify.outputs.environment-name }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verify GitHub Environment
+      id: verify
+      shell: bash
+      env:
+        EDGEZERO__GITHUB__ENVIRONMENT: ${{ inputs.environment-name }}
+        EDGEZERO__GITHUB__REPOSITORY: ${{ inputs.repository }}
+        EDGEZERO__GITHUB__TOKEN: ${{ inputs.github-token }}
+        EDGEZERO__GITHUB__API_URL: ${{ github.api_url }}
+        BASH_ENV: ""
+        ENV: ""
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
+      run: exec "$GITHUB_ACTION_PATH/scripts/require-environment.sh"

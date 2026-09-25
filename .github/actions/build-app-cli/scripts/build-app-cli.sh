@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Compiles the CLI package the APPLICATION provides — a crate in the app's own
-# workspace — into an action-owned CARGO_TARGET_DIR, then packages the binary
+# workspace — into an application-scoped cached CARGO_TARGET_DIR when configured,
+# or an action-owned scratch directory otherwise. It then packages the binary
 # plus a self-describing app-cli-meta.json into a tar so the executable bit
 # survives actions/upload-artifact. Never builds the EdgeZero monorepo CLI.
 #
@@ -17,6 +18,7 @@ set -euo pipefail
 #   RUNNER_TEMP                           optional  action-owned scratch root (default: /tmp)
 #   EDGEZERO__PROVIDER__ENV_CLEAR         optional  JSON array of provider aliases to scrub before the build (default: [])
 #   EDGEZERO__ACTION__WORKSPACE           optional  per-invocation scratch root (default: mktemp under RUNNER_TEMP)
+#   EDGEZERO__RUST_CACHE__TARGET_DIR      optional  shared Cargo target directory beneath RUNNER_TEMP
 #   EDGEZERO__ACTION__OUTPUT_FILE         optional  outputs handoff file, started fresh (default: GITHUB_OUTPUT)
 # Writes (outputs):
 #   app-cli-package                       the package that was built
@@ -194,6 +196,19 @@ main() {
   [[ -n "$action_ws" ]] || action_ws=$(mktemp -d "$runner_temp/edgezero-cli.XXXXXX")
   local stage_root="$action_ws/artifact"
   local build_target_dir="$action_ws/build"
+  local cached_target_dir="${EDGEZERO__RUST_CACHE__TARGET_DIR:-}"
+
+  if [[ -n "$cached_target_dir" ]]; then
+    [[ -d "$runner_temp" ]] || fail "RUNNER_TEMP does not exist or is not a directory"
+    [[ -d "$cached_target_dir" ]] ||
+      fail "cached Cargo target directory does not exist or is not a directory"
+    local runner_temp_real cached_target_real
+    runner_temp_real=$(canonical_path "$runner_temp")
+    cached_target_real=$(canonical_path "$cached_target_dir")
+    is_under "$runner_temp_real" "$cached_target_real" ||
+      fail "cached Cargo target directory must resolve inside RUNNER_TEMP"
+    build_target_dir="$cached_target_real"
+  fi
 
   require_linux_x86_64
   require_cmd cargo
@@ -260,8 +275,11 @@ main() {
   [[ "$has_bin" == "true" ]] || fail "app-cli-package '$cli_package' declares no binary target named '$cli_bin'"
   cli_version=$(jq -r '.version' <<<"$package_json")
 
-  # Build into an action-owned target dir so the checkout stays clean.
-  reset_owned_dir "$build_target_dir" "$runner_temp"
+  # Keep restored artifacts when setup-rust-build-cache supplied the target.
+  # The uncached fallback remains isolated to this invocation and starts clean.
+  if [[ -z "$cached_target_dir" ]]; then
+    reset_owned_dir "$build_target_dir" "$runner_temp"
+  fi
   run_untrusted CARGO_TARGET_DIR="$build_target_dir" cargo +"$rust_toolchain" build \
     --locked --release -p "$cli_package" --bin "$cli_bin"
 
@@ -278,7 +296,7 @@ main() {
     >"$stage_root/app-cli-meta.json"
 
   # Fixed tarball name — never derive a path component from caller input.
-  local tarball="$stage_root/../edgezero-cli.tar"
+  local tarball="$stage_root/../app-cli.tar"
   tar -C "$stage_root" -cf "$tarball" "$cli_bin" app-cli-meta.json
   tarball=$(canonical_path "$tarball")
 

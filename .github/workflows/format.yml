@@ -19,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Cache cargo dependencies
         uses: actions/cache@v5
@@ -99,6 +101,8 @@ jobs:
             features: spin
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v5
@@ -140,6 +144,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Retrieve Node.js version
         id: node-version

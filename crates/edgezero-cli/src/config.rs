@@ -23,7 +23,7 @@ use crate::args::{
     parse_duration_secs,
 };
 use crate::diff::{collect_changes, render_json, render_structured};
-use crate::ensure_adapter_defined;
+use crate::{ensure_adapter_defined, manifest_variable_defaults};
 use edgezero_adapter::registry::{
     self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
 };
@@ -32,12 +32,13 @@ use edgezero_core::app_config::{
     SecretPathSegment,
 };
 use edgezero_core::blob_envelope::{BlobEnvelope, BlobEnvelopeError, ENVELOPE_VERSION_V1};
-use edgezero_core::env_config::EnvConfig;
-use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
+use edgezero_core::env_config::{EnvConfig, merge_env_defaults};
+use edgezero_core::manifest::{Manifest, ManifestAdapter, ManifestLoader, StoreDeclaration};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use similar::TextDiff;
 use std::collections::BTreeMap;
+use std::env;
 use std::io::{Error as IoError, IsTerminal as _, Write, stdin};
 use std::iter;
 use std::path::{Path, PathBuf};
@@ -72,6 +73,9 @@ struct PushContext {
     /// helper borrows from this to build the `AdapterPushContext<'_>`
     /// it hands the adapter trait method.
     adapter_push_ctx: ResolvedAdapterPushContext,
+    /// Final config entry key after CLI/environment resolution and adapter
+    /// policy validation.
+    key: String,
     /// Resolved config store id (`--store` or the manifest
     /// default), paired with its env-resolved platform name. The
     /// platform name is what the adapter writes / pushes into
@@ -114,6 +118,12 @@ struct ValidationContext {
     /// overlay setting the typed flow will use, so the same
     /// flattened key set drives every adapter's `validate_*` call.
     raw_config: Value,
+}
+
+#[derive(Clone, Copy)]
+enum AdapterValidationScope {
+    All,
+    Selected(&'static dyn adapter_registry::Adapter),
 }
 
 impl ValidationContext {
@@ -218,7 +228,7 @@ struct ResolvedTomlLeaf<'raw> {
 #[inline]
 pub fn run_config_validate(args: &ConfigValidateArgs) -> Result<(), String> {
     let ctx = load_validation_context(args)?;
-    run_shared_checks(&ctx)?;
+    run_shared_checks(&ctx, AdapterValidationScope::All)?;
     log::info!(
         "[edgezero] config validate (raw): {} OK{}",
         args.manifest.display(),
@@ -237,7 +247,7 @@ where
     C: DeserializeOwned + Validate + AppConfigMeta,
 {
     let ctx = load_validation_context(args)?;
-    run_shared_checks(&ctx)?;
+    run_shared_checks(&ctx, AdapterValidationScope::All)?;
 
     // Typed deserialise + validate_excluding_secrets (push,
     // diff, AND typed validate all use deserialize-only +
@@ -255,7 +265,7 @@ where
         .map_err(|err| format!("typed app-config failed validation: {err}"))?;
 
     typed_secret_checks(&typed, &ctx)?;
-    run_adapter_typed_checks::<C>(&ctx)?;
+    run_adapter_typed_checks::<C>(&ctx, AdapterValidationScope::All)?;
 
     log::info!(
         "[edgezero] config validate (typed): {} + {} OK{}",
@@ -384,9 +394,9 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
     let env_config = if args.no_env {
         EnvConfig::from_vars(iter::empty::<(String, String)>())
     } else {
-        EnvConfig::from_env()
+        effective_manifest_environment(manifest, &args.adapter, env::vars())
     };
-    let platform = env_config.store_name("config", &logical);
+    let platform = env_config.store_name_checked("config", &logical)?;
     let store = ResolvedStoreId::new(logical, platform);
 
     let manifest_root = args
@@ -445,7 +455,8 @@ where
 {
     // Pre-flight: load + validate.
     let ctx = load_push_context(args)?;
-    run_shared_checks(&ctx.validation)?;
+    let validation_scope = AdapterValidationScope::Selected(ctx.adapter);
+    run_shared_checks(&ctx.validation, validation_scope)?;
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
     let typed: C = app_config::deserialize_app_config_with_options::<C>(
@@ -457,7 +468,7 @@ where
     app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("typed app-config failed validation: {err}"))?;
     typed_secret_checks(&typed, &ctx.validation)?;
-    run_adapter_typed_checks::<C>(&ctx.validation)?;
+    run_adapter_typed_checks::<C>(&ctx.validation, validation_scope)?;
 
     // Resolve adapter paths.
     let (manifest_root, adapter_manifest_path, component_selector, push_ctx) =
@@ -469,10 +480,8 @@ where
         push_ctx: &push_ctx,
     };
 
-    // Build envelope. `--key` overrides the manifest's resolved logical store id;
-    // `--staging` instead targets the `<logical>_staging` variant the staging
-    // selector points at. The two are mutually exclusive.
-    let key = resolve_config_key(args.key.as_deref(), &ctx.store.logical, args.staging)?;
+    // Build the envelope only after selector and adapter key-policy validation.
+    let key = ctx.key.clone();
     let body = build_config_envelope::<C>(&typed)?;
     let local_envelope: BlobEnvelope =
         serde_json::from_str(&body).map_err(|err| format!("local envelope parse failed: {err}"))?;
@@ -611,7 +620,16 @@ where
         strict: false,
     };
     let ctx = load_validation_context(&validate_args)?;
-    run_shared_checks(&ctx)?;
+    ensure_adapter_defined(&args.adapter, Some(&ctx.manifest_loader))?;
+    let adapter = adapter_registry::get_adapter(&args.adapter).ok_or_else(|| {
+        format!(
+            "adapter `{}` is declared in {} but not registered in this build",
+            args.adapter,
+            args.manifest.display()
+        )
+    })?;
+    let validation_scope = AdapterValidationScope::Selected(adapter);
+    run_shared_checks(&ctx, validation_scope)?;
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
     let typed: C = app_config::deserialize_app_config_with_options::<C>(
@@ -623,7 +641,7 @@ where
     app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("local validation failed: {err}"))?;
     typed_secret_checks(&typed, &ctx)?;
-    run_adapter_typed_checks::<C>(&ctx)?;
+    run_adapter_typed_checks::<C>(&ctx, validation_scope)?;
 
     // Build the local envelope.
     let local_data: serde_json::Value = serde_json::to_value(&typed)
@@ -632,20 +650,16 @@ where
     let local_sha = local_envelope.sha256.clone();
 
     // Resolve adapter + store + key (mirrors the push flow).
-    ensure_adapter_defined(&args.adapter, Some(&ctx.manifest_loader))?;
-    let adapter = adapter_registry::get_adapter(&args.adapter).ok_or_else(|| {
-        format!(
-            "adapter `{}` is declared in {} but not registered in this build",
-            args.adapter,
-            args.manifest.display()
-        )
-    })?;
     let logical = resolve_config_store_id(args.store.as_deref(), ctx.manifest())?;
-    let env_config = EnvConfig::from_env();
-    let platform = env_config.store_name("config", &logical);
-    let store = ResolvedStoreId::new(logical.clone(), platform);
-    // Diff exactly what `config push` would write, `--staging` included.
-    let key = resolve_config_key(args.key.as_deref(), &logical, args.staging)?;
+    let env_config = effective_manifest_environment(ctx.manifest(), &args.adapter, env::vars());
+    let (store, key) = resolve_config_store_and_key(
+        adapter,
+        &env_config,
+        &logical,
+        args.key.as_deref(),
+        args.staging,
+        args.local,
+    )?;
 
     // Resolve adapter paths for the read call.
     let manifest_root = ctx
@@ -1351,16 +1365,41 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
         )
     })?;
     let logical = resolve_config_store_id(args.store.as_deref(), validation.manifest())?;
-    let env_config = EnvConfig::from_env();
-    let platform = env_config.store_name("config", &logical);
+    let env_config =
+        effective_manifest_environment(validation.manifest(), &args.adapter, env::vars());
+    let (store, key) = resolve_config_store_and_key(
+        adapter,
+        &env_config,
+        &logical,
+        args.key.as_deref(),
+        args.staging,
+        args.local,
+    )?;
     let adapter_push_ctx =
         resolve_adapter_push_ctx(args, &env_config, validation.manifest(), &args.adapter);
     Ok(PushContext {
         adapter,
         adapter_push_ctx,
-        store: ResolvedStoreId::new(logical, platform),
+        key,
+        store,
         validation,
     })
+}
+
+pub(crate) fn effective_manifest_environment<I, K, V>(
+    manifest: &Manifest,
+    adapter: &str,
+    parent: I,
+) -> EnvConfig
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    EnvConfig::from_vars(merge_env_defaults(
+        manifest_variable_defaults(manifest, adapter),
+        parent,
+    ))
 }
 
 /// Resolve the push-time overlay values: `--local` flag (passed
@@ -1379,31 +1418,39 @@ fn resolve_adapter_push_ctx(
     }
 }
 
-/// Derive the config-store key a push or diff targets.
+/// Resolve the config-store key a push or diff targets after [`EnvConfig`] has
+/// applied the canonical environment override and production/staging fallback.
 ///
-/// `--staging` writes (or diffs) the `<logical>_staging` variant in the SAME
-/// store — never the production key the live service reads. Fastly config stores
-/// are not versioned like staged service versions, so a different key is what
-/// isolates staged config.
-///
-/// `--key` and `--staging` are mutually exclusive, and that is not a style
-/// choice. The staging key is not merely a name we write: a staged deploy puts
-/// `<logical>_staging` into the staging selector store, and that selector is what
-/// a staged version READS. An explicit key would be written to a key nothing
-/// selects — a push that silently goes nowhere. Refuse instead.
+/// `--key` keeps its production override behavior. It remains incompatible with
+/// `--staging`, because a staged push must use the canonical target key resolved
+/// from `EDGEZERO__STORES__CONFIG__<ID>__KEY` and the adapter policy.
 fn resolve_config_key(
     explicit: Option<&str>,
-    logical: &str,
+    runtime_key: &str,
     staging: bool,
 ) -> Result<String, String> {
     match (explicit, staging) {
         (Some(key), true) => Err(format!(
-            "`--key {key}` cannot be combined with `--staging`. The staging key is derived from the store's logical id (`{logical}_staging`) because that is what the staging selector store — created and linked by a staged deploy — points a staged version at. An explicit key would be written to a key nothing reads.\n  Push the staged config without `--key`, or push to `--key {key}` without `--staging` and point the selector at it yourself."
+            "`--key {key}` cannot be combined with `--staging`. A staged push must use the canonical `EDGEZERO__STORES__CONFIG__<ID>__KEY` selected for that target (currently `{runtime_key}`), so the pushed entry and deployed runtime cannot diverge.\n  Set that canonical KEY in the staging environment and push without `--key`, or push to `--key {key}` without `--staging`."
         )),
         (Some(key), false) => Ok(key.to_owned()),
-        (None, false) => Ok(logical.to_owned()),
-        (None, true) => Ok(format!("{logical}_staging")),
+        (None, _) => Ok(runtime_key.to_owned()),
     }
+}
+
+fn resolve_config_store_and_key(
+    adapter: &dyn adapter_registry::Adapter,
+    env_config: &EnvConfig,
+    logical: &str,
+    explicit_key: Option<&str>,
+    staging: bool,
+    local: bool,
+) -> Result<(ResolvedStoreId, String), String> {
+    let platform = env_config.store_name_checked("config", logical)?;
+    let runtime_key = env_config.store_key_checked("config", logical)?;
+    let key = resolve_config_key(explicit_key, &runtime_key, staging)?;
+    adapter.validate_config_key_for_target(logical, &key, staging, local)?;
+    Ok((ResolvedStoreId::new(logical, platform), key))
 }
 
 fn resolve_config_store_id(requested: Option<&str>, manifest: &Manifest) -> Result<String, String> {
@@ -1526,10 +1573,18 @@ fn resolve_app_config_path(
     )
 }
 
-fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
-    run_adapter_shared_checks(ctx)?;
+fn run_shared_checks(
+    ctx: &ValidationContext,
+    adapter_scope: AdapterValidationScope,
+) -> Result<(), String> {
+    run_adapter_shared_checks(ctx, adapter_scope)?;
     if ctx.args_strict {
-        strict_capability_completeness(ctx.manifest())?;
+        match adapter_scope {
+            AdapterValidationScope::All => strict_capability_completeness(ctx.manifest())?,
+            AdapterValidationScope::Selected(adapter) => {
+                enforce_single_store_capability(ctx.manifest(), adapter.name())?;
+            }
+        }
         strict_handler_paths(ctx.manifest())?;
     }
     Ok(())
@@ -1540,13 +1595,13 @@ fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
 // `Adapter` trait impl. No `if adapter == "spin"` branches here.
 // -------------------------------------------------------------------
 
-/// Run the adapter-agnostic shared checks: for every adapter
-/// declared in the manifest, look up its `Adapter` impl in the
-/// registry and invoke `validate_app_config_keys` +
-/// `validate_adapter_manifest`. Adapters not in the registry (e.g.
-/// a feature-gated build that omitted some) are silently skipped —
-/// they can't validate what they don't link.
-fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
+/// Run adapter-specific shared checks for the requested scope. Whole-project
+/// validation checks every registered adapter declared in the manifest;
+/// targeted lifecycle commands check only their selected adapter.
+fn run_adapter_shared_checks(
+    ctx: &ValidationContext,
+    adapter_scope: AdapterValidationScope,
+) -> Result<(), String> {
     let raw_table = ctx
         .raw_config
         .as_table()
@@ -1554,12 +1609,17 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
     let flattened = flatten_keys(raw_table);
     let key_refs: Vec<&str> = flattened.iter().map(String::as_str).collect();
     let manifest_root = ctx.manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    let env_config = EnvConfig::from_env();
+    let parent_variables = env::vars().collect::<Vec<_>>();
 
-    for (name, adapter_cfg) in &ctx.manifest().adapters {
-        let Some(adapter) = adapter_registry::get_adapter(name) else {
-            continue;
-        };
+    let validate = |name: &str,
+                    adapter_cfg: &ManifestAdapter,
+                    adapter: &'static dyn adapter_registry::Adapter|
+     -> Result<(), String> {
+        let env_config = effective_manifest_environment(
+            ctx.manifest(),
+            name,
+            parent_variables.iter().map(|(key, value)| (key, value)),
+        );
         adapter.validate_app_config_keys(&key_refs)?;
         adapter.validate_adapter_manifest(
             manifest_root,
@@ -1567,6 +1627,31 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
             adapter_cfg.adapter.component.as_deref(),
         )?;
         reject_merged_id_collisions(name, adapter, ctx.manifest(), &env_config)?;
+        Ok(())
+    };
+
+    match adapter_scope {
+        AdapterValidationScope::All => {
+            for (name, adapter_cfg) in &ctx.manifest().adapters {
+                let Some(adapter) = adapter_registry::get_adapter(name) else {
+                    continue;
+                };
+                validate(name, adapter_cfg, adapter)?;
+            }
+        }
+        AdapterValidationScope::Selected(adapter) => {
+            let (name, adapter_cfg) =
+                ctx.manifest()
+                    .adapter_entry(adapter.name())
+                    .ok_or_else(|| {
+                        format!(
+                            "adapter `{}` has no `[adapters.{}]` block",
+                            adapter.name(),
+                            adapter.name()
+                        )
+                    })?;
+            validate(name, adapter_cfg, adapter)?;
+        }
     }
     Ok(())
 }
@@ -1745,12 +1830,15 @@ fn collect_secret_leaves<'raw>(
     Ok(out)
 }
 
-/// Typed-only adapter dispatch: feed each adapter the `#[secret]`
+/// Typed-only adapter dispatch: feed each adapter in the requested scope the `#[secret]`
 /// (`KeyInDefault` and `KeyInNamedStore` — `StoreRef` values are
 /// runtime store ids, not flat-namespace candidates) so adapters
 /// whose secret store has a flat-namespace constraint (Spin) can
 /// detect within-secrets collisions.
-fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result<(), String> {
+fn run_adapter_typed_checks<C: AppConfigMeta>(
+    ctx: &ValidationContext,
+    adapter_scope: AdapterValidationScope,
+) -> Result<(), String> {
     let default_store_id = ctx
         .manifest()
         .stores
@@ -1780,8 +1868,16 @@ fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result
         }
     }
 
-    for name in ctx.manifest().adapters.keys() {
-        if let Some(adapter) = adapter_registry::get_adapter(name) {
+    match adapter_scope {
+        AdapterValidationScope::All => {
+            for name in ctx.manifest().adapters.keys() {
+                let Some(adapter) = adapter_registry::get_adapter(name) else {
+                    continue;
+                };
+                adapter.validate_typed_secrets(&entries)?;
+            }
+        }
+        AdapterValidationScope::Selected(adapter) => {
             adapter.validate_typed_secrets(&entries)?;
         }
     }
@@ -1994,9 +2090,43 @@ mod tests {
     use std::borrow::Cow;
 
     use std::fs;
-    #[cfg(unix)]
-    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    struct FixedConfigKeyAdapter;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the test adapter only customizes final config-key validation"
+    )]
+    impl adapter_registry::Adapter for FixedConfigKeyAdapter {
+        fn execute(
+            &self,
+            _action: adapter_registry::AdapterAction,
+            _args: &[String],
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "fixed-key-test"
+        }
+
+        fn validate_config_key_for_target(
+            &self,
+            logical_store_id: &str,
+            key: &str,
+            _staging: bool,
+            _local: bool,
+        ) -> Result<(), String> {
+            if key == logical_store_id {
+                Ok(())
+            } else {
+                Err("fixed key required".to_owned())
+            }
+        }
+    }
+
+    static FIXED_CONFIG_KEY_ADAPTER: FixedConfigKeyAdapter = FixedConfigKeyAdapter;
 
     // ---------- config gc argument gating ----------
 
@@ -2124,6 +2254,29 @@ serve = "echo"
 ids = ["app_config"]
 "#;
 
+    const GC_MANIFEST_WITH_STORE_DEFAULT: &str = r#"
+[app]
+name = "demo-app"
+
+[[environment.variables]]
+name = "CONFIG_STORE"
+env = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"
+value = "manifest_config"
+adapters = ["fastly"]
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+"#;
+
     /// COMMAND-LEVEL GC: a dry-run drives the whole wrapper — manifest load, store
     /// resolution, adapter-registry dispatch, listing, classification, and
     /// reporting — end to end. A store with only a live root and a foreign sibling
@@ -2135,7 +2288,6 @@ ids = ["app_config"]
         use serde_json::json;
 
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
 
         let live = serde_json::to_string(&BlobEnvelope::new(
@@ -2179,7 +2331,6 @@ ids = ["app_config"]
         use serde_json::json;
 
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
 
         let list = json!([
@@ -2228,7 +2379,6 @@ ids = ["app_config"]
         use serde_json::json;
 
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let _env = EnvOverride::set(
             "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME",
             "shared_config",
@@ -2265,6 +2415,116 @@ ids = ["app_config"]
         assert!(
             log.contains("--store-id=store-42"),
             "the entry listing must run against the ENV-derived store id: {log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_gc_command_selects_the_manifest_default_store() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(GC_MANIFEST_WITH_STORE_DEFAULT, FIXTURE_APP_CONFIG);
+        let live = serde_json::to_string(&BlobEnvelope::new(
+            json!({ "greeting": "hi" }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        let entries = json!([
+            { "item_key": "app_config", "item_value": live, "created_at": "2026-07-01T00:00:00Z" },
+        ])
+        .to_string();
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_gc_list(
+            r#"[{"name":"manifest_config","id":"store-default"}]"#,
+            &entries,
+            &oplog,
+        );
+        let _prepend = PathPrepend::new(fake.path());
+
+        run_config_gc(&ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest,
+            store: None,
+            no_env: false,
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        })
+        .expect("manifest store default must be applied");
+
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            log.contains("--store-id=store-default"),
+            "gc must use the adapter-scoped manifest default: {log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_gc_rejects_an_empty_store_selector_before_provider_io() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _selector = EnvOverride::set("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "");
+        let (dir, manifest, _) = setup_project(GC_MANIFEST, FIXTURE_APP_CONFIG);
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_gc_list(
+            r#"[{"name":"app_config","id":"store-logical"}]"#,
+            "[]",
+            &oplog,
+        );
+        let _prepend = PathPrepend::new(fake.path());
+
+        let error = run_config_gc(&ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest,
+            store: None,
+            no_env: false,
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        })
+        .expect_err("an explicitly empty store selector must be rejected");
+
+        assert!(
+            error.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"),
+            "error must identify the invalid selector without its value: {error}"
+        );
+        assert!(!oplog.exists(), "provider must not be called: {oplog:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_gc_no_env_ignores_manifest_and_parent_store_selectors() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _selector = EnvOverride::set(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME",
+            "parent_config",
+        );
+        let (dir, manifest, _) = setup_project(GC_MANIFEST_WITH_STORE_DEFAULT, FIXTURE_APP_CONFIG);
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_gc_list(
+            r#"[{"name":"app_config","id":"store-logical"}]"#,
+            "[]",
+            &oplog,
+        );
+        let _prepend = PathPrepend::new(fake.path());
+
+        run_config_gc(&ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest,
+            store: None,
+            no_env: true,
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        })
+        .expect("--no-env must select the logical store");
+
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            log.contains("--store-id=store-logical"),
+            "--no-env must suppress manifest and parent selectors: {log}"
         );
     }
 
@@ -2444,28 +2704,200 @@ source = "target/wasm32-wasip2/release/demo.wasm"
 
     #[test]
     fn resolve_config_key_covers_key_and_staging_combinations() {
+        let defaults = EnvConfig::default();
+        let production_default = defaults.store_key("config", "app_config");
         // Production: the logical id, or an explicit --key verbatim.
         assert_eq!(
-            resolve_config_key(None, "app_config", false).unwrap(),
+            resolve_config_key(None, &production_default, false).unwrap(),
             "app_config"
         );
         assert_eq!(
-            resolve_config_key(Some("custom"), "app_config", false).unwrap(),
+            resolve_config_key(Some("custom"), &production_default, false).unwrap(),
             "custom"
         );
-        // Staging: the `<logical>_staging` variant the selector store points at.
+        let selected =
+            EnvConfig::from_vars([("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", "app_config")]);
+        let selected_production_key = selected.store_key("config", "app_config");
         assert_eq!(
-            resolve_config_key(None, "app_config", true).unwrap(),
-            "app_config_staging"
+            resolve_config_key(None, &selected_production_key, false).unwrap(),
+            selected_production_key,
+            "production push and runtime selection must use the same explicit canonical KEY"
         );
-        // --key + --staging is REFUSED: an explicit staging key would be written
-        // to a key the staging selector never points at, so nothing would read
-        // it. A silent no-op is worse than an error.
-        let err = resolve_config_key(Some("custom"), "app_config", true)
+        let selected_runtime_key = selected.store_key("config", "app_config");
+        assert_eq!(
+            resolve_config_key(None, &selected_runtime_key, true).unwrap(),
+            selected_runtime_key,
+            "staging push and runtime must select the same explicit canonical KEY"
+        );
+
+        // --key + --staging is refused because only the canonical environment KEY
+        // can guarantee that the pushed entry is the one the deployed runtime
+        // reads.
+        let err = resolve_config_key(Some("custom"), &selected_runtime_key, true)
             .expect_err("--key with --staging must be rejected");
         assert!(
-            err.contains("--staging") && err.contains("app_config_staging"),
-            "the error must explain the derivation: {err}"
+            err.contains("--staging")
+                && err.contains("EDGEZERO__STORES__CONFIG__<ID>__KEY")
+                && !err.contains("selector store"),
+            "the error must explain canonical runtime-key selection without legacy selectors: {err}"
+        );
+    }
+
+    #[test]
+    fn config_target_rejects_present_invalid_selectors_before_fallback() {
+        for (setting, value) in [("NAME", ""), ("NAME", "bad\nname"), ("KEY", "   ")] {
+            let variable = format!("EDGEZERO__STORES__CONFIG__APP_CONFIG__{setting}");
+            let env = EnvConfig::from_vars([(variable.as_str(), value)]);
+            let error = resolve_config_store_and_key(
+                &FIXED_CONFIG_KEY_ADAPTER,
+                &env,
+                "app_config",
+                None,
+                false,
+                false,
+            )
+            .expect_err("present invalid selectors must fail instead of falling back");
+            assert!(
+                error.contains(&variable),
+                "error must name {variable}: {error}"
+            );
+            assert!(
+                value.is_empty() || !error.contains(value),
+                "error must redact the invalid value: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_target_validates_the_final_key_after_cli_precedence() {
+        let env = EnvConfig::default();
+        let (store, key) = resolve_config_store_and_key(
+            &FIXED_CONFIG_KEY_ADAPTER,
+            &env,
+            "app_config",
+            None,
+            false,
+            false,
+        )
+        .expect("the deterministic default is accepted");
+        assert_eq!(store, ResolvedStoreId::from_logical("app_config"));
+        assert_eq!(key, "app_config");
+
+        let error = resolve_config_store_and_key(
+            &FIXED_CONFIG_KEY_ADAPTER,
+            &env,
+            "app_config",
+            Some("custom"),
+            false,
+            false,
+        )
+        .expect_err("adapter validation must see the explicit final key");
+        assert_eq!(error, "fixed key required");
+
+        let (_, staging_key) = resolve_config_store_and_key(
+            &FIXED_CONFIG_KEY_ADAPTER,
+            &env,
+            "app_config",
+            None,
+            true,
+            false,
+        )
+        .expect("staging uses the same logical key without target derivation");
+        assert_eq!(staging_key, "app_config");
+
+        let staging_env = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+            "app_config_staging",
+        )]);
+        let staging_error = resolve_config_store_and_key(
+            &FIXED_CONFIG_KEY_ADAPTER,
+            &staging_env,
+            "app_config",
+            None,
+            true,
+            false,
+        )
+        .expect_err("target-specific keys must not change runtime behavior");
+        assert_eq!(staging_error, "fixed key required");
+    }
+
+    #[test]
+    fn manifest_defaults_and_parent_select_the_same_store_and_key_as_deploy() {
+        let manifest = ManifestLoader::load_from_str(
+            r#"
+[app]
+name = "demo-app"
+
+[[environment.variables]]
+name = "CONFIG_NAME"
+env = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"
+value = "manifest-name"
+adapters = ["fastly"]
+
+[[environment.variables]]
+name = "CONFIG_KEY"
+env = "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"
+value = "manifest-key"
+adapters = ["fastly"]
+
+[[environment.variables]]
+name = "OTHER_ADAPTER"
+env = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"
+value = "must-not-apply"
+adapters = ["cloudflare"]
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+
+[stores.config]
+ids = ["app_config"]
+"#,
+        );
+        let defaults = effective_manifest_environment(
+            manifest.manifest(),
+            "fastly",
+            iter::empty::<(&str, &str)>(),
+        );
+        assert_eq!(defaults.store_name("config", "app_config"), "manifest-name");
+        assert_eq!(defaults.store_key("config", "app_config"), "manifest-key");
+
+        let parent = effective_manifest_environment(
+            manifest.manifest(),
+            "fastly",
+            [
+                ("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "parent-name"),
+                ("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", "parent-key"),
+            ],
+        );
+        assert_eq!(parent.store_name("config", "app_config"), "parent-name");
+        assert_eq!(parent.store_key("config", "app_config"), "parent-key");
+
+        let no_key = ManifestLoader::load_from_str(
+            r#"
+[app]
+name = "demo-app"
+
+[[environment.variables]]
+name = "CONFIG_NAME"
+env = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"
+value = "manifest-name"
+adapters = ["fastly"]
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+
+[stores.config]
+ids = ["app_config"]
+"#,
+        );
+        let staging_without_key = effective_manifest_environment(
+            no_key.manifest(),
+            "fastly",
+            iter::empty::<(&str, &str)>(),
+        );
+        assert_eq!(
+            staging_without_key.store_key("config", "app_config"),
+            "app_config"
         );
     }
 
@@ -3520,6 +3952,60 @@ ids = ["default"]
         }
     }
 
+    /// A targeted Fastly push validates the selected adapter only. The
+    /// application manifest may declare Spin for a different publisher without
+    /// making `spin.toml` part of the Fastly deployment input.
+    #[test]
+    fn fastly_push_does_not_require_unselected_spin_manifest() {
+        const MULTI_ADAPTER_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[adapters.spin.adapter]
+crate = "crates/demo-app-adapter-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(MULTI_ADAPTER_MANIFEST, FIXTURE_APP_CONFIG);
+        fs::write(
+            dir.path().join("fastly.toml"),
+            "manifest_version = 3\nname = \"demo-app\"\nlanguage = \"rust\"\n",
+        )
+        .expect("write fastly.toml");
+        assert!(
+            !dir.path().join("spin.toml").exists(),
+            "the unselected adapter manifest must be absent for this regression"
+        );
+
+        let mut args = push_args(&manifest, "fastly");
+        args.local = true;
+        args.dry_run = true;
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+
+        run_config_push_typed::<FixtureConfig>(&args)
+            .expect("a Fastly push must not load the unselected Spin manifest");
+    }
+
     /// The dry-run degradation does NOT weaken the real push: a real
     /// `config push --local` over malformed TOML still fails fatally at the
     /// writer (which cannot parse the file to write into it).
@@ -3558,12 +4044,10 @@ ids = ["default"]
             .expect_err("a real push over malformed TOML must fail at the writer");
     }
 
-    /// The body-aware preflight runs BEFORE any remote I/O: an infeasible cloud
-    /// push (here, a reserved `--key`) fails with the preflight error, not a
-    /// `fastly`-not-found / auth error from the remote read. If preflight ran
-    /// after `read_remote`, the error would be about the missing/failed shell-out.
+    /// Fastly's deterministic-key policy runs before any remote I/O. A custom
+    /// `--key` fails locally rather than reaching a provider read or write.
     #[test]
-    fn cloud_push_preflight_rejects_reserved_key_before_remote_io() {
+    fn fastly_push_rejects_custom_key_before_remote_io() {
         const FASTLY_ONLY_MANIFEST: &str = r#"
 [app]
 name = "demo-app"
@@ -3584,7 +4068,6 @@ ids = ["app_config"]
 ids = ["default"]
 "#;
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
         // A fake `fastly` on PATH records any invocation, so an ordering
         // regression shows up as a logged call rather than a real shell-out.
@@ -3593,22 +4076,72 @@ ids = ["default"]
         let _prepend = PathPrepend::new(fake.path());
 
         let mut args = push_args(&manifest, "fastly");
-        // A reserved-namespace --key: infeasible, and preflight-detectable.
+        // Fastly derives the production key from the logical store ID.
         args.key = Some("app_config.__edgezero_chunks.deadbeef.0".to_owned());
         args.yes = true;
         args.app_config = Some(dir.path().join("demo-app.toml"));
 
         let err = run_config_push_typed::<FixtureConfig>(&args)
-            .expect_err("a reserved --key must be rejected");
+            .expect_err("a custom Fastly --key must be rejected");
         assert!(
-            err.contains("reserved infix"),
-            "must fail at preflight (before any remote read), not on a shell-out: {err}"
+            err.contains("logical config key `app_config`"),
+            "must fail at Fastly key validation before any remote read: {err}"
         );
         assert!(
             !oplog.exists(),
             "preflight must reject BEFORE any `fastly` invocation; log: {:?}",
             fs::read_to_string(&oplog).unwrap_or_default()
         );
+    }
+
+    /// An explicitly exported but empty canonical selector must fail while the
+    /// push context is being resolved. It must never fall back to the logical
+    /// store or key and reach the provider.
+    #[test]
+    fn fastly_push_rejects_empty_selectors_before_remote_io() {
+        const FASTLY_ONLY_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-app-adapter-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+"#;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+        let oplog = dir.path().join("fastly-ops.log");
+        let fake = fake_fastly_logging(&oplog);
+        let _prepend = PathPrepend::new(fake.path());
+
+        let mut args = push_args(&manifest, "fastly");
+        args.yes = true;
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+
+        for variable in [
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME",
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+        ] {
+            let selector = EnvOverride::set(variable, "");
+            let error = run_config_push_typed::<FixtureConfig>(&args)
+                .expect_err("an exported empty selector must fail before provider I/O");
+            assert!(
+                error.contains(variable),
+                "error must identify the invalid canonical selector: {error}"
+            );
+            assert!(
+                !oplog.exists(),
+                "selector validation must reject before any `fastly` invocation"
+            );
+            drop(selector);
+        }
     }
 
     /// Stronger ordering proof: the generic push runs the FULL body-aware
@@ -3622,7 +4155,7 @@ ids = ["default"]
     /// the generic path performs no list/describe/update/delete before the offline
     /// feasibility check has passed.
     #[test]
-    fn cloud_push_preflight_rejects_derived_key_overflow_before_remote_io() {
+    fn fastly_push_preflight_rejects_derived_key_overflow_before_remote_io() {
         const FASTLY_ONLY_MANIFEST: &str = r#"
 [app]
 name = "demo-app"
@@ -3643,8 +4176,9 @@ ids = ["app_config"]
 ids = ["default"]
 "#;
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _path_lock = path_mutation_guard().lock().expect("path guard");
-        let (dir, manifest, _) = setup_project(FASTLY_ONLY_MANIFEST, FIXTURE_APP_CONFIG);
+        let logical = "r".repeat(200);
+        let long_id_manifest = FASTLY_ONLY_MANIFEST.replace("app_config", &logical);
+        let (dir, manifest, _) = setup_project(&long_id_manifest, FIXTURE_APP_CONFIG);
         // A fake `fastly` on PATH records any invocation, so an ordering
         // regression shows up as a logged call rather than a real shell-out
         // against the developer's authenticated CLI.
@@ -3660,9 +4194,9 @@ ids = ["default"]
         fs::write(dir.path().join("demo-app.toml"), big_app_config).expect("write big app config");
 
         let mut args = push_args(&manifest, "fastly");
-        // A VALID root key (<= 255 chars, no reserved infix) whose DERIVED chunk
-        // key (+~85 chars) overflows the store's 255-char limit once chunked.
-        args.key = Some("r".repeat(200));
+        // A valid logical root key (<= 255 chars, no reserved infix) whose
+        // derived chunk key (+~85 chars) exceeds Fastly's 255-char limit.
+        args.store = Some(logical);
         args.yes = true;
         args.app_config = Some(dir.path().join("demo-app.toml"));
 
@@ -4408,15 +4942,6 @@ ids = ["default"]
 
     // --- PATH-mutation helpers (mirrors Cloudflare adapter test pattern) ---
 
-    /// Process-wide mutex serialising PATH-mutating tests so parallel
-    /// test threads don't race on the `$PATH` environment variable.
-    #[cfg(unix)]
-    fn path_mutation_guard() -> &'static Mutex<()> {
-        use std::sync::OnceLock;
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
-    }
-
     /// Build a tempdir containing a `fastly` script that APPENDS every
     /// invocation to `oplog` and fails. Injected via PATH so an ordering
     /// regression is caught as a recorded invocation instead of silently
@@ -4546,7 +5071,6 @@ ids = ["default"]
     #[test]
     fn c4_unsupported_yes_flag_passes_consent_reaches_write() {
         let _manifest = manifest_guard().lock().expect("manifest guard");
-        let _path = path_mutation_guard().lock().expect("path mutation guard");
         let (dir, manifest_path, _) = setup_project(&spin_cloud_manifest(), FIXTURE_APP_CONFIG);
         write_minimal_spin_toml(dir.path());
         // Inject a fake `spin` that returns exit 1 immediately so the

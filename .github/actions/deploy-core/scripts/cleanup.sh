@@ -7,9 +7,7 @@ set -euo pipefail
 # This script does `rm -rf`, so it removes ONLY directories it can prove the
 # action owns: real paths strictly beneath RUNNER_TEMP. An inherited or
 # job-level value pointing at the checkout — or anywhere else on a self-hosted
-# runner — is refused, not deleted. (An earlier revision removed
-# `$EDGEZERO_FASTLY_HOME`, a variable nothing in the action ever set: its value
-# could only ever come from the caller's environment.)
+# runner — is refused, not deleted.
 #
 # Reads (env):
 #   RUNNER_TEMP                           required  the only root anything may be removed beneath

@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, PoisonError, RwLock};
 
 static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
@@ -41,25 +41,64 @@ pub enum AdapterAction {
     Serve,
 }
 
-/// A single declared store id, paired with the platform name the
-/// runtime will resolve via `EDGEZERO__STORES__<KIND>__<ID>__NAME`.
+/// Logical store ids declared by the application manifest for a deploy.
 ///
-/// The CLI's `provision` and `push` paths resolve the env override
-/// once (against `std::env`) and pass both names through, so the
-/// adapter writes the PLATFORM name into wrangler.toml /
-/// spin.toml / fastly.toml. Without the platform name on this
-/// side, `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config`
-/// would be silently ignored at provision time and the runtime
-/// would later look up a binding named `prod_config` that
-/// provision never created.
+/// This stays platform-neutral: each adapter decides whether and how its
+/// runtime needs these declarations materialized.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DeployStoreIds {
+    pub config: Vec<String>,
+    pub kv: Vec<String>,
+    pub secrets: Vec<String>,
+}
+
+impl DeployStoreIds {
+    /// Whether the application declares no runtime stores of any kind.
+    #[must_use]
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.config.is_empty() && self.kv.is_empty() && self.secrets.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DeployOwnership {
+    AdapterManaged,
+    #[default]
+    ManifestCommand,
+}
+
+/// Structured application context for an adapter deploy.
+///
+/// Native-CLI passthrough remains in the separate `args` slice. EdgeZero-owned
+/// deployment data belongs here so it cannot collide with provider CLI flags.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AdapterDeployContext {
+    pub adapter_manifest_path: Option<PathBuf>,
+    /// Exact application manifest loaded by the generic CLI.
+    pub application_manifest_path: Option<PathBuf>,
+    /// Canonical root of an extracted immutable application release.
+    pub application_release_root: Option<PathBuf>,
+    pub service_id: Option<String>,
+    pub staging: bool,
+    pub stores: DeployStoreIds,
+    pub variable_defaults: BTreeMap<String, String>,
+}
+
+/// A declared logical store id paired with the selected provider resource name.
+///
+/// The CLI resolves `EDGEZERO__STORES__<KIND>__<ID>__NAME` once before a
+/// provider operation. Adapters decide how the selected resource is exposed to
+/// package code: some runtimes open the selected platform binding directly,
+/// while Fastly links the selected physical resource under the logical id.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedStoreId {
     /// The logical id declared in `[stores.<kind>].ids`. Used for
     /// human-facing messages and for the validate/strict checks.
     pub logical: String,
-    /// The platform name the runtime resolves at request time --
-    /// `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME` or, when unset,
-    /// the logical id itself.
+    /// The provider resource or binding selected by
+    /// `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME`, falling back to the logical
+    /// id when unset. This is not necessarily the alias opened by package code.
     pub platform: String,
 }
 
@@ -273,7 +312,42 @@ pub enum ReadConfigEntry {
 /// `SecretField` from `edgezero-core`) so this crate stays dep-free
 /// of `edgezero-core`. Defaults are no-ops; adapters override what
 /// they actually need.
+#[expect(
+    clippy::arbitrary_source_item_ordering,
+    reason = "deploy lifecycle hooks read in invocation order: preflight before deploy"
+)]
 pub trait Adapter: Sync + Send {
+    /// Decide whether the manifest command or adapter owns this deployment.
+    ///
+    /// # Errors
+    /// Returns an error string when the adapter cannot safely select a deploy path.
+    #[inline]
+    fn preflight_deploy(
+        &self,
+        _context: &AdapterDeployContext,
+        _args: &[String],
+    ) -> Result<DeployOwnership, String> {
+        Ok(DeployOwnership::ManifestCommand)
+    }
+
+    /// Deploy with EdgeZero-owned inputs carried as typed context and only
+    /// provider-native passthrough in `args`.
+    ///
+    /// Adapters that do not need structured deploy data can use the default
+    /// dispatch to their existing `execute` implementation.
+    ///
+    /// # Errors
+    /// Returns an error string when the adapter deploy fails.
+    #[inline]
+    fn deploy(&self, context: &AdapterDeployContext, args: &[String]) -> Result<(), String> {
+        let action = if context.staging {
+            AdapterAction::DeployStaging
+        } else {
+            AdapterAction::Deploy
+        };
+        self.execute(action, args)
+    }
+
     /// Execute the requested action with optional adapter-specific args.
     ///
     /// `args` is a stringly-typed pass-through for arguments meant
@@ -289,6 +363,23 @@ pub trait Adapter: Sync + Send {
     /// # Errors
     /// Returns an error string if the requested adapter action fails.
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
+
+    /// Finish a successful deploy.
+    ///
+    /// `command_output` is present when a manifest-defined deploy command ran
+    /// instead of the adapter's built-in deploy. Adapters can reconcile
+    /// provider state or emit deployment metadata from either path.
+    ///
+    /// # Errors
+    /// Returns an error string when provider state cannot be finalized.
+    #[inline]
+    fn finalize_deploy(
+        &self,
+        _context: &AdapterDeployContext,
+        _command_output: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Reclaim chunk entries that no LIVE config pointer references.
     ///
@@ -372,6 +463,29 @@ pub trait Adapter: Sync + Send {
     /// Returns a human-readable error string if the push is infeasible.
     #[inline]
     fn preflight_config_write(&self, _key: &str, _body: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Validate the final config key selected by CLI and environment precedence
+    /// before config push or diff performs provider I/O.
+    ///
+    /// `logical_store_id` is the portable manifest ID. `key` is the final key
+    /// the operation would read or write. `staging` identifies the requested
+    /// deployment target, and `local` identifies an emulator operation.
+    /// Adapters whose runtimes use fixed keys can reject a divergent selection;
+    /// the default preserves configurable keys.
+    ///
+    /// # Errors
+    /// Returns a human-readable error when the selected key cannot be read by
+    /// this adapter's runtime for the requested target.
+    #[inline]
+    fn validate_config_key_for_target(
+        &self,
+        _logical_store_id: &str,
+        _key: &str,
+        _staging: bool,
+        _local: bool,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -688,6 +802,18 @@ mod tests {
     }
 
     #[test]
+    fn default_deploy_preflight_keeps_manifest_command() {
+        let context = AdapterDeployContext::default();
+        assert_eq!(
+            FIRST.preflight_deploy(&context, &[]).unwrap(),
+            DeployOwnership::ManifestCommand
+        );
+        assert!(context.application_manifest_path.is_none());
+        assert!(context.application_release_root.is_none());
+        assert!(context.variable_defaults.is_empty());
+    }
+
+    #[test]
     fn registers_and_fetches_adapter() {
         let _guard = TEST_LOCK.lock().expect("lock");
         reset();
@@ -779,6 +905,10 @@ mod tests {
         );
         let entry = TypedSecretEntry::new("vault", "api_token", "demo_api_token");
         assert_eq!(FIRST.validate_typed_secrets(&[entry]), Ok(()));
+        assert_eq!(
+            FIRST.validate_config_key_for_target("app_config", "publisher-selected", true, false),
+            Ok(())
+        );
     }
 
     #[test]
