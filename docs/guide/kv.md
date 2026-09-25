@@ -119,7 +119,7 @@ Timing logs are limited to derived metadata such as lengths, counts, booleans, a
 
 ### Local Development
 
-- **Axum**: Uses a persistent `redb` embedded database stored under `.edgezero/`. Each declared KV id gets its own derived file; data persists across restarts (add `.edgezero/` to your `.gitignore`).
+- **Axum**: Uses a persistent `redb` embedded database under `.edgezero/`. Each distinct resolved store name gets its own file, `.edgezero/kv-<slug>-<hash>.redb`; ids that resolve to the same platform name share it. Data persists across restarts (add `.edgezero/` to your `.gitignore`).
 - **Fastly (Viceroy)**: Local Viceroy data uses a hand-authored
   `[local_server.kv_stores]` entry. For a default physical name, `edgezero
 provision --adapter fastly` creates the remote store and writes only the

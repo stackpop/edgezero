@@ -38,6 +38,7 @@ export default defineConfig({
           { text: 'Middleware', link: '/guide/middleware' },
           { text: 'Streaming', link: '/guide/streaming' },
           { text: 'Proxying', link: '/guide/proxying' },
+          { text: 'KV Storage', link: '/guide/kv' },
         ],
       },
       {

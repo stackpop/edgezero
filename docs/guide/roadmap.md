@@ -15,8 +15,6 @@ shift as the roadmap evolves.
   where proxy headers/automatic decompression apply so expectations match runtime behavior.
 - Example coverage: add focused guides for `axum.toml`, manifest `description` fields, logging
   precedence, and introspection routes + body-mode behavior to reduce ambiguity.
-- Spin support: add first-class Spin adapter support and document how EdgeZero manifests mirror
-  Spin-compatible deployments.
 - Provider additions: prototype a third adapter (e.g. AWS Lambda@Edge or Vercel Edge Functions)
   using the stabilized adapter API to validate cross-provider abstractions.
 
@@ -29,8 +27,10 @@ shift as the roadmap evolves.
 - Documentation baseline: published a single-source-of-truth docs set aligned with current APIs
   (App::build_app entrypoints, adapter dispatch signatures, middleware signature, proxy handle
   usage).
-- Platform focus: Fastly Compute@Edge and Cloudflare Workers are the primary edge targets, with Axum
-  serving local development and native deployment needs.
+- Platform focus: Fastly Compute@Edge, Cloudflare Workers, and Fermyon Spin are the edge targets,
+  with Axum serving local development and native deployment needs.
+- Spin support: first-class `edgezero-adapter-spin` (`wasm32-wasip2`) with its own adapter guide,
+  contract tests, and CLI scaffold target.
 - Core contracts: request/response mapping rules are now captured in the adapter contract docs.
 
 ## Open Design Questions (for later pickup)

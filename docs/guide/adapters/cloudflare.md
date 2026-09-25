@@ -5,7 +5,7 @@ Deploy EdgeZero applications to Cloudflare Workers using WebAssembly.
 ## Prerequisites
 
 - [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/)
-- worker-builder: `cargo install worker-builder`
+- worker-build: `cargo install worker-build`
 - Rust `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
 
 ## Project Setup
@@ -28,10 +28,10 @@ The Wrangler manifest configures your Worker:
 ```toml
 name = "my-app"
 main = "build/worker/shim.mjs"
-compatibility_date = "2024-01-01"
+compatibility_date = "2023-05-01"
 
 [build]
-command = "edgezero build --adapter cloudflare"
+command = "worker-build --release"
 ```
 
 ### Entrypoint
@@ -56,10 +56,35 @@ derived from the baked store ids and queried individually). Per-id
 request extensions automatically. No `edgezero.toml` is loaded by
 the runtime — see [the migration guide](../manifest-store-migration.md).
 
-The low-level `dispatch()` helper remains available only for fully manual wiring and does not inject
-store metadata. Prefer `run_app` or `dispatch_with_config` for normal use.
-`dispatch_with_config_handle` exists for advanced/manual cases where you already have a prepared
-`ConfigStoreHandle`.
+For fully manual wiring, `CloudflareService::new(&app)` builds a dispatcher one
+store at a time: `.with_config(binding)` (a KV binding name),
+`.with_config_handle(handle)`, `.with_kv(binding)`, `.with_secrets()`, the
+matching `.require_kv()` / `.require_secrets()` flags, and finally
+`.dispatch(req, env, ctx).await`, which needs the worker `Env` and `Context`
+to open bindings:
+
+```rust
+use edgezero_adapter_cloudflare::request::CloudflareService;
+use edgezero_core::app::Hooks as _;
+use my_app_core::App;
+use worker::*;
+
+#[event(fetch)]
+pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    let app = App::build_app();
+    CloudflareService::new(&app)
+        .with_config("app_config")
+        .with_kv("sessions")
+        .dispatch(req, env, ctx)
+        .await
+}
+```
+
+This path takes bindings verbatim and does not resolve `EDGEZERO__STORES__*`
+selectors, so prefer `run_app` unless you are mocking a backend.
+`run_app` dispatches through an internal registry-based path; unlike Fastly's
+`dispatch_with_registries`, it is not part of the Cloudflare adapter's public
+API.
 
 ## Building
 
@@ -98,7 +123,7 @@ wrangler deploy --cwd crates/my-app-adapter-cloudflare
 Cloudflare Workers use the global `fetch` API for outbound requests:
 
 ```rust
-use edgezero_adapter_cloudflare::CloudflareProxyClient;
+use edgezero_adapter_cloudflare::proxy::CloudflareProxyClient;
 use edgezero_core::proxy::ProxyService;
 
 let client = CloudflareProxyClient;
@@ -124,7 +149,7 @@ Access Cloudflare-specific APIs via the request context extensions:
 
 ```rust
 use edgezero_core::context::RequestContext;
-use edgezero_adapter_cloudflare::CloudflareRequestContext;
+use edgezero_adapter_cloudflare::context::CloudflareRequestContext;
 
 async fn handler(ctx: RequestContext) -> Result<Response, EdgeError> {
     if let Some(cf_ctx) = CloudflareRequestContext::get(ctx.request()) {
@@ -138,19 +163,18 @@ async fn handler(ctx: RequestContext) -> Result<Response, EdgeError> {
 }
 ```
 
-## Environment Variables & Secrets
+## Environment Variables
 
-Define variables in `wrangler.toml`:
+Define non-secret variables in `wrangler.toml`; the adapter reads the
+`EDGEZERO__*` selectors from the same `[vars]` table:
 
 ```toml
 [vars]
 API_URL = "https://api.example.com"
-
-# Secrets are set via wrangler CLI
-# wrangler secret put API_KEY
 ```
 
-Access in handlers via the Cloudflare context or environment bindings.
+Secrets go through the Worker secret store instead; see
+[Secret Store](#secret-store).
 
 ## Config Store
 
@@ -174,23 +198,61 @@ id      = "abc123…"
 
 The binding name comes from `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME`
 (defaulting to the logical id `app_config` when unset). Populate the
-namespace via `wrangler kv:key put`. Missing bindings log a one-time
+namespace via `wrangler kv key put`. Missing bindings log a one-time
 warning and the id is dropped from the registry. See
 [the migration guide](../manifest-store-migration.md) if you are coming
 from the pre-rewrite `[vars]`-backed JSON-string form.
 
+KV and config share the same `[[kv_namespaces]]` binding space on Cloudflare,
+so the same logical id must not appear under both `[stores.kv]` and
+`[stores.config]`; both would resolve to a single underlying namespace at
+runtime. `edgezero config validate` rejects the collision.
+
+## Secret Store
+
+Worker Secrets is a single flat bag with no namespace concept, so exactly one
+`[stores.secrets]` id is permitted; `edgezero config validate --strict` rejects
+more than one. Handlers read values through the `Secrets` extractor or
+`ctx.secret_store(id)`, and a secret with no matching binding resolves to `None`
+rather than erroring.
+
+```toml
+# edgezero.toml
+[stores.secrets]
+ids = ["default"]
+```
+
+Populate secrets with the Wrangler CLI; there is no binding flag, since the
+secret name is the binding:
+
+```bash
+wrangler secret put API_KEY
+```
+
 ## KV Storage
 
-Use Cloudflare KV for edge storage:
+Each declared `[stores.kv]` id maps to a KV namespace binding, exactly like a
+config id:
+
+```toml
+# edgezero.toml
+[stores.kv]
+ids = ["sessions"]
+```
 
 ```toml
 # wrangler.toml
 [[kv_namespaces]]
-binding = "MY_KV"
-id = "abc123"
+binding = "sessions"
+id      = "abc123…"
 ```
 
-Access via the Cloudflare environment bindings in your handler.
+The binding name comes from `EDGEZERO__STORES__KV__SESSIONS__NAME`, defaulting
+to the logical id. `edgezero provision --adapter cloudflare` creates the
+namespace and appends the binding for you. Handlers reach the store through the
+portable `Kv` extractor or `ctx.kv_store(id)`; a hand-picked binding that is not
+declared under `[stores.kv]` is never opened. See [KV Storage](/guide/kv) for
+the API.
 
 ## Durable Objects
 
@@ -206,7 +268,7 @@ bindings = [
 
 ## Streaming
 
-Cloudflare Workers support streaming via `ReadableStream`. The adapter automatically converts `Body::stream` to Cloudflare's streaming format.
+Cloudflare Workers support streaming via `ReadableStream`. The adapter automatically converts `Body::Stream` to Cloudflare's streaming format.
 
 See the [Streaming guide](/guide/streaming) for examples and patterns.
 
