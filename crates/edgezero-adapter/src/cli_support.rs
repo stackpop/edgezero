@@ -8,6 +8,9 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::process;
+use crate::registry::{AuthState, AuthStatusOutcome};
+
 /// Walks up the directory tree looking for `manifest_name` alongside a `Cargo.toml`.
 #[inline]
 #[must_use]
@@ -80,21 +83,46 @@ pub fn path_distance(left: &Path, right: &Path) -> usize {
 /// the child fails to spawn, or it exits non-zero.
 #[inline]
 pub fn run_native_cli(program: &str, args: &[&str], install_hint: &str) -> Result<(), String> {
-    let status = Command::new(program).args(args).status().map_err(|err| {
+    match native_auth_status(program, args, install_hint)?.failure {
+        None => Ok(()),
+        Some(failure) => Err(failure),
+    }
+}
+
+/// [`run_native_cli`] for a session probe (`wrangler whoami`, …): a non-zero
+/// exit is a RESULT (`Unauthenticated`, carrying the same message
+/// `run_native_cli` would return), not an error.
+///
+/// # Errors
+/// Returns an error string if the binary is missing from `PATH` or the child
+/// fails to spawn.
+#[inline]
+pub fn native_auth_status(
+    program: &str,
+    args: &[&str],
+    install_hint: &str,
+) -> Result<AuthStatusOutcome, String> {
+    let status = process::status(Command::new(program).args(args)).map_err(|err| {
         if err.kind() == ErrorKind::NotFound {
             format!("`{program}` not found on PATH; {install_hint}")
         } else {
             format!("failed to spawn `{program}`: {err}")
         }
     })?;
-    if status.success() {
-        Ok(())
+    Ok(if status.success() {
+        AuthStatusOutcome {
+            failure: None,
+            state: AuthState::Authenticated,
+        }
     } else {
-        Err(format!(
-            "`{program} {}` exited with status {status}",
-            args.join(" ")
-        ))
-    }
+        AuthStatusOutcome {
+            failure: Some(format!(
+                "`{program} {}` exited with status {status}",
+                args.join(" ")
+            )),
+            state: AuthState::Unauthenticated,
+        }
+    })
 }
 
 /// Reads the crate name from a `Cargo.toml`, supporting both the inline and `[package]` forms.
@@ -241,5 +269,21 @@ mod tests {
             err.contains("exited with status"),
             "expected the exit-status branch, got: {err}"
         );
+    }
+
+    #[test]
+    fn native_auth_status_maps_exit_status_to_state() {
+        let ok = native_auth_status("true", &[], "hint").expect("spawns");
+        assert_eq!(ok.state, AuthState::Authenticated);
+        assert_eq!(ok.failure, None);
+
+        let unauthenticated = native_auth_status("false", &[], "hint").expect("spawns");
+        assert_eq!(unauthenticated.state, AuthState::Unauthenticated);
+        let failure = unauthenticated.failure.expect("failure message");
+        assert!(failure.contains("exited with status"), "got: {failure}");
+
+        let missing = native_auth_status("edgezero-no-such-program-xyz", &[], "install it")
+            .expect_err("missing program is an error, not a state");
+        assert!(missing.contains("install it"), "got: {missing}");
     }
 }

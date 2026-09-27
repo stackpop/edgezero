@@ -15,6 +15,7 @@ use crate::config::{
     enforce_single_store_capability, reject_merged_id_collisions, strict_handler_paths,
 };
 use crate::ensure_adapter_defined;
+use crate::output::{self, CommandName, Outcome, OutputScope, ProvisionResult};
 use edgezero_adapter::registry::{self as adapter_registry, ProvisionStores, ResolvedStoreId};
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{ManifestLoader, StoreDeclaration};
@@ -27,6 +28,11 @@ use edgezero_core::manifest::{ManifestLoader, StoreDeclaration};
 /// reports a failure.
 #[inline]
 pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
+    let _scope = OutputScope::enter(args.format);
+    output::finish(CommandName::Provision, args.format, provision(args))
+}
+
+fn provision(args: &ProvisionArgs) -> Outcome<ProvisionResult> {
     let manifest_loader = ManifestLoader::from_path(&args.manifest)
         .map_err(|err| format!("failed to load {}: {err}", args.manifest.display()))?;
     let manifest = manifest_loader.manifest();
@@ -114,7 +120,7 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
         secrets: &secret_ids,
     };
 
-    let lines = adapter.provision(
+    let report = adapter.provision(
         manifest_root,
         adapter_cfg.adapter.manifest.as_deref(),
         adapter_cfg.adapter.component.as_deref(),
@@ -125,10 +131,10 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
     if args.dry_run {
         log::info!("[edgezero] provision --dry-run for `{}`:", args.adapter);
     }
-    for line in lines {
-        log::info!("{line}");
+    for entry in &report.entries {
+        log::info!("{}", entry.message);
     }
-    Ok(())
+    Ok(ProvisionResult::new(&args.adapter, args.dry_run, &report))
 }
 
 /// Pair each declared id in `declaration` with its platform name
@@ -150,7 +156,7 @@ fn resolve_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::ProvisionArgs;
+    use crate::args::{OutputFormat, ProvisionArgs};
     use crate::test_support::{EnvOverride, PROVISION_MANIFEST, manifest_guard};
     use std::fs;
     use tempfile::TempDir;
@@ -167,6 +173,7 @@ mod tests {
         run_provision(&ProvisionArgs {
             adapter: "axum".to_owned(),
             dry_run: false,
+            format: OutputFormat::Text,
             manifest: manifest_path.clone(),
         })
         .expect("axum provision exits 0 (no remote resources)");
@@ -184,6 +191,7 @@ mod tests {
         run_provision(&ProvisionArgs {
             adapter: "axum".to_owned(),
             dry_run: true,
+            format: OutputFormat::Text,
             manifest: manifest_path.clone(),
         })
         .expect("axum dry-run also exits 0");
@@ -201,6 +209,7 @@ mod tests {
         let err = run_provision(&ProvisionArgs {
             adapter: "wat".to_owned(),
             dry_run: false,
+            format: OutputFormat::Text,
             manifest: manifest_path.clone(),
         })
         .expect_err("unknown adapter must error");
@@ -230,6 +239,7 @@ mod tests {
         run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
+            format: OutputFormat::Text,
             manifest: manifest_path.clone(),
         })
         .expect("spin dry-run dispatches cleanly");
@@ -268,6 +278,7 @@ adapters = ["axum"]
         let err = run_provision(&ProvisionArgs {
             adapter: "axum".to_owned(),
             dry_run: true,
+            format: OutputFormat::Text,
             manifest: manifest_path.clone(),
         })
         .expect_err("malformed handler must error before dispatch");
@@ -298,6 +309,7 @@ adapters = ["axum"]
         let err = run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
+            format: OutputFormat::Text,
             manifest: manifest_path.clone(),
         })
         .expect_err("zero-component spin.toml must error pre-dispatch");
@@ -349,6 +361,7 @@ default = "default"
         let err = run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
+            format: OutputFormat::Text,
             manifest: manifest_path.clone(),
         })
         .expect_err("Single-capability violation must error");
@@ -398,6 +411,7 @@ ids = ["default"]
         run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
+            format: OutputFormat::Text,
             manifest: manifest_path.clone(),
         })
         .expect("multi-config dispatch must succeed under KV-backed config");
@@ -451,6 +465,7 @@ ids = ["default"]
         let err = run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
+            format: OutputFormat::Text,
             manifest: manifest_path.clone(),
         })
         .expect_err("env-overlay platform-label collision must fail provision");
@@ -480,6 +495,7 @@ ids = ["default"]
         run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
+            format: OutputFormat::Text,
             manifest: manifest_path.clone(),
         })
         .expect("single-id case dispatches cleanly");
@@ -501,6 +517,7 @@ ids = ["default"]
         run_provision(&ProvisionArgs {
             adapter: "cloudflare".to_owned(),
             dry_run: true,
+            format: OutputFormat::Text,
             manifest: manifest_path.clone(),
         })
         .expect("cloudflare dry-run dispatches cleanly");
@@ -521,6 +538,7 @@ ids = ["default"]
         run_provision(&ProvisionArgs {
             adapter: "fastly".to_owned(),
             dry_run: true,
+            format: OutputFormat::Text,
             manifest: manifest_path.clone(),
         })
         .expect("fastly dry-run dispatches cleanly");

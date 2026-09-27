@@ -15,6 +15,10 @@
 //! ```
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test harness runs `cargo` with inherited stdio to show build output; the `--format json` stdout policy does not apply"
+)]
 mod tests {
     use std::path::Path;
     use std::process::{Command, ExitStatus};

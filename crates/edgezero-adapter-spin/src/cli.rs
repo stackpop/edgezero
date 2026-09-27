@@ -14,10 +14,13 @@ use std::process::Command;
 
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
-    find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
+    find_manifest_upwards, find_workspace_root, native_auth_status, path_distance,
+    read_package_name, run_native_cli,
 };
+use edgezero_adapter::process;
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    ActionOutcome, Adapter, AdapterAction, AdapterPushContext, BuildOutcome, ProvisionAction,
+    ProvisionEntry, ProvisionReport, ProvisionStores, ReadConfigEntry, ResolvedStoreId, StoreKind,
     TypedSecretEntry, register_adapter,
 };
 use edgezero_adapter::scaffold::{
@@ -136,27 +139,32 @@ struct SpinCliAdapter;
     reason = "KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation). `read_config_entry` and `read_config_entry_local` are both overridden below (four-branch SQLite-direct / Fermyon Cloud / non-Spin-backend dispatch)."
 )]
 impl Adapter for SpinCliAdapter {
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
+    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<ActionOutcome, String> {
         match action {
             // `spin cloud {login|logout|info}` is the native sign-in
             // surface for Fermyon Cloud. EdgeZero stores no
             // credentials — this is a thin shell-out.
             AdapterAction::AuthLogin => {
                 run_native_cli("spin", &["cloud", "login"], SPIN_INSTALL_HINT)
+                    .map(|()| ActionOutcome::Empty)
             }
             AdapterAction::AuthLogout => {
                 run_native_cli("spin", &["cloud", "logout"], SPIN_INSTALL_HINT)
+                    .map(|()| ActionOutcome::Empty)
             }
             AdapterAction::AuthStatus => {
-                run_native_cli("spin", &["cloud", "info"], SPIN_INSTALL_HINT)
+                native_auth_status("spin", &["cloud", "info"], SPIN_INSTALL_HINT)
+                    .map(ActionOutcome::AuthStatus)
             }
             AdapterAction::Build => {
                 let artifact = build(args)?;
                 log::info!("[edgezero] Spin build complete -> {}", artifact.display());
-                Ok(())
+                Ok(ActionOutcome::Build(BuildOutcome {
+                    artifact: Some(artifact),
+                }))
             }
-            AdapterAction::Deploy => deploy(args),
-            AdapterAction::Serve => serve(args),
+            AdapterAction::Deploy => deploy(args).map(|()| ActionOutcome::Empty),
+            AdapterAction::Serve => serve(args).map(|()| ActionOutcome::Empty),
             // The Fastly staging lifecycle is Fastly-only.
             AdapterAction::DeployStaging
             | AdapterAction::EmitVersion
@@ -187,7 +195,7 @@ impl Adapter for SpinCliAdapter {
         component_selector: Option<&str>,
         stores: &ProvisionStores<'_>,
         dry_run: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<ProvisionReport, String> {
         //: spin provision is pure spin.toml editing — no
         // shell-out (Spin KV stores are provisioned by the Spin
         // runtime / Fermyon at deploy). For each declared KV id
@@ -203,17 +211,22 @@ impl Adapter for SpinCliAdapter {
         };
         let spin_path = manifest_root.join(rel);
 
-        let mut out = Vec::new();
+        let mut entries = Vec::new();
         // Resolve the component once if either KV or config has
         // anything to provision.
         let needs_component = !stores.kv.is_empty() || !stores.config.is_empty();
         if needs_component {
             let component_id = resolve_spin_component(&spin_path, component_selector)?;
-            for (kind, store) in stores
+            for (kind, store_kind, store) in stores
                 .kv
                 .iter()
-                .map(|store| ("KV", store))
-                .chain(stores.config.iter().map(|store| ("config", store)))
+                .map(|store| ("KV", StoreKind::Kv, store))
+                .chain(
+                    stores
+                        .config
+                        .iter()
+                        .map(|store| ("config", StoreKind::Config, store)),
+                )
             {
                 let logical = store.logical.as_str();
                 // The label the runtime opens is what
@@ -225,37 +238,39 @@ impl Adapter for SpinCliAdapter {
                 // runtime lookup match.
                 let label = store.platform.as_str();
                 if dry_run {
-                    out.push(format!(
+                    entries.push(ProvisionEntry::for_store(ProvisionAction::WouldCreate, store_kind, store, format!(
                         "would ensure {kind} label `{label}` (logical id `{logical}`) is in [component.{component_id}].key_value_stores in {}",
                         spin_path.display()
-                    ));
+                    )));
                     continue;
                 }
                 let added = ensure_kv_label_in_component(&spin_path, &component_id, label)?;
                 if added {
-                    out.push(format!(
+                    entries.push(ProvisionEntry::for_store(ProvisionAction::Updated, store_kind, store, format!(
                         "added {kind} label `{label}` (logical id `{logical}`) to [component.{component_id}].key_value_stores in {}",
                         spin_path.display()
-                    ));
+                    )));
                 } else {
-                    out.push(format!(
+                    entries.push(ProvisionEntry::for_store(ProvisionAction::AlreadyPresent, store_kind, store, format!(
                         "{kind} label `{label}` (logical id `{logical}`) already present in [component.{component_id}].key_value_stores in {}; skipping",
                         spin_path.display()
-                    ));
+                    )));
                 }
             }
         }
         for store in stores.secrets {
             let logical = store.logical.as_str();
             let platform = store.platform.as_str();
-            out.push(format!(
+            entries.push(ProvisionEntry::for_store(ProvisionAction::NotApplicable, StoreKind::Secrets, store, format!(
                 "spin secret id `{logical}` (platform name `{platform}`) requires manual `[variables].* secret = true` + `[component.*.variables].*` declarations in spin.toml; nothing to do here"
+            )));
+        }
+        if entries.is_empty() {
+            entries.push(ProvisionEntry::note(
+                "spin has no declared stores to provision".to_owned(),
             ));
         }
-        if out.is_empty() {
-            out.push("spin has no declared stores to provision".to_owned());
-        }
-        Ok(out)
+        Ok(ProvisionReport { entries })
     }
 
     fn push_config_entries(
@@ -1060,20 +1075,21 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let cargo_manifest = manifest_dir.join("Cargo.toml");
     let crate_name = read_package_name(&cargo_manifest)?;
 
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--target",
-            TARGET_TRIPLE,
-            "--manifest-path",
-            cargo_manifest
-                .to_str()
-                .ok_or("invalid Cargo manifest path")?,
-        ])
-        .args(extra_args)
-        .status()
-        .map_err(|err| format!("failed to run cargo build: {err}"))?;
+    let status = process::status(
+        Command::new("cargo")
+            .args([
+                "build",
+                "--release",
+                "--target",
+                TARGET_TRIPLE,
+                "--manifest-path",
+                cargo_manifest
+                    .to_str()
+                    .ok_or("invalid Cargo manifest path")?,
+            ])
+            .args(extra_args),
+    )
+    .map_err(|err| format!("failed to run cargo build: {err}"))?;
     if !status.success() {
         return Err(format!("cargo build failed with status {status}"));
     }
@@ -1100,12 +1116,13 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
 
-    let status = Command::new("spin")
-        .args(["deploy"])
-        .args(extra_args)
-        .current_dir(manifest_dir)
-        .status()
-        .map_err(|err| format!("failed to run spin CLI: {err}"))?;
+    let status = process::status(
+        Command::new("spin")
+            .args(["deploy"])
+            .args(extra_args)
+            .current_dir(manifest_dir),
+    )
+    .map_err(|err| format!("failed to run spin CLI: {err}"))?;
     if !status.success() {
         return Err(format!("spin deploy failed with status {status}"));
     }
@@ -1207,12 +1224,13 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
         .parent()
         .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
 
-    let status = Command::new("spin")
-        .args(["up"])
-        .args(extra_args)
-        .current_dir(manifest_dir)
-        .status()
-        .map_err(|err| format!("failed to run spin CLI: {err}"))?;
+    let status = process::status(
+        Command::new("spin")
+            .args(["up"])
+            .args(extra_args)
+            .current_dir(manifest_dir),
+    )
+    .map_err(|err| format!("failed to run spin CLI: {err}"))?;
     if !status.success() {
         return Err(format!("spin up failed with status {status}"));
     }
@@ -1382,8 +1400,12 @@ mod tests {
             reason = "StubAdapter exercises only the trait default for validate_typed_secrets"
         )]
         impl Adapter for StubAdapter {
-            fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
-                Ok(())
+            fn execute(
+                &self,
+                _action: AdapterAction,
+                _args: &[String],
+            ) -> Result<ActionOutcome, String> {
+                Ok(ActionOutcome::Empty)
             }
             fn name(&self) -> &'static str {
                 "stub"
@@ -1653,7 +1675,8 @@ mod tests {
         };
         let out = SpinCliAdapter
             .provision(dir.path(), Some("spin.toml"), None, &stores, true)
-            .expect("dry-run succeeds");
+            .expect("dry-run succeeds")
+            .into_messages();
         assert_eq!(out.len(), 2);
         assert!(out[0].contains("would ensure KV label `sessions`"));
         assert!(out[1].contains("would ensure KV label `cache`"));
@@ -1684,7 +1707,8 @@ mod tests {
         };
         let out = SpinCliAdapter
             .provision(dir.path(), Some("spin.toml"), None, &stores, false)
-            .expect("real-run succeeds");
+            .expect("real-run succeeds")
+            .into_messages();
         assert!(
             out[0].contains("`prod_sessions`") && out[0].contains("`sessions`"),
             "status line names BOTH the platform label and the logical id: {out:?}"
@@ -1716,7 +1740,8 @@ mod tests {
         };
         let out = SpinCliAdapter
             .provision(dir.path(), Some("spin.toml"), None, &stores, false)
-            .expect("real run succeeds");
+            .expect("real run succeeds")
+            .into_messages();
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("added KV label `sessions`"), "got: {out:?}");
         let after = fs::read_to_string(dir.path().join("spin.toml")).expect("read back");
@@ -1764,7 +1789,8 @@ mod tests {
         };
         let out = SpinCliAdapter
             .provision(dir.path(), Some("spin.toml"), None, &stores, false)
-            .expect("config + secrets provision succeeds");
+            .expect("config + secrets provision succeeds")
+            .into_messages();
         assert_eq!(out.len(), 2);
         assert!(
             out[0].contains("config label") && out[0].contains("key_value_stores"),
@@ -1796,7 +1822,8 @@ mod tests {
         };
         let out = SpinCliAdapter
             .provision(dir.path(), Some("spin.toml"), None, &stores, false)
-            .expect("no-store provision is fine");
+            .expect("no-store provision is fine")
+            .into_messages();
         assert_eq!(out, vec!["spin has no declared stores to provision"]);
     }
 

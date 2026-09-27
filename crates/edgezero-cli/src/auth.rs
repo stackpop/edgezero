@@ -8,8 +8,11 @@
 //! overrides live in `[adapters.<name>.commands].auth-{login,logout,
 //! status}` in `edgezero.toml`; `axum` is a no-op (no remote auth).
 
+use edgezero_adapter::registry::{ActionOutcome, AuthState};
+
 use crate::adapter::{self, Action};
-use crate::args::{AuthArgs, AuthSub};
+use crate::args::{AuthArgs, AuthSub, OutputFormat};
+use crate::output::{self, AuthStatusResult, CommandName, Failure, Outcome, OutputScope};
 use crate::{ensure_adapter_defined, load_manifest_optional};
 
 /// Sign in / out / status against the adapter's native auth surface.
@@ -24,12 +27,35 @@ pub fn run_auth(args: &AuthArgs) -> Result<(), String> {
     let (adapter_name, action) = match &args.sub {
         AuthSub::Login { adapter } => (adapter.as_str(), Action::AuthLogin),
         AuthSub::Logout { adapter } => (adapter.as_str(), Action::AuthLogout),
-        AuthSub::Status { adapter } => (adapter.as_str(), Action::AuthStatus),
+        AuthSub::Status { adapter, format } => return run_auth_status(adapter, *format),
     };
 
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(adapter_name, manifest.as_ref())?;
-    adapter::execute(adapter_name, action, manifest.as_ref(), &[])
+    adapter::execute(adapter_name, action, manifest.as_ref(), &[]).map(|_| ())
+}
+
+/// `auth status`: the only `auth` subcommand with a `--format`.
+fn run_auth_status(adapter_name: &str, format: OutputFormat) -> Result<(), String> {
+    let _scope = OutputScope::enter(format);
+    output::finish(CommandName::AuthStatus, format, auth_status(adapter_name))
+}
+
+fn auth_status(adapter_name: &str) -> Outcome<AuthStatusResult> {
+    let manifest = load_manifest_optional()?;
+    ensure_adapter_defined(adapter_name, manifest.as_ref())?;
+    let outcome = adapter::execute(adapter_name, Action::AuthStatus, manifest.as_ref(), &[])?;
+    let ActionOutcome::AuthStatus(status) = outcome else {
+        return Err(format!("adapter `{adapter_name}` returned no auth status result").into());
+    };
+    let result = AuthStatusResult::new(adapter_name, status.state);
+    match (status.state, status.failure) {
+        (AuthState::Unauthenticated, failure) => Err(Failure::with_result(
+            failure.unwrap_or_else(|| format!("adapter `{adapter_name}` is not authenticated")),
+            result,
+        )),
+        (AuthState::Authenticated | AuthState::NotApplicable, _) => Ok(result),
+    }
 }
 
 #[cfg(test)]
@@ -66,6 +92,7 @@ mod tests {
             },
             AuthSub::Status {
                 adapter: "fastly".to_owned(),
+                format: OutputFormat::Text,
             },
         ] {
             run_auth(&AuthArgs { sub }).expect("auth subcommand runs");

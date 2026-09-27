@@ -130,6 +130,11 @@ pub struct ConfigGcArgs {
     /// with `--yes` -- a single run cannot both preview and delete.
     #[arg(long, conflicts_with = "yes")]
     pub dry_run: bool,
+    /// Output format: `text` (default, the human-readable output) or
+    /// `json` (a single versioned JSON envelope on stdout; everything else
+    /// goes to stderr).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
     /// Path to `edgezero.toml`.
     #[arg(long, default_value = "edgezero.toml")]
     pub manifest: PathBuf,
@@ -173,6 +178,7 @@ impl Default for ConfigGcArgs {
         Self {
             adapter: String::new(),
             dry_run: false,
+            format: OutputFormat::Text,
             manifest: PathBuf::from("edgezero.toml"),
             no_env: false,
             older_than: None,
@@ -226,6 +232,9 @@ pub enum AuthSub {
     Status {
         #[arg(long)]
         adapter: String,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
     },
 }
 
@@ -236,9 +245,15 @@ pub struct BuildArgs {
     /// Target adapter name.
     #[arg(long = "adapter", required = true)]
     pub adapter: String,
-    /// Arguments passed through to the adapter build command.
+    /// Arguments passed through to the adapter build command. `--format`
+    /// must come before the first passthrough token.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub adapter_args: Vec<String>,
+    /// Output format: `text` (default, the human-readable output) or
+    /// `json` (a single versioned JSON envelope on stdout; everything else
+    /// goes to stderr).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
 }
 
 /// Arguments for the `deploy` command.
@@ -255,6 +270,11 @@ pub struct DeployArgs {
     /// staging-intended deploy to PRODUCTION.
     #[arg(last = true)]
     pub adapter_args: Vec<String>,
+    /// Output format: `text` (default, the human-readable output) or
+    /// `json` (a single versioned JSON envelope on stdout; everything else
+    /// goes to stderr).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
     /// Platform service id the deploy targets. Consumed by the Fastly
     /// staging lifecycle: production deploy passes it
     /// through to `fastly compute deploy` and resolves the activated
@@ -293,6 +313,11 @@ pub struct ProvisionArgs {
     /// without performing them.
     #[arg(long)]
     pub dry_run: bool,
+    /// Output format: `text` (default, the human-readable output) or
+    /// `json` (a single versioned JSON envelope on stdout; everything else
+    /// goes to stderr).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
     /// Path to the manifest (default: `edgezero.toml`).
     #[arg(long, default_value = "edgezero.toml")]
     pub manifest: PathBuf,
@@ -312,6 +337,7 @@ impl Default for ProvisionArgs {
         Self {
             adapter: String::new(),
             dry_run: false,
+            format: OutputFormat::Text,
             manifest: default_manifest_path(),
         }
     }
@@ -341,6 +367,11 @@ pub struct HealthcheckArgs {
     /// contract always threads it.
     #[arg(long, required = true)]
     pub domain: String,
+    /// Output format: `text` (default, the human-readable output) or
+    /// `json` (a single versioned JSON envelope on stdout; everything else
+    /// goes to stderr).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
     /// URL path to probe on the domain (must begin with '/'). Applies to
     /// production and staging alike — staging reroutes the same URL to the
     /// resolved staging IP. Defaults to '/'.
@@ -378,6 +409,11 @@ pub struct RollbackArgs {
     /// Target adapter name.
     #[arg(long = "adapter", required = true)]
     pub adapter: String,
+    /// Output format: `text` (default, the human-readable output) or
+    /// `json` (a single versioned JSON envelope on stdout; everything else
+    /// goes to stderr).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
     /// Production only: the version to re-activate. Fastly exposes no
     /// metadata to tell a previously-live version from a staged one, so
     /// the rollback target CANNOT be inferred; it is captured before the
@@ -405,9 +441,31 @@ pub struct ActiveVersionArgs {
     /// Target adapter name.
     #[arg(long = "adapter", required = true)]
     pub adapter: String,
+    /// Output format: `text` (default, the human-readable output) or
+    /// `json` (a single versioned JSON envelope on stdout; everything else
+    /// goes to stderr).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
     /// Platform service id whose active version to resolve. Required.
     #[arg(long, required = true)]
     pub service_id: String,
+}
+
+/// Output format for the commands with a machine-readable mode
+/// (`active-version`, `auth status`, `build`, `config gc`, `config validate`,
+/// `deploy`, `healthcheck`, `provision`, `rollback`).
+///
+/// Distinct from [`DiffFormat`]: `config diff`'s `structured` / `unified`
+/// renderings are diff-specific and meaningless here.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum OutputFormat {
+    /// A single versioned JSON envelope on stdout; all other output goes to
+    /// stderr.
+    Json,
+    /// Human-readable output (the default).
+    #[default]
+    Text,
 }
 
 /// Output format for `config diff`.
@@ -609,6 +667,11 @@ pub struct ConfigValidateArgs {
     /// resolved from the manifest's `[app].name`, next to the manifest).
     #[arg(long)]
     pub app_config: Option<PathBuf>,
+    /// Output format: `text` (default, the human-readable output) or
+    /// `json` (a single versioned JSON envelope on stdout; everything else
+    /// goes to stderr).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
     /// Path to the manifest (default: `edgezero.toml`).
     #[arg(long, default_value = "edgezero.toml")]
     pub manifest: PathBuf,
@@ -629,6 +692,7 @@ impl Default for ConfigValidateArgs {
     fn default() -> Self {
         Self {
             app_config: None,
+            format: OutputFormat::Text,
             manifest: default_manifest_path(),
             no_env: false,
             strict: false,
@@ -686,6 +750,46 @@ pub fn parse_duration_secs(raw: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every command with a machine-readable mode, without `--format`.
+    const FORMAT_COMMANDS: [&[&str]; 9] = [
+        &[
+            "edgezero",
+            "active-version",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "SVC1",
+        ],
+        &["edgezero", "auth", "status", "--adapter", "fastly"],
+        &["edgezero", "build", "--adapter", "fastly"],
+        &["edgezero", "config", "gc", "--adapter", "fastly"],
+        &["edgezero", "config", "validate"],
+        &["edgezero", "deploy", "--adapter", "fastly"],
+        &[
+            "edgezero",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--domain",
+            "app.example.com",
+            "--service-id",
+            "SVC1",
+            "--version",
+            "7",
+        ],
+        &["edgezero", "provision", "--adapter", "fastly"],
+        &[
+            "edgezero",
+            "rollback",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "SVC1",
+            "--version",
+            "7",
+        ],
+    ];
 
     /// Thin wrapper so `ConfigDiffArgs` (a `clap::Args`) can be
     /// tested via real clap parsing. `ConfigDiffArgs` is `#[non_exhaustive]`
@@ -792,6 +896,7 @@ mod tests {
         let Command::Build(BuildArgs {
             adapter,
             adapter_args,
+            ..
         }) = args.cmd
         else {
             panic!("expected Command::Build");
@@ -926,7 +1031,7 @@ mod tests {
         let args = Args::try_parse_from(["edgezero", "auth", "status", "--adapter", "spin"])
             .expect("parse `auth status --adapter spin`");
         let Command::Auth(AuthArgs {
-            sub: AuthSub::Status { adapter },
+            sub: AuthSub::Status { adapter, .. },
         }) = args.cmd
         else {
             panic!("expected Command::Auth(AuthSub::Status)");
@@ -1455,5 +1560,68 @@ mod tests {
         parse_duration_secs("7w").unwrap_err();
         parse_duration_secs("-1d").unwrap_err();
         parse_duration_secs("d").unwrap_err();
+    }
+
+    /// The `--format` a `FORMAT_COMMANDS` invocation parsed to.
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "test helper: any other command is a bug in the test table"
+    )]
+    fn format_of(invocation: &[&str]) -> OutputFormat {
+        match Args::try_parse_from(invocation).expect("parses").cmd {
+            Command::ActiveVersion(parsed) => parsed.format,
+            Command::Auth(AuthArgs {
+                sub: AuthSub::Status { format, .. },
+            }) => format,
+            Command::Build(parsed) => parsed.format,
+            Command::Config(ConfigCmd::Gc(args)) => args.format,
+            Command::Config(ConfigCmd::Validate(args)) => args.format,
+            Command::Deploy(parsed) => parsed.format,
+            Command::Healthcheck(parsed) => parsed.format,
+            Command::Provision(parsed) => parsed.format,
+            Command::Rollback(parsed) => parsed.format,
+            other => panic!("no `--format` on {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_defaults_to_text_and_accepts_json_on_every_command() {
+        for argv in FORMAT_COMMANDS {
+            assert_eq!(format_of(argv), OutputFormat::Text, "{argv:?}");
+            let mut with_json = argv.to_vec();
+            with_json.extend(["--format", "json"]);
+            assert_eq!(format_of(&with_json), OutputFormat::Json, "{with_json:?}");
+            let mut with_text = argv.to_vec();
+            with_text.extend(["--format=text"]);
+            assert_eq!(format_of(&with_text), OutputFormat::Text, "{with_text:?}");
+        }
+    }
+
+    #[test]
+    fn format_rejects_diff_only_values() {
+        for value in ["unified", "structured"] {
+            let mut argv = FORMAT_COMMANDS[2].to_vec();
+            argv.extend(["--format", value]);
+            Args::try_parse_from(&argv).expect_err("diff-only formats are rejected");
+        }
+    }
+
+    #[test]
+    fn build_format_precedes_passthrough_args() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "build",
+            "--adapter",
+            "fastly",
+            "--format",
+            "json",
+            "--release",
+        ])
+        .expect("parses");
+        let Command::Build(build) = args.cmd else {
+            panic!("expected Command::Build");
+        };
+        assert_eq!(build.format, OutputFormat::Json);
+        assert_eq!(build.adapter_args, vec!["--release".to_owned()]);
     }
 }

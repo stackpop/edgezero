@@ -7,3 +7,12 @@ allow-expect-in-tests = true
 allow-indexing-slicing-in-tests = true
 allow-panic-in-tests = true
 allow-unwrap-in-tests = true
+
+# `--format json` reserves stdout for the JSON envelope, so every child that
+# inherits stdout must go through `edgezero_adapter::process::status`, which
+# applies the stdout-to-stderr policy. Captured spawns (`.output()`, or
+# `.spawn()` with piped stdout) carry a documented `#[expect]`.
+disallowed-methods = [
+    { path = "std::process::Command::status", reason = "use `edgezero_adapter::process::status` so the `--format json` stdout policy applies" },
+    { path = "std::process::Command::spawn", reason = "inherits stdout by default; pipe stdout and `#[expect]` with a reason, or use `edgezero_adapter::process::status`" },
+]
