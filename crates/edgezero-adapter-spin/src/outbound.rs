@@ -247,9 +247,9 @@ mod spin_impl {
     use edgezero_core::compression::{
         ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_gzip_stream,
     };
-    use edgezero_core::error::{BadGatewayReason, EdgeError};
     #[cfg(feature = "test-utils")]
     use edgezero_core::error::BudgetSource;
+    use edgezero_core::error::{BadGatewayReason, EdgeError};
     use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH};
     use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
     use edgezero_core::outbound::{
@@ -1197,6 +1197,7 @@ mod spin_impl {
             assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
         }
 
+        #[cfg(feature = "test-utils")]
         #[test]
         fn converted_response_retains_injected_clock() {
             assert!(block_on(
