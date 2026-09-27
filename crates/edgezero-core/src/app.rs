@@ -11,6 +11,7 @@ use crate::ingress::{
     IngressHeadParts, PreparedIngress, apply_admission_policy, default_admission_policy,
 };
 use crate::manifest::BakedManifest;
+use crate::platform::PlatformMetadata;
 use crate::response::IntoResponse as _;
 use crate::response_egress::{
     DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressDecision,
@@ -42,6 +43,7 @@ pub struct App {
     ingress_policy: IngressAdmissionPolicy,
     monotonic_clock: MonotonicClock,
     name: String,
+    platform: PlatformMetadata,
     response_egress_observer: ResponseEgressObserverHandle,
     response_egress_policy: ResponseEgressPolicyCallback,
     router: RouterService,
@@ -299,6 +301,13 @@ impl App {
         Self::with_name(router, DEFAULT_APP_NAME)
     }
 
+    /// Target properties installed before application configuration.
+    #[must_use]
+    #[inline]
+    pub const fn platform(&self) -> PlatformMetadata {
+        self.platform
+    }
+
     fn render_error_response(&self, error: EdgeError) -> Response {
         let status = error.status();
         let required_headers = match error.required_response_headers() {
@@ -447,6 +456,20 @@ impl App {
     where
         S: Into<String>,
     {
+        Self::with_name_and_platform(router, name, PlatformMetadata::default())
+    }
+
+    /// Construct a new application with the provided router, name, and target metadata.
+    #[must_use]
+    #[inline]
+    pub fn with_name_and_platform<S>(
+        router: RouterService,
+        name: S,
+        platform: PlatformMetadata,
+    ) -> Self
+    where
+        S: Into<String>,
+    {
         Self {
             config_extraction_limits: ConfigExtractionLimits::default(),
             detached_response_egress_decision_factory: Arc::new(|head| {
@@ -460,6 +483,7 @@ impl App {
             ingress_policy: default_admission_policy(),
             monotonic_clock: MonotonicClock::default(),
             name: name.into(),
+            platform,
             response_egress_observer: ResponseEgressObserverHandle::default(),
             response_egress_policy: Arc::new(default_response_egress_policy),
             router,
@@ -496,16 +520,16 @@ pub struct StoresMetadata {
 
 /// Trait implemented by application hook adapters.
 pub trait Hooks {
-    /// Construct an `App` by wiring the routes and invoking the configuration hook.
+    /// Construct an `App` with target metadata available to the configuration hook.
     ///
     /// # Errors
     /// Returns the typed configuration error without exposing a partially configured app.
     #[inline]
-    fn build_app() -> Result<App, EdgeError>
+    fn build_app(platform: PlatformMetadata) -> Result<App, EdgeError>
     where
         Self: Sized,
     {
-        let mut app = App::with_name(Self::routes(), Self::name());
+        let mut app = App::with_name_and_platform(Self::routes(), Self::name(), platform);
         Self::configure(&mut app)?;
         Ok(app)
     }
@@ -607,6 +631,9 @@ mod tests {
     };
     use crate::manifest::BakedManifest;
     use crate::middleware::{Middleware, Next};
+    use crate::platform::{
+        MemoryCeiling, MemoryCeilingScope, MemoryCeilingSource, PlatformMetadata,
+    };
     use crate::response_egress::{
         DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressDecision, ResponseEgressAttempt,
         ResponseEgressHead, ResponseEgressObserver, ResponseEgressOutcome, ResponseEgressPolicy,
@@ -625,6 +652,8 @@ mod tests {
     struct DefaultHooks;
 
     struct FailingHooks;
+
+    struct MemoryAwareHooks;
 
     struct TestHooks;
 
@@ -676,6 +705,34 @@ mod tests {
     impl Hooks for FailingHooks {
         fn configure(_app: &mut App) -> Result<(), EdgeError> {
             Err(EdgeError::service_unavailable("configuration unavailable"))
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test stub exercises platform metadata visibility during configuration"
+    )]
+    impl Hooks for MemoryAwareHooks {
+        fn configure(app: &mut App) -> Result<(), EdgeError> {
+            let expected = MemoryCeiling::new(
+                128_000_000,
+                MemoryCeilingScope::PerInstance,
+                None,
+                MemoryCeilingSource::PlatformLimit {
+                    provider: "test-platform",
+                },
+            );
+            if app.platform().memory_ceiling() == Some(expected) {
+                Ok(())
+            } else {
+                Err(EdgeError::service_unavailable(
+                    "platform metadata unavailable during configuration",
+                ))
+            }
         }
 
         fn routes() -> RouterService {
@@ -833,7 +890,7 @@ mod tests {
 
     #[test]
     fn build_app_invokes_hooks_for_routes_and_configuration() {
-        let app = TestHooks::build_app().expect("configured app");
+        let app = TestHooks::build_app(PlatformMetadata::default()).expect("configured app");
         assert_eq!(app.name(), "configured");
         let stores = TestHooks::stores();
         let config = stores.config.expect("config store metadata");
@@ -857,10 +914,35 @@ mod tests {
 
     #[test]
     fn build_app_propagates_configuration_failure() {
-        let Err(error) = FailingHooks::build_app() else {
+        let Err(error) = FailingHooks::build_app(PlatformMetadata::default()) else {
             panic!("configuration failure must stop application assembly");
         };
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn build_app_exposes_memory_ceiling_during_configuration() {
+        let ceiling = MemoryCeiling::new(
+            128_000_000,
+            MemoryCeilingScope::PerInstance,
+            None,
+            MemoryCeilingSource::PlatformLimit {
+                provider: "test-platform",
+            },
+        );
+        let platform = PlatformMetadata::new(Some(ceiling));
+
+        let app = MemoryAwareHooks::build_app(platform).expect("configured app");
+
+        assert_eq!(app.platform(), platform);
+    }
+
+    #[test]
+    fn build_app_accepts_explicit_unknown_platform_memory() {
+        let app = DefaultHooks::build_app(PlatformMetadata::default()).expect("default app");
+
+        assert_eq!(app.platform(), PlatformMetadata::default());
+        assert_eq!(app.platform().memory_ceiling(), None);
     }
 
     #[test]
@@ -2331,7 +2413,7 @@ mod tests {
 
     #[test]
     fn default_hooks_use_default_name_and_into_router() {
-        let app = DefaultHooks::build_app().expect("default app");
+        let app = DefaultHooks::build_app(PlatformMetadata::default()).expect("default app");
         assert_eq!(app.name(), App::default_name());
         assert!(matches!(DefaultHooks::manifest(), BakedManifest::Absent));
         assert_eq!(DefaultHooks::manifest_json(), None);

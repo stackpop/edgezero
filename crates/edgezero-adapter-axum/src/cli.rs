@@ -20,7 +20,7 @@ use edgezero_adapter::scaffold::{
 };
 use edgezero_core::addr;
 use edgezero_core::manifest::ManifestLoader;
-use edgezero_core::{Capability, CapabilitySupport};
+use edgezero_core::{Capability, CapabilitySupport, MemoryCeiling};
 use toml::Value;
 use walkdir::WalkDir;
 
@@ -209,6 +209,10 @@ impl Adapter for AxumCliAdapter {
                 "axum adapter does not support pinned target action {action:?}"
             )),
         }
+    }
+
+    fn memory_ceiling(&self) -> Option<MemoryCeiling> {
+        crate::AXUM_PLATFORM.memory_ceiling()
     }
 
     fn name(&self) -> &'static str {
@@ -857,6 +861,15 @@ mod tests {
                 "{capability:?}"
             );
         }
+    }
+
+    #[test]
+    fn adapter_memory_ceiling_matches_runtime_metadata() {
+        assert_eq!(
+            AXUM_ADAPTER.memory_ceiling(),
+            crate::AXUM_PLATFORM.memory_ceiling()
+        );
+        assert_eq!(AXUM_ADAPTER.memory_ceiling(), None);
     }
 
     #[test]

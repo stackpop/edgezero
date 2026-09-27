@@ -1018,7 +1018,7 @@ eventual release.
   refused, fallback, error, and normal response paths without response extensions.
   The macro uses
   `Hooks::configure(&mut App) -> Result<(), EdgeError>` as the app-owned setter point, and
-  `Hooks::build_app()` prevents request conversion, admission, body polling, or dispatch when
+  `Hooks::build_app(platform)` prevents request conversion, admission, body polling, or dispatch when
   startup policy is invalid. Axum also fails before listener bind; Cloudflare, Fastly, and Spin
   enforce this boundary per host invocation.
 - `crates/edgezero-core/src/error.rs`: add `RequestHeaderFieldsTooLarge { message }` with

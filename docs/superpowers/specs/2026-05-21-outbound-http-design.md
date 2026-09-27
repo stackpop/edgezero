@@ -3490,9 +3490,9 @@ must not force every out-of-tree adapter to recompile-or-break), and `Adapter::c
 carries a **default returning `CapabilitySupport::Unsupported`** for any capability an
 adapter doesn't recognize — so an out-of-tree adapter compiled against an older core still
 builds, and an unknown capability fails closed (Unsupported → a `required` mismatch
-hard-fails) rather than failing to compile. The registry `Adapter` trait gains one method
-(`capability`). This outbound spec does not change or depend on the trait's store/config
-lifecycle methods:
+hard-fails) rather than failing to compile. The registry `Adapter` trait also reports target
+memory metadata through a defaulted `memory_ceiling` method. This outbound spec does not change
+or depend on the trait's store/config lifecycle methods:
 
 ```rust
 // crates/edgezero-adapter/src/registry.rs — current (post-#269) shape
@@ -3506,6 +3506,11 @@ pub trait Adapter: Sync + Send {
     fn capability(&self, _capability: Capability) -> CapabilitySupport {
         CapabilitySupport::Unsupported
     }
+    // Target resource metadata, separate from behavioral capability support. Native,
+    // operator-configured, and otherwise unknown targets inherit `None`.
+    fn memory_ceiling(&self) -> Option<MemoryCeiling> {
+        None
+    }
     // NOTE for in-tree overrides: an adapter that overrides `capability` REPLACES this
     // default — the default does not run for capabilities the override's `match` doesn't
     // name. `Capability` is `#[non_exhaustive]`, so every in-tree `match capability { .. }`
@@ -3513,12 +3518,24 @@ pub trait Adapter: Sync + Send {
     // reads as some accidental value instead of the intended fail-closed `Unsupported`.
 
  // Existing non-outbound methods are elided. `ensure_capabilities` consults only
- // `capability(..)`.
+ // `capability(..)` for behavior gates. Resource-policy consumers consult
+ // `memory_ceiling()` independently.
 }
 ```
 
 This reference is intentionally partial. Existing non-outbound trait methods retain
 their current ownership and behavior.
+
+`MemoryCeiling` carries exact primary bytes, an optional separately published stack allowance,
+`MemoryCeilingScope::{PerExecution, PerInstance}`, and typed provenance. Cloudflare reports
+128,000,000 bytes per instance; Fastly reports a 128,000,000-byte heap plus a separate
+1,000,000-byte stack per execution. Axum and generic Spin report `None`. The Spin runtime exposes
+an explicit Akamai Functions profile with 134,217,728 bytes per execution; it is not the generic
+default because Spin's `max_instance_memory` is runtime-configurable.
+
+The registry is CLI-owned, so runtime adapters also pass the same canonical `PlatformMetadata`
+to `Hooks::build_app(platform)` before `Hooks::configure` runs. `App::platform()` therefore
+supports startup resource validation without linking CLI registration code into runtime artifacts.
 
 **Publication order:** adding the trait/default does not immediately advertise the matrix.
 Each in-tree adapter inherits `Unsupported` until its outbound implementation, deterministic

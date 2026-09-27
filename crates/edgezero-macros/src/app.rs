@@ -197,6 +197,67 @@ fn build_route_tokens(manifest: &Manifest) -> Result<Vec<TokenStream2>, String> 
     Ok(tokens)
 }
 
+fn build_hooks_tokens(
+    app_ident: &Ident,
+    configure_tokens: &TokenStream2,
+    manifest_json_lit: &LitStr,
+    owns_logging: bool,
+    app_name_lit: &LitStr,
+    stores_tokens: &TokenStream2,
+) -> TokenStream2 {
+    quote! {
+        pub struct #app_ident;
+
+        impl edgezero_core::app::Hooks for #app_ident {
+            fn routes() -> edgezero_core::router::RouterService {
+                build_router()
+            }
+
+            #configure_tokens
+
+            fn manifest() -> ::edgezero_core::manifest::BakedManifest {
+                static CACHE: ::std::sync::OnceLock<
+                    ::edgezero_core::manifest::BakedManifest,
+                > = ::std::sync::OnceLock::new();
+                *CACHE.get_or_init(|| {
+                    match <Self as ::edgezero_core::app::Hooks>::manifest_json() {
+                        None => ::edgezero_core::manifest::BakedManifest::Absent,
+                        Some(json) => {
+                            ::edgezero_core::manifest::Manifest::from_baked_json(json)
+                        }
+                    }
+                })
+            }
+
+            fn manifest_json() -> Option<&'static str> {
+                Some(#manifest_json_lit)
+            }
+
+            fn owns_logging() -> bool {
+                #owns_logging
+            }
+
+            fn name() -> &'static str {
+                #app_name_lit
+            }
+
+            #stores_tokens
+
+            fn build_app(
+                platform: ::edgezero_core::platform::PlatformMetadata,
+            ) -> Result<edgezero_core::app::App, edgezero_core::error::EdgeError> {
+                let mut app = edgezero_core::app::App::with_name_and_platform(
+                    Self::routes(),
+                    Self::name(),
+                    platform,
+                );
+                Self::configure(&mut app)?;
+                Ok(app)
+            }
+        }
+    }
+}
+
 pub fn expand_app(input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(input as AppArgs);
 
@@ -246,65 +307,23 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     let manifest_path_lit = LitStr::new(&manifest_path.to_string_lossy(), Span::call_site());
     let owns_logging_lit = args.owns_logging.unwrap_or(false);
     let configure_tokens = build_configure_tokens(args.configure.as_ref());
-    // Emitted only when `state = <expr>` is given; `Option<TokenStream2>: ToTokens`
-    // renders `None` as nothing, so an app without `state` is unchanged.
     let state_call = args.state.as_ref().map(|state_expr| {
         quote! { builder = builder.with_state(#state_expr); }
     });
+    let hooks_tokens = build_hooks_tokens(
+        &app_ident,
+        &configure_tokens,
+        &manifest_json_lit,
+        owns_logging_lit,
+        &app_name_lit,
+        &stores_tokens,
+    );
 
-    // The emitted `Hooks` impl below explicitly defines `configure`,
-    // `owns_logging`, and `build_app`. `configure` invokes the supplied callback
-    // when present; the other bodies mirror the trait defaults. This is required
-    // because `missing_trait_methods` (restriction = deny) forbids relying on
-    // trait defaults in the impl. If those `Hooks` defaults change, update these
-    // emitted bodies to match.
     let output = quote! {
         // Force a rebuild when the manifest file changes (include_bytes tracks it as a build input).
         const _: &[u8] = include_bytes!(#manifest_path_lit);
 
-        pub struct #app_ident;
-
-        impl edgezero_core::app::Hooks for #app_ident {
-            fn routes() -> edgezero_core::router::RouterService {
-                build_router()
-            }
-
-            #configure_tokens
-
-            fn manifest() -> ::edgezero_core::manifest::BakedManifest {
-                static CACHE: ::std::sync::OnceLock<
-                    ::edgezero_core::manifest::BakedManifest,
-                > = ::std::sync::OnceLock::new();
-                *CACHE.get_or_init(|| {
-                    match <Self as ::edgezero_core::app::Hooks>::manifest_json() {
-                        None => ::edgezero_core::manifest::BakedManifest::Absent,
-                        Some(json) => {
-                            ::edgezero_core::manifest::Manifest::from_baked_json(json)
-                        }
-                    }
-                })
-            }
-
-            fn manifest_json() -> Option<&'static str> {
-                Some(#manifest_json_lit)
-            }
-
-            fn owns_logging() -> bool {
-                #owns_logging_lit
-            }
-
-            fn name() -> &'static str {
-                #app_name_lit
-            }
-
-            #stores_tokens
-
-            fn build_app() -> Result<edgezero_core::app::App, edgezero_core::error::EdgeError> {
-                let mut app = edgezero_core::app::App::with_name(Self::routes(), Self::name());
-                Self::configure(&mut app)?;
-                Ok(app)
-            }
-        }
+        #hooks_tokens
 
         pub fn build_router() -> edgezero_core::router::RouterService {
             let mut builder = edgezero_core::router::RouterService::builder();

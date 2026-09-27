@@ -67,14 +67,15 @@ matching `.require_kv()` / `.require_secrets()` flags, and finally
 to open bindings:
 
 ```rust
-use edgezero_adapter_cloudflare::request::CloudflareService;
+use edgezero_adapter_cloudflare::{CLOUDFLARE_PLATFORM, request::CloudflareService};
 use edgezero_core::app::Hooks as _;
 use my_app_core::App;
 use worker::*;
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    let app = App::build_app();
+    let app = App::build_app(CLOUDFLARE_PLATFORM)
+        .map_err(|_| Error::RustError("application configuration failed".to_owned()))?;
     CloudflareService::new(&app)
         .with_config("app_config")
         .with_kv("sessions")

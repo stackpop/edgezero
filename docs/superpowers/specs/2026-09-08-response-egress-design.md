@@ -399,8 +399,8 @@ invalid limits. The `Hooks` contract is a hard cut to a fallible builder:
 
 ```rust
 pub trait Hooks {
-    fn build_app() -> Result<App, EdgeError> {
-        let mut app = App::with_name(Self::routes(), Self::name());
+    fn build_app(platform: PlatformMetadata) -> Result<App, EdgeError> {
+        let mut app = App::with_name_and_platform(Self::routes(), Self::name(), platform);
         Self::configure(&mut app)?;
         Ok(app)
     }

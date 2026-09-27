@@ -26,3 +26,7 @@ pub mod cli;
 
 #[cfg(test)]
 pub mod test_utils;
+
+/// Native Axum has no framework-owned memory ceiling; the operator selects it.
+pub const AXUM_PLATFORM: edgezero_core::PlatformMetadata =
+    edgezero_core::PlatformMetadata::new(None);

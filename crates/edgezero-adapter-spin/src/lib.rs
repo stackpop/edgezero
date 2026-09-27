@@ -32,14 +32,31 @@ use core::future::Future;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use core::pin::Pin;
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 use edgezero_core::app::{App, Hooks};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+use edgezero_core::error::EdgeError;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use spin_sdk::http::Request as SpinRequest;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use spin_sdk::wasip3::http::types::Response as WasiResponse;
+
+/// Akamai Functions' published default quota for a Spin function execution.
+pub const AKAMAI_FUNCTIONS_PLATFORM: edgezero_core::PlatformMetadata =
+    edgezero_core::PlatformMetadata::new(Some(edgezero_core::MemoryCeiling::new(
+        128 * 1024 * 1024,
+        edgezero_core::MemoryCeilingScope::PerExecution,
+        None,
+        edgezero_core::MemoryCeilingSource::HostedDefault {
+            provider: "Akamai Functions",
+        },
+    )));
+
+/// Generic Spin has a runtime-configured memory limit rather than one portable ceiling.
+pub const SPIN_PLATFORM: edgezero_core::PlatformMetadata =
+    edgezero_core::PlatformMetadata::new(None);
 
 /// Raw `WASIp3` response whose body and transmission lifetime remain owned by `EdgeZero`.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -66,8 +83,15 @@ impl AppExt for App {
 }
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
-    A::build_app().context("application configuration failed")
+fn build_app_for_dispatch<A: Hooks>(
+    platform: edgezero_core::PlatformMetadata,
+) -> anyhow::Result<App> {
+    build_target_app::<A>(platform).context("application configuration failed")
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+fn build_target_app<A: Hooks>(platform: edgezero_core::PlatformMetadata) -> Result<App, EdgeError> {
+    A::build_app(platform)
 }
 
 /// Test seam for the production application-assembly error mapping.
@@ -75,7 +99,7 @@ fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
 #[doc(hidden)]
 #[inline]
 pub fn build_app_for_test<A: Hooks>() -> anyhow::Result<App> {
-    build_app_for_dispatch::<A>()
+    build_app_for_dispatch::<A>(SPIN_PLATFORM)
 }
 
 /// Initialize the logger for Spin.
@@ -126,7 +150,24 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[inline]
 pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinResponse> {
-    let app = build_app_for_dispatch::<A>()?;
+    run_app_with_platform::<A>(req, SPIN_PLATFORM).await
+}
+
+/// Build and dispatch a Spin application with explicit runtime platform metadata.
+///
+/// Use [`AKAMAI_FUNCTIONS_PLATFORM`] for Akamai Functions. Self-hosted Spin
+/// deployments can construct metadata from their configured `max_instance_memory`.
+///
+/// # Errors
+/// Returns [`anyhow::Error`] when application configuration, request conversion,
+/// routing, store binding, or response translation fails.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[inline]
+pub async fn run_app_with_platform<A: Hooks>(
+    req: SpinRequest,
+    platform: edgezero_core::PlatformMetadata,
+) -> anyhow::Result<SpinResponse> {
+    let app = build_app_for_dispatch::<A>(platform)?;
     // Best-effort: every Spin `#[http_service]` re-enters this function, so a
     // second `log::set_logger` call returns Err — drop the result instead of
     // `.expect()` to avoid panicking on every subsequent request. Skipped
@@ -138,4 +179,70 @@ pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinResponse>
     let stores = A::stores();
     request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)
         .await
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use edgezero_core::app::{App, Hooks};
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::router::RouterService;
+
+    macro_rules! platform_hooks {
+        ($hooks:ty, $platform:expr) => {
+            #[expect(
+                clippy::missing_trait_methods,
+                reason = "test hook overrides application construction to prove the adapter uses target metadata"
+            )]
+            impl Hooks for $hooks {
+                fn build_app(platform: edgezero_core::PlatformMetadata) -> Result<App, EdgeError> {
+                    if platform != $platform {
+                        return Err(EdgeError::service_unavailable("wrong platform metadata"));
+                    }
+                    let mut app =
+                        App::with_name_and_platform(Self::routes(), Self::name(), platform);
+                    Self::configure(&mut app)?;
+                    Ok(app)
+                }
+
+                fn configure(app: &mut App) -> Result<(), EdgeError> {
+                    if app.platform() == $platform {
+                        Ok(())
+                    } else {
+                        Err(EdgeError::service_unavailable("wrong application platform"))
+                    }
+                }
+
+                fn routes() -> RouterService {
+                    RouterService::builder().build()
+                }
+            }
+        };
+    }
+
+    struct GenericPlatformConfiguration;
+    struct HostedPlatformConfiguration;
+
+    platform_hooks!(GenericPlatformConfiguration, crate::SPIN_PLATFORM);
+    platform_hooks!(
+        HostedPlatformConfiguration,
+        crate::AKAMAI_FUNCTIONS_PLATFORM
+    );
+
+    #[test]
+    fn application_configuration_receives_generic_spin_platform_metadata() {
+        let app = super::build_target_app::<GenericPlatformConfiguration>(crate::SPIN_PLATFORM)
+            .expect("configured application");
+
+        assert_eq!(app.platform(), crate::SPIN_PLATFORM);
+    }
+
+    #[test]
+    fn application_configuration_receives_explicit_hosted_platform_metadata() {
+        let app = super::build_target_app::<HostedPlatformConfiguration>(
+            crate::AKAMAI_FUNCTIONS_PLATFORM,
+        )
+        .expect("configured application");
+
+        assert_eq!(app.platform(), crate::AKAMAI_FUNCTIONS_PLATFORM);
+    }
 }

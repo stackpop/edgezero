@@ -17,7 +17,7 @@ use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
-use edgezero_core::{Capability, CapabilitySupport};
+use edgezero_core::{Capability, CapabilitySupport, MemoryCeiling};
 use walkdir::WalkDir;
 
 static CLOUDFLARE_ADAPTER: CloudflareCliAdapter = CloudflareCliAdapter;
@@ -219,6 +219,10 @@ impl Adapter for CloudflareCliAdapter {
                 "cloudflare adapter does not support pinned target action {action:?}"
             )),
         }
+    }
+
+    fn memory_ceiling(&self) -> Option<MemoryCeiling> {
+        crate::CLOUDFLARE_PLATFORM.memory_ceiling()
     }
 
     fn merged_id_kinds(&self) -> &'static [&'static str] {
@@ -1326,6 +1330,27 @@ mod tests {
                 "{capability:?}"
             );
         }
+    }
+
+    #[test]
+    fn adapter_memory_ceiling_matches_runtime_metadata() {
+        let ceiling = CLOUDFLARE_ADAPTER
+            .memory_ceiling()
+            .expect("Cloudflare publishes a memory ceiling");
+
+        assert_eq!(Some(ceiling), crate::CLOUDFLARE_PLATFORM.memory_ceiling());
+        assert_eq!(ceiling.total_bytes(), 128_000_000);
+        assert_eq!(
+            ceiling.scope(),
+            edgezero_core::MemoryCeilingScope::PerInstance
+        );
+        assert_eq!(ceiling.stack_bytes(), None);
+        assert_eq!(
+            ceiling.source(),
+            edgezero_core::MemoryCeilingSource::PlatformLimit {
+                provider: "Cloudflare Workers",
+            }
+        );
     }
 
     // ---------- extract_namespace_id ----------

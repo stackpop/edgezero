@@ -1604,7 +1604,7 @@ mod tests {
             "generated apps must use EdgeZero's reusable late-bound resource owner",
         );
         assert!(
-            core_lib.contains("super::App::build_app().expect(\"configured app\")"),
+            core_lib.contains("super::App::build_app(edgezero_core::PlatformMetadata::default())"),
             "generated tests must handle fallible application assembly",
         );
         assert_generated_fallback_policy(&core_lib);

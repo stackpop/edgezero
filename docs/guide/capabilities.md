@@ -29,6 +29,31 @@ Support levels mean:
   deployment prerequisite.
 - `Unsupported`: unavailable on that adapter.
 
+## Platform Memory Ceilings
+
+`Adapter::memory_ceiling()` reports target-owned memory policy separately from behavioral
+capabilities. Runtime adapters install the same `PlatformMetadata` before `Hooks::configure`
+runs, so startup validation and CLI tooling use one canonical value. `Primary ceiling` excludes
+the separately published Fastly stack allowance.
+
+| Target                  | Primary ceiling           | Separate stack       | Scope              | Provenance                         |
+| ----------------------- | ------------------------- | -------------------- | ------------------ | ---------------------------------- |
+| Axum                    | Unknown                   | None                 | Operator-defined   | Operator configuration             |
+| Cloudflare Workers      | 128000000 bytes (128 MB)  | None                 | Per instance       | Platform limit: Cloudflare Workers |
+| Fastly Compute          | 128000000 bytes (128 MB)  | 1000000 bytes (1 MB) | Per execution      | Platform limit: Fastly Compute     |
+| Spin (generic)          | Unknown                   | None                 | Runtime-configured | Spin runtime                       |
+| Akamai Functions (Spin) | 134217728 bytes (128 MiB) | None                 | Per execution      | Hosted default: Akamai Functions   |
+
+Cloudflare's limit is shared by concurrent requests in one isolate, so concurrency divides the
+available application envelope. Fastly gives each execution its own heap and stack allowances.
+Generic Spin is deliberately unknown because `max_instance_memory` is runtime-configurable;
+applications deployed to Akamai Functions opt into `AKAMAI_FUNCTIONS_PLATFORM` through the Spin
+platform-aware entrypoint rather than changing the meaning of every Spin deployment.
+
+Sources: [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/),
+[Fastly Compute resource limits](https://docs.fastly.com/products/compute-resource-limits), and
+[Akamai Functions quotas](https://techdocs.akamai.com/akamai-functions/docs/quotas-and-limits).
+
 ## Ingress Matrix
 
 | Capability                       | Axum        | Cloudflare  | Fastly      | Spin        |
@@ -102,9 +127,11 @@ proved cancellable within a finite wall-clock interval, so every adapter reports
 [configuration design](https://github.com/stackpop/edgezero/blob/main/docs/superpowers/specs/2026-06-16-blob-app-config.md#632-bounded-capability-scoped-extraction-reads)
 defines the normative accounting, cancellation, error, and promotion requirements.
 
-Application assembly is fallible. `Hooks::configure(&mut App) -> Result<(), EdgeError>` runs before
-EdgeZero request conversion, body polling, or dispatch, and `Hooks::build_app()` propagates that
-result. Axum also completes assembly before binding its listener.
+Application assembly is fallible. `Hooks::configure(&mut App) -> Result<(), EdgeError>` runs after
+the runtime adapter installs `PlatformMetadata` and before EdgeZero request conversion, body
+polling, or dispatch. The hard-cut `Hooks::build_app(platform)` signature requires every caller to
+choose target metadata explicitly and propagates the configuration result. Axum also completes
+assembly before binding its listener.
 
 ## Response Egress Matrix
 

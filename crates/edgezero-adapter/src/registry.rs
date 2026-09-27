@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, PoisonError, RwLock};
 
-use edgezero_core::{Capability, CapabilitySupport};
+use edgezero_core::{Capability, CapabilitySupport, MemoryCeiling};
 
 static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -412,6 +412,16 @@ pub trait Adapter: Sync + Send {
         ))
     }
 
+    /// Report the target's memory ceiling and accounting scope when known.
+    ///
+    /// The default is unknown because native targets and configurable runtimes
+    /// may not have one portable platform limit.
+    #[must_use]
+    #[inline]
+    fn memory_ceiling(&self) -> Option<MemoryCeiling> {
+        None
+    }
+
     /// Store kinds whose logical-id namespaces the adapter merges into
     /// a single backend at runtime — declaring the SAME logical id
     /// under two merged kinds causes silent write collisions because
@@ -799,6 +809,11 @@ mod tests {
             FIRST.capability(Capability::OutboundHttp),
             CapabilitySupport::Unsupported
         );
+    }
+
+    #[test]
+    fn adapter_memory_ceiling_default_is_unknown() {
+        assert_eq!(FIRST.memory_ceiling(), None);
     }
 
     #[test]

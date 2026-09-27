@@ -392,7 +392,7 @@ fn serve_local(
 /// # Errors
 /// Returns an error if the dev server fails to bind or any required store handle cannot be initialised.
 fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
-    A::build_app().context("application configuration failed")
+    A::build_app(crate::AXUM_PLATFORM).context("application configuration failed")
 }
 
 /// Runs an application with the Axum development server.
@@ -595,6 +595,8 @@ mod tests {
 
     struct FailingConfiguration;
 
+    struct PlatformAwareConfiguration;
+
     #[expect(
         clippy::missing_trait_methods,
         reason = "test hook exercises only adapter startup failure"
@@ -602,6 +604,33 @@ mod tests {
     impl Hooks for FailingConfiguration {
         fn configure(_app: &mut App) -> Result<(), EdgeError> {
             Err(EdgeError::service_unavailable("configuration unavailable"))
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test hook overrides application construction to prove the adapter uses target metadata"
+    )]
+    impl Hooks for PlatformAwareConfiguration {
+        fn build_app(platform: edgezero_core::PlatformMetadata) -> Result<App, EdgeError> {
+            if platform != crate::AXUM_PLATFORM {
+                return Err(EdgeError::service_unavailable("wrong platform metadata"));
+            }
+            let mut app = App::with_name_and_platform(Self::routes(), Self::name(), platform);
+            Self::configure(&mut app)?;
+            Ok(app)
+        }
+
+        fn configure(app: &mut App) -> Result<(), EdgeError> {
+            if app.platform() == crate::AXUM_PLATFORM {
+                Ok(())
+            } else {
+                Err(EdgeError::service_unavailable("wrong application platform"))
+            }
         }
 
         fn routes() -> RouterService {
@@ -619,6 +648,13 @@ mod tests {
         let error = result.expect_err("configuration must fail before listener bind");
         assert_eq!(error.to_string(), "application configuration failed");
         assert_eq!(bind_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn application_configuration_receives_axum_platform_metadata() {
+        let app = build_app_for_dispatch::<PlatformAwareConfiguration>().expect("configured app");
+
+        assert_eq!(app.platform(), crate::AXUM_PLATFORM);
     }
 
     #[test]

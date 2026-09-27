@@ -25,18 +25,38 @@ pub mod response;
 pub mod secret_store;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-use edgezero_core::app::{App, Hooks, StoresMetadata};
+use edgezero_core::app::StoresMetadata;
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+use edgezero_core::app::{App, Hooks};
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+use edgezero_core::error::EdgeError;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use worker::{Context, Env, Error as WorkerError, Request, Response};
 
+/// Cloudflare Workers' published per-isolate memory limit.
+pub const CLOUDFLARE_PLATFORM: edgezero_core::PlatformMetadata =
+    edgezero_core::PlatformMetadata::new(Some(edgezero_core::MemoryCeiling::new(
+        128_000_000,
+        edgezero_core::MemoryCeilingScope::PerInstance,
+        None,
+        edgezero_core::MemoryCeilingSource::PlatformLimit {
+            provider: "Cloudflare Workers",
+        },
+    )));
+
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 fn build_app_for_dispatch<A: Hooks>() -> Result<App, WorkerError> {
-    A::build_app().map_err(|error| {
+    build_target_app::<A>().map_err(|error| {
         log::error!("application configuration failed: {}", error.kind());
         WorkerError::RustError("application configuration failed".to_owned())
     })
+}
+
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+fn build_target_app<A: Hooks>() -> Result<App, EdgeError> {
+    A::build_app(CLOUDFLARE_PLATFORM)
 }
 
 /// Test seam for the production application-assembly error mapping.
@@ -142,4 +162,48 @@ pub async fn run_app<A: Hooks>(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use edgezero_core::app::{App, Hooks};
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::router::RouterService;
+
+    struct PlatformAwareConfiguration;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test hook overrides application construction to prove the adapter uses target metadata"
+    )]
+    impl Hooks for PlatformAwareConfiguration {
+        fn build_app(platform: edgezero_core::PlatformMetadata) -> Result<App, EdgeError> {
+            if platform != crate::CLOUDFLARE_PLATFORM {
+                return Err(EdgeError::service_unavailable("wrong platform metadata"));
+            }
+            let mut app = App::with_name_and_platform(Self::routes(), Self::name(), platform);
+            Self::configure(&mut app)?;
+            Ok(app)
+        }
+
+        fn configure(app: &mut App) -> Result<(), EdgeError> {
+            if app.platform() == crate::CLOUDFLARE_PLATFORM {
+                Ok(())
+            } else {
+                Err(EdgeError::service_unavailable("wrong application platform"))
+            }
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[test]
+    fn application_configuration_receives_cloudflare_platform_metadata() {
+        let app = super::build_target_app::<PlatformAwareConfiguration>()
+            .expect("configured application");
+
+        assert_eq!(app.platform(), crate::CLOUDFLARE_PLATFORM);
+    }
 }

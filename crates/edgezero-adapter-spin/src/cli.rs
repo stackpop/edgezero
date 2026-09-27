@@ -24,7 +24,7 @@ use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
-use edgezero_core::{Capability, CapabilitySupport};
+use edgezero_core::{Capability, CapabilitySupport, MemoryCeiling};
 use walkdir::WalkDir;
 
 mod push_cloud;
@@ -224,6 +224,10 @@ impl Adapter for SpinCliAdapter {
                 "spin adapter cannot execute operational action {action:?} against a pinned runtime target"
             )),
         }
+    }
+
+    fn memory_ceiling(&self) -> Option<MemoryCeiling> {
+        crate::SPIN_PLATFORM.memory_ceiling()
     }
 
     fn merged_id_kinds(&self) -> &'static [&'static str] {
@@ -1413,6 +1417,31 @@ mod tests {
                 "{capability:?}"
             );
         }
+    }
+
+    #[test]
+    fn adapter_memory_ceiling_distinguishes_generic_and_hosted_profiles() {
+        assert_eq!(SPIN_ADAPTER.memory_ceiling(), None);
+        assert_eq!(
+            SPIN_ADAPTER.memory_ceiling(),
+            crate::SPIN_PLATFORM.memory_ceiling()
+        );
+
+        let ceiling = crate::AKAMAI_FUNCTIONS_PLATFORM
+            .memory_ceiling()
+            .expect("Akamai Functions publishes a hosted quota");
+        assert_eq!(ceiling.total_bytes(), 128 * 1024 * 1024);
+        assert_eq!(
+            ceiling.scope(),
+            edgezero_core::MemoryCeilingScope::PerExecution
+        );
+        assert_eq!(ceiling.stack_bytes(), None);
+        assert_eq!(
+            ceiling.source(),
+            edgezero_core::MemoryCeilingSource::HostedDefault {
+                provider: "Akamai Functions",
+            }
+        );
     }
 
     #[test]

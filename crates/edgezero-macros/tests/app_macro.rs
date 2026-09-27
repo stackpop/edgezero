@@ -51,7 +51,8 @@ mod configured_app {
 
     #[test]
     fn app_macro_configure_callback_installs_ingress_policy() {
-        let app = ConfiguredApp::build_app().expect("configured app");
+        let app = ConfiguredApp::build_app(edgezero_core::PlatformMetadata::default())
+            .expect("configured app");
         let head = IngressHeadParts::new(
             Method::GET,
             Uri::from_static("/"),
@@ -94,9 +95,52 @@ mod failing_configured_app {
 
     #[test]
     fn app_macro_propagates_configuration_failure() {
-        let Err(error) = FailingConfiguredApp::build_app() else {
+        let Err(error) =
+            FailingConfiguredApp::build_app(edgezero_core::PlatformMetadata::default())
+        else {
             panic!("configuration failure must stop application assembly");
         };
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+#[cfg(test)]
+mod platform_configured_app {
+    use edgezero_core::app::{App, Hooks as _};
+    use edgezero_core::{
+        EdgeError, MemoryCeiling, MemoryCeilingScope, MemoryCeilingSource, PlatformMetadata,
+    };
+
+    const TEST_PLATFORM: PlatformMetadata = PlatformMetadata::new(Some(MemoryCeiling::new(
+        64_000_000,
+        MemoryCeilingScope::PerExecution,
+        None,
+        MemoryCeilingSource::PlatformLimit {
+            provider: "macro-test",
+        },
+    )));
+
+    fn configure_app(app: &mut App) -> Result<(), EdgeError> {
+        if app.platform() == TEST_PLATFORM {
+            Ok(())
+        } else {
+            Err(EdgeError::service_unavailable(
+                "platform metadata unavailable during configuration",
+            ))
+        }
+    }
+
+    edgezero_core::app!(
+        "tests/fixtures/owns_logging.toml",
+        PlatformConfiguredApp,
+        configure = configure_app
+    );
+
+    #[test]
+    fn app_macro_installs_platform_metadata_before_configuration() {
+        let app =
+            PlatformConfiguredApp::build_app(TEST_PLATFORM).expect("platform-aware configured app");
+
+        assert_eq!(app.platform(), TEST_PLATFORM);
     }
 }

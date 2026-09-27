@@ -4642,7 +4642,7 @@ these variants.
 
 `ConfigExtractionLimits::default()` returns the five constants above. `App` owns one
 config-extraction-limits value, set through the fallible
-`Hooks::configure(&mut App) -> Result<(), EdgeError>` callback; `Hooks::build_app()` prevents
+`Hooks::configure(&mut App) -> Result<(), EdgeError>` callback; `Hooks::build_app(platform)` prevents
 request conversion, admission, body polling, or dispatch when validation fails (and prevents
 listener bind on Axum), while the adapter copies a successfully validated value into
 `RequestContext`. All values must be finite and nonzero, and

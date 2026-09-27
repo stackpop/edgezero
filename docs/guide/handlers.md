@@ -326,7 +326,7 @@ app-state struct and register that.
 
 > **Make `app_state()` cheap.** The macro emits the `state` expression inside the
 > generated `build_router()`, which each adapter's `run_app` calls through
-> `A::build_app()` — **once at startup** for long-lived runtimes (Axum), but
+> `A::build_app(platform)` — **once at startup** for long-lived runtimes (Axum), but
 > **once per request** on Fastly Compute (each request is a fresh Wasm instance).
 > So the `state` expression runs on that cadence: build heavy state **once** and
 > hand out clones (e.g. a `OnceLock<Arc<AppState>>` as above, or a `static`), and

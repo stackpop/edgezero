@@ -34,6 +34,7 @@ pub mod manifest;
 pub mod middleware;
 pub mod outbound;
 pub mod params;
+pub mod platform;
 pub mod responder;
 pub mod response;
 pub mod response_egress;
@@ -87,6 +88,7 @@ pub use outbound::{
     limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch, normalize_response_headers,
     rechunk_stream, validate_for_dispatch,
 };
+pub use platform::{MemoryCeiling, MemoryCeilingScope, MemoryCeilingSource, PlatformMetadata};
 pub use response_egress::{
     DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressDecision,
     DetachedResponseEgressDecisionFactory, DetachedResponseEgressHead,

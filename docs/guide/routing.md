@@ -182,11 +182,12 @@ Axum-style `:name` parameters are **not supported**. Use `{name}` instead.
 
 Routes are matched by specificity (static segments first, then parameters, then catch-alls).
 Registering two routes that conflict for the same method (for example, two routes that both look
-like `/users/{id}`) panics while the routes are registered (inside `build_app()`) with
+like `/users/{id}`) panics while the routes are registered (inside `build_app(platform)`) with
 `duplicate route definition for <path>`.
 When that happens depends on the adapter: Axum builds the router once at startup, so the conflict
-surfaces before any traffic, but the Fastly, Cloudflare, and Spin entry points call `build_app()`
-per request, so a conflicting route deploys successfully and then panics on the first request.
+surfaces before any traffic, but the Fastly, Cloudflare, and Spin entry points call
+`build_app(platform)` per request, so a conflicting route deploys successfully and then panics on
+the first request.
 Run the app under the Axum dev server before deploying to an edge target.
 
 ## Next Steps

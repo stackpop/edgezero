@@ -34,7 +34,7 @@ use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
-use edgezero_core::{Capability, CapabilitySupport};
+use edgezero_core::{Capability, CapabilitySupport, MemoryCeiling};
 use walkdir::WalkDir;
 
 static FASTLY_ADAPTER: FastlyCliAdapter = FastlyCliAdapter;
@@ -491,6 +491,10 @@ impl Adapter for FastlyCliAdapter {
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
         gc_fastly_config_store(store.platform.as_str(), older_than_secs, dry_run)
+    }
+
+    fn memory_ceiling(&self) -> Option<MemoryCeiling> {
+        crate::FASTLY_PLATFORM.memory_ceiling()
     }
 
     fn name(&self) -> &'static str {
@@ -5757,6 +5761,27 @@ mod tests {
                 "{capability:?}"
             );
         }
+    }
+
+    #[test]
+    fn adapter_memory_ceiling_matches_runtime_metadata() {
+        let ceiling = FASTLY_ADAPTER
+            .memory_ceiling()
+            .expect("Fastly publishes a memory ceiling");
+
+        assert_eq!(Some(ceiling), crate::FASTLY_PLATFORM.memory_ceiling());
+        assert_eq!(ceiling.total_bytes(), 128_000_000);
+        assert_eq!(
+            ceiling.scope(),
+            edgezero_core::MemoryCeilingScope::PerExecution
+        );
+        assert_eq!(ceiling.stack_bytes(), Some(1_000_000));
+        assert_eq!(
+            ceiling.source(),
+            edgezero_core::MemoryCeilingSource::PlatformLimit {
+                provider: "Fastly Compute",
+            }
+        );
     }
 
     // `PathPrepend` (RAII $PATH guard) is the shared helper imported above from

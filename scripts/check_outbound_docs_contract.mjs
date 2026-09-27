@@ -4,7 +4,10 @@ import { readFileSync } from 'node:fs'
 
 const capabilityPath = 'docs/guide/capabilities.md'
 const handlersGuidePath = 'docs/guide/handlers.md'
+const axumGuidePath = 'docs/guide/adapters/axum.md'
+const cloudflareGuidePath = 'docs/guide/adapters/cloudflare.md'
 const proxyGuidePath = 'docs/guide/proxying.md'
+const routingGuidePath = 'docs/guide/routing.md'
 const fastlyGuidePath = 'docs/guide/adapters/fastly.md'
 const scaffoldReadmePath =
   'crates/edgezero-cli/src/templates/root/README.md.hbs'
@@ -228,6 +231,38 @@ const expectedLimitRows = [
     'Unset',
   ],
 ]
+const expectedMemoryHeader = [
+  'Target',
+  'Primary ceiling',
+  'Separate stack',
+  'Scope',
+  'Provenance',
+]
+const expectedMemoryRows = [
+  ['Axum', 'Unknown', 'None', 'Operator-defined', 'Operator configuration'],
+  [
+    'Cloudflare Workers',
+    '128000000 bytes (128 MB)',
+    'None',
+    'Per instance',
+    'Platform limit: Cloudflare Workers',
+  ],
+  [
+    'Fastly Compute',
+    '128000000 bytes (128 MB)',
+    '1000000 bytes (1 MB)',
+    'Per execution',
+    'Platform limit: Fastly Compute',
+  ],
+  ['Spin (generic)', 'Unknown', 'None', 'Runtime-configured', 'Spin runtime'],
+  [
+    'Akamai Functions (Spin)',
+    '134217728 bytes (128 MiB)',
+    'None',
+    'Per execution',
+    'Hosted default: Akamai Functions',
+  ],
+]
 
 function fail(message) {
   process.stderr.write(`outbound docs contract: ${message}\n`)
@@ -290,6 +325,53 @@ try {
 }
 
 const lines = capabilitySource.split(/\r?\n/u)
+
+function readExactTable(sectionTitle, header, name) {
+  const headingIndex = lines.findIndex(
+    (line) => line.trim() === `## ${sectionTitle}`,
+  )
+  if (headingIndex === -1) fail(`${name} section is missing`)
+  const nextHeadingIndex = lines.findIndex(
+    (line, index) => index > headingIndex && line.startsWith('## '),
+  )
+  const sectionEnd = nextHeadingIndex === -1 ? lines.length : nextHeadingIndex
+  const headerIndex = lines.findIndex(
+    (line, index) =>
+      index > headingIndex &&
+      index < sectionEnd &&
+      JSON.stringify(cells(line)) === JSON.stringify(header),
+  )
+  if (headerIndex === -1) fail(`${name} table is missing`)
+  const separator = cells(lines[headerIndex + 1] ?? '')
+  if (
+    separator === null ||
+    separator.length !== header.length ||
+    !separator.every((value) => /^:?-{3,}:?$/u.test(value))
+  ) {
+    fail(`${name} table has an invalid separator row`)
+  }
+  const rows = []
+  for (let index = headerIndex + 2; index < sectionEnd; index += 1) {
+    const row = cells(lines[index])
+    if (row === null) break
+    if (row.length !== header.length) {
+      fail(`${name} row ${index + 1} has ${row.length} cells, expected ${header.length}`)
+    }
+    rows.push(row)
+  }
+  return rows
+}
+
+const actualMemoryRows = readExactTable(
+  'Platform Memory Ceilings',
+  expectedMemoryHeader,
+  'platform memory',
+)
+if (JSON.stringify(actualMemoryRows) !== JSON.stringify(expectedMemoryRows)) {
+  fail(
+    `platform memory mismatch\nexpected=${JSON.stringify(expectedMemoryRows)}\nactual=${JSON.stringify(actualMemoryRows)}`,
+  )
+}
 
 function findMatrixHeader(sectionTitle, name) {
   const headingIndex = lines.findIndex(
@@ -422,6 +504,43 @@ for (const requiredFragment of [
 ]) {
   if (!handlersGuideSource.includes(requiredFragment)) {
     fail(`${handlersGuidePath} is missing lifecycle contract: ${requiredFragment}`)
+  }
+}
+const cloudflareGuideSource = readFileSync(cloudflareGuidePath, 'utf8')
+if (
+  !cloudflareGuideSource.includes(
+    'App::build_app(CLOUDFLARE_PLATFORM)',
+  ) ||
+  cloudflareGuideSource.includes('App::build_app()')
+) {
+  fail(
+    `${cloudflareGuidePath} must construct manual applications with Cloudflare platform metadata`,
+  )
+}
+const axumGuideSource = readFileSync(axumGuidePath, 'utf8')
+if (
+  !axumGuideSource.includes(
+    'App::build_app(edgezero_adapter_axum::AXUM_PLATFORM)',
+  ) ||
+  axumGuideSource.includes('App::build_app()')
+) {
+  fail(
+    `${axumGuidePath} must construct manual applications with Axum platform metadata`,
+  )
+}
+const routingGuideSource = readFileSync(routingGuidePath, 'utf8')
+if (
+  !routingGuideSource.includes('build_app(platform)') ||
+  routingGuideSource.includes('build_app()')
+) {
+  fail(`${routingGuidePath} must document the platform-aware application builder`)
+}
+for (const [path, source] of [
+  [capabilityPath, capabilitySource],
+  [handlersGuidePath, handlersGuideSource],
+]) {
+  if (source.includes('build_app_for_platform')) {
+    fail(`${path} contains the removed application builder name`)
   }
 }
 if (

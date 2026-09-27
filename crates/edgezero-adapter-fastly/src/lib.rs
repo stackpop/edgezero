@@ -33,10 +33,12 @@ pub mod secret_store;
 
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::app::StoresMetadata;
-#[cfg(feature = "fastly")]
+#[cfg(any(feature = "fastly", test))]
 use edgezero_core::app::{App, Hooks};
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::env_config::EnvConfig;
+#[cfg(any(feature = "fastly", test))]
+use edgezero_core::error::EdgeError;
 #[cfg(feature = "fastly")]
 use edgezero_core::http::{Extensions, Response};
 #[cfg(any(feature = "fastly", test))]
@@ -45,6 +47,17 @@ use edgezero_core::manifest::ResolvedLoggingConfig;
 use fastly::compute_runtime::service_id;
 #[cfg(feature = "fastly")]
 use std::sync::Once;
+
+/// Fastly Compute's published per-execution heap and stack limits.
+pub const FASTLY_PLATFORM: edgezero_core::PlatformMetadata =
+    edgezero_core::PlatformMetadata::new(Some(edgezero_core::MemoryCeiling::new(
+        128_000_000,
+        edgezero_core::MemoryCeilingScope::PerExecution,
+        Some(1_000_000),
+        edgezero_core::MemoryCeilingSource::PlatformLimit {
+            provider: "Fastly Compute",
+        },
+    )));
 
 #[cfg(any(feature = "fastly", all(feature = "cli", not(target_arch = "wasm32"))))]
 const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";
@@ -118,7 +131,12 @@ impl From<&EnvConfig> for FastlyLogging {
 
 #[cfg(feature = "fastly")]
 fn build_app_for_dispatch<A: Hooks>() -> Result<App, fastly::Error> {
-    A::build_app().context("application configuration failed")
+    build_target_app::<A>().context("application configuration failed")
+}
+
+#[cfg(any(feature = "fastly", test))]
+fn build_target_app<A: Hooks>() -> Result<App, EdgeError> {
+    A::build_app(FASTLY_PLATFORM)
 }
 
 /// Test seam for the production application-assembly error mapping.
@@ -466,5 +484,49 @@ mod runtime_env_key_tests {
                 "EDGEZERO__LOGGING__USE_FASTLY_LOGGER",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use edgezero_core::app::{App, Hooks};
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::router::RouterService;
+
+    struct PlatformAwareConfiguration;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test hook overrides application construction to prove the adapter uses target metadata"
+    )]
+    impl Hooks for PlatformAwareConfiguration {
+        fn build_app(platform: edgezero_core::PlatformMetadata) -> Result<App, EdgeError> {
+            if platform != crate::FASTLY_PLATFORM {
+                return Err(EdgeError::service_unavailable("wrong platform metadata"));
+            }
+            let mut app = App::with_name_and_platform(Self::routes(), Self::name(), platform);
+            Self::configure(&mut app)?;
+            Ok(app)
+        }
+
+        fn configure(app: &mut App) -> Result<(), EdgeError> {
+            if app.platform() == crate::FASTLY_PLATFORM {
+                Ok(())
+            } else {
+                Err(EdgeError::service_unavailable("wrong application platform"))
+            }
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[test]
+    fn application_configuration_receives_fastly_platform_metadata() {
+        let app = super::build_target_app::<PlatformAwareConfiguration>()
+            .expect("configured application");
+
+        assert_eq!(app.platform(), crate::FASTLY_PLATFORM);
     }
 }
