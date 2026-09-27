@@ -14,7 +14,7 @@ before an adapter begins serving a request.
 explicit abort. Core transfers the completion through `PreparedIngress`,
 `ResponseEgressEnvelope`, and the sole `ResponseEgressAttempt`; the attempt stores terminal state,
 invokes the response completion once, then invokes the global observer. Adapters map abort to their
-strongest pre-response transport boundary and propagate fallible `Hooks::build_app()` before request
+strongest pre-response transport boundary and propagate fallible `App::build::<A>(platform)` before request
 conversion, admission, or body polling. This is an atomic hard cut with no extension carrier,
 infallible compatibility method, or response-extraction bypass.
 
@@ -65,7 +65,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 - `Abort` creates no response, envelope, attempt, completion report, or global observer report and
   polls no request body.
 - No adapter maps `Abort` to EdgeZero's normal JSON error response.
-- `Hooks::configure` and `Hooks::build_app` return `Result`; no unchecked or infallible bridge is
+- `Hooks::configure` and core-owned `App::build::<A>` return `Result`; no unchecked or infallible bridge is
   retained.
 - After every production edit, run the narrowest affected package tests before proceeding.
 
@@ -428,7 +428,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 - [x] **Step 1: Write red core and macro propagation tests**
 
   Add a failing configure callback returning a typed `EdgeError`. Assert both hand-written Hooks
-  and macro-generated Hooks return the same error from `build_app()` and never expose a partially
+  and macro-generated Hooks return the same error from `App::build::<A>` and never expose a partially
   configured `App`.
 
 - [x] **Step 2: Run core/macro tests and verify callback results are currently discarded**
@@ -440,28 +440,30 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
   cargo test -p edgezero-macros --test app_macro
   ```
 
-  Expected: compile failure because `configure` and `build_app` are infallible.
+  Expected: compile failure because `configure` and application assembly are infallible.
 
 - [x] **Step 3: Implement the fallible trait and macro signatures**
 
   Hard-cut to:
 
   ```rust
-  pub trait Hooks {
-      fn build_app() -> Result<App, EdgeError> {
-          let mut app = App::with_name(Self::routes(), Self::name());
-          Self::configure(&mut app)?;
+  impl App {
+      pub fn build<A: Hooks>(platform: PlatformMetadata) -> Result<Self, EdgeError> {
+          let mut app = Self::with_name_and_platform(A::routes(), A::name(), platform);
+          A::configure(&mut app)?;
           Ok(app)
       }
+  }
 
+  pub trait Hooks {
       fn configure(_app: &mut App) -> Result<(), EdgeError> {
           Ok(())
       }
   }
   ```
 
-  Make `app!` emit the same explicit methods and return the configured callback result. Do not add
-  `build_app_unchecked`, callback coercion, or panic fallback.
+  Make `app!` emit the hook methods and return the configured callback result. Do not add an
+  overridable builder, callback coercion, or panic fallback.
 
 - [x] **Step 4: Write red adapter-boundary tests**
 
@@ -554,7 +556,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 
   Make `configure_app` return `Result<(), EdgeError>`, add `Ok(())`, and give every decision an
   explicit `ResponseEgressCompletion`. Demonstrate a response-owned permit/drop probe without a
-  global response-id map. Update every demo/template `build_app()` call to handle `Result`.
+  global response-id map. Update every demo/template `App::build::<A>` call to handle `Result`.
 
 - [x] **Step 4: Migrate adapter templates and generated fixtures**
 
@@ -658,7 +660,7 @@ Spin SDK WASIp3, proc macros, Handlebars templates, VitePress documentation.
 - [x] **Step 5: Perform a final code-review pass**
 
   Review ownership/drop paths, callback panic ordering, abort zero-read behavior, fixed public error
-  messages, adapter capability claims, generated code, and every `build_app()` call. Remove dead
+  messages, adapter capability claims, generated code, and every `App::build::<A>` call. Remove dead
   branches and imports introduced by the hard cut; do not retain compatibility aliases.
 
 - [x] **Step 6: Commit any verification fixes and push PR #275**

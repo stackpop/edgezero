@@ -129,9 +129,9 @@ defines the normative accounting, cancellation, error, and promotion requirement
 
 Application assembly is fallible. `Hooks::configure(&mut App) -> Result<(), EdgeError>` runs after
 the runtime adapter installs `PlatformMetadata` and before EdgeZero request conversion, body
-polling, or dispatch. The hard-cut `Hooks::build_app(platform)` signature requires every caller to
-choose target metadata explicitly and propagates the configuration result. Axum also completes
-assembly before binding its listener.
+polling, or dispatch. The hard-cut, core-owned `App::build::<A>(platform)` constructor requires
+every caller to choose target metadata explicitly, cannot be replaced by application hooks, and
+propagates the configuration result. Axum also completes assembly before binding its listener.
 
 ## Response Egress Matrix
 

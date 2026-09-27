@@ -68,13 +68,13 @@ to open bindings:
 
 ```rust
 use edgezero_adapter_cloudflare::{CLOUDFLARE_PLATFORM, request::CloudflareService};
-use edgezero_core::app::Hooks as _;
+use edgezero_core::app::App as EdgeZeroApp;
 use my_app_core::App;
 use worker::*;
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    let app = App::build_app(CLOUDFLARE_PLATFORM)
+    let app = EdgeZeroApp::build::<App>(CLOUDFLARE_PLATFORM)
         .map_err(|_| Error::RustError("application configuration failed".to_owned()))?;
     CloudflareService::new(&app)
         .with_config("app_config")

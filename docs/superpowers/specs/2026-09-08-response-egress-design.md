@@ -395,23 +395,26 @@ or attach provider capability declarations to individual reports.
 ### 3.4 Fallible application assembly
 
 Application configuration is startup policy and must not require `expect` or panic to reject
-invalid limits. The `Hooks` contract is a hard cut to a fallible builder:
+invalid limits. Construction is core-owned so hooks cannot discard target metadata or bypass
+configuration:
 
 ```rust
-pub trait Hooks {
-    fn build_app(platform: PlatformMetadata) -> Result<App, EdgeError> {
-        let mut app = App::with_name_and_platform(Self::routes(), Self::name(), platform);
-        Self::configure(&mut app)?;
+impl App {
+    pub fn build<A: Hooks>(platform: PlatformMetadata) -> Result<Self, EdgeError> {
+        let mut app = Self::with_name_and_platform(A::routes(), A::name(), platform);
+        A::configure(&mut app)?;
         Ok(app)
     }
+}
 
+pub trait Hooks {
     fn configure(_app: &mut App) -> Result<(), EdgeError> {
         Ok(())
     }
 }
 ```
 
-The `app!` macro emits the same signatures. A supplied `configure = <expr>` callback must return
+The `app!` macro emits the hook signatures only. A supplied `configure = <expr>` callback must return
 `Result<(), EdgeError>` and its result is returned directly rather than discarded. No adapter
 continues with a partially configured `App`:
 
@@ -683,7 +686,7 @@ The implementation is atomic. It removes rather than deprecates:
   without beginning and terminally settling its attempt;
 - any response-extension-based completion carrier or cloneable shared callback slot; completion is
   a direct, non-clone admission/envelope/attempt ownership chain;
-- infallible `Hooks::configure` and `Hooks::build_app` signatures, callback-result discards, and
+- infallible `Hooks::configure` and overridable application-assembly signatures, callback-result discards, and
   application-side `expect` calls used only to bridge fallible startup policy;
 - obsolete tests, fixtures, imports, dependencies, capability footnotes, and adapter-guide
   text that describe buffered egress; and

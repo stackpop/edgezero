@@ -164,7 +164,7 @@ fn response_lifecycle(
 ///
 /// IMPORTANT: `app!(state = <expr>)` emits this call inside the macro-generated
 /// `build_router()`, which every adapter's `run_app` invokes via
-/// `A::build_app(platform)`
+/// `EdgeZeroApp::build::<A>(platform)`
 /// — once at startup for long-lived runtimes (Axum), but **once per request** on
 /// Fastly Compute (each request is a fresh Wasm instance). So `app_state()` must
 /// be **cheap**: build the heavy state once and hand out clones. Here a
@@ -194,7 +194,7 @@ mod lifecycle_tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use edgezero_core::app::{App as EdgeZeroApp, Hooks as _};
+    use edgezero_core::app::App as EdgeZeroApp;
     use edgezero_core::body::Body;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{request_builder, HeaderMap, Method, Response, StatusCode, Version};
@@ -219,7 +219,7 @@ mod lifecycle_tests {
 
     #[test]
     fn configured_admission_uses_finite_class_aware_deadlines() {
-        let app = super::App::build_app(edgezero_core::PlatformMetadata::default())
+        let app = EdgeZeroApp::build::<super::App>(edgezero_core::PlatformMetadata::default())
             .expect("configured app");
         let start = MonotonicInstant::now();
 
@@ -248,7 +248,7 @@ mod lifecycle_tests {
 
     #[test]
     fn admission_handler_consumes_the_typed_grant_once() {
-        let app = super::App::build_app(edgezero_core::PlatformMetadata::default())
+        let app = EdgeZeroApp::build::<super::App>(edgezero_core::PlatformMetadata::default())
             .expect("configured app");
         let start = MonotonicInstant::now();
         let prepared = begin_ingress(&app, "/admission", start);
@@ -268,7 +268,7 @@ mod lifecycle_tests {
     fn late_bound_permit_lives_until_terminal_egress() {
         let releases = Arc::new(AtomicUsize::new(0));
         let policy_releases = Arc::clone(&releases);
-        let mut app = super::App::build_app(edgezero_core::PlatformMetadata::default())
+        let mut app = EdgeZeroApp::build::<super::App>(edgezero_core::PlatformMetadata::default())
             .expect("configured app");
         app.set_ingress_admission_policy(move |head| {
             let RouteResolution::Matched(metadata) = head.route_resolution().clone() else {
@@ -305,7 +305,7 @@ mod lifecycle_tests {
         let late_bound_effects = Arc::new(AtomicUsize::new(0));
         let static_effects_for_policy = Arc::clone(&static_effects);
         let late_bound_effects_for_policy = Arc::clone(&late_bound_effects);
-        let mut app = super::App::build_app(edgezero_core::PlatformMetadata::default())
+        let mut app = EdgeZeroApp::build::<super::App>(edgezero_core::PlatformMetadata::default())
             .expect("configured app");
         app.set_ingress_admission_policy(move |head| {
             let static_permit = super::ResponsePermit {
@@ -361,7 +361,7 @@ mod lifecycle_tests {
 
     #[test]
     fn configured_admission_preserves_fallback_status_at_exact_cap() {
-        let app = super::App::build_app(edgezero_core::PlatformMetadata::default())
+        let app = EdgeZeroApp::build::<super::App>(edgezero_core::PlatformMetadata::default())
             .expect("configured app");
         for (method, path, expected) in [
             (Method::POST, "/missing", StatusCode::NOT_FOUND),
@@ -387,7 +387,7 @@ mod lifecycle_tests {
 
     #[test]
     fn configured_admission_returns_exact_overflow_response_for_both_fallbacks() {
-        let app = super::App::build_app(edgezero_core::PlatformMetadata::default())
+        let app = EdgeZeroApp::build::<super::App>(edgezero_core::PlatformMetadata::default())
             .expect("configured app");
         for (method, path) in [(Method::POST, "/missing"), (Method::POST, "/")] {
             let request = request_builder()
@@ -418,7 +418,7 @@ mod lifecycle_tests {
 
     #[test]
     fn configured_admission_returns_exact_timeout_response() {
-        let app = super::App::build_app(edgezero_core::PlatformMetadata::default())
+        let app = EdgeZeroApp::build::<super::App>(edgezero_core::PlatformMetadata::default())
             .expect("configured app");
         let request = request_builder()
             .method(Method::POST)

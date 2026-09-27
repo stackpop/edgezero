@@ -1425,11 +1425,8 @@ mod tests {
         let fallback = normalize_source_whitespace(fallback_initializer_block(core_lib));
         assert!(
             core_lib.contains("FALLBACK_INGRESS_BODY_BYTES: usize = 4 * 1024")
-                && core_lib.contains(
-                    "let (lease, completion) = response_lifecycle(None, ResponsePermit::new(None));",
-                )
-                && fallback.contains("completion,")
-                && fallback.contains("grant: IngressGrant::new(lease)")
+                && fallback.contains("completion: ResponseEgressCompletion::empty()")
+                && fallback.contains("grant: IngressGrant::empty()")
                 && fallback.contains("max_body_bytes: FALLBACK_INGRESS_BODY_BYTES")
                 && fallback.contains(concat!(
                     "on_exceeded: BufferedIngressResponse::text( ",
@@ -1441,20 +1438,19 @@ mod tests {
                     "StatusCode::REQUEST_TIMEOUT, ",
                     "\"request timeout\\n\", ),",
                 )),
-            "generated admission policy must own the fallback lease and exact terminal responses",
+            "generated admission policy must bound fallback reads with exact terminal responses",
         );
     }
 
     #[test]
     #[should_panic(
-        expected = "generated admission policy must own the fallback lease and exact terminal responses"
+        expected = "generated admission policy must bound fallback reads with exact terminal responses"
     )]
     fn generated_fallback_policy_rejects_swapped_terminal_mappings() {
         assert_generated_fallback_policy(
-            r#"let (lease, completion) = response_lifecycle(None);
-            AdmissionDecision::ReadBodyBeforeFallback {
-                completion,
-                grant: IngressGrant::new(lease),
+            r#"AdmissionDecision::ReadBodyBeforeFallback {
+                completion: ResponseEgressCompletion::empty(),
+                grant: IngressGrant::empty(),
                 max_body_bytes: FALLBACK_INGRESS_BODY_BYTES,
                 on_exceeded: BufferedIngressResponse::text(
                     StatusCode::REQUEST_TIMEOUT,
@@ -1558,53 +1554,18 @@ mod tests {
             "generated app must configure ingress admission",
         );
         assert!(
-            core_lib.contains("IngressGrant::new"),
-            "generated admission policy must issue an app-owned grant",
+            core_lib.contains("completion: ResponseEgressCompletion::empty()")
+                && core_lib.contains("grant: IngressGrant::empty()")
+                && !core_lib.contains("ResponsePermit")
+                && !core_lib.contains("AdmissionLease")
+                && !core_lib.contains("ResponseEgressCompletion::late_bound")
+                && !core_lib.contains("set_detached_response_egress_decision_factory"),
+            "generated apps must use the minimal core-owned lifecycle defaults",
         );
         assert!(
-            core_lib.contains("ResponseEgressCompletion::new")
-                && core_lib.contains("DetachedResponseEgressDecision::Send")
-                && core_lib.contains("set_detached_response_egress_decision_factory")
-                && !core_lib.contains("set_detached_response_egress_completion_factory")
-                && core_lib.contains("fn response_lifecycle(")
-                && core_lib.contains("let permit = ResponsePermit::new(route_class.clone());")
-                && core_lib
-                    .contains("let (lease, completion) = response_lifecycle(route_class, permit);")
-                && core_lib.contains("grant: IngressGrant::new(lease)")
-                && core_lib.contains("ResponseEgressCompletion::late_bound")
-                && core_lib.contains("ResponseEgressResource<ResponsePermit>"),
-            "generated admission decisions must pair grants with explicit response completions",
-        );
-        let detached_send_fields = core_lib
-            .split_once("DetachedResponseEgressDecision::Send {")
-            .and_then(|(_, suffix)| suffix.split_once('}'))
-            .map(|(fields, _)| normalize_source_whitespace(fields))
-            .expect("generated detached response egress must use the named Send variant");
-        assert!(
-            !core_lib.contains(concat!("DetachedResponseEgressDecision::", "Send(")),
-            "generated detached response egress must not use the tuple Send variant",
-        );
-        assert!(
-            detached_send_fields.contains("completion,"),
-            "generated detached response egress must name its completion field",
-        );
-        assert!(
-            detached_send_fields
-                .contains("deadline: head.write_deadline_after(DEFAULT_RESPONSE_WRITE_BUDGET),"),
-            "generated detached response egress must name its mandatory default deadline",
-        );
-        assert!(
-            core_lib.contains("static_completion.join(late_bound_completion)"),
-            "generated response lifecycle must compose static and late-bound completions",
-        );
-        assert!(
-            !core_lib.contains("struct ResponsePermitSlot")
-                && !core_lib.contains("struct ResponsePermitState")
-                && !core_lib.contains("Mutex<ResponsePermitState>"),
-            "generated apps must use EdgeZero's reusable late-bound resource owner",
-        );
-        assert!(
-            core_lib.contains("super::App::build_app(edgezero_core::PlatformMetadata::default())"),
+            core_lib.contains(
+                "EdgeZeroApp::build::<super::App>(edgezero_core::PlatformMetadata::default())"
+            ),
             "generated tests must handle fallible application assembly",
         );
         assert_generated_fallback_policy(&core_lib);
@@ -1614,9 +1575,10 @@ mod tests {
         let handlers = fs::read_to_string(project_dir.join("crates/demo-app-core/src/handlers.rs"))
             .expect("read handlers.rs");
         assert!(
-            handlers.contains("install_response_permit()\n        .map_err(EdgeError::internal)?")
-                && !handlers.contains("install_response_permit().is_err()"),
-            "generated admission handler must install the late-bound resource with its typed error",
+            handlers.contains("ctx.take_ingress_grant().is_some()")
+                && !handlers.contains("AdmissionLease")
+                && !handlers.contains("install_response_permit"),
+            "generated admission handler must demonstrate one-time grant consumption without a fake permit",
         );
         assert!(
             handlers.contains("pub async fn stream() -> Result<Response, EdgeError>"),
@@ -1656,7 +1618,7 @@ mod tests {
             "OutboundBatchTermination::Cutoff",
             "OutboundBatch::from_driver",
             "OutboundBatchDriverEvent::Item",
-            "use edgezero_core::{BudgetSource, OutboundBatchDriverEvent};",
+            "use edgezero_core::{BudgetSource, Deadline, OutboundBatchDriverEvent};",
             "FanoutSlotOutcome::Unresolved",
             "OutboundCachePolicy::Bypass",
             "slot.elapsed",

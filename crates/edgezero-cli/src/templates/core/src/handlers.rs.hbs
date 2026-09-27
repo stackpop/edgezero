@@ -10,14 +10,11 @@ use edgezero_core::outbound::{
     OutboundBatchTermination, OutboundCachePolicy, OutboundRequest, OutboundSlotResult,
 };
 use edgezero_core::response::Text;
-use edgezero_core::time::Deadline;
 use futures::{StreamExt as _, stream};
 use std::env;
 use std::io::Error as IoError;
 use std::num::NonZeroU64;
 use std::time::Duration;
-
-use crate::AdmissionLease;
 
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
 const MAX_BROTLI_DECODER_BYTES: u64 = 0x0200_0000;
@@ -119,23 +116,11 @@ pub async fn admission(RequestContext(ctx): RequestContext) -> Result<Response, 
         .route_metadata()
         .and_then(|metadata| metadata.class())
         .map(str::to_owned);
-    let grant = ctx
-        .take_ingress_grant()
-        .ok_or_else(|| EdgeError::internal(IoError::other("admission grant was not installed")))?;
-    let lease = grant
-        .downcast::<AdmissionLease>()
-        .map_err(|_grant| EdgeError::internal(IoError::other("admission grant type mismatch")))?;
-    if lease.route_class != route_class {
-        return Err(EdgeError::internal(IoError::other(
-            "admission grant route class mismatch",
-        )));
-    }
-    lease
-        .install_response_permit()
-        .map_err(EdgeError::internal)?;
+    let grant_consumed_once =
+        ctx.take_ingress_grant().is_some() && ctx.take_ingress_grant().is_none();
 
     json_response(&AdmissionView {
-        grant_consumed_once: ctx.take_ingress_grant().is_none(),
+        grant_consumed_once,
         route_class,
     })
 }
@@ -153,8 +138,7 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
     }
 
     let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_owned());
-    let now = ctx.monotonic_clock().now();
-    let deadline = Deadline::at_instant(now.checked_add(OUTBOUND_BATCH_BUDGET).unwrap_or(now));
+    let deadline = ctx.monotonic_clock().deadline_after(OUTBOUND_BATCH_BUDGET);
     let source_uri = Uri::from_static("/fanout");
     let requests = input
         .paths
@@ -334,7 +318,7 @@ mod tests {
     use edgezero_core::params::PathParams;
     use edgezero_core::response::IntoResponse as _;
     use edgezero_core::test_env::env_lock;
-    use edgezero_core::{BudgetSource, OutboundBatchDriverEvent};
+    use edgezero_core::{BudgetSource, Deadline, OutboundBatchDriverEvent};
     use futures::executor::block_on;
     use std::collections::HashMap;
     use std::time::Duration;

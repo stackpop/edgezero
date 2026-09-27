@@ -371,6 +371,7 @@ pub struct MonotonicClock { /* Arc<dyn Fn() -> MonotonicInstant + Send + Sync> *
 impl MonotonicClock {
     pub fn new<Now>(now: Now) -> Self
     where Now: Fn() -> MonotonicInstant + Send + Sync + 'static;
+    pub fn deadline_after(&self, duration: Duration) -> Deadline;
     pub fn now(&self) -> MonotonicInstant;
 }
 
@@ -1018,8 +1019,8 @@ eventual release.
   refused, fallback, error, and normal response paths without response extensions.
   The macro uses
   `Hooks::configure(&mut App) -> Result<(), EdgeError>` as the app-owned setter point, and
-  `Hooks::build_app(platform)` prevents request conversion, admission, body polling, or dispatch when
-  startup policy is invalid. Axum also fails before listener bind; Cloudflare, Fastly, and Spin
+  the core-owned `App::build::<A>(platform)` prevents request conversion, admission, body polling,
+  or dispatch when startup policy is invalid. Axum also fails before listener bind; Cloudflare, Fastly, and Spin
   enforce this boundary per host invocation.
 - `crates/edgezero-core/src/error.rs`: add `RequestHeaderFieldsTooLarge { message }` with
   status 431 and kind `request_header_fields_too_large`, `RequestTimeout { message }` with

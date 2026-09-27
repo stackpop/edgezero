@@ -37,7 +37,7 @@ High-level backlog and decisions to drive the next milestones.
 - [ ] CLI: cover `dev_server`, generator, and template scaffolding flows with tempdir-based integration tests to guard manual HTTP parsing and shell commands.
 - [ ] CI: verify feature combinations (without `demo-example`, `json`, `form`) compile and run basic smoke tests.
 - [ ] Macros: add trybuild coverage for `app!` manifest expansion (route/middleware generation and error surfacing).
-- [x] Core: unit-test `App::build_app`/`Hooks` wiring and `PathParams::deserialize` edge cases beyond indirect coverage. _(Added targeted unit tests in `crates/edgezero-core/src/app.rs` and `crates/edgezero-core/src/params.rs`.)_
+- [x] Core: unit-test `App::build::<A>`/`Hooks` wiring and `PathParams::deserialize` edge cases beyond indirect coverage. _(Added targeted unit tests in `crates/edgezero-core/src/app.rs` and `crates/edgezero-core/src/params.rs`.)_
 - [x] Coverage hygiene: consolidate duplicate router/extractor request-parsing tests and share adapter contract fixtures to reduce redundant maintenance. _(Router duplicates trimmed; extractor suite now owns request parsing checks.)_
 - [x] Router: add regression cases for overlapping routes, prefix/nest behaviour, and BodyMode error handling (`Streaming` vs `Buffered`).
 - [x] Controller: cover negative paths (`State<T>` missing, `ValidatedJson` errors) and assert returned status/body.
@@ -56,7 +56,7 @@ High-level backlog and decisions to drive the next milestones.
   - [x] Adapter-owned streaming writer and backpressure propagation
   - [x] Example: deploy sample with `wrangler` (`examples/app-demo/crates/app-demo-adapter-cloudflare`)
 - [ ] CLI
-  - [x] `edgezero new <name>`: scaffold an app (lib with `build_app()`)
+  - [x] `edgezero new <name>`: scaffold an app (lib consumed by `App::build::<A>`)
   - [x] `edgezero build --adapter fastly|cloudflare`
   - [x] `edgezero deploy --adapter fastly|cloudflare`
   - [ ] `edgezero dev` improvements: better HTTP parsing, hot-reload
@@ -596,7 +596,7 @@ High-level backlog and decisions to drive the next milestones.
 
 ## Codex Plan (2026-01-27 - Docs Alignment + Roadmap Additions)
 
-- [x] Update guides to reflect current APIs (App::build_app, adapter entrypoints, middleware signature, outbound client usage).
+- [x] Update guides to reflect current APIs (`App::build::<A>`, adapter entrypoints, middleware signature, outbound client usage).
 - [x] Correct routing, streaming, handlers, and CLI reference docs to match current behavior.
 - [x] Refresh configuration docs to align with manifest schema and loader APIs.
 - [x] Add missing-feature backlog (list-adapters, exit codes, manifest search-up, RUST_LOG, hot reload) to the roadmap section.

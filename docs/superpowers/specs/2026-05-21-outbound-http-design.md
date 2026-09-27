@@ -1760,6 +1760,7 @@ pub struct MonotonicClock { /* Arc<dyn Fn() -> MonotonicInstant + Send + Sync> *
 impl MonotonicClock {
     pub fn new<Now>(now: Now) -> Self
     where Now: Fn() -> MonotonicInstant + Send + Sync + 'static;
+    pub fn deadline_after(&self, duration: Duration) -> Deadline;
     pub fn now(&self) -> MonotonicInstant;
 }
 
@@ -1832,7 +1833,7 @@ backwards terminal sample to the existing zero-elapsed internal invariant outcom
 
 | External concept | EdgeZero mechanism |
 | --- | --- |
-| External batch deadline (whole fan-out) | Compute one absolute cutoff at handler entry and pass it once to `start_batch_until(reqs, cutoff)`. Code using an injected application clock constructs it with `Deadline::at_instant(..)` from one `RequestContext::monotonic_clock().now()` sample and checked arithmetic. Do not copy the cutoff into each request. |
+| External batch deadline (whole fan-out) | Compute one absolute cutoff at handler entry with `RequestContext::monotonic_clock().deadline_after(duration)` and pass it once to `start_batch_until(reqs, cutoff)`. Do not use process-global `Deadline::after` with an injected app clock, and do not copy the cutoff into each request. |
 | Optional request-specific absolute deadline | `OutboundRequest::deadline(request_deadline)` |
 | Per-target request timeout | `OutboundRequest::timeout(per_target)` |
 | Effective per-request budget | minimum of request timeout, request deadline, method cutoff, and the default safety budget where applicable |
@@ -3534,7 +3535,8 @@ an explicit Akamai Functions profile with 134,217,728 bytes per execution; it is
 default because Spin's `max_instance_memory` is runtime-configurable.
 
 The registry is CLI-owned, so runtime adapters also pass the same canonical `PlatformMetadata`
-to `Hooks::build_app(platform)` before `Hooks::configure` runs. `App::platform()` therefore
+to the core-owned `App::build::<A>(platform)` before `Hooks::configure` runs. Application hooks
+cannot replace this assembly step. `App::platform()` therefore
 supports startup resource validation without linking CLI registration code into runtime artifacts.
 
 **Publication order:** adding the trait/default does not immediately advertise the matrix.

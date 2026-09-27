@@ -21,7 +21,7 @@
 - [x] Add failing core tests for `MemoryCeiling`, scope/provenance, `PlatformMetadata`, and visibility inside `Hooks::configure`.
 - [x] Run the focused core tests and confirm the missing API failures.
 - [x] Add non-exhaustive platform metadata types with const constructors and accessors; immediately run the focused core tests until green.
-- [x] Add `App::platform()` and hard-cut `Hooks::build_app(platform)` as the single construction path; immediately run the focused app tests until green.
+- [x] Add `App::platform()` and hard-cut core-owned `App::build::<A>(platform)` as the single construction path; immediately run the focused app tests until green.
 - [x] Update macro-generated `Hooks` implementations so platform metadata is installed before `configure`; immediately run macro and generated-code tests until green.
 
 ### Task 2: Canonical adapter metadata

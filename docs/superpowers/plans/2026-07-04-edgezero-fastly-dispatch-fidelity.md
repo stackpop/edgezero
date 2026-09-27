@@ -821,7 +821,7 @@ where
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
-    let app = A::build_app();
+    let app = App::build::<A>(FASTLY_PLATFORM)?;
     request::dispatch_with_registries(
         &app,
         req,

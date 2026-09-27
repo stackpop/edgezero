@@ -23,7 +23,7 @@ shift as the roadmap evolves.
 - Manifest ergonomics: established the `edgezero.toml` schema and CLI scaffolding for route
   triggers, env/secrets, and build targets.
 - Documentation baseline: published a single-source-of-truth docs set aligned with current APIs
-  (App::build_app entrypoints, adapter dispatch signatures, middleware signature, and outbound
+  (`App::build::<A>` entrypoints, adapter dispatch signatures, middleware signature, and outbound
   HTTP capabilities).
 - Outbound contract: shipped the portable client, typed limits/errors, per-slot timing, exact
   capability matrix, and adapter-specific runtime implementations.

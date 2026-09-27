@@ -56,7 +56,7 @@ fn build_app_for_dispatch<A: Hooks>() -> Result<App, WorkerError> {
 
 #[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
 fn build_target_app<A: Hooks>() -> Result<App, EdgeError> {
-    A::build_app(CLOUDFLARE_PLATFORM)
+    App::build::<A>(CLOUDFLARE_PLATFORM)
 }
 
 /// Test seam for the production application-assembly error mapping.
@@ -174,18 +174,9 @@ mod platform_tests {
 
     #[expect(
         clippy::missing_trait_methods,
-        reason = "test hook overrides application construction to prove the adapter uses target metadata"
+        reason = "test hook exercises only target metadata propagation"
     )]
     impl Hooks for PlatformAwareConfiguration {
-        fn build_app(platform: edgezero_core::PlatformMetadata) -> Result<App, EdgeError> {
-            if platform != crate::CLOUDFLARE_PLATFORM {
-                return Err(EdgeError::service_unavailable("wrong platform metadata"));
-            }
-            let mut app = App::with_name_and_platform(Self::routes(), Self::name(), platform);
-            Self::configure(&mut app)?;
-            Ok(app)
-        }
-
         fn configure(app: &mut App) -> Result<(), EdgeError> {
             if app.platform() == crate::CLOUDFLARE_PLATFORM {
                 Ok(())

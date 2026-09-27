@@ -478,7 +478,8 @@ git commit -m "feat(core): add typed gateway errors"
 
 **Interfaces:**
 - Produces (for Phase 1b `dispatch_budget` + all adapters): public
-  `type MonotonicInstant = web_time::Instant`, `Deadline` (`Copy`),
+  `type MonotonicInstant = web_time::Instant`, injectable `MonotonicClock` with
+  `deadline_after(Duration)`, and `Deadline` (`Copy`),
   `Deadline::after(Duration) -> Self`, `::at_instant(MonotonicInstant) -> Self`,
   `::instant(&self) -> MonotonicInstant`, `::remaining(&self) -> Option<Duration>`,
   `::is_expired(&self) -> bool`; consts `DEFAULT_NO_DEADLINE_BUDGET` (30 s),

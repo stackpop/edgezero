@@ -91,7 +91,7 @@ fn build_app_for_dispatch<A: Hooks>(
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 fn build_target_app<A: Hooks>(platform: edgezero_core::PlatformMetadata) -> Result<App, EdgeError> {
-    A::build_app(platform)
+    App::build::<A>(platform)
 }
 
 /// Test seam for the production application-assembly error mapping.
@@ -191,19 +191,9 @@ mod platform_tests {
         ($hooks:ty, $platform:expr) => {
             #[expect(
                 clippy::missing_trait_methods,
-                reason = "test hook overrides application construction to prove the adapter uses target metadata"
+                reason = "test hook exercises only target metadata propagation"
             )]
             impl Hooks for $hooks {
-                fn build_app(platform: edgezero_core::PlatformMetadata) -> Result<App, EdgeError> {
-                    if platform != $platform {
-                        return Err(EdgeError::service_unavailable("wrong platform metadata"));
-                    }
-                    let mut app =
-                        App::with_name_and_platform(Self::routes(), Self::name(), platform);
-                    Self::configure(&mut app)?;
-                    Ok(app)
-                }
-
                 fn configure(app: &mut App) -> Result<(), EdgeError> {
                     if app.platform() == $platform {
                         Ok(())

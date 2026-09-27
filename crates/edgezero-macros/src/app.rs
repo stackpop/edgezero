@@ -242,18 +242,6 @@ fn build_hooks_tokens(
             }
 
             #stores_tokens
-
-            fn build_app(
-                platform: ::edgezero_core::platform::PlatformMetadata,
-            ) -> Result<edgezero_core::app::App, edgezero_core::error::EdgeError> {
-                let mut app = edgezero_core::app::App::with_name_and_platform(
-                    Self::routes(),
-                    Self::name(),
-                    platform,
-                );
-                Self::configure(&mut app)?;
-                Ok(app)
-            }
         }
     }
 }

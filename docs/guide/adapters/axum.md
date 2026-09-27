@@ -101,7 +101,7 @@ The Axum adapter's `run_app` helper installs `simple_logger` at the level read f
 unparseable. It does not read `edgezero.toml`, and `echo_stdout` has no effect on
 the runtime. To install a different logger, set `owns_logging = true` on your `app!`
 declaration so `run_app` skips its own logger, then install yours in `main`. Wiring
-`App::build_app(edgezero_adapter_axum::AXUM_PLATFORM)` and `AxumDevServer` by hand remains the fallback if you also need
+`edgezero_core::app::App::build::<App>(edgezero_adapter_axum::AXUM_PLATFORM)` and `AxumDevServer` by hand remains the fallback if you also need
 to control the bind address or store setup.
 
 ::: tip Logging status
@@ -116,12 +116,12 @@ The Axum adapter enables standard Rust testing:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use edgezero_core::app::Hooks;
+    use edgezero_core::app::App as EdgeZeroApp;
     use edgezero_core::http::{Request, Method};
 
     #[tokio::test]
     async fn test_handler() {
-        let app = App::build_app(edgezero_adapter_axum::AXUM_PLATFORM)
+        let app = EdgeZeroApp::build::<App>(edgezero_adapter_axum::AXUM_PLATFORM)
             .expect("configured app");
         let router = app.router();
 

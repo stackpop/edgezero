@@ -17,7 +17,6 @@ use edgezero_core::outbound::{
     OutboundBatchTermination, OutboundCachePolicy, OutboundRequest, OutboundSlotResult,
 };
 use edgezero_core::response::Text;
-use edgezero_core::time::Deadline;
 use edgezero_core::ResponseEgressDeadline;
 use futures::{stream, StreamExt as _};
 
@@ -179,8 +178,7 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
     }
 
     let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_owned());
-    let now = ctx.monotonic_clock().now();
-    let deadline = Deadline::at_instant(now.checked_add(OUTBOUND_BATCH_BUDGET).unwrap_or(now));
+    let deadline = ctx.monotonic_clock().deadline_after(OUTBOUND_BATCH_BUDGET);
     let source_uri = Uri::from_static("/fanout");
     let requests = input
         .paths

@@ -4,7 +4,7 @@
 
 **Goal:** Make the checked-in demo and newly generated projects exercise the current outbound HTTP and ingress-admission contracts instead of relying on compatibility defaults.
 
-**Architecture:** Extend `app!` with one optional `configure = <expr>` callback that implements the existing `Hooks::configure(&mut App)` seam. The demo and core template use that callback to install a finite, route-aware admission policy and opaque request grant. Their outbound examples share explicit encoded, decoded, final-buffer, request-body, header, Brotli, and timeout policy, while a batch endpoint exposes positional per-slot elapsed time.
+**Architecture:** Extend `app!` with one optional `configure = <expr>` callback that implements the existing `Hooks::configure(&mut App)` seam. The demo uses that callback to demonstrate application-owned leases and composed completion resources. The generated core template installs the same finite route-aware read policy with empty core-owned lifecycle tokens, avoiding a no-op semaphore in every new application. Their outbound examples share explicit encoded, decoded, final-buffer, request-body, header, Brotli, and timeout policy, while a batch endpoint exposes positional per-slot elapsed time.
 
 **Tech Stack:** Rust, proc macros (`syn`/`quote`), Handlebars templates, TOML manifests, EdgeZero core/adapters, native and WASM contract tests.
 
@@ -19,7 +19,7 @@
 - [x] Add parser tests for `configure = crate::configure_app`, mixed keyword ordering, duplicate rejection, and the updated unknown-key diagnostic.
 - [x] Run the focused macro tests and confirm they fail because `configure` is not accepted.
 - [x] Parse one optional configure expression and emit `Hooks::configure(app)` as a call to it; preserve the empty default for existing macro invocations.
-- [x] Add an integration test proving `Hooks::build_app()` invokes the emitted callback and installs its policy.
+- [x] Add an integration test proving `App::build::<A>(platform)` invokes the emitted callback and installs its policy.
 - [x] Run all macro tests and strict macro clippy.
 
 ### Task 2: Align ingress behavior in the demo and scaffold
@@ -34,8 +34,8 @@
 
 - [x] Add failing demo tests proving manifest route classes reach resolution, the configured callback supplies finite class-aware deadlines, and the opaque grant can be consumed exactly once by a handler.
 - [x] Add route classes for health, diagnostic, and outbound routes in both manifests.
-- [x] Define a small application-owned admission lease and configure callback in both core crates/templates; outbound routes receive a tighter read budget and every request receives a finite deadline.
-- [x] Add an admission diagnostic handler that consumes the typed grant and confirms its route class without exposing provider data.
+- [x] Define a small application-owned admission lease in the demo; keep the scaffold on empty core lifecycle tokens. In both, outbound routes receive a tighter read budget and every request receives a finite deadline.
+- [x] Add an admission diagnostic handler that consumes the grant once and confirms its route class without exposing provider data; the demo additionally proves typed downcast and late-bound ownership.
 - [x] Run the demo core tests and generated-source assertions.
 
 ### Task 3: Align outbound examples with current limits and timing
@@ -60,7 +60,7 @@
 - Modify: `.github/workflows/test.yml`
 - Test: generated project under a temporary directory
 
-- [x] Add generator assertions for the configure callback, ingress policy/grant, route classes, independent outbound caps, and per-slot timing endpoint.
+- [x] Add generator assertions for the configure callback, finite ingress policy, empty core lifecycle tokens, absence of demo-only permits, route classes, independent outbound caps, and per-slot timing endpoint.
 - [x] Run focused generator tests and confirm the new assertions fail before template changes, then pass after them.
 - [x] Generate a fresh all-adapter project and run its tests and strict clippy.
 - [x] Run the checked-in demo tests, strict clippy, and all three adapter WASM checks.

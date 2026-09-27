@@ -107,10 +107,13 @@ terminal slots in observed completion order while retaining each original input 
 an application keep completed results when its own cutoff wins:
 
 ```rust
-use edgezero_core::{EdgeError, OutboundBatchNext, OutboundBatchTermination};
-use edgezero_core::time::Deadline;
+use std::time::Duration;
 
-let cutoff = Deadline::after(Duration::from_secs(2));
+use edgezero_core::{EdgeError, OutboundBatchNext, OutboundBatchTermination};
+
+let cutoff = ctx
+    .monotonic_clock()
+    .deadline_after(Duration::from_secs(2));
 let mut batch = client.start_batch_until(requests, cutoff);
 let termination = loop {
     match batch.next().await? {
@@ -127,6 +130,9 @@ assert!(matches!(
     OutboundBatchTermination::Completed | OutboundBatchTermination::Cutoff
 ));
 ```
+
+Anchor relative cutoffs through the request clock as shown. `Deadline::after` uses the process
+default clock and is intended only for code that also uses the default clock.
 
 `client.send_all_until(requests, cutoff).await` collects the same driver into an index-aligned
 `Vec<Option<OutboundSlotResult>>` plus `results.termination`. `Completed` guarantees every slot is

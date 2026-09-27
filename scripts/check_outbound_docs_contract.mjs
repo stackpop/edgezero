@@ -509,9 +509,9 @@ for (const requiredFragment of [
 const cloudflareGuideSource = readFileSync(cloudflareGuidePath, 'utf8')
 if (
   !cloudflareGuideSource.includes(
-    'App::build_app(CLOUDFLARE_PLATFORM)',
+    'EdgeZeroApp::build::<App>(CLOUDFLARE_PLATFORM)',
   ) ||
-  cloudflareGuideSource.includes('App::build_app()')
+  cloudflareGuideSource.includes('build_app')
 ) {
   fail(
     `${cloudflareGuidePath} must construct manual applications with Cloudflare platform metadata`,
@@ -520,9 +520,9 @@ if (
 const axumGuideSource = readFileSync(axumGuidePath, 'utf8')
 if (
   !axumGuideSource.includes(
-    'App::build_app(edgezero_adapter_axum::AXUM_PLATFORM)',
+    'EdgeZeroApp::build::<App>(edgezero_adapter_axum::AXUM_PLATFORM)',
   ) ||
-  axumGuideSource.includes('App::build_app()')
+  axumGuideSource.includes('build_app')
 ) {
   fail(
     `${axumGuidePath} must construct manual applications with Axum platform metadata`,
@@ -530,8 +530,8 @@ if (
 }
 const routingGuideSource = readFileSync(routingGuidePath, 'utf8')
 if (
-  !routingGuideSource.includes('build_app(platform)') ||
-  routingGuideSource.includes('build_app()')
+  !routingGuideSource.includes('App::build::<A>(platform)') ||
+  routingGuideSource.includes('build_app')
 ) {
   fail(`${routingGuidePath} must document the platform-aware application builder`)
 }
@@ -560,6 +560,14 @@ for (const requiredFragment of [
   if (!hardCutSurfaces[2][1].includes(requiredFragment)) {
     fail(`${proxyGuidePath} is missing typed batch contract: ${requiredFragment}`)
   }
+}
+if (
+  !hardCutSurfaces[2][1].includes('.deadline_after(Duration::from_secs(2))') ||
+  hardCutSurfaces[2][1].includes(
+    'let cutoff = Deadline::after(Duration::from_secs(2))',
+  )
+) {
+  fail(`${proxyGuidePath} must anchor batch cutoffs to the request clock`)
 }
 if (
   !hardCutSurfaces[3][1].includes('run_app_with_hooks') ||

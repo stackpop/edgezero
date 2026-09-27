@@ -34,6 +34,15 @@ pub struct MonotonicClock {
 }
 
 impl MonotonicClock {
+    /// Returns a deadline anchored to this clock and clamped to the portable maximum.
+    #[must_use]
+    #[inline]
+    pub fn deadline_after(&self, duration: Duration) -> Deadline {
+        let now = self.now();
+        let clamped = duration.min(DEADLINE_FAR_FUTURE);
+        Deadline(now.checked_add(clamped).unwrap_or(now))
+    }
+
     #[must_use]
     #[inline]
     pub fn new<Now>(now: Now) -> Self
@@ -65,7 +74,9 @@ impl fmt::Debug for MonotonicClock {
 }
 
 impl Deadline {
-    /// Returns a deadline `now + min(duration, DEADLINE_FAR_FUTURE)`; never panics.
+    /// Returns a deadline anchored to the process-default clock; never panics.
+    ///
+    /// Use [`MonotonicClock::deadline_after`] when work is paired with an injected clock.
     #[inline]
     #[must_use]
     pub fn after(duration: Duration) -> Self {
@@ -88,7 +99,7 @@ impl Deadline {
         self.0
     }
 
-    /// Returns `true` once the deadline instant is at or before now.
+    /// Returns `true` once the deadline instant is at or before the process-default clock.
     #[inline]
     #[must_use]
     pub fn is_expired(&self) -> bool {
@@ -102,7 +113,7 @@ impl Deadline {
         self.remaining_at(now).is_none()
     }
 
-    /// Returns the remaining time, or `None` once the deadline is reached or passed.
+    /// Returns process-default-clock time remaining, or `None` once reached or passed.
     #[inline]
     #[must_use]
     pub fn remaining(&self) -> Option<Duration> {
@@ -195,6 +206,30 @@ mod tests {
         *now.lock().expect("clock lock") = advanced;
         assert_eq!(clock.now(), advanced);
         assert_eq!(clock.clone().now(), advanced);
+    }
+
+    #[test]
+    fn monotonic_clock_deadline_after_uses_the_injected_source() {
+        let start = MonotonicInstant::now();
+        let clock = MonotonicClock::new(move || start);
+        let deadline = clock.deadline_after(Duration::from_secs(2));
+
+        assert_eq!(
+            deadline.instant(),
+            start.checked_add(Duration::from_secs(2)).expect("deadline")
+        );
+    }
+
+    #[test]
+    fn monotonic_clock_deadline_after_clamps_to_far_future() {
+        let start = MonotonicInstant::now();
+        let clock = MonotonicClock::new(move || start);
+        let deadline = clock.deadline_after(Duration::MAX);
+
+        assert_eq!(
+            deadline.instant(),
+            start.checked_add(DEADLINE_FAR_FUTURE).expect("deadline")
+        );
     }
 
     #[test]

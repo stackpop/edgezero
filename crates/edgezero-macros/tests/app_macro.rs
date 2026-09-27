@@ -22,7 +22,7 @@ mod tests {
 
 #[cfg(test)]
 mod configured_app {
-    use edgezero_core::app::{App, Hooks as _};
+    use edgezero_core::app::App;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::ConfigExtractionLimits;
     use edgezero_core::http::{HeaderMap, Method, Response, StatusCode, Uri, Version};
@@ -51,7 +51,7 @@ mod configured_app {
 
     #[test]
     fn app_macro_configure_callback_installs_ingress_policy() {
-        let app = ConfiguredApp::build_app(edgezero_core::PlatformMetadata::default())
+        let app = App::build::<ConfiguredApp>(edgezero_core::PlatformMetadata::default())
             .expect("configured app");
         let head = IngressHeadParts::new(
             Method::GET,
@@ -79,7 +79,7 @@ mod configured_app {
 
 #[cfg(test)]
 mod failing_configured_app {
-    use edgezero_core::app::{App, Hooks as _};
+    use edgezero_core::app::App;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::StatusCode;
 
@@ -96,7 +96,7 @@ mod failing_configured_app {
     #[test]
     fn app_macro_propagates_configuration_failure() {
         let Err(error) =
-            FailingConfiguredApp::build_app(edgezero_core::PlatformMetadata::default())
+            App::build::<FailingConfiguredApp>(edgezero_core::PlatformMetadata::default())
         else {
             panic!("configuration failure must stop application assembly");
         };
@@ -106,7 +106,7 @@ mod failing_configured_app {
 
 #[cfg(test)]
 mod platform_configured_app {
-    use edgezero_core::app::{App, Hooks as _};
+    use edgezero_core::app::App;
     use edgezero_core::{
         EdgeError, MemoryCeiling, MemoryCeilingScope, MemoryCeilingSource, PlatformMetadata,
     };
@@ -138,8 +138,8 @@ mod platform_configured_app {
 
     #[test]
     fn app_macro_installs_platform_metadata_before_configuration() {
-        let app =
-            PlatformConfiguredApp::build_app(TEST_PLATFORM).expect("platform-aware configured app");
+        let app = App::build::<PlatformConfiguredApp>(TEST_PLATFORM)
+            .expect("platform-aware configured app");
 
         assert_eq!(app.platform(), TEST_PLATFORM);
     }

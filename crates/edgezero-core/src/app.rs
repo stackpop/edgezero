@@ -139,6 +139,23 @@ impl App {
         }
     }
 
+    /// Construct an application from hooks after installing target metadata.
+    ///
+    /// This is the sole adapter-facing assembly path. Application hooks cannot
+    /// replace construction or observe an app before its platform is installed.
+    ///
+    /// # Errors
+    /// Returns the typed configuration error without exposing a partially configured app.
+    #[inline]
+    pub fn build<A>(platform: PlatformMetadata) -> Result<Self, EdgeError>
+    where
+        A: Hooks,
+    {
+        let mut app = Self::with_name_and_platform(A::routes(), A::name(), platform);
+        A::configure(&mut app)?;
+        Ok(app)
+    }
+
     #[must_use]
     #[inline]
     pub fn config_extraction_limits(&self) -> ConfigExtractionLimits {
@@ -520,20 +537,6 @@ pub struct StoresMetadata {
 
 /// Trait implemented by application hook adapters.
 pub trait Hooks {
-    /// Construct an `App` with target metadata available to the configuration hook.
-    ///
-    /// # Errors
-    /// Returns the typed configuration error without exposing a partially configured app.
-    #[inline]
-    fn build_app(platform: PlatformMetadata) -> Result<App, EdgeError>
-    where
-        Self: Sized,
-    {
-        let mut app = App::with_name_and_platform(Self::routes(), Self::name(), platform);
-        Self::configure(&mut app)?;
-        Ok(app)
-    }
-
     /// Allow implementations to mutate the freshly constructed application before use.
     /// The default implementation performs no changes.
     ///
@@ -890,7 +893,7 @@ mod tests {
 
     #[test]
     fn build_app_invokes_hooks_for_routes_and_configuration() {
-        let app = TestHooks::build_app(PlatformMetadata::default()).expect("configured app");
+        let app = App::build::<TestHooks>(PlatformMetadata::default()).expect("configured app");
         assert_eq!(app.name(), "configured");
         let stores = TestHooks::stores();
         let config = stores.config.expect("config store metadata");
@@ -914,7 +917,7 @@ mod tests {
 
     #[test]
     fn build_app_propagates_configuration_failure() {
-        let Err(error) = FailingHooks::build_app(PlatformMetadata::default()) else {
+        let Err(error) = App::build::<FailingHooks>(PlatformMetadata::default()) else {
             panic!("configuration failure must stop application assembly");
         };
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -932,14 +935,14 @@ mod tests {
         );
         let platform = PlatformMetadata::new(Some(ceiling));
 
-        let app = MemoryAwareHooks::build_app(platform).expect("configured app");
+        let app = App::build::<MemoryAwareHooks>(platform).expect("configured app");
 
         assert_eq!(app.platform(), platform);
     }
 
     #[test]
     fn build_app_accepts_explicit_unknown_platform_memory() {
-        let app = DefaultHooks::build_app(PlatformMetadata::default()).expect("default app");
+        let app = App::build::<DefaultHooks>(PlatformMetadata::default()).expect("default app");
 
         assert_eq!(app.platform(), PlatformMetadata::default());
         assert_eq!(app.platform().memory_ceiling(), None);
@@ -2413,7 +2416,7 @@ mod tests {
 
     #[test]
     fn default_hooks_use_default_name_and_into_router() {
-        let app = DefaultHooks::build_app(PlatformMetadata::default()).expect("default app");
+        let app = App::build::<DefaultHooks>(PlatformMetadata::default()).expect("default app");
         assert_eq!(app.name(), App::default_name());
         assert!(matches!(DefaultHooks::manifest(), BakedManifest::Absent));
         assert_eq!(DefaultHooks::manifest_json(), None);
