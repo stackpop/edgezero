@@ -737,6 +737,7 @@ mod tests {
                 StatusCode::OK,
                 HeaderMap::new(),
                 Body::empty(),
+                crate::MonotonicClock::default(),
             ))
         }
 

@@ -527,7 +527,9 @@ mod tests {
     use edgezero_core::store_registry::{
         ConfigRegistry, ConfigStoreBinding, KvRegistry, StoreRegistry,
     };
-    use edgezero_core::{BudgetSource, Deadline, MonotonicClock, OutboundBatchDriverEvent};
+    use edgezero_core::{
+        BudgetSource, Deadline, MonotonicClock, MonotonicInstant, OutboundBatchDriverEvent,
+    };
     use futures::executor::block_on;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -539,7 +541,10 @@ mod tests {
         data: Mutex<BTreeMap<String, Bytes>>,
     }
 
-    struct TestOutboundClient;
+    #[derive(Clone, Default)]
+    struct TestOutboundClient {
+        clock: MonotonicClock,
+    }
 
     struct UnavailableConfigStore;
 
@@ -643,7 +648,7 @@ mod tests {
                 .is_some_and(|value| value.as_str() == "/status/201?source=demo"));
             assert!(parts.deadline.is_none());
             assert_outbound_policy(&parts);
-            response_for(parts)
+            response_for(parts, self.clock.clone())
         }
 
         fn start_batch_until(
@@ -668,7 +673,7 @@ mod tests {
                 );
                 results.push(OutboundBatchItem::new(
                     index,
-                    OutboundSlotResult::new(elapsed, response_for(parts)),
+                    OutboundSlotResult::new(elapsed, response_for(parts, self.clock.clone())),
                 ));
             }
             if let Some(batch_deadline) = observed_deadline {
@@ -774,7 +779,10 @@ mod tests {
         assert_eq!(parts.max_brotli_decoder_bytes, MAX_BROTLI_DECODER_BYTES);
     }
 
-    fn response_for(parts: OutboundRequestParts) -> Result<OutboundResponse, EdgeError> {
+    fn response_for(
+        parts: OutboundRequestParts,
+        clock: MonotonicClock,
+    ) -> Result<OutboundResponse, EdgeError> {
         if parts.uri.path() == "/fail" {
             return Err(EdgeError::gateway_timeout_caused(
                 "provider URL https://user:token@example.invalid",
@@ -794,7 +802,13 @@ mod tests {
         } else {
             Body::text("outbound-response")
         };
-        Ok(OutboundResponse::new(parts.method, status, headers, body))
+        Ok(OutboundResponse::new(
+            parts.method,
+            status,
+            headers,
+            body,
+            clock,
+        ))
     }
 
     #[test]
@@ -1266,7 +1280,7 @@ mod tests {
             .expect("request");
         request
             .extensions_mut()
-            .insert(HttpClient::with_client(TestOutboundClient));
+            .insert(HttpClient::with_client(TestOutboundClient::default()));
 
         let mut params = HashMap::new();
         params.insert("rest".to_owned(), "status/201".to_owned());
@@ -1283,6 +1297,27 @@ mod tests {
                 .as_ref(),
             b"outbound-response"
         );
+    }
+
+    #[test]
+    fn app_demo_outbound_client_retains_its_clock_in_responses() {
+        let start = MonotonicInstant::now();
+        let observed = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&observed);
+        let client = TestOutboundClient {
+            clock: MonotonicClock::new(move || *clock_now.lock().expect("clock lock")),
+        };
+        let request = outbound_policy(
+            OutboundRequest::post("https://example.com/status/201?source=demo").expect("request"),
+        );
+        let response = block_on(client.send(request)).expect("response");
+        let deadline = start.checked_add(Duration::from_secs(1)).expect("deadline");
+        *observed.lock().expect("clock lock") = deadline;
+
+        let error = block_on(response.into_bytes_bounded_until(64, Deadline::at_instant(deadline)))
+            .expect_err("retained clock reached deadline");
+
+        assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
     }
 
     #[test]
@@ -1318,7 +1353,8 @@ mod tests {
     #[test]
     fn outbound_fixture_settles_no_content_body_at_source() {
         let request = OutboundRequest::get("https://example.com/status/204").expect("request");
-        let response = response_for(request.into_parts()).expect("response");
+        let response =
+            response_for(request.into_parts(), MonotonicClock::default()).expect("response");
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(
@@ -1362,7 +1398,7 @@ mod tests {
             .expect("request");
         request
             .extensions_mut()
-            .insert(HttpClient::with_client(TestOutboundClient));
+            .insert(HttpClient::with_client(TestOutboundClient::default()));
         RequestContext::new(request, PathParams::default())
     }
 

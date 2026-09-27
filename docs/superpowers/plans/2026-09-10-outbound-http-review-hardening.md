@@ -144,11 +144,11 @@
 - Modify: `docs/guide/capabilities.md`
 
 - [x] Add failing per-adapter tests proving method-entry anchoring, preflight elapsed timing, post-ready expiry, backwards-clock handling, and clock retention by streamed upload/response paths. Cloudflare and Spin deferred-path probes run through their hosted contract binaries rather than unexecuted library-only tests.
-- [x] Store a `MonotonicClock` on every native outbound client. Preserve default-clock constructors for low-level use and add explicit clock constructors for standard adapter wiring and tests.
+- [x] Store a `MonotonicClock` on every native outbound client. Require explicit clocks at every low-level response constructor and use clock-paired client constructors for standard adapter wiring and tests.
 - [x] Install each standard request's outbound client with the exact `App::monotonic_clock()` clone used by ingress; keep standalone low-level request converters explicitly default-clocked.
 - [x] Replace every production outbound `MonotonicInstant::now`, `Deadline::remaining`, and `Deadline::is_expired` call with the client clock plus explicit `remaining_at` or `is_expired_at`; carry clock clones into all deferred body streams and Fastly pending slots.
 - [x] Keep `DispatchBudget` as the copyable result of pure budget selection while ensuring its start snapshot, all later deadline checks, error precedence, dispatch-slack checks, and slot completion observations use one clock domain. Fastly backend identity uses the method-entry `budget.duration`; preparation-time clock samples cannot fragment a homogeneous batch's dynamic-backend identity.
-- [x] Update the outbound specification and capability guide with constructor semantics, app-clock propagation, low-level defaults, and the full injected-clock acceptance matrix.
+- [x] Update the outbound specification and capability guide with constructor semantics, app-clock propagation, explicit low-level clock ownership, and the full injected-clock acceptance matrix.
 - [x] Run focused outbound adapter tests, source scans for global-clock bypasses, full workspace tests, strict Clippy, feature builds, and all three WASM target checks before committing and pushing.
 
 ### Task 8: Final implementation-review corrections

@@ -553,7 +553,8 @@ mod tests {
         use std::task::Poll;
 
         use edgezero_adapter_spin::outbound::{
-            SpinOutboundClient, deferred_clock_paths_hold_for_test,
+            SpinOutboundClient, converted_response_retains_injected_clock_for_test,
+            deferred_clock_paths_hold_for_test,
         };
         use edgezero_adapter_spin::request::{
             dispatch_ingress_source_error_for_test, dispatch_ingress_stream_for_test,
@@ -779,6 +780,13 @@ mod tests {
         #[test]
         fn deferred_request_and_response_paths_retain_the_injected_clock() {
             assert!(block_on(deferred_clock_paths_hold_for_test()));
+        }
+
+        #[test]
+        fn converted_response_retains_injected_clock() {
+            assert!(block_on(
+                converted_response_retains_injected_clock_for_test()
+            ));
         }
 
         #[test]

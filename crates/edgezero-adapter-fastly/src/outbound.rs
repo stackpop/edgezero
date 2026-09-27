@@ -996,7 +996,7 @@ mod fastly_impl {
             HeaderValue::from_static("fastly"),
         )?;
         if disposition == ResponseBodyDisposition::FramingBodyless {
-            return Ok(OutboundResponse::new_with_monotonic_clock(
+            return Ok(OutboundResponse::new(
                 request_method,
                 status,
                 headers,
@@ -1019,7 +1019,7 @@ mod fastly_impl {
                     item?;
                 }
             }
-            return Ok(OutboundResponse::new_with_monotonic_clock(
+            return Ok(OutboundResponse::new(
                 request_method,
                 status,
                 headers,
@@ -1066,7 +1066,7 @@ mod fastly_impl {
             }
             ResponseMode::Streamed => Body::from_stream(deadline_bound),
         };
-        Ok(OutboundResponse::new_with_monotonic_clock(
+        Ok(OutboundResponse::new(
             request_method,
             status,
             headers,
@@ -1695,6 +1695,38 @@ mod fastly_impl {
             let error = block_on(body.next())
                 .expect("terminal item")
                 .expect_err("post-ready expiry");
+
+            assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
+        }
+
+        #[test]
+        fn converted_response_retains_injected_clock() {
+            let start = MonotonicInstant::now();
+            let budget = clock_budget(start, Duration::from_secs(1));
+            let observed = Arc::new(Mutex::new(start));
+            let clock_observed = Arc::clone(&observed);
+            let clock =
+                MonotonicClock::new(move || *clock_observed.lock().expect("clock observation"));
+            let native = FastlyResponse::from_status(StatusCode::NO_CONTENT.as_u16());
+            let response = block_on(process_response(
+                native,
+                Method::GET,
+                ResponseMode::Streamed,
+                budget,
+                32 * 1024 * 1024,
+                24,
+                None,
+                None,
+                None,
+                None,
+                None,
+                clock,
+            ))
+            .expect("converted response");
+            *observed.lock().expect("clock observation") = budget.deadline.instant();
+
+            let error = block_on(response.into_bytes_bounded_until(1, budget.deadline))
+                .expect_err("retained clock reached deadline");
 
             assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
         }

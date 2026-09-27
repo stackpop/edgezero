@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 edgezero-macros = { path = "../edgezero-macros" }
+alloc-no-stdlib = { workspace = true }
+alloc-stdlib = { workspace = true }
 anyhow = { workspace = true }
 async-compression = { workspace = true }
 async-stream = { workspace = true }

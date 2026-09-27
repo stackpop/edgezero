@@ -642,29 +642,14 @@ impl OutboundResponse {
     }
 
     #[must_use]
-    /// Constructs a low-level adapter response using the default monotonic clock.
+    /// Constructs an adapter response paired with its application clock.
     ///
     /// `headers` must already have passed [`normalize_response_headers`], including bodyless
     /// disposition handling, before the response is exposed through app-facing accessors.
-    /// Standard adapters use the clock-paired internal constructor and enforce this precondition.
+    /// The clock must be the same source used for the request and outbound client. This keeps
+    /// deferred response-body deadlines in the application's monotonic clock domain.
     #[inline]
-    pub fn new(request_method: Method, status: StatusCode, headers: HeaderMap, body: Body) -> Self {
-        Self::new_with_monotonic_clock(
-            request_method,
-            status,
-            headers,
-            body,
-            MonotonicClock::default(),
-        )
-    }
-
-    /// Constructs an adapter response paired with its application clock.
-    ///
-    /// `headers` must satisfy the same normalization precondition as [`Self::new`].
-    #[doc(hidden)]
-    #[must_use]
-    #[inline]
-    pub fn new_with_monotonic_clock(
+    pub fn new(
         request_method: Method,
         status: StatusCode,
         headers: HeaderMap,
@@ -1739,6 +1724,7 @@ mod tests {
                 StatusCode::CREATED,
                 HeaderMap::new(),
                 Body::from("single"),
+                MonotonicClock::default(),
             ))
         }
 
@@ -1769,6 +1755,7 @@ mod tests {
                                 StatusCode::OK,
                                 HeaderMap::new(),
                                 Body::empty(),
+                                MonotonicClock::default(),
                             ))
                         },
                     },
@@ -1912,7 +1899,13 @@ mod tests {
     }
 
     fn response_with_body(body: Body) -> OutboundResponse {
-        OutboundResponse::new(Method::GET, StatusCode::OK, HeaderMap::new(), body)
+        OutboundResponse::new(
+            Method::GET,
+            StatusCode::OK,
+            HeaderMap::new(),
+            body,
+            MonotonicClock::default(),
+        )
     }
 
     #[test]
@@ -2408,6 +2401,7 @@ mod tests {
             StatusCode::CREATED,
             headers,
             Body::from("payload"),
+            MonotonicClock::default(),
         );
         assert_eq!(response.status(), StatusCode::CREATED);
         assert!(response.is_success());
@@ -2431,6 +2425,7 @@ mod tests {
             StatusCode::OK,
             HeaderMap::new(),
             Body::from("owned"),
+            MonotonicClock::default(),
         )
         .into_body();
         assert_eq!(body.as_bytes(), Some(b"owned".as_slice()));
@@ -2709,9 +2704,15 @@ mod tests {
         headers.append("set-cookie", HeaderValue::from_static("a=1"));
         headers.append("set-cookie", HeaderValue::from_static("b=2"));
         let body = Body::stream(stream::iter([Bytes::from_static(b"lazy")]));
-        let response = OutboundResponse::new(Method::GET, StatusCode::OK, headers, body)
-            .into_response()
-            .expect("response");
+        let response = OutboundResponse::new(
+            Method::GET,
+            StatusCode::OK,
+            headers,
+            body,
+            MonotonicClock::default(),
+        )
+        .into_response()
+        .expect("response");
 
         assert!(response.headers().get("connection").is_none());
         assert!(response.headers().get("x-private").is_none());
@@ -2739,9 +2740,15 @@ mod tests {
                 Poll::Ready(Some(Ok(Bytes::from_static(b"must-not-escape"))))
             }));
 
-            let response = OutboundResponse::new(method, status, HeaderMap::new(), body)
-                .into_response()
-                .expect("bodyless response");
+            let response = OutboundResponse::new(
+                method,
+                status,
+                HeaderMap::new(),
+                body,
+                MonotonicClock::default(),
+            )
+            .into_response()
+            .expect("bodyless response");
 
             assert_eq!(polls.get(), 0, "{status}");
             assert_eq!(drops.get(), 1, "{status}");
@@ -2815,7 +2822,7 @@ mod tests {
         let clock_now = Arc::clone(&observed);
         let clock = MonotonicClock::new(move || *clock_now.lock().expect("clock lock"));
         let deadline = start.checked_add(Duration::from_secs(1)).expect("deadline");
-        let response = OutboundResponse::new_with_monotonic_clock(
+        let response = OutboundResponse::new(
             Method::GET,
             StatusCode::OK,
             HeaderMap::new(),

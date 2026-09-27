@@ -22,13 +22,14 @@ const _: fn(PartialBuffer<&[u8]>) = consume_pinned_compression_core;
 /// Conservative non-window charge for the decoder implementation pinned by
 /// the workspace lockfiles.
 ///
-/// The audit covers the boxed decoder state, initial context-map table, block
-/// type/length Huffman arrays, literal and distance context maps, context
-/// modes, three Huffman tree groups and their index arrays, and decoder bridge
-/// buffers in `brotli-decompressor 5.0.1`/`compression-codecs 0.4.38`. Their
-/// grammar-bounded maxima fit within 16 MiB. The ring allocation is charged as
-/// `2^WBITS`; dependency upgrades must repeat this source audit before changing
-/// either pin or charge.
+/// The source audit in
+/// `docs/audits/2026-09-27-brotli-decoder-memory-accounting.md` derives a
+/// 3,442,530-byte allocation-payload subtotal for the boxed decoder state,
+/// Huffman storage, context maps, and bridge buffer in the pinned decoder
+/// graph. The 16 MiB accounting reservation leaves conservative headroom for
+/// wrapper objects and allocator overhead that are not claimed as exact heap
+/// bounds. The ring allocation is charged separately as `2^WBITS`; dependency
+/// upgrades must repeat the audit before changing either pin or charge.
 #[expect(
     clippy::decimal_literal_representation,
     reason = "the decimal byte count is the reviewed public contract"
@@ -395,13 +396,14 @@ mod tests {
     use super::*;
     use crate::error::BudgetSource;
     use crate::http::{HeaderMap, HeaderValue};
-    use brotli::CompressorWriter;
+    use brotli::{BrotliState, CompressorWriter, HuffmanCode, enc::StandardAlloc};
     use bytes::Bytes;
     use flate2::{Compression, write::GzEncoder};
     use futures::executor::block_on;
     use futures_util::stream::{self, poll_fn};
     use std::cell::Cell;
     use std::io::Write as _;
+    use std::mem::size_of;
     use std::rc::Rc;
     use std::task::Poll;
 
@@ -489,6 +491,48 @@ mod tests {
             brotli_decoder_memory_charge(31),
             Err(EdgeError::BadRequest { .. })
         ));
+    }
+
+    #[test]
+    fn brotli_fixed_charge_covers_source_audited_payload_subtotal() {
+        type DecoderState = BrotliState<StandardAlloc, StandardAlloc, StandardAlloc>;
+
+        const HUFFMAN_CODE_BYTES: u64 = 4;
+        const MAX_BLOCK_TYPES_OR_TREES: u64 = 256;
+        const MAX_HUFFMAN_TABLE_ENTRIES: u64 = 1_080;
+        const DECODER_STATE_RESERVE_BYTES: u64 = 0x0001_0000;
+        const RING_FIXED_SLACK_BYTES: u64 = 42 + 24;
+
+        let decode_buffer_bytes = u64::try_from(BUFFER_SIZE).expect("buffer size fits u64");
+
+        assert_eq!(
+            u64::try_from(size_of::<HuffmanCode>()).expect("HuffmanCode size fits u64"),
+            HUFFMAN_CODE_BYTES
+        );
+        assert!(
+            u64::try_from(size_of::<DecoderState>()).expect("decoder state size fits u64")
+                <= DECODER_STATE_RESERVE_BYTES
+        );
+
+        let context_map_table = MAX_HUFFMAN_TABLE_ENTRIES * HUFFMAN_CODE_BYTES;
+        let block_trees = 2 * 3 * MAX_HUFFMAN_TABLE_ENTRIES * HUFFMAN_CODE_BYTES;
+        let context_modes = MAX_BLOCK_TYPES_OR_TREES;
+        let context_maps = MAX_BLOCK_TYPES_OR_TREES * 64 + MAX_BLOCK_TYPES_OR_TREES * 4;
+        let huffman_group_indices = 3 * MAX_BLOCK_TYPES_OR_TREES * 4;
+        let huffman_group_codes =
+            3 * MAX_BLOCK_TYPES_OR_TREES * MAX_HUFFMAN_TABLE_ENTRIES * HUFFMAN_CODE_BYTES;
+        let audited_payload_bytes = DECODER_STATE_RESERVE_BYTES
+            + context_map_table
+            + block_trees
+            + context_modes
+            + context_maps
+            + huffman_group_indices
+            + huffman_group_codes
+            + decode_buffer_bytes
+            + RING_FIXED_SLACK_BYTES;
+
+        assert_eq!(audited_payload_bytes, 3_442_530);
+        assert!(audited_payload_bytes <= BROTLI_DECODER_FIXED_CHARGE_BYTES);
     }
 
     #[test]

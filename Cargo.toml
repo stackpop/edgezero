@@ -27,6 +27,8 @@ publish = false
 version = "0.1.0"
 
 [workspace.dependencies]
+alloc-no-stdlib = "=2.0.4"
+alloc-stdlib = "=0.2.4"
 anyhow = "1"
 async-compression = { version = "=0.4.43", features = [
     "futures-io",

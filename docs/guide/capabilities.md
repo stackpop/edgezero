@@ -324,9 +324,10 @@ documented BestEffort completion-order limitation.
 
 Standard adapter wiring clones the application's monotonic clock into its outbound client, so
 ingress timing, dispatch budgets, slot elapsed values, error precedence, and deferred body
-streams remain in one clock domain. Explicit low-level outbound constructors use the default
-clock. A backwards injected clock cannot enlarge the method-entry budget; backwards elapsed
-sampling fails closed as an internal slot outcome with zero elapsed.
+streams remain in one clock domain. The low-level `OutboundResponse` constructor requires that
+clock explicitly, so third-party adapters cannot silently fall back to the process clock. A
+backwards injected clock cannot enlarge the method-entry budget; backwards elapsed sampling fails
+closed as an internal slot outcome with zero elapsed.
 
 Axum, Cloudflare, and Spin drive complete eligible exchanges concurrently. Fastly dispatches
 eligible requests before selecting pending handles, but guest dispatch is sequential and body

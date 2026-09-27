@@ -15,7 +15,7 @@
 - Adapter dispatch has both `execute(..)` and `execute_capture(..)` entry points.
 - The action set includes staged deploy, version emission, healthcheck, and rollback in
   addition to build/serve/deploy/auth.
-- The outbound design declares exactly seven **outbound** capabilities. The matrix and its
+- The outbound design declares exactly twelve **outbound** capabilities. The matrix and its
   footnotes in spec §3.5.2 are the only authority for those support levels; other specs may
   add non-outbound cells to the shared enum.
 
@@ -102,9 +102,10 @@ locked workerd fixture, while browser WASM covers only portable bridge behavior.
 Phase 2 includes the shared decoder's gzip-member/native-completion contract, transport-side
 encoded cap, opt-in rechunker, response-header caps, and pre-allocation Brotli-window check
 (§3.4.1/§3.4.5).
-Phase 4 includes Axum's single `block_in_place` + `Handle::block_on` response-conversion
-boundary and Cloudflare's deployed-proven host-event yield quotas, frozen-clock regressions,
-manual response-body encoding, and null-body 205 branch (§4.1/§4.2).
+Phase 4 includes Axum's connection-owned Hyper HTTP/1 response-delivery boundary and
+Cloudflare's host-event yield quotas, frozen-clock regressions, manual response-body encoding,
+and null-body 205 branch (§4.1/§4.2). Provider capability promotion still requires the deployed
+evidence named by the authoritative design.
 Phase 5 Task 0 must verify the Spin SDK-resource runner/harness compatibility gate in spec
 §5.5; HTTP/Preview 3 registration flags alone are not execution evidence. Tasks 1-6 remain
 blocked until the committed crate-local runner executes the named real-SDK resource tests

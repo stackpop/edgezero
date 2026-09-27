@@ -1056,17 +1056,9 @@ impl OutboundResponse {
  /// `content-encoding` / `content-length`; and lossy UTF-8 handling has run. `Body::Once` is
  /// used in Buffered mode after the adapter has drained and capped; `Body::Stream` is wrapped
  /// with the decoded-output deadline guard in Streamed mode.
- /// Low-level constructor using `MonotonicClock::default()`. Standard adapters instead pair the
- /// response with the outbound client's retained application clock.
+ /// The caller must provide the outbound client's retained application clock. There is no
+ /// process-default fallback because deferred body operations must remain in that clock domain.
     pub fn new(
-        request_method: Method,
-        status: StatusCode,
-        headers: HeaderMap,
-        body: Body,
-    ) -> Self;
-
-    #[doc(hidden)]
-    pub fn new_with_monotonic_clock(
         request_method: Method,
         status: StatusCode,
         headers: HeaderMap,
@@ -3064,15 +3056,22 @@ These are per-response controls, not aggregate batch limits.
    `brotli_decoder_memory_charge(WBITS) = BROTLI_DECODER_FIXED_CHARGE_BYTES + 2^WBITS`
    with checked `u64` arithmetic. `BROTLI_DECODER_FIXED_CHARGE_BYTES` is 16 MiB and covers
    the pinned Rust decoder's non-ring state; `2^WBITS` charges its maximum ring window. The
-   normal dependency graph is pinned exactly to `async-compression 0.4.43`, `brotli 8.0.4`,
-   `brotli-decompressor 5.0.1`, `compression-codecs 0.4.38`, and
-   `compression-core 0.4.32`. Core constructs `async_compression`'s reader with the explicitly
+   normal dependency graph is pinned exactly to `alloc-no-stdlib 2.0.4`, `alloc-stdlib 0.2.4`,
+   `async-compression 0.4.43`, `brotli 8.0.4`, `brotli-decompressor 5.0.1`,
+   `compression-codecs 0.4.38`, and `compression-core 0.4.32`. Core constructs
+   `async_compression`'s reader with the explicitly
    pinned `compression_codecs::BrotliDecoder`, and CI runs
    `scripts/check_brotli_dependency_contract.mjs` against both root and demo lockfiles. The
-   implementation plan source-audits that decoder graph, records every allocation
-   family included in the 16 MiB constant, and runs an allocation-tracking adversarial
-   corpus for every supported WBITS. A dependency upgrade must repeat that audit and may
-   raise the constant; it may not retain the old charge on test evidence alone. Reject with
+   checked-in [decoder memory audit](../../audits/2026-09-27-brotli-decoder-memory-accounting.md)
+   derives a 3,442,530-byte allocation-payload subtotal for that graph, including the ring
+   allocation's 66-byte write-ahead/dictionary slack beyond `2^WBITS`. The 16 MiB fixed charge
+   is a conservative accounting reservation with explicit headroom for wrapper and allocator
+   overhead; it is not represented as an exact total-heap bound. A core regression test checks
+   compiled type and EdgeZero buffer sizes, while CI pins every audited normal dependency by
+   version, registry source, and checksum to protect private table, grammar, and layout
+   assumptions. Allocation measurements may supplement but never replace this source proof. A
+   dependency upgrade must repeat the audit and may raise the constant; it may not retain the old
+   charge on test evidence alone. Reject with
    `DecoderMemory` before constructing the decoder when the charge exceeds
    `max_brotli_decoder_bytes`. The default 32 MiB cap therefore admits the default WBITS 24
    and rejects a raised window unless the caller also raises the memory policy. This is a
@@ -4765,10 +4764,11 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   `Content-Length` retention is part of Cloudflare's documented
   `outbound-header-fidelity = BestEffort` deviation; the app-visible header decision and
   raw encoded payload remain deterministic.
-- `capability()` per §3.5.2: `Native` for four of the eight outbound capabilities
-  (`outbound-http`, `outbound-flexible-phase-budget` (single `worker::Delay` for the total
-  race, no per-phase split), `outbound-batch-slot-isolation`, and
-  `lazy-streamed-response-passthrough`). `outbound-deadlines` and
+- `capability()` follows the twelve-row matrix in §3.5.2. `outbound-http`,
+  `outbound-flexible-phase-budget` (single `worker::Delay` for the total race, no per-phase
+  split), `outbound-batch-slot-isolation`, `outbound-batch-completion-order`,
+  `outbound-cache-bypass`, and `lazy-streamed-response-passthrough` are `Native`.
+  `outbound-deadlines` and
   `streamed-upload-deadlines` are `BestEffort` because the owned abort path lacks deployed
   host-observed cancellation evidence. `outbound-header-fidelity` is independently
   `BestEffort` because workerd removes raw-octet/field-line information before the guest,
@@ -6400,7 +6400,7 @@ Each adapter crate tests its shipped conversion and classification seams.
 | --- | --- |
 | Capability metadata | All four adapters return the exact twelve **outbound** cells in §3.5.2, including completion order, cancellation, slot isolation, cache bypass, authority override, complete resource accounting = Unsupported everywhere, Fastly outbound HTTP = BestEffort, Cloudflare header fidelity = BestEffort, and Spin deadline/upload/flexible-phase-budget = BestEffort. Tests do not assert that the shared enum has only twelve global variants; non-outbound cells belong to their own specs. A fixture adapter that relies on the trait default returns Unsupported. Because each adapter crate matches core's non-exhaustive `Capability` enum across a crate boundary, normal adapter compilation requires a wildcard; review asserts that its result is `_ => Unsupported`. A hypothetical future variant is a structural fail-closed invariant, not a value current Rust code can safely construct at runtime. |
 | Request conversion | Method/body/headers/full canonical URI survive conversion; normalized hop-by-hop fields cannot reappear; buffered and streamed request caps map to 400. Dot-segment/percent/numeric-host/IDNA cases use the exact core serialization rather than adapter reconstruction. Typed `EdgeError` request chunks survive adapter conversion; in-tree paths never route them through `from_external_stream`. |
-| Deadline anchoring and clock propagation | Every standard adapter installs its outbound client with the exact `App::monotonic_clock()` clone used by ingress; explicit low-level constructors use a documented default clock. Every adapter captures one stored-clock snapshot as the first operation in `send`/`start_batch_until`, before normalization, preflight, or builder work. An injected clock advances during preparation and proves that elapsed time consumes the valid request's original budget; no path re-anchors or bypasses the client clock. Preflight slot elapsed, provider-error precedence, post-ready expiry, deferred upload/response streams, returned `OutboundResponse` bounded-until collection, and response-egress coordinator checks use that same handle. A backwards clock cannot enlarge `budget.duration`; a backwards terminal sample produces zero elapsed plus an internal invariant outcome. Invalid-request precedence remains the shared validator's result because validation still runs before budget selection. |
+| Deadline anchoring and clock propagation | Every standard adapter installs its outbound client with the exact `App::monotonic_clock()` clone used by ingress; every low-level response constructor requires its caller to supply that clock explicitly. Every adapter captures one stored-clock snapshot as the first operation in `send`/`start_batch_until`, before normalization, preflight, or builder work. An injected clock advances during preparation and proves that elapsed time consumes the valid request's original budget; no path re-anchors or bypasses the client clock. Preflight slot elapsed, provider-error precedence, post-ready expiry, deferred upload/response streams, returned `OutboundResponse` bounded-until collection, and response-egress coordinator checks use that same handle. A backwards clock cannot enlarge `budget.duration`; a backwards terminal sample produces zero elapsed plus an internal invariant outcome. Invalid-request precedence remains the shared validator's result because validation still runs before budget selection. |
 | `start_batch_until` / `send_all_until` on every adapter | Run the production batch orchestration with injected transport/clock seams for Axum, Cloudflare, Fastly, and Spin. Empty input returns empty without dispatch; mixed valid/invalid slots retain exact input indices; preflight failures dispatch no work for that slot and never poll rejected source streams; GET/HEAD body errors precede batch-only errors; transport errors, cap failures, timeouts, and non-2xx responses preserve sibling outcomes without cancelling siblings. Assert every emitted slot carries its own elapsed time from the one method-entry snapshot through that slot's terminal point; advance the injected clock during preflight to prove that time is included. A same-tick terminal result may legitimately report zero. A slow sibling's later completion must not overwrite an earlier slot's elapsed value. Valid one-slot buffered batches match single-send outcome semantics while elapsed is asserted independently. Script reverse completion order on concurrent adapters; assert every eligible exchange is polled before a stalled sibling finishes. Assert cancellation retains already emitted items, reports unresolved indices, and does not consume a ready item when a `next()` future is dropped. Fastly tests dispatch-before-selection, selected-handle identity reassociation, all three reassociation failure diagnostics, exact error-to-driver-event propagation with previously collected slots, bounded groups, and immediate elapsed sampling after each preflight/dispatch/selected-body terminal result while retaining its documented BestEffort timing caveats. Backwards injected time produces zero plus an internal outcome, distinguishable from legitimate zero by outcome. |
 | Streamed fan-out usage | On Axum/Cloudflare/Spin, join per-request tasks containing both `send` and body consumption. Script a fast response whose body can finish before its deadline while a sibling's headers remain pending beyond it. Assert the fast body is consumed and succeeds before those sibling headers arrive. Joining only sends and delaying all body consumption must fail this regression. Fastly is excluded from this non-portable usage pattern. |
 | Response conversion | Every adapter enforces adapter-visible upstream header limits before normalization, including fields normalization later strips, accounts the synthetic proxy marker after normalization, then applies body/decode caps, calls the shared four-state content-encoding classifier, passes the originating method and retained clock into `OutboundResponse`, and settles native body handles for framing-bodyless and 205 responses; repeated `Set-Cookie` survives. HEAD/304 malformed, conflicting, comma-list, and `u64`-overflow `Content-Length` fail as protocol 502 before body polling while valid representation lengths are retained; 1xx/204 remove the field. Effective identity includes absent or exactly one bare `identity`, and its decoded over-cap `Content-Length` rejects before body polling. Encoded, decoded, header-byte/count, and Brotli-window failures preserve typed reasons and cleanup. |
@@ -6662,12 +6662,12 @@ Outbound-facing changes:
   existing error envelope and does not serialize any reason/provenance field. Their wire
   messages, plus `Internal`, are fixed category strings; detailed provider diagnostics and
   request targets are not serialized.
-- `Manifest` gains the eight outbound capabilities and
+- `Manifest` gains the twelve outbound capabilities and
   `[capabilities.outbound].hosts`. Existing non-outbound capability and store schemas are
   unchanged. The depth-independent misplaced-`capabilities` rejection is intentionally
   fail-closed.
 - `Adapter` gains the defaulted `capability()` method. Each in-tree adapter returns all
-  eight matrix values and ends its non-exhaustive match with
+  twelve matrix values and ends its non-exhaustive match with
   `_ => CapabilitySupport::Unsupported`.
 - Capability enforcement uses outbound-scoped `execute_runtime(..)` and
   `execute_capture_runtime(..)`, which share one helper that gates `build` / `serve` / `deploy` /
@@ -6752,7 +6752,7 @@ the durable anchors.
   this specification; any local test fixture affected by the global `Body::from_stream`
   signature change switches to the appropriate explicit constructor without changing
   behavior.
-- `src/manifest.rs` adds the eight outbound capabilities,
+- `src/manifest.rs` adds the twelve outbound capabilities,
   `ManifestCapabilities`, `ManifestOutboundCapability`, host validation, misplaced
   nested-`capabilities` rejection, and the three-state baked-manifest contract.
   Runtime and baked parse paths run the same validation/finalization logic.
@@ -6782,9 +6782,10 @@ the durable anchors.
 
 - Each adapter imports EdgeZero-owned `MonotonicClock`/`MonotonicInstant` timing types from
   core and adds `test-utils = []` to `[features]`. Production outbound code does not take
-  direct process-global snapshots; only explicit default-clock constructors may select the
-  default source. Keep the adapter test feature independent of runtime/CLI features and
-  preserve current defaults (§5.5).
+  direct process-global snapshots. An adapter client's `Default` implementation may select
+  the process source, but every response conversion must pass that client's retained clock
+  explicitly into `OutboundResponse::new`. Keep the adapter test feature independent of
+  runtime/CLI features and preserve current adapter-client defaults (§5.5).
 - `tests/contract.rs` gains the native adapter-driver cases and SDK-specific test modules
   described in §5.5. `.github/workflows/test.yml` explicitly executes the native commands
   and enables `test-utils` in the existing WASM contract matrix in the same adapter phase.
@@ -6926,7 +6927,7 @@ Adapter-specific work:
 - Required local gates are the repository `CLAUDE.md` commands, all adapter WASM
   target checks, the generated-project compile plus explicit nonzero core-test execution,
   and the app-demo build. Phase 7 adds deterministic legacy-API and published-capability
-  document checks; the latter compares all eight rows/support values and requires exactly
+  document checks; the latter compares all twelve rows/support values and requires exactly
   one VitePress sidebar link. Documentation-only edits use Markdown/link/diff verification
   rather than rebuilding Rust.
 

@@ -70,6 +70,8 @@ each core request. Implementations must:
 - Map typed cache-bypass and validated wire-authority policy without changing URI-owned routing,
   TLS SNI, or certificate identity
 - Preserve typed deadline, transport, protocol, codec, and resource failures without message matching
+- Construct every `OutboundResponse` with the same `MonotonicClock` retained by the outbound
+  client; the constructor has no process-default-clock fallback
 - Attach `x-edgezero-proxy: <adapter>` to completed outbound responses
 - Publish an exact static capability level for every outbound capability
 

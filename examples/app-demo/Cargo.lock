@@ -900,6 +900,8 @@ dependencies = [
 name = "edgezero-core"
 version = "0.1.0"
 dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
  "anyhow",
  "async-compression",
  "async-stream",

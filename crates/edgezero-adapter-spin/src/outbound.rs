@@ -248,6 +248,8 @@ mod spin_impl {
         ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_gzip_stream,
     };
     use edgezero_core::error::{BadGatewayReason, EdgeError};
+    #[cfg(feature = "test-utils")]
+    use edgezero_core::error::BudgetSource;
     use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH};
     use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
     use edgezero_core::outbound::{
@@ -702,7 +704,7 @@ mod spin_impl {
 
         let native = response_stream(response, budget, clock.clone());
         if disposition == ResponseBodyDisposition::FramingBodyless {
-            return Ok(OutboundResponse::new_with_monotonic_clock(
+            return Ok(OutboundResponse::new(
                 request_method,
                 status,
                 headers,
@@ -719,7 +721,7 @@ mod spin_impl {
         );
         if matches!(disposition, ResponseBodyDisposition::ResetContent { .. }) {
             settle_reset_content(native, declared_reset_body).await?;
-            return Ok(OutboundResponse::new_with_monotonic_clock(
+            return Ok(OutboundResponse::new(
                 request_method,
                 status,
                 headers,
@@ -766,7 +768,7 @@ mod spin_impl {
             }
             ResponseMode::Streamed => Body::from_stream(deadline_bound),
         };
-        Ok(OutboundResponse::new_with_monotonic_clock(
+        Ok(OutboundResponse::new(
             request_method,
             status,
             headers,
@@ -989,6 +991,69 @@ mod spin_impl {
         )
     }
 
+    /// Proves response conversion retains the client clock in the hosted contract binary.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    #[inline]
+    pub async fn converted_response_retains_injected_clock_for_test() -> bool {
+        use std::sync::{Arc, Mutex};
+
+        fn set_clock(clock: &Mutex<MonotonicInstant>, observed_at: MonotonicInstant) -> bool {
+            let Ok(mut current) = clock.lock() else {
+                return false;
+            };
+            *current = observed_at;
+            true
+        }
+
+        let start = MonotonicInstant::now();
+        let duration = Duration::from_secs(1);
+        let budget = DispatchBudget {
+            cause: BudgetSource::PerCallTimeout,
+            deadline: Deadline::at_instant(start.checked_add(duration).unwrap_or(start)),
+            duration,
+        };
+        let clock_now = Arc::new(Mutex::new(start));
+        let clock_observed = Arc::clone(&clock_now);
+        let clock =
+            MonotonicClock::new(move || clock_observed.lock().map_or(start, |current| *current));
+        let (writer, contents, trailers) = BodyWriter::new();
+        let (native, response_done) = Response::new(Fields::new(), Some(contents), trailers);
+        if native
+            .set_status_code(StatusCode::NO_CONTENT.as_u16())
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(response) = process_response(
+            native,
+            Method::GET,
+            ResponseMode::Streamed,
+            budget,
+            32 * 1024 * 1024,
+            24,
+            None,
+            None,
+            None,
+            None,
+            None,
+            clock,
+        )
+        .await
+        else {
+            return false;
+        };
+        drop((writer, response_done));
+        if !set_clock(&clock_now, budget.deadline.instant()) {
+            return false;
+        }
+
+        matches!(
+            response.into_bytes_bounded_until(1, budget.deadline).await,
+            Err(EdgeError::GatewayTimeout { .. })
+        )
+    }
+
     #[cfg(test)]
     mod clock_tests {
         use std::collections::VecDeque;
@@ -1131,13 +1196,22 @@ mod spin_impl {
 
             assert!(matches!(error, EdgeError::GatewayTimeout { .. }));
         }
+
+        #[test]
+        fn converted_response_retains_injected_clock() {
+            assert!(block_on(
+                converted_response_retains_injected_clock_for_test()
+            ));
+        }
     }
 }
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use spin_impl::SpinOutboundClient;
 #[cfg(all(feature = "spin", target_arch = "wasm32", feature = "test-utils"))]
-pub use spin_impl::deferred_clock_paths_hold_for_test;
+pub use spin_impl::{
+    converted_response_retains_injected_clock_for_test, deferred_clock_paths_hold_for_test,
+};
 
 #[cfg(all(feature = "spin", any(feature = "test-utils", target_arch = "wasm32")))]
 fn map_spin_send_error(

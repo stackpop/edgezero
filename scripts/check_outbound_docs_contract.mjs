@@ -12,6 +12,14 @@ const fastlyGuidePath = 'docs/guide/adapters/fastly.md'
 const scaffoldReadmePath =
   'crates/edgezero-cli/src/templates/root/README.md.hbs'
 const outboundCorePath = 'crates/edgezero-core/src/outbound.rs'
+const outboundAdapterPaths = [
+  'crates/edgezero-adapter-axum/src/outbound.rs',
+  'crates/edgezero-adapter-cloudflare/src/outbound.rs',
+  'crates/edgezero-adapter-fastly/src/outbound.rs',
+  'crates/edgezero-adapter-spin/src/outbound.rs',
+]
+const brotliAuditPath =
+  'docs/audits/2026-09-27-brotli-decoder-memory-accounting.md'
 const outboundSpecPath =
   'docs/superpowers/specs/2026-05-21-outbound-http-design.md'
 const inboundSpecPath =
@@ -22,6 +30,8 @@ const outboundImplementationIndexPath =
   'docs/superpowers/plans/2026-07-10-outbound-http-implementation.md'
 const outboundBatchTerminationPlanPath =
   'docs/superpowers/plans/2026-09-16-outbound-batch-termination.md'
+const outboundReviewHardeningPlanPath =
+  'docs/superpowers/plans/2026-09-10-outbound-http-review-hardening.md'
 const spinPhasePath =
   'docs/superpowers/plans/2026-09-06-outbound-http-phase5-spin.md'
 const cloudflarePhasePath =
@@ -598,6 +608,16 @@ if (outboundSpecSource.includes("Today's Fastly client")) {
     'outbound specification still describes the historical Fastly client as current',
   )
 }
+for (const staleFragment of [
+  'explicit low-level constructors use a documented default clock',
+  'explicit default-clock constructors may select the',
+  'Preserve default-clock constructors for low-level use',
+  'low-level defaults',
+]) {
+  if (outboundSpecSource.includes(staleFragment)) {
+    fail(`outbound specification contains removed clock behavior: ${staleFragment}`)
+  }
+}
 const budgetSourceDefinitions = outboundSpecSource.match(
   /pub enum BudgetSource\s*\{/gu,
 )
@@ -629,6 +649,10 @@ for (const staleFragment of [
   'Result<OutboundBatchResults, EdgeError>',
   'let Ok((selection, metadata)) = select_pending_slot(&mut pending) else',
   'private failure event',
+  'four of the eight outbound capabilities',
+  'the eight outbound capabilities',
+  'all eight rows/support values',
+  'allocation-tracking adversarial',
 ]) {
   if (outboundSpecSource.includes(staleFragment)) {
     fail(
@@ -709,6 +733,19 @@ for (const staleFragment of [
   }
 }
 
+const outboundReviewHardeningPlanSource = readFileSync(
+  outboundReviewHardeningPlanPath,
+  'utf8',
+)
+for (const staleFragment of [
+  'Preserve default-clock constructors for low-level use',
+  'low-level defaults',
+]) {
+  if (outboundReviewHardeningPlanSource.includes(staleFragment)) {
+    fail(`${outboundReviewHardeningPlanPath} contains removed clock behavior`)
+  }
+}
+
 const currentDocumentation = [
   [outboundImplementationIndexPath, readFileSync(outboundImplementationIndexPath, 'utf8')],
   [
@@ -750,9 +787,53 @@ if (!outboundImplementationIndexSource.includes('Spin SDK 7 / WASI HTTP 0.3')) {
 if (
   outboundImplementationIndexSource.includes('| Executable:') ||
   outboundImplementationIndexSource.includes('Tasks 1-6 blocked') ||
-  outboundImplementationIndexSource.includes('all downstream phases stay')
+  outboundImplementationIndexSource.includes('all downstream phases stay') ||
+  outboundImplementationIndexSource.includes('exactly seven **outbound** capabilities') ||
+  outboundImplementationIndexSource.includes('block_in_place` + `Handle::block_on')
 ) {
-  fail('outbound implementation index still presents implemented phases as pending')
+  fail('outbound implementation index contains stale implementation state')
+}
+
+let brotliAuditSource
+try {
+  brotliAuditSource = readFileSync(brotliAuditPath, 'utf8')
+} catch (error) {
+  fail(`cannot read ${brotliAuditPath}: ${error.message}`)
+}
+const normalizedBrotliAuditSource = brotliAuditSource.replace(/\s+/gu, ' ')
+const expectedBrotliDependencies = JSON.parse(
+  readFileSync('scripts/brotli_dependency_contract.json', 'utf8'),
+)
+const auditedBrotliDependencies = new Map(
+  [...brotliAuditSource.matchAll(/^\| `([^`]+)`\s+\| `([^`]+)`\s+\| `([0-9a-f]{64})` \|$/gmu)].map(
+    (match) => [match[1], [match[2], match[3]]],
+  ),
+)
+if (auditedBrotliDependencies.size !== expectedBrotliDependencies.length) {
+  fail(`${brotliAuditPath} must contain exactly the pinned dependency graph`)
+}
+for (const [name, version, checksum] of expectedBrotliDependencies) {
+  const audited = auditedBrotliDependencies.get(name)
+  if (audited?.[0] !== version || audited?.[1] !== checksum) {
+    fail(`${brotliAuditPath} has stale version or checksum evidence for ${name}`)
+  }
+}
+for (const requiredFragment of [
+  '`brotli-decompressor`',
+  '`5.0.1`',
+  '`compression-codecs`',
+  '`0.4.38`',
+  '`alloc-stdlib`',
+  '`0.2.4`',
+  '3 * 256 * 1080 * 4',
+  '3,442,530',
+  '16,777,216',
+  'Source-audited payload subtotal',
+  "The ring buffer's `2^WBITS` bytes are excluded from the fixed term",
+]) {
+  if (!normalizedBrotliAuditSource.includes(requiredFragment)) {
+    fail(`${brotliAuditPath} is missing audited evidence: ${requiredFragment}`)
+  }
 }
 
 const outboundBatchTerminationPlanSource = currentDocumentation[1][1]
@@ -1032,6 +1113,33 @@ if (
   )
 ) {
   fail('OutboundBatchDriverEvent must remain non-exhaustive')
+}
+if (outboundCoreSource.includes('new_with_monotonic_clock')) {
+  fail('OutboundResponse must not retain the hidden clock-paired constructor')
+}
+const outboundResponseConstructor =
+  /impl OutboundResponse \{[\s\S]*?pub fn new\(\s*request_method: Method,\s*status: StatusCode,\s*headers: HeaderMap,\s*body: Body,\s*monotonic_clock: MonotonicClock,\s*\) -> Self \{/u
+if (!outboundResponseConstructor.test(outboundCoreSource)) {
+  fail('OutboundResponse::new must require the application monotonic clock')
+}
+for (const adapterPath of outboundAdapterPaths) {
+  const adapterSource = readFileSync(adapterPath, 'utf8')
+  const constructorCount =
+    adapterSource.match(/OutboundResponse::new\(/gu)?.length ?? 0
+  const pairedClockCount =
+    adapterSource.match(/response_clock,\s*\)\)/gu)?.length ?? 0
+  if (
+    constructorCount === 0 ||
+    constructorCount !== pairedClockCount ||
+    !adapterSource.includes('let response_clock = clock.clone();')
+  ) {
+    fail(
+      `${adapterPath} must clone the client clock and pass it to every outbound response`,
+    )
+  }
+  if (!adapterSource.includes('converted_response_retains_injected_clock')) {
+    fail(`${adapterPath} must behaviorally test the returned response clock`)
+  }
 }
 const documentedDefaults = new Map(
   actualLimitRows.map((row) => [row[0], row[2]]),

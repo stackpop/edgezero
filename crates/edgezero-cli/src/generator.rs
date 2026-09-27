@@ -1593,7 +1593,7 @@ mod tests {
             "handler tests must use the fallible IntoResponse pattern",
         );
         assert!(
-            handlers.contains("HttpClient::with_client(TestOutboundClient)"),
+            handlers.contains("HttpClient::with_client(TestOutboundClient::default())"),
             "generated tests must execute the portable outbound client",
         );
         assert!(
@@ -1618,7 +1618,10 @@ mod tests {
             "OutboundBatchTermination::Cutoff",
             "OutboundBatch::from_driver",
             "OutboundBatchDriverEvent::Item",
-            "use edgezero_core::{BudgetSource, Deadline, OutboundBatchDriverEvent};",
+            "BudgetSource, Deadline, MonotonicClock, MonotonicInstant, OutboundBatchDriverEvent,",
+            "clock: MonotonicClock",
+            "self.clock.clone()",
+            "generated_outbound_client_retains_its_clock_in_responses",
             "FanoutSlotOutcome::Unresolved",
             "OutboundCachePolicy::Bypass",
             "slot.elapsed",

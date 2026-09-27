@@ -3,13 +3,11 @@
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 
-const expected = new Map([
-  ['async-compression', '0.4.43'],
-  ['brotli', '8.0.4'],
-  ['brotli-decompressor', '5.0.1'],
-  ['compression-codecs', '0.4.38'],
-  ['compression-core', '0.4.32'],
-])
+const expected = JSON.parse(
+  readFileSync('scripts/brotli_dependency_contract.json', 'utf8'),
+)
+
+const registrySource = 'registry+https://github.com/rust-lang/crates.io-index'
 
 function fail(workspace, message) {
   process.stderr.write(`brotli dependency contract (${workspace}): ${message}\n`)
@@ -23,6 +21,38 @@ function metadata(workspace) {
     { cwd: workspace, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
   )
   return JSON.parse(output)
+}
+
+function lockValue(packageBlock, key) {
+  return packageBlock.match(new RegExp(`^${key} = "([^"]+)"$`, 'mu'))?.[1]
+}
+
+function auditLockfile(workspace) {
+  const lockPath = workspace === '.' ? 'Cargo.lock' : `${workspace}/Cargo.lock`
+  const packageBlocks = readFileSync(lockPath, 'utf8')
+    .split('[[package]]')
+    .slice(1)
+
+  for (const [name, version, checksum] of expected) {
+    const matches = packageBlocks.filter(
+      (block) => lockValue(block, 'name') === name,
+    )
+    if (matches.length !== 1) {
+      fail(workspace, `expected one locked ${name} package, found ${matches.length}`)
+      continue
+    }
+    const block = matches[0]
+    if (
+      lockValue(block, 'version') !== version ||
+      lockValue(block, 'source') !== registrySource ||
+      lockValue(block, 'checksum') !== checksum
+    ) {
+      fail(
+        workspace,
+        `locked ${name} source, version, or checksum differs from the audited contract`,
+      )
+    }
+  }
 }
 
 function auditWorkflowFetchOrder() {
@@ -51,6 +81,7 @@ function auditWorkflowFetchOrder() {
 }
 
 function audit(workspace) {
+  auditLockfile(workspace)
   const graph = metadata(workspace)
   const packagesById = new Map(graph.packages.map((pkg) => [pkg.id, pkg]))
   const nodesById = new Map(graph.resolve.nodes.map((node) => [node.id, node]))
