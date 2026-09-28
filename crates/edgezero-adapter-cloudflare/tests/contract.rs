@@ -285,4 +285,13 @@ mod tests {
         let body = response.text().await.expect("text");
         assert_eq!(body, "no");
     }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn request_timing_clock_handle_and_attachment_work_on_runtime() {
+        super::request_timing_tests::clock_handle_and_attachment_work_on_runtime();
+    }
 }
+
+#[cfg(test)]
+#[path = "../../edgezero-core/tests/support/request_timing.rs"]
+mod request_timing_tests;
