@@ -536,4 +536,13 @@ mod tests {
             "no secret handle yields the no-handle marker"
         );
     }
+
+    #[test]
+    fn request_timing_clock_handle_and_attachment_work_on_runtime() {
+        super::request_timing_tests::clock_handle_and_attachment_work_on_runtime();
+    }
 }
+
+#[cfg(test)]
+#[path = "../../edgezero-core/tests/support/request_timing.rs"]
+mod request_timing_tests;
