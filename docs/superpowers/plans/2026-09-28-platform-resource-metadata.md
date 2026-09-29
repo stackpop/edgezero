@@ -134,4 +134,4 @@
 - [x] From `docs`, run `npm ci`, `npm run lint`, `npm run format`, and `npm run build`.
 - [x] Run `bash scripts/check_no_placeholder_pins.sh`, `bash scripts/check_no_legacy_typed_reads.sh`, `bash scripts/check_outbound_legacy_api.sh`, `node scripts/check_outbound_docs_contract.mjs`, `node scripts/check_brotli_dependency_contract.mjs`, and `node scripts/check_serde_json_map_contract.mjs`.
 - [x] Review `git diff --check`, the full diff, and a case-insensitive prohibited consumer-specific terminology scan across `CHANGELOG.md`, `crates`, `examples`, `docs`, and `scripts` for unrelated changes, stale APIs, and prohibited wording.
-- [ ] Commit with a consumer-neutral message, push PR 275, and wait for all hosted checks.
+- [x] Commit with a consumer-neutral message, push PR 275, and wait for all hosted checks.
