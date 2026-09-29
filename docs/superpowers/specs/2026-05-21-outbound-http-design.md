@@ -158,7 +158,7 @@ pub struct OutboundBatchItem {
     pub result: OutboundSlotResult,
 }
 
-/// Ordered collection of the batch state at completion or cutoff.
+/// Ordered collection of the batch state at completion or observation cutoff.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct OutboundBatchResults {
@@ -181,7 +181,7 @@ pub struct OutboundBatchFailure {
 pub enum OutboundBatchTermination {
     /// Every input slot produced exactly one terminal result.
     Completed,
-    /// The method-level cutoff won while one or more slots remained unresolved.
+    /// The observation cutoff won while one or more slots remained unresolved.
     Cutoff,
 }
 
@@ -214,7 +214,7 @@ impl OutboundBatch {
     /// terminal result for those indices.
     pub fn cancel(self) -> Vec<usize>;
 
-    /// Collects terminal items into the original input order until completion/cutoff.
+    /// Collects terminal items into the original input order until completion or observation cutoff.
     pub async fn collect(self) -> Result<OutboundBatchResults, OutboundBatchFailure>;
 
     /// Builds an already-cut-off batch without polling adapter transport work.
@@ -310,7 +310,7 @@ pub trait OutboundHttpClient: Send + Sync {
  /// whose own budget would have covered it can still return
  /// `gateway_timeout`. Apps that require the stricter cross-slot timing
  /// guarantee declare the capability required and get a hard build failure
- /// on Fastly. `start_batch_until(vec![], cutoff)` produces an already-complete batch.
+ /// on Fastly. `start_batch_until(vec![], observation_cutoff)` produces an already-complete batch.
  ///
  /// **Memory model — CORE-OWNED retained payload only.** This formula bounds the
  /// buffers EdgeZero core holds; it deliberately EXCLUDES (a) adapter-side upload
@@ -349,7 +349,7 @@ pub trait OutboundHttpClient: Send + Sync {
  /// use send for a streamed response"))`, identically on every adapter.
  /// Reason: the portable batch transfers only terminal, fully buffered slots. A streamed
  /// response would transfer a live provider body out of the adapter-owned cancellation and
- /// cutoff state machine. There is no portable concurrent
+ /// observation-cutoff state machine. There is no portable concurrent
  /// body-consumption primitive in the batch driver to fix this (Fastly has no
  /// guest reactor). Apps that want streamed responses use
  /// single `send` and orchestrate concurrency themselves on the three
@@ -390,7 +390,7 @@ pub trait OutboundHttpClient: Send + Sync {
     fn start_batch_until(
         &self,
         reqs: Vec<OutboundRequest>,
-        cutoff: Deadline,
+        observation_cutoff: Deadline,
     ) -> OutboundBatch;
 }
 ```
@@ -399,8 +399,8 @@ Both `send` and `start_batch_until` are required on the trait. Each adapter impl
 shares its single-request preparation and buffered response processing with its batch driver.
 `next()` yields every observed terminal item at most once and then returns
 `Finished(Completed)` or `Finished(Cutoff)`. If its future is dropped before it returns, no item is
-consumed. The method-level cutoff wins equality; once the adapter clock is at or past the cutoff,
-no newly observed success is yielded. Adapter drivers signal cutoff explicitly. Stream EOF is
+consumed. The observation cutoff wins equality; once the adapter clock is at or past that cutoff,
+no newly observed success is yielded. Adapter drivers signal cutoff termination explicitly. Stream EOF is
 valid only after all input indices have emitted; premature driver EOF, a duplicate or out-of-range
 index, or polling after an invariant failure returns `EdgeError::Internal` rather than fabricating
 timeout-like unresolved slots. Dropping the batch is equivalent to `cancel()` with the returned
@@ -425,23 +425,23 @@ impl HttpClient {
     pub fn start_batch_until(
         &self,
         reqs: Vec<OutboundRequest>,
-        cutoff: Deadline,
+        observation_cutoff: Deadline,
     ) -> OutboundBatch;
     pub async fn send_all_until(
         &self,
         reqs: Vec<OutboundRequest>,
-        cutoff: Deadline,
+        observation_cutoff: Deadline,
     ) -> Result<OutboundBatchResults, OutboundBatchFailure>;
     pub fn with_client<C: OutboundHttpClient + 'static>(client: C) -> Self;
 }
 ```
 
 `HttpClient::send_all_until` is exactly
-`self.start_batch_until(reqs, cutoff).collect().await`; it is not a second adapter operation.
+`self.start_batch_until(reqs, observation_cutoff).collect().await`; it is not a second adapter operation.
 On success, its `slots` vector always has the input length. A slot rejected during preflight is
 `Some(OutboundSlotResult { outcome: Err(..), .. })`. `None` is legal only when `termination` is
 `OutboundBatchTermination::Cutoff` and means that the slot had not become terminal before the
-method-level cutoff. `Completed` guarantees every slot is `Some`. An explicit adapter failure,
+observation cutoff. `Completed` guarantees every slot is `Some`. An explicit adapter failure,
 premature driver EOF, or invalid index is not a successful collection and is never `Cutoff`.
 `OutboundBatchFailure.error` retains the precise `EdgeError`, while `slots` retains every terminal
 result collected before the failure. Converting `OutboundBatchFailure` into `EdgeError` explicitly
@@ -943,7 +943,7 @@ pub fn finish_batch_item(
     index: usize,
     started_at: MonotonicInstant,
     completed_at: MonotonicInstant,
-    cutoff: Deadline,
+    observation_cutoff: Deadline,
     outcome: Result<OutboundResponse, EdgeError>,
 ) -> Option<OutboundBatchItem>;
 pub async fn collect_response_stream(stream: BodyStream, max: u64) -> Result<Bytes, EdgeError>;
@@ -1527,7 +1527,7 @@ the method/body rule here AND the batch's generic "no `Body::Stream` in buffered
 rejection).** The **method/body check runs FIRST**, so the error is the specific
 `"GET/HEAD request must not carry a streamed body…"` (below), NOT the generic
 streamed-in-batch message — the more informative, method-specific diagnostic wins.
-(§5.4 pins this precedence with a `start_batch_until([GET + Body::Stream], cutoff)` row asserting the
+(§5.4 pins this precedence with a `start_batch_until([GET + Body::Stream], observation_cutoff)` row asserting the
 method-specific message.) The rule is:
 
 | Method | Body | Outcome |
@@ -1679,8 +1679,8 @@ was not already emitted, and invokes the strongest nonblocking teardown availabl
 The caller retains items it already received, which is the portable
 partial-result-on-cancellation contract.
 
-The driver owns the method-level absolute cutoff. Before accepting a provider completion it
-samples the same injected clock used for request budgets. Equality is expired. When the cutoff
+The driver owns the absolute observation cutoff. Before accepting a provider completion it
+samples the same injected clock used for request budgets. Equality is expired. When the observation cutoff
 wins, the driver stops yielding new terminal results, tears down or abandons unresolved work, and
 emits an explicit cutoff event. A response that was provider-ready but not observable before a
 blocking provider primitive returned remains unresolved; capability rows make that limitation
@@ -1688,11 +1688,11 @@ explicit. Core infers normal completion only after every input index emits exact
 premature driver EOF and duplicate or out-of-range indices are invariant failures returned as
 `EdgeError::Internal`; they never become `Cutoff`. An adapter that detects its own invariant
 failure emits `OutboundBatchDriverEvent::Failed` carrying that exact `EdgeError` rather than ending
-its driver or fabricating a cutoff. Incremental `next()` callers receive the error directly.
+its driver or fabricating cutoff termination. Incremental `next()` callers receive the error directly.
 
 On the concurrent Axum, Cloudflare, and Spin drivers, each child samples its terminal instant
 synchronously when that child is observed ready. The terminal samples follow poll-observation order in the shared monotonic clock domain. Once one observation is at or past
-the cutoff, a later-observed child cannot have an earlier on-time terminal sample unless the
+the observation cutoff, a later-observed child cannot have an earlier on-time terminal sample unless the
 injected clock violates its monotonic contract; backwards samples already fail closed as internal
 slot outcomes. The drivers therefore emit `Cutoff` immediately rather than polling or grouping
 siblings after expiry. Fastly stores provider-selected completions across blocking host operations
@@ -1700,7 +1700,7 @@ and retains its separately documented BestEffort completion-order limitation.
 
 `HttpClient::send_all_until` is the simple ordered view. It constructs the batch and calls
 `collect()`. A successful `OutboundBatchResults.slots` always has the input length. Preflight and
-other terminal failures are `Some`; only work unresolved when the method cutoff won is `None`, and
+other terminal failures are `Some`; only work unresolved when the observation cutoff won is `None`, and
 only when `termination == Cutoff`. `Completed` guarantees no missing slots. If the driver fails,
 `OutboundBatchFailure.slots` has the same input length and preserves every result collected before
 the failure; unresolved positions remain `None`, but that absence is distinguished from cutoff by
@@ -1709,10 +1709,10 @@ compatibility `send_all` method.
 
 | Adapter | `start_batch_until` mechanism | Completion/cancellation quality |
 | --- | --- | --- |
-| Axum | `FuturesUnordered` of complete reqwest exchanges raced with the absolute cutoff | completion order and future-drop cancellation are Native |
+| Axum | `FuturesUnordered` of complete reqwest exchanges raced with the absolute observation cutoff | completion order and future-drop cancellation are Native |
 | Cloudflare | completion set of complete Fetch exchanges, each retaining its `AbortController` | completion order is Native; host cancellation remains BestEffort pending deployed proof |
-| Spin | completion set of owned WASI HTTP exchanges raced with the cutoff timer | completion order is Native; host teardown remains BestEffort |
-| Fastly | sequential `send_async` dispatch followed by indexed pending-handle selection | completion ordering, cutoff observation, and teardown remain BestEffort |
+| Spin | completion set of owned WASI HTTP exchanges raced with the observation-cutoff timer | completion order is Native; host teardown remains BestEffort |
+| Fastly | sequential `send_async` dispatch followed by indexed pending-handle selection | completion ordering, observation-cutoff handling, and teardown remain BestEffort |
 
 **Why the adapter owns the batch.** Fastly's pending requests are not ordinary guest-reactor
 futures, and its wait/select calls can block inside the host. Application code therefore cannot
@@ -1821,14 +1821,14 @@ armed into them comes from the same paired clock snapshot. Later remaining-budge
 clock cannot enlarge the budget selected at method entry. Checked elapsed subtraction maps a
 backwards terminal sample to the existing zero-elapsed internal invariant outcome.
 
-#### 3.3.2 Mapping an external batch deadline to EdgeZero deadlines
+#### 3.3.2 Mapping an external batch observation deadline to EdgeZero deadlines
 
 | External concept | EdgeZero mechanism |
 | --- | --- |
-| External batch deadline (whole fan-out) | Compute one absolute cutoff at handler entry with `RequestContext::monotonic_clock().deadline_after(duration)` and pass it once to `start_batch_until(reqs, cutoff)`. Do not use process-global `Deadline::after` with an injected app clock, and do not copy the cutoff into each request. |
+| External batch deadline (whole fan-out) | Compute one absolute observation cutoff at handler entry with `RequestContext::monotonic_clock().deadline_after(duration)` and pass it once to `start_batch_until(reqs, observation_cutoff)`. Do not use process-global `Deadline::after` with an injected app clock, and do not copy the observation cutoff into each request. |
 | Optional request-specific absolute deadline | `OutboundRequest::deadline(request_deadline)` |
 | Per-target request timeout | `OutboundRequest::timeout(per_target)` |
-| Effective per-request budget | minimum of request timeout, request deadline, method cutoff, and the default safety budget where applicable |
+| Effective per-request budget | minimum of request timeout, request deadline, observation cutoff, and the default safety budget where applicable |
 
 **Effective budget rule (`dispatch_budget(req)`).** Returns a `DispatchBudget` struct
 carrying **both** the duration to feed to platform SDK timeouts AND the absolute
@@ -1846,7 +1846,7 @@ pub struct DispatchBudget {
 }
 
 /// Records which configured input selected the effective deadline. The
-/// per-call timeout, request deadline, and method cutoff are separate inputs (§3.3.2 table);
+/// per-call timeout, request deadline, and observation cutoff are separate inputs (§3.3.2 table);
 /// the effective deadline is the tightest candidate, and `cause`
 /// remembers which one won. This is provenance, not the physical timer phase and not
 /// proof that the named deadline itself expired.
@@ -1870,7 +1870,7 @@ pub struct DispatchBudget {
 // `#[non_exhaustive]`: a future phase/reason variant must stay non-breaking (public enum).
 #[non_exhaustive]
 pub enum BudgetSource {
-    /// The method-level `start_batch_until` cutoff was the tighter bound.
+    /// The `start_batch_until` observation cutoff was the tighter bound.
     BatchCutoff,
     /// Neither timeout nor deadline was set — `DEFAULT_NO_DEADLINE_BUDGET` (30 s) applies.
     Default,
@@ -1923,7 +1923,7 @@ pub enum BudgetSource {
 pub fn dispatch_budget(
     req: &OutboundRequest,
     now: MonotonicInstant,
-    batch_cutoff: Option<Deadline>,
+    observation_cutoff: Option<Deadline>,
 ) -> Result<DispatchBudget, EdgeError> {
     let inputs = req.budget_inputs();   // single crate-visible accessor (see contract above)
 
@@ -1952,7 +1952,7 @@ pub fn dispatch_budget(
         let far = now.checked_add(DEADLINE_FAR_FUTURE).unwrap_or(now);
         Deadline::at_instant(deadline.instant().min(far))
     });
-    let from_batch_cutoff = batch_cutoff.map(|deadline| {
+    let from_observation_cutoff = observation_cutoff.map(|deadline| {
         let far = now.checked_add(DEADLINE_FAR_FUTURE).unwrap_or(now);
         Deadline::at_instant(deadline.instant().min(far))
     });
@@ -1967,11 +1967,11 @@ pub fn dispatch_budget(
  // becomes an explicit invariant error instead of a panic, which is also the
  // rule that adapter/core boundaries never crash the host.
  // Tag each candidate with the BudgetSource it represents, pick the tightest, and
- // CARRY the cause. On an exact-instant tie the iteration order wins. The method-level
- // batch cutoff is first so cutoff equality leaves the slot unresolved. Among request-owned
+ // CARRY the cause. On an exact-instant tie the iteration order wins. The batch observation
+ // cutoff is first so equality leaves the slot unresolved. Among request-owned
  // constraints, a per-call timeout precedes the absolute request deadline.
     let (cause, deadline) = [
-        from_batch_cutoff.map(|deadline| (BudgetSource::BatchCutoff, deadline)),
+        from_observation_cutoff.map(|deadline| (BudgetSource::BatchCutoff, deadline)),
         from_timeout.map(|deadline| (BudgetSource::PerCallTimeout, deadline)),
         from_caller.map(|deadline| (BudgetSource::RequestDeadline, deadline)),
         from_default_only.map(|deadline| (BudgetSource::Default, deadline)),
@@ -2001,7 +2001,7 @@ pub fn dispatch_budget(
 **Timeout provenance — the outcome carries the selected budget input, not the timer phase.**
 Because `DispatchBudget` records `cause`, every timeout an adapter (or the pre-dispatch
 check) raises carries the effective `budget.cause`. `BudgetSource::RequestDeadline` means
-the request-carried absolute deadline was tightest; `BatchCutoff` means the method-level cutoff
+the request-carried absolute deadline was tightest; `BatchCutoff` means the observation cutoff
 was tightest. Neither alone proves that its absolute instant has elapsed: Fastly may fire a rigid connect/first-byte phase timer
 while that absolute deadline is still live (§4.3). It is not a retry classification,
 physical timeout phase, or batch-abandonment signal. A timeout says only that EdgeZero
@@ -2016,7 +2016,7 @@ the same absolute instant; the documented equality rule then selects `PerCallTim
 The zero-effective-budget timeout carries that selected cause.
 `BudgetSource::BatchCutoff` attribution alone never emits `OutboundBatchDriverEvent::Cutoff`;
 `OutboundBatchDriverEvent::Cutoff` may be emitted only when an observation from the batch's
-monotonic clock shows that the method-level absolute cutoff has expired; equality is expired.
+monotonic clock shows that the absolute observation cutoff has expired; equality is expired.
 An earlier Fastly phase timeout remains that slot's terminal `GatewayTimeout` item and does not
 discard siblings.
 
@@ -2071,9 +2071,9 @@ cannot escape the bound (§3.3.2 step 1). For brevity the table writes
 between-chunk checks (§3.3.4) and the streamed-body wrappers in §4.1/§4.2/§4.4 use, so
 per-request `timeout` is honoured across the entire exchange — including the streamed
 body phase — whether or not a request deadline was provided. A batch driver also supplies its
-method cutoff to `dispatch_budget`. When `BatchCutoff` wins and expires, the driver ends with
+observation cutoff to `dispatch_budget`. When `BatchCutoff` wins and expires, the driver ends with
 that slot unresolved rather than manufacturing a per-slot timeout item. A tighter request
-timeout or request deadline still produces its ordinary terminal timeout before the cutoff.
+timeout or request deadline still produces its ordinary terminal timeout before the observation cutoff.
 
 "No deadline configured" therefore differs from "deadline configured and expired" —
 the former is bounded by the synthetic 30 s ceiling; the latter is a hard fail at
@@ -2097,7 +2097,7 @@ adapter captures one monotonic `entry_now` as the first operation inside `send`,
 `batch_now` as the first operation inside `start_batch_until`, **before** request normalization,
 batch preflight, platform builder construction, or any other preparation. Validation still
 runs before `dispatch_budget` so the portable bad-request precedence is unchanged, but every
-valid request computes its budget from that entry snapshot and the optional method cutoff. No
+valid request computes its budget from that entry snapshot and the optional observation cutoff. No
 adapter re-anchors after preflight. Clock-seam tests advance time during preparation and prove it
 consumes the same absolute budget; `start_batch_until` additionally proves every valid slot shares
 exactly one snapshot.
@@ -2167,8 +2167,8 @@ that observation into a portable guarantee.
 
 **Fastly precision, stated honestly.** Fastly has no guest wall-clock primitive to
 preempt a chunk read in progress. At dispatch the adapter computes `let budget =
-dispatch_budget(req, now, method_cutoff)?` (§3.3.2, where `method_cutoff` is `None` for a
-single `send` and `Some(cutoff)` for a batch; `now` is snapshotted inline for single `send`
+dispatch_budget(req, now, observation_cutoff)?` (§3.3.2, where `observation_cutoff` is `None` for a
+single `send` and `Some(observation_cutoff)` for a batch; `now` is snapshotted inline for single `send`
 and passed in as the shared `batch_now` for `start_batch_until`. `DEFAULT_NO_DEADLINE_BUDGET = 30 s`
 and the synthetic absolute deadline both apply when no deadline is set, identical to
 every other adapter) and derives the host timeouts via the named helper:
@@ -2202,7 +2202,7 @@ fn fastly_timeout_ms(budget: &DispatchBudget) -> u64 {
     u64::try_from(clamped).unwrap_or(u64::from(u32::MAX).saturating_sub(1))
 }
 
-// `dispatch_budget` always takes an explicit `now` and optional batch cutoff. Public `send`
+// `dispatch_budget` always takes an explicit `now` and optional observation cutoff. Public `send`
 // snapshots at method entry before preflight; `start_batch_until` snapshots once into
 // `batch_now` at method entry and reuses it
 // across slots so the dynamic-backend identity stays consistent for a shared
@@ -2379,9 +2379,9 @@ buffered body synchronously before selecting another handle. Therefore:
   make `outbound-batch-completion-order` `BestEffort` on Fastly rather than `Native`.
 - **Buffered body drain is serialized by selection, not input order.** While one selected body is
   draining, other completed headers cannot be observed by the guest. A later-observed slot can
-  consequently cross its own request deadline or the method cutoff even if its response would
+  consequently cross its own request deadline or the observation cutoff even if its response would
   have completed within that bound when drained in isolation. A request-deadline expiry is a
-  terminal attributed 504; a method-cutoff expiry leaves that slot unresolved. Small response
+  terminal attributed 504; an observation-cutoff expiry leaves that slot unresolved. Small response
   bodies reduce this serial drain term, but the contract assigns no universal threshold because
   host-call timing is deployment-specific.
 
@@ -2904,7 +2904,7 @@ the third plus `ResponseLimitReason` in the same mechanical style.
 | Outbound response over a body/header/window resource limit | `response_too_large`, typed `ResponseLimitReason` (§3.4.5) | 502 |
 | Outbound response body not valid JSON, gzip, or Brotli / `json::<T>` called on a streamed body | `bad_gateway`, reason `Decode(Json/Gzip/Brotli)` for malformed content and `Protocol` for invalid API state | 502 |
 | Outbound per-request timeout or request deadline exceeded | `gateway_timeout` (carries `budget.cause`: per-call vs request deadline — §3.3.2) | 504 |
-| Batch method cutoff reached | collection terminates as `Cutoff`; unresolved slots are `None`; no synthetic terminal slot error is emitted | n/a |
+| Batch observation cutoff reached | collection terminates as `Cutoff`; unresolved slots are `None`; no synthetic terminal slot error is emitted | n/a |
 | Malformed or explicitly failed batch driver | `OutboundBatchFailure` with the precise batch-level `Internal` and all previously collected slots; never represented as `Cutoff` | 500 |
 | Outbound completed with a non-2xx status | **not an error** — `Ok(OutboundResponse)` | app decides |
 
@@ -3490,8 +3490,8 @@ must not force every out-of-tree adapter to recompile-or-break), and `Adapter::c
 carries a **default returning `CapabilitySupport::Unsupported`** for any capability an
 adapter doesn't recognize — so an out-of-tree adapter compiled against an older core still
 builds, and an unknown capability fails closed (Unsupported → a `required` mismatch
-hard-fails) rather than failing to compile. The registry `Adapter` trait also reports target
-memory metadata through a defaulted `memory_ceiling` method. This outbound spec does not change
+hard-fails) rather than failing to compile. The registry `Adapter` trait also reports typed target
+resource facts through a defaulted `platform_metadata` method. This outbound spec does not change
 or depend on the trait's store/config lifecycle methods:
 
 ```rust
@@ -3506,10 +3506,10 @@ pub trait Adapter: Sync + Send {
     fn capability(&self, _capability: Capability) -> CapabilitySupport {
         CapabilitySupport::Unsupported
     }
-    // Target resource metadata, separate from behavioral capability support. Native,
-    // operator-configured, and otherwise unknown targets inherit `None`.
-    fn memory_ceiling(&self) -> Option<MemoryCeiling> {
-        None
+    // Target resource metadata, separate from behavioral capability support. The
+    // default preserves unknown memory, population, and host-accounting facts.
+    fn platform_metadata(&self) -> PlatformMetadata {
+        PlatformMetadata::default()
     }
     // NOTE for in-tree overrides: an adapter that overrides `capability` REPLACES this
     // default — the default does not run for capabilities the override's `match` doesn't
@@ -3519,19 +3519,38 @@ pub trait Adapter: Sync + Send {
 
  // Existing non-outbound methods are elided. `ensure_capabilities` consults only
  // `capability(..)` for behavior gates. Resource-policy consumers consult
- // `memory_ceiling()` independently.
+ // `platform_metadata()` independently.
 }
 ```
 
 This reference is intentionally partial. Existing non-outbound trait methods retain
 their current ownership and behavior.
 
-`MemoryCeiling` carries exact primary bytes, an optional separately published stack allowance,
-`MemoryCeilingScope::{PerExecution, PerInstance}`, and typed provenance. Cloudflare reports
-128,000,000 bytes per instance; Fastly reports a 128,000,000-byte heap plus a separate
-1,000,000-byte stack per execution. Axum and generic Spin report `None`. The Spin runtime exposes
-an explicit Akamai Functions profile with 134,217,728 bytes per execution; it is not the generic
-default because Spin's `max_instance_memory` is runtime-configurable.
+`PlatformMetadata` carries `PlatformFact` values for the memory ceiling, the maximum live inbound
+request population charged to that memory domain, and whether host-owned ingress memory counts
+toward the ceiling. Each known fact carries `PlatformResourceSource`; each unknown fact carries a
+`PlatformUnknownReason`. `MemoryCeiling` itself carries exact primary bytes, an optional separately
+published stack allowance, and `MemoryCeilingScope::{PerExecution, PerInstance}`.
+
+Axum records all three facts as `Unknown(OperatorConfigured)`. Cloudflare records a platform-limit
+memory fact of 128,000,000 bytes per instance while population and host accounting are
+`Unknown(ProviderUnpublished)`. Its six-simultaneous-outbound-connection limit applies to
+connections waiting for response headers within one invocation and is not evidence of an inbound
+request population bound. Fastly records a platform-limit 128,000,000-byte heap plus a separate
+1,000,000-byte stack per execution, a platform-limit population of one, and
+`Unknown(ProviderUnpublished)` host accounting. Generic Spin records all three facts as
+`Unknown(RuntimeConfigured)`. The explicit Akamai Functions Spin profile records a hosted-default
+134,217,728-byte ceiling per execution, a hosted-default population of one, and
+`Unknown(ProviderUnpublished)` host accounting. Generic Spin does not inherit that profile because
+its deployment memory is runtime-configurable.
+
+All adapters currently receive host-parsed requests. Provider-unpublished host parser, HPACK, and
+framing allocations therefore remain unknown; guest-visible allocation accounting cannot replace
+that missing provider fact. `PlatformMetadata::validate_memory_envelope` returns `Fits` only when
+the ceiling, population, host accounting, scope, and any separate-stack requirement are complete
+and compatible. A known minimum excess returns `Exceeds` even if another fact is unknown.
+Otherwise, missing facts return `Indeterminate` with typed reasons and must not be treated as a
+complete validation result.
 
 The registry is CLI-owned, so runtime adapters also pass the same canonical `PlatformMetadata`
 to the core-owned `App::build::<A>(platform)` before `Hooks::configure` runs. Application hooks
@@ -3693,7 +3712,7 @@ whose three setters are guaranteed or a host API that disables independent defau
 ⁴ `outbound-batch-slot-isolation` is `BestEffort` on Fastly for two direct cross-slot reasons.
 **(a) Selected response-body drain** (§3.3.4): a slot whose own
 `budget.deadline` would have covered its body in isolation can still return
-`gateway_timeout`, or remain unresolved at the method cutoff, because another selected body
+`gateway_timeout`, or remain unresolved at the observation cutoff, because another selected body
 monopolised the guest before the next `select_handles` call. Selection is not input-ordered, but
 body consumption is still one selected slot at a time. **(b) Cold sequential registration**
 (§4.3): a first-time `Backend::builder(..).finish()` can block without a guest-side bound,
@@ -4478,7 +4497,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   on every adapter. Buffered survivors become complete-exchange futures in a
   `FuturesUnordered`; the adapter polls every eligible future before yielding the first item and
   emits each terminal completion with its original index. It passes that entry snapshot and the
-  method cutoff to every per-slot `dispatch_budget(req, batch_now, Some(cutoff))` — see §3.3.2 /
+  observation cutoff to every per-slot `dispatch_budget(req, batch_now, Some(observation_cutoff))` — see §3.3.2 /
   §4.3 for why a per-slot
   second clock sample would drift the shared-deadline `duration` and (on Fastly) the
   backend identity.
@@ -4559,7 +4578,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   **preflight** per slot: call `validate_for_dispatch(&request)` first; only a request that
   passes that portable validator reaches the batch-only checks. Then any request with `Body::Stream`
   OR `response_mode = Streamed` is converted to `Err(EdgeError::bad_request(..))`
-  per §3.1.1 before provider construction. It passes that entry snapshot and the method cutoff to
+  per §3.1.1 before provider construction. It passes that entry snapshot and the observation cutoff to
   every `dispatch_budget` call. Buffered survivors become complete Fetch-exchange futures in a
   `FuturesUnordered`; the adapter polls every eligible future before yielding and associates each
   terminal completion with its original index. The Workers event loop provides the concurrency.
@@ -4839,23 +4858,23 @@ struct PendingSlotMetadata {
 fn start_batch_until(
     &self,
     requests: Vec<OutboundRequest>,
-    cutoff: Deadline,
+    observation_cutoff: Deadline,
 ) -> OutboundBatch {
     let batch_started_at = self.clock.now();
     let slot_count = requests.len();
-    if cutoff.is_expired_at(batch_started_at) {
+    if observation_cutoff.is_expired_at(batch_started_at) {
         return OutboundBatch::cutoff(slot_count);
     }
 
     // Validate and synchronously issue every eligible request before selecting any response.
     // `validate_for_dispatch` runs before the buffered-batch-only checks, preserving the shared
     // GET/HEAD body-error precedence. A preflight/dispatch failure becomes a terminal item only
-    // when it is observed before the method cutoff.
+    // when it is observed before the observation cutoff.
     let mut completed = Vec::new();
     let mut pending = Vec::new();
     let mut cutoff_reached = false;
     for (index, request) in requests.into_iter().enumerate() {
-        match self.prepare_batch(request, batch_started_at, cutoff)
+        match self.prepare_batch(request, batch_started_at, observation_cutoff)
             .and_then(|prepared| self.dispatch_batch_slot(index, prepared))
         {
             Ok(slot) => pending.push(slot),
@@ -4864,7 +4883,7 @@ fn start_batch_until(
                     index,
                     batch_started_at,
                     self.clock.now(),
-                    cutoff,
+                    observation_cutoff,
                     Err(error),
                 ) else {
                     cutoff_reached = true;
@@ -4884,7 +4903,7 @@ fn start_batch_until(
             yield OutboundBatchDriverEvent::Cutoff;
             return;
         }
-        while !pending.is_empty() && !cutoff.is_expired_at(clock.now()) {
+        while !pending.is_empty() && !observation_cutoff.is_expired_at(clock.now()) {
             // `select_pending_slot` calls `select_handles`, restores metadata by raw handle
             // identity, and supports bounded groups up to Fastly's MAX_PENDING_REQS.
             let (selection, metadata) = match select_pending_slot(&mut pending) {
@@ -4900,7 +4919,7 @@ fn start_batch_until(
                 index,
                 batch_started_at,
                 clock.now(),
-                cutoff,
+                observation_cutoff,
                 outcome,
             ) else {
                 yield OutboundBatchDriverEvent::Cutoff;
@@ -4930,7 +4949,7 @@ fn start_batch_until(
   and stops guest observation, but Fastly exposes no finite host-cancellation proof for those
   already-issued requests. A selected response body is still drained synchronously, so cancellation
   cannot preempt a blocking host body read. A sibling request deadline never actively cancels
-  another slot. A cutoff ends the driver and leaves remaining slots unresolved; a provider-selection
+  another slot. The observation cutoff ends the driver and leaves remaining slots unresolved; a provider-selection
   failure that prevents the driver from preserving its slot invariants is a batch-level `Internal`
   error and is never represented as unresolved work.
 - **Dynamic backends.** Arbitrary HTTPS hosts use Fastly dynamic backends
@@ -5767,7 +5786,7 @@ this operation. `run_app_with_hooks` is the advanced auto-receiving wrapper. The
   **preflight** per slot: call `validate_for_dispatch(&request)` first; only a request that
   passes that portable validator reaches the batch-only checks. Then any request with `Body::Stream`
   OR `response_mode = Streamed` is converted to `Err(EdgeError::bad_request(..))`
-  per §3.1.1 before provider construction. It passes that entry snapshot and method cutoff to
+  per §3.1.1 before provider construction. It passes that entry snapshot and the observation cutoff to
   every `dispatch_budget` call. Buffered survivors become complete-exchange futures in a
   `FuturesUnordered`; each drives the hand-built `wasi:http` request plus
   `wasip3::http::client::send`. The adapter polls every eligible future before yielding and
@@ -6369,10 +6388,10 @@ Required coverage:
   `ResponseTooLarge` also maps to 502 but carries `ResponseLimitReason`, not
   `BadGatewayReason`. Tests cover every reason and prove the JSON wire shape does not expose
   `reason` for either variant.
-- `HttpClient::start_batch_until` delegates the complete input and cutoff to its injected client.
+- `HttpClient::start_batch_until` delegates the complete input and observation cutoff to its injected client.
   `HttpClient::send_all_until` collects that same driver into index-aligned `Option` slots,
-  including empty input, mixed success/error results, and unresolved-at-cutoff slots. Tests assert
-  `Completed` for complete and empty batches, `Cutoff` for explicit cutoff, and
+  including empty input, mixed success/error results, and slots unresolved at the observation cutoff. Tests assert
+  `Completed` for complete and empty batches, `Cutoff` for explicit observation-cutoff termination, and
   `OutboundBatchFailure` carrying batch-level `Internal` plus previously collected slots for an
   explicit driver failure, premature EOF, or duplicate/out-of-range index. Successful-result
   `None` occurs only with `Cutoff`; failure-result `None` marks a slot not collected before the

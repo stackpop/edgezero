@@ -51,8 +51,8 @@
 - Modify: `crates/edgezero-adapter-spin/src/cli.rs`
 
 - [x] Add `adapter_platform_metadata_default_is_unknown` in the registry; add `adapter_platform_metadata_matches_runtime_metadata` in Axum, Cloudflare, and Fastly; add `adapter_platform_metadata_distinguishes_generic_and_hosted_profiles` in Spin. Assert every fact and reason, including one request per execution for Fastly and the hosted Spin profile, and provider-unpublished Cloudflare population/framing facts.
-- [x] Run `cargo test --offline --locked -p edgezero-adapter adapter_platform_metadata_default_is_unknown` and confirm it fails against the old trait. Run each adapter test with `scripts/run_test_nonzero.sh <test-name> cargo test --offline --locked -p edgezero-adapter-<adapter> --no-default-features --features cli --lib <test-name>` and confirm it fails against `Adapter::memory_ceiling()` or the old constants.
-- [x] Replace `Adapter::memory_ceiling()` with `platform_metadata()` and no compatibility alias. Update each in-tree CLI adapter to return its runtime constant.
+- [x] Run `cargo test --offline --locked -p edgezero-adapter adapter_platform_metadata_default_is_unknown` and confirm it fails against the old trait. Run each adapter test with `scripts/run_test_nonzero.sh <test-name> cargo test --offline --locked -p edgezero-adapter-<adapter> --no-default-features --features cli --lib <test-name>` and confirm it fails against the retired memory-only adapter metadata method or the old constants.
+- [x] Replace the memory-only adapter metadata method with `platform_metadata()` and no compatibility alias. Update each in-tree CLI adapter to return its runtime constant.
 - [x] Hard-cut every adapter `PlatformMetadata::new` and `MemoryCeiling::new` caller to the three-fact model.
 - [x] Run `cargo test --offline --locked -p edgezero-adapter`, then each adapter's platform metadata tests, until green.
 
@@ -96,12 +96,12 @@
 - Modify: `crates/edgezero-cli/src/templates/core/src/lib.rs.hbs`
 - Modify: `examples/app-demo/crates/app-demo-core/src/lib.rs`
 
-- [ ] Rewrite `platform_memory_docs.rs` first to derive every documented memory, population, accounting, scope, and provenance cell from adapter constants. Run `cargo test --offline --locked -p edgezero-cli --test platform_memory_docs` and confirm it fails against the old table.
-- [ ] Extend the legacy checker to reject `MemoryCeilingSource`, `Adapter::memory_ceiling`, old one-argument `PlatformMetadata::new`, old four-argument `MemoryCeiling::new`, compatibility aliases, and stale batch parameter/example wording. Explicitly allowlist only `CHANGELOG.md` and `docs/superpowers/specs/2026-09-28-platform-resource-metadata-design.md`, and add checker self-tests proving the same spellings still fail in every other active surface. Run it and confirm failure before migration.
-- [ ] Update the capability guide, normative outbound spec, completed platform-memory plan, demo, and generator template. State that unknown provider facts prevent complete validation and that the outbound six-connection limit is not inbound population evidence.
-- [ ] Add the exact old-to-new migration table from the focused design to `CHANGELOG.md`; make the adapter overview link to that table without repeating legacy signatures.
-- [ ] Run `cargo test --offline --locked -p edgezero-cli --test platform_memory_docs`, generator unit tests, `bash scripts/check_outbound_legacy_api.sh`, and `node scripts/check_outbound_docs_contract.mjs` until green.
-- [ ] Run `rg -n "MemoryCeilingSource|fn memory_ceiling\\(&self\\)|\\.memory_ceiling\\(\\).*Option|new_with_monotonic_clock" crates examples docs scripts` and confirm no live stale API remains outside historical text intentionally checked by the migration table.
+- [x] Rewrite `platform_memory_docs.rs` first to derive every documented memory, population, accounting, scope, and provenance cell from adapter constants. Run `cargo test --offline --locked -p edgezero-cli --test platform_memory_docs` and confirm it fails against the old table.
+- [x] Extend the legacy checker to reject the retired memory provenance type, memory-only adapter metadata method, former one-argument platform-metadata constructor, former four-argument memory-ceiling constructor, compatibility aliases, and stale batch parameter/example wording. Explicitly allowlist only `CHANGELOG.md` and the focused platform-resource design, and add checker self-tests proving those forms still fail in every other active surface. Run it and confirm failure before migration.
+- [x] Update the capability guide, normative outbound spec, completed platform-memory plan, demo, and generator template. State that unknown provider facts prevent complete validation and that the outbound six-connection limit is not inbound population evidence.
+- [x] Add the exact old-to-new migration table from the focused design to `CHANGELOG.md`; make the adapter overview link to that table without repeating legacy signatures.
+- [x] Run `cargo test --offline --locked -p edgezero-cli --test platform_memory_docs`, generator unit tests, `bash scripts/check_outbound_legacy_api.sh`, and `node scripts/check_outbound_docs_contract.mjs` until green.
+- [x] Run the Task 5 stale-API scan for the retired provenance type, memory-only trait method, optional-return accessor, and hidden clock-pairing constructor; confirm no live stale API remains outside the two allowlisted migration records.
 
 ### Task 6: Review, verification, and delivery
 
@@ -133,5 +133,5 @@
 - [ ] Run `RUSTDOCFLAGS="-D warnings" cargo doc --offline --locked --workspace --all-features --no-deps`.
 - [ ] From `docs`, run `npm ci`, `npm run lint`, `npm run format`, and `npm run build`.
 - [ ] Run `bash scripts/check_no_placeholder_pins.sh`, `bash scripts/check_no_legacy_typed_reads.sh`, `bash scripts/check_outbound_legacy_api.sh`, `node scripts/check_outbound_docs_contract.mjs`, `node scripts/check_brotli_dependency_contract.mjs`, and `node scripts/check_serde_json_map_contract.mjs`.
-- [ ] Review `git diff --check`, the full diff, and `rg -n "midbid|Midbid|MIDBID" CHANGELOG.md crates examples docs scripts` for unrelated changes, stale APIs, and prohibited consumer-specific wording.
+- [ ] Review `git diff --check`, the full diff, and a case-insensitive prohibited consumer-specific terminology scan across `CHANGELOG.md`, `crates`, `examples`, `docs`, and `scripts` for unrelated changes, stale APIs, and prohibited wording.
 - [ ] Commit with a consumer-neutral message, push PR 275, and wait for all hosted checks.

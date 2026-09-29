@@ -2,9 +2,25 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Expose target memory ceilings, accounting scope, and provenance through both CLI adapter metadata and runtime application configuration.
+> **Historical status:** The original memory-ceiling work was completed on 2026-09-26.
+>
+> **Retrospective revision (2026-09-29):** The plan was superseded by the
+> [platform resource metadata design](../specs/2026-09-28-platform-resource-metadata-design.md),
+> and its API references were updated to the current `PlatformFact` and `PlatformMetadata`
+> contract so they cannot be mistaken for migration guidance. The checked items below are a
+> retrospective final-state map of the original task areas, not an execution log and not a claim
+> that those exact types or tests existed on 2026-09-26. Repository history remains the record of
+> the original implementation. See the
+> [Unreleased changelog](../../../CHANGELOG.md#platform-resource-metadata) for the hard-cut
+> migration table.
 
-**Architecture:** `edgezero-core` owns an extensible platform descriptor. Runtime adapters pass that descriptor into application construction before the configuration callback runs, while CLI adapter implementations delegate to the same target constants. Generic Spin remains unbounded/unknown unless an entrypoint explicitly selects a hosted or runtime-configured descriptor.
+**Retrospective final-state goal:** Expose target memory ceilings, accounting scope, and provenance through both CLI adapter metadata and runtime application configuration.
+
+**Retrospective final-state architecture:** `edgezero-core` owns an extensible platform descriptor containing explicit known
+or unknown memory, inbound population, and host-ingress accounting facts. Runtime adapters pass
+that descriptor into application construction before the configuration callback runs, while CLI
+adapter implementations delegate to the same target constants. Generic Spin remains unknown unless
+an entrypoint explicitly selects a hosted or runtime-configured descriptor.
 
 **Tech Stack:** Rust, EdgeZero adapter registry, proc macros, Cargo tests, Markdown contract checks.
 
@@ -18,9 +34,9 @@
 - Modify: `crates/edgezero-core/src/app.rs`
 - Modify: `crates/edgezero-macros/src/app.rs`
 
-- [x] Add failing core tests for `MemoryCeiling`, scope/provenance, `PlatformMetadata`, and visibility inside `Hooks::configure`.
+- [x] Add failing core tests for `MemoryCeiling`, fact-level provenance, `PlatformMetadata`, and visibility inside `Hooks::configure`.
 - [x] Run the focused core tests and confirm the missing API failures.
-- [x] Add non-exhaustive platform metadata types with const constructors and accessors; immediately run the focused core tests until green.
+- [x] Add non-exhaustive platform metadata types with const constructors and accessors; provenance is carried by `PlatformFact::Known`; immediately run the focused core tests until green.
 - [x] Add `App::platform()` and hard-cut core-owned `App::build::<A>(platform)` as the single construction path; immediately run the focused app tests until green.
 - [x] Update macro-generated `Hooks` implementations so platform metadata is installed before `configure`; immediately run macro and generated-code tests until green.
 
@@ -37,12 +53,12 @@
 - Modify: `crates/edgezero-adapter-spin/src/lib.rs`
 - Modify: `crates/edgezero-adapter-spin/src/cli.rs`
 
-- [x] Add a failing registry test proving the inherited CLI default is `None`; run it and confirm the missing API failure.
-- [x] Add failing Axum tests proving both CLI and runtime metadata are unknown; run them and confirm failure before implementation.
-- [x] Add failing Cloudflare tests proving `128_000_000` primary bytes, no separate stack, per-instance scope, and platform-limit provenance; run them and confirm failure before implementation.
-- [x] Add failing Fastly tests proving `128_000_000` primary bytes, a separate `1_000_000`-byte stack, per-execution scope, and platform-limit provenance; run them and confirm failure before implementation.
-- [x] Add failing Spin tests proving generic CLI/runtime metadata is unknown and the explicit Akamai profile is `128 * 1024 * 1024` bytes per execution with hosted-default provenance; prove the explicit descriptor is visible inside `configure`.
-- [x] Add default `Adapter::memory_ceiling()`; run the registry test until green.
+- [x] Add a failing registry test proving the inherited CLI default contains three explicit unknown facts; run it and confirm the missing API failure.
+- [x] Add failing Axum tests proving CLI and runtime memory, population, and host-accounting facts are unknown with the operator-configured reason; run them and confirm failure before implementation.
+- [x] Add failing Cloudflare tests proving `128_000_000` primary bytes, no separate stack, per-instance scope, platform-limit provenance, and provider-unpublished population/accounting facts; run them and confirm failure before implementation.
+- [x] Add failing Fastly tests proving `128_000_000` primary bytes, a separate `1_000_000`-byte stack, per-execution scope, a population of one with platform-limit provenance, and provider-unpublished host accounting; run them and confirm failure before implementation.
+- [x] Add failing Spin tests proving generic CLI/runtime facts are runtime-configured unknowns and the explicit Akamai profile is `128 * 1024 * 1024` bytes per execution with a population of one and hosted-default provenance; prove the explicit descriptor is visible inside `configure`.
+- [x] Add default `Adapter::platform_metadata()` returning fully unknown metadata; run the registry test until green.
 - [x] Add Axum's canonical unknown metadata and CLI override; run Axum tests until green.
 - [x] Add Cloudflare's canonical platform constant and CLI override; run Cloudflare tests until green.
 - [x] Add Fastly's canonical platform constant and CLI override; run Fastly tests until green.
@@ -70,9 +86,9 @@
 - Modify: `scripts/check_outbound_docs_contract.mjs`
 - Modify: adapter/CLI integration tests as needed
 
-- [x] Add a platform-memory table that distinguishes exact bytes/units, separate stack, scope, and provenance.
+- [x] Add a platform-resource table that distinguishes exact bytes/units, separate stack, scope, population, host-ingress accounting, provenance, and unknown reasons.
 - [x] Document that generic Spin is runtime-configured and that the Akamai hosted profile is explicit.
-- [x] Add checker assertions for the table and a Rust integration test that renders or compares the documented values, units, scope, and provenance against the canonical constants.
+- [x] Add checker assertions for the table and a Rust integration test that derives every documented resource cell from the canonical constants.
 - [x] Run the docs contract and focused registry tests.
 
 ### Task 5: Full verification and delivery

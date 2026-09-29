@@ -77,7 +77,8 @@ each core request. Implementations must:
 
 Provider limitations are part of the contract rather than hidden implementation details. See
 [Capabilities](/guide/capabilities) for the support matrix, timing semantics, and accounting
-exclusions.
+exclusions. Consumers upgrading platform resource or response construction APIs should use the
+[Unreleased migration table](https://github.com/stackpop/edgezero/blob/main/CHANGELOG.md#platform-resource-metadata).
 
 ## Logging Initialisation
 

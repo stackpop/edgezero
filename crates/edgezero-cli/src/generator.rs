@@ -1553,6 +1553,28 @@ mod tests {
             core_lib.contains("set_ingress_admission_policy"),
             "generated app must configure ingress admission",
         );
+        let memory_behavior_tests = [
+            "platform_memory_startup_accepts_fit",
+            "platform_memory_startup_preserves_primary_excess",
+            "platform_memory_startup_preserves_stack_excess",
+            "platform_memory_startup_keeps_indeterminate_distinct_from_fit",
+            "platform_memory_startup_preserves_validation_error",
+            "platform_memory_validation_accounts_for_both_stack_shapes",
+        ];
+        assert!(
+            core_lib.contains("platform_memory_startup(app.platform())")
+                && core_lib.contains("platform.validate_memory_envelope(envelope)")
+                && core_lib.contains("MemoryEnvelopeValidation::Fits")
+                && core_lib.contains("MemoryEnvelopeValidation::Exceeds")
+                && core_lib.contains("MemoryEnvelopeValidation::Indeterminate")
+                && core_lib.contains("PlatformMemoryStartupError::UnsupportedValidationOutcome")
+                && memory_behavior_tests
+                    .into_iter()
+                    .all(|test_name| core_lib.contains(test_name))
+                && !core_lib.contains("Semaphore")
+                && !core_lib.contains("set_ingress_concurrency"),
+            "generated app must carry typed memory startup behavior without adding a concurrency gate",
+        );
         assert!(
             core_lib.contains("completion: ResponseEgressCompletion::empty()")
                 && core_lib.contains("grant: IngressGrant::empty()")

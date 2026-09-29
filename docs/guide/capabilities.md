@@ -31,24 +31,35 @@ Support levels mean:
 
 ## Platform Memory Ceilings
 
-`Adapter::memory_ceiling()` reports target-owned memory policy separately from behavioral
+`Adapter::platform_metadata()` reports target-owned resource facts separately from behavioral
 capabilities. Runtime adapters install the same `PlatformMetadata` before `Hooks::configure`
 runs, so startup validation and CLI tooling use one canonical value. `Primary ceiling` excludes
-the separately published Fastly stack allowance.
+the separately published Fastly stack allowance. A source is shown only for a known fact; an
+unknown fact instead records why it is unknown.
 
-| Target                  | Primary ceiling           | Separate stack       | Scope              | Provenance                         |
-| ----------------------- | ------------------------- | -------------------- | ------------------ | ---------------------------------- |
-| Axum                    | Unknown                   | None                 | Operator-defined   | Operator configuration             |
-| Cloudflare Workers      | 128000000 bytes (128 MB)  | None                 | Per instance       | Platform limit: Cloudflare Workers |
-| Fastly Compute          | 128000000 bytes (128 MB)  | 1000000 bytes (1 MB) | Per execution      | Platform limit: Fastly Compute     |
-| Spin (generic)          | Unknown                   | None                 | Runtime-configured | Spin runtime                       |
-| Akamai Functions (Spin) | 134217728 bytes (128 MiB) | None                 | Per execution      | Hosted default: Akamai Functions   |
+| Target                  | Primary ceiling           | Separate stack       | Scope         | Memory source / reason             | Live inbound requests | Population source / reason       | Host ingress/framing charge | Accounting source / reason    |
+| ----------------------- | ------------------------- | -------------------- | ------------- | ---------------------------------- | --------------------- | -------------------------------- | --------------------------- | ----------------------------- |
+| Axum                    | Unknown                   | Unknown              | Unknown       | Unknown: Operator configured       | Unknown               | Unknown: Operator configured     | Unknown                     | Unknown: Operator configured  |
+| Cloudflare Workers      | 128000000 bytes (128 MB)  | None                 | Per instance  | Platform limit: Cloudflare Workers | Unknown               | Unknown: Provider unpublished    | Unknown                     | Unknown: Provider unpublished |
+| Fastly Compute          | 128000000 bytes (128 MB)  | 1000000 bytes (1 MB) | Per execution | Platform limit: Fastly Compute     | 1                     | Platform limit: Fastly Compute   | Unknown                     | Unknown: Provider unpublished |
+| Spin (generic)          | Unknown                   | Unknown              | Unknown       | Unknown: Runtime configured        | Unknown               | Unknown: Runtime configured      | Unknown                     | Unknown: Runtime configured   |
+| Akamai Functions (Spin) | 134217728 bytes (128 MiB) | None                 | Per execution | Hosted default: Akamai Functions   | 1                     | Hosted default: Akamai Functions | Unknown                     | Unknown: Provider unpublished |
 
-Cloudflare's limit is shared by concurrent requests in one isolate, so concurrency divides the
-available application envelope. Fastly gives each execution its own heap and stack allowances.
-Generic Spin is deliberately unknown because `max_instance_memory` is runtime-configurable;
-applications deployed to Akamai Functions opt into `AKAMAI_FUNCTIONS_PLATFORM` through the Spin
-platform-aware entrypoint rather than changing the meaning of every Spin deployment.
+Cloudflare's limit is shared by concurrent requests in one isolate, but the provider does not
+publish the maximum live inbound request population charged to that memory domain. Its limit of
+six simultaneous outbound connections applies to connections waiting for response headers within
+one invocation; it is not an inbound population bound. Fastly publishes per-execution heap and
+separate stack allowances with a population of one. Generic Spin leaves all three facts unknown
+because deployment configuration controls them. Applications deployed to Akamai Functions opt
+into `AKAMAI_FUNCTIONS_PLATFORM`, which publishes the hosted 128 MiB per-execution default and a
+population of one rather than changing the meaning of every Spin deployment.
+
+All current adapters receive host-parsed requests. Where the provider does not publish whether
+host parser, HPACK, or framing allocations count toward the memory ceiling, host-ingress
+accounting remains `Unknown: Provider unpublished`; guest-visible allocation data cannot fill in
+that fact. Unknown memory, population, or host-accounting facts make
+`PlatformMetadata::validate_memory_envelope` return `Indeterminate`, so only `Fits` is a complete
+validation result. A known minimum can still return `Exceeds` before all other facts are known.
 
 Sources: [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/),
 [Fastly Compute resource limits](https://docs.fastly.com/products/compute-resource-limits), and
