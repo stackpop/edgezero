@@ -50,11 +50,11 @@
 - Modify: `crates/edgezero-adapter-spin/src/lib.rs`
 - Modify: `crates/edgezero-adapter-spin/src/cli.rs`
 
-- [ ] Add `adapter_platform_metadata_default_is_unknown` in the registry; add `adapter_platform_metadata_matches_runtime_metadata` in Axum, Cloudflare, and Fastly; add `adapter_platform_metadata_distinguishes_generic_and_hosted_profiles` in Spin. Assert every fact and reason, including one request per execution for Fastly and the hosted Spin profile, and provider-unpublished Cloudflare population/framing facts.
-- [ ] Run `cargo test --offline --locked -p edgezero-adapter adapter_platform_metadata_default_is_unknown` and confirm it fails against the old trait. Run each adapter test with `scripts/run_test_nonzero.sh <test-name> cargo test --offline --locked -p edgezero-adapter-<adapter> --no-default-features --features cli --lib <test-name>` and confirm it fails against `Adapter::memory_ceiling()` or the old constants.
-- [ ] Replace `Adapter::memory_ceiling()` with `platform_metadata()` and no compatibility alias. Update each in-tree CLI adapter to return its runtime constant.
-- [ ] Hard-cut every adapter `PlatformMetadata::new` and `MemoryCeiling::new` caller to the three-fact model.
-- [ ] Run `cargo test --offline --locked -p edgezero-adapter`, then each adapter's platform metadata tests, until green.
+- [x] Add `adapter_platform_metadata_default_is_unknown` in the registry; add `adapter_platform_metadata_matches_runtime_metadata` in Axum, Cloudflare, and Fastly; add `adapter_platform_metadata_distinguishes_generic_and_hosted_profiles` in Spin. Assert every fact and reason, including one request per execution for Fastly and the hosted Spin profile, and provider-unpublished Cloudflare population/framing facts.
+- [x] Run `cargo test --offline --locked -p edgezero-adapter adapter_platform_metadata_default_is_unknown` and confirm it fails against the old trait. Run each adapter test with `scripts/run_test_nonzero.sh <test-name> cargo test --offline --locked -p edgezero-adapter-<adapter> --no-default-features --features cli --lib <test-name>` and confirm it fails against `Adapter::memory_ceiling()` or the old constants.
+- [x] Replace `Adapter::memory_ceiling()` with `platform_metadata()` and no compatibility alias. Update each in-tree CLI adapter to return its runtime constant.
+- [x] Hard-cut every adapter `PlatformMetadata::new` and `MemoryCeiling::new` caller to the three-fact model.
+- [x] Run `cargo test --offline --locked -p edgezero-adapter`, then each adapter's platform metadata tests, until green.
 
 ### Task 4: Batch observation cutoff contract
 

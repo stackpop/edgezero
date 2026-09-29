@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, PoisonError, RwLock};
 
-use edgezero_core::{Capability, CapabilitySupport, MemoryCeiling};
+use edgezero_core::{Capability, CapabilitySupport, PlatformMetadata};
 
 static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -412,16 +412,6 @@ pub trait Adapter: Sync + Send {
         ))
     }
 
-    /// Report the target's memory ceiling and accounting scope when known.
-    ///
-    /// The default is unknown because native targets and configurable runtimes
-    /// may not have one portable platform limit.
-    #[must_use]
-    #[inline]
-    fn memory_ceiling(&self) -> Option<MemoryCeiling> {
-        None
-    }
-
     /// Store kinds whose logical-id namespaces the adapter merges into
     /// a single backend at runtime — declaring the SAME logical id
     /// under two merged kinds causes silent write collisions because
@@ -441,6 +431,15 @@ pub trait Adapter: Sync + Send {
 
     /// Name used to reference the adapter (case-insensitive).
     fn name(&self) -> &'static str;
+
+    /// Report the target's resource metadata.
+    ///
+    /// The default leaves every fact unknown.
+    #[must_use]
+    #[inline]
+    fn platform_metadata(&self) -> PlatformMetadata {
+        PlatformMetadata::default()
+    }
 
     /// Reject a config `(key, body)` that this adapter cannot store, BEFORE any
     /// provider I/O. Called by `config push` ahead of the remote read, so an
@@ -812,8 +811,22 @@ mod tests {
     }
 
     #[test]
-    fn adapter_memory_ceiling_default_is_unknown() {
-        assert_eq!(FIRST.memory_ceiling(), None);
+    fn adapter_platform_metadata_default_is_unknown() {
+        let metadata = FIRST.platform_metadata();
+
+        assert_eq!(metadata, edgezero_core::PlatformMetadata::default());
+        assert_eq!(
+            metadata.memory_ceiling(),
+            edgezero_core::PlatformFact::unknown(edgezero_core::PlatformUnknownReason::Unspecified)
+        );
+        assert_eq!(
+            metadata.inbound_request_population_bound(),
+            edgezero_core::PlatformFact::unknown(edgezero_core::PlatformUnknownReason::Unspecified)
+        );
+        assert_eq!(
+            metadata.host_ingress_memory_accounting(),
+            edgezero_core::PlatformFact::unknown(edgezero_core::PlatformUnknownReason::Unspecified)
+        );
     }
 
     #[test]

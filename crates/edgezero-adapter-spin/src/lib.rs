@@ -42,21 +42,38 @@ use edgezero_core::error::EdgeError;
 use spin_sdk::http::Request as SpinRequest;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use spin_sdk::wasip3::http::types::Response as WasiResponse;
+use std::num::NonZeroU32;
 
 /// Akamai Functions' published default quota for a Spin function execution.
 pub const AKAMAI_FUNCTIONS_PLATFORM: edgezero_core::PlatformMetadata =
-    edgezero_core::PlatformMetadata::new(Some(edgezero_core::MemoryCeiling::new(
-        128 * 1024 * 1024,
-        edgezero_core::MemoryCeilingScope::PerExecution,
-        None,
-        edgezero_core::MemoryCeilingSource::HostedDefault {
-            provider: "Akamai Functions",
-        },
-    )));
+    edgezero_core::PlatformMetadata::new(
+        edgezero_core::PlatformFact::known(
+            edgezero_core::MemoryCeiling::new(
+                128 * 1024 * 1024,
+                edgezero_core::MemoryCeilingScope::PerExecution,
+                None,
+            ),
+            edgezero_core::PlatformResourceSource::HostedDefault {
+                provider: "Akamai Functions",
+            },
+        ),
+        edgezero_core::PlatformFact::known(
+            edgezero_core::InboundRequestPopulationBound::new(NonZeroU32::MIN),
+            edgezero_core::PlatformResourceSource::HostedDefault {
+                provider: "Akamai Functions",
+            },
+        ),
+        edgezero_core::PlatformFact::unknown(
+            edgezero_core::PlatformUnknownReason::ProviderUnpublished,
+        ),
+    );
 
-/// Generic Spin has a runtime-configured memory limit rather than one portable ceiling.
-pub const SPIN_PLATFORM: edgezero_core::PlatformMetadata =
-    edgezero_core::PlatformMetadata::new(None);
+/// Generic Spin resource limits and accounting are runtime-configured.
+pub const SPIN_PLATFORM: edgezero_core::PlatformMetadata = edgezero_core::PlatformMetadata::new(
+    edgezero_core::PlatformFact::unknown(edgezero_core::PlatformUnknownReason::RuntimeConfigured),
+    edgezero_core::PlatformFact::unknown(edgezero_core::PlatformUnknownReason::RuntimeConfigured),
+    edgezero_core::PlatformFact::unknown(edgezero_core::PlatformUnknownReason::RuntimeConfigured),
+);
 
 /// Raw `WASIp3` response whose body and transmission lifetime remain owned by `EdgeZero`.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]

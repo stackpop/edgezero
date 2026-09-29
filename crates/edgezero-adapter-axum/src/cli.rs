@@ -20,7 +20,7 @@ use edgezero_adapter::scaffold::{
 };
 use edgezero_core::addr;
 use edgezero_core::manifest::ManifestLoader;
-use edgezero_core::{Capability, CapabilitySupport, MemoryCeiling};
+use edgezero_core::{Capability, CapabilitySupport, PlatformMetadata};
 use toml::Value;
 use walkdir::WalkDir;
 
@@ -211,12 +211,12 @@ impl Adapter for AxumCliAdapter {
         }
     }
 
-    fn memory_ceiling(&self) -> Option<MemoryCeiling> {
-        crate::AXUM_PLATFORM.memory_ceiling()
-    }
-
     fn name(&self) -> &'static str {
         "axum"
+    }
+
+    fn platform_metadata(&self) -> PlatformMetadata {
+        crate::AXUM_PLATFORM
     }
 
     fn provision(
@@ -864,12 +864,28 @@ mod tests {
     }
 
     #[test]
-    fn adapter_memory_ceiling_matches_runtime_metadata() {
+    fn adapter_platform_metadata_matches_runtime_metadata() {
+        let metadata = AXUM_ADAPTER.platform_metadata();
+
+        assert_eq!(metadata, crate::AXUM_PLATFORM);
         assert_eq!(
-            AXUM_ADAPTER.memory_ceiling(),
-            crate::AXUM_PLATFORM.memory_ceiling()
+            metadata.memory_ceiling(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::OperatorConfigured
+            )
         );
-        assert_eq!(AXUM_ADAPTER.memory_ceiling(), None);
+        assert_eq!(
+            metadata.inbound_request_population_bound(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::OperatorConfigured
+            )
+        );
+        assert_eq!(
+            metadata.host_ingress_memory_accounting(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::OperatorConfigured
+            )
+        );
     }
 
     #[test]

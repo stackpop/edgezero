@@ -24,7 +24,7 @@ use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
-use edgezero_core::{Capability, CapabilitySupport, MemoryCeiling};
+use edgezero_core::{Capability, CapabilitySupport, PlatformMetadata};
 use walkdir::WalkDir;
 
 mod push_cloud;
@@ -226,10 +226,6 @@ impl Adapter for SpinCliAdapter {
         }
     }
 
-    fn memory_ceiling(&self) -> Option<MemoryCeiling> {
-        crate::SPIN_PLATFORM.memory_ceiling()
-    }
-
     fn merged_id_kinds(&self) -> &'static [&'static str] {
         // Both KV and Config back to `spin_sdk::key_value::Store` via
         // the same `provision` path; declaring the same logical id
@@ -240,6 +236,10 @@ impl Adapter for SpinCliAdapter {
 
     fn name(&self) -> &'static str {
         "spin"
+    }
+
+    fn platform_metadata(&self) -> PlatformMetadata {
+        crate::SPIN_PLATFORM
     }
 
     fn provision(
@@ -1310,6 +1310,7 @@ fn serve_from_manifest(manifest: &Path, extra_args: &[String]) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU32;
     use tempfile::tempdir;
 
     // Shared fixture names. Pinning these as consts (instead of
@@ -1420,27 +1421,64 @@ mod tests {
     }
 
     #[test]
-    fn adapter_memory_ceiling_distinguishes_generic_and_hosted_profiles() {
-        assert_eq!(SPIN_ADAPTER.memory_ceiling(), None);
+    fn adapter_platform_metadata_distinguishes_generic_and_hosted_profiles() {
+        let generic = SPIN_ADAPTER.platform_metadata();
+
+        assert_eq!(generic, crate::SPIN_PLATFORM);
         assert_eq!(
-            SPIN_ADAPTER.memory_ceiling(),
-            crate::SPIN_PLATFORM.memory_ceiling()
+            generic.memory_ceiling(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::RuntimeConfigured
+            )
+        );
+        assert_eq!(
+            generic.inbound_request_population_bound(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::RuntimeConfigured
+            )
+        );
+        assert_eq!(
+            generic.host_ingress_memory_accounting(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::RuntimeConfigured
+            )
         );
 
-        let ceiling = crate::AKAMAI_FUNCTIONS_PLATFORM
-            .memory_ceiling()
-            .expect("Akamai Functions publishes a hosted quota");
-        assert_eq!(ceiling.total_bytes(), 128 * 1024 * 1024);
+        let hosted = crate::AKAMAI_FUNCTIONS_PLATFORM;
+        let source = edgezero_core::PlatformResourceSource::HostedDefault {
+            provider: "Akamai Functions",
+        };
         assert_eq!(
-            ceiling.scope(),
-            edgezero_core::MemoryCeilingScope::PerExecution
+            hosted.memory_ceiling(),
+            edgezero_core::PlatformFact::known(
+                edgezero_core::MemoryCeiling::new(
+                    128 * 1024 * 1024,
+                    edgezero_core::MemoryCeilingScope::PerExecution,
+                    None,
+                ),
+                source,
+            )
         );
-        assert_eq!(ceiling.stack_bytes(), None);
         assert_eq!(
-            ceiling.source(),
-            edgezero_core::MemoryCeilingSource::HostedDefault {
-                provider: "Akamai Functions",
-            }
+            hosted.inbound_request_population_bound(),
+            edgezero_core::PlatformFact::known(
+                edgezero_core::InboundRequestPopulationBound::new(NonZeroU32::MIN),
+                source,
+            )
+        );
+        assert_eq!(
+            hosted
+                .inbound_request_population_bound()
+                .value()
+                .expect("the hosted profile publishes the per-execution population")
+                .max_live_requests(),
+            NonZeroU32::MIN
+        );
+        assert_eq!(
+            hosted.host_ingress_memory_accounting(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::ProviderUnpublished
+            )
         );
     }
 

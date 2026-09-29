@@ -34,7 +34,7 @@ use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
-use edgezero_core::{Capability, CapabilitySupport, MemoryCeiling};
+use edgezero_core::{Capability, CapabilitySupport, PlatformMetadata};
 use walkdir::WalkDir;
 
 static FASTLY_ADAPTER: FastlyCliAdapter = FastlyCliAdapter;
@@ -493,12 +493,12 @@ impl Adapter for FastlyCliAdapter {
         gc_fastly_config_store(store.platform.as_str(), older_than_secs, dry_run)
     }
 
-    fn memory_ceiling(&self) -> Option<MemoryCeiling> {
-        crate::FASTLY_PLATFORM.memory_ceiling()
-    }
-
     fn name(&self) -> &'static str {
         "fastly"
+    }
+
+    fn platform_metadata(&self) -> PlatformMetadata {
+        crate::FASTLY_PLATFORM
     }
 
     fn preflight_config_write(&self, key: &str, body: &str) -> Result<(), String> {
@@ -5654,6 +5654,7 @@ mod tests {
     #[cfg(unix)]
     use edgezero_core::test_env::{EnvOverride, PathPrepend};
     use std::collections::{BTreeMap, HashSet};
+    use std::num::NonZeroU32;
 
     #[cfg(unix)]
     use std::sync::Mutex;
@@ -5764,23 +5765,44 @@ mod tests {
     }
 
     #[test]
-    fn adapter_memory_ceiling_matches_runtime_metadata() {
-        let ceiling = FASTLY_ADAPTER
-            .memory_ceiling()
-            .expect("Fastly publishes a memory ceiling");
+    fn adapter_platform_metadata_matches_runtime_metadata() {
+        let metadata = FASTLY_ADAPTER.platform_metadata();
+        let source = edgezero_core::PlatformResourceSource::PlatformLimit {
+            provider: "Fastly Compute",
+        };
 
-        assert_eq!(Some(ceiling), crate::FASTLY_PLATFORM.memory_ceiling());
-        assert_eq!(ceiling.total_bytes(), 128_000_000);
+        assert_eq!(metadata, crate::FASTLY_PLATFORM);
         assert_eq!(
-            ceiling.scope(),
-            edgezero_core::MemoryCeilingScope::PerExecution
+            metadata.memory_ceiling(),
+            edgezero_core::PlatformFact::known(
+                edgezero_core::MemoryCeiling::new(
+                    128_000_000,
+                    edgezero_core::MemoryCeilingScope::PerExecution,
+                    Some(1_000_000),
+                ),
+                source,
+            )
         );
-        assert_eq!(ceiling.stack_bytes(), Some(1_000_000));
         assert_eq!(
-            ceiling.source(),
-            edgezero_core::MemoryCeilingSource::PlatformLimit {
-                provider: "Fastly Compute",
-            }
+            metadata.inbound_request_population_bound(),
+            edgezero_core::PlatformFact::known(
+                edgezero_core::InboundRequestPopulationBound::new(NonZeroU32::MIN),
+                source,
+            )
+        );
+        assert_eq!(
+            metadata
+                .inbound_request_population_bound()
+                .value()
+                .expect("Fastly publishes the per-execution population")
+                .max_live_requests(),
+            NonZeroU32::MIN
+        );
+        assert_eq!(
+            metadata.host_ingress_memory_accounting(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::ProviderUnpublished
+            )
         );
     }
 

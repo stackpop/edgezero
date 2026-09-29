@@ -17,7 +17,7 @@ use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
-use edgezero_core::{Capability, CapabilitySupport, MemoryCeiling};
+use edgezero_core::{Capability, CapabilitySupport, PlatformMetadata};
 use walkdir::WalkDir;
 
 static CLOUDFLARE_ADAPTER: CloudflareCliAdapter = CloudflareCliAdapter;
@@ -221,10 +221,6 @@ impl Adapter for CloudflareCliAdapter {
         }
     }
 
-    fn memory_ceiling(&self) -> Option<MemoryCeiling> {
-        crate::CLOUDFLARE_PLATFORM.memory_ceiling()
-    }
-
     fn merged_id_kinds(&self) -> &'static [&'static str] {
         // Both KV and Config back to Worker KV namespaces via the
         // same `[[kv_namespaces]] binding = <platform-name>`
@@ -245,6 +241,10 @@ impl Adapter for CloudflareCliAdapter {
 
     fn name(&self) -> &'static str {
         "cloudflare"
+    }
+
+    fn platform_metadata(&self) -> PlatformMetadata {
+        crate::CLOUDFLARE_PLATFORM
     }
 
     fn provision(
@@ -1333,23 +1333,35 @@ mod tests {
     }
 
     #[test]
-    fn adapter_memory_ceiling_matches_runtime_metadata() {
-        let ceiling = CLOUDFLARE_ADAPTER
-            .memory_ceiling()
-            .expect("Cloudflare publishes a memory ceiling");
+    fn adapter_platform_metadata_matches_runtime_metadata() {
+        let metadata = CLOUDFLARE_ADAPTER.platform_metadata();
+        let source = edgezero_core::PlatformResourceSource::PlatformLimit {
+            provider: "Cloudflare Workers",
+        };
 
-        assert_eq!(Some(ceiling), crate::CLOUDFLARE_PLATFORM.memory_ceiling());
-        assert_eq!(ceiling.total_bytes(), 128_000_000);
+        assert_eq!(metadata, crate::CLOUDFLARE_PLATFORM);
         assert_eq!(
-            ceiling.scope(),
-            edgezero_core::MemoryCeilingScope::PerInstance
+            metadata.memory_ceiling(),
+            edgezero_core::PlatformFact::known(
+                edgezero_core::MemoryCeiling::new(
+                    128_000_000,
+                    edgezero_core::MemoryCeilingScope::PerInstance,
+                    None,
+                ),
+                source,
+            )
         );
-        assert_eq!(ceiling.stack_bytes(), None);
         assert_eq!(
-            ceiling.source(),
-            edgezero_core::MemoryCeilingSource::PlatformLimit {
-                provider: "Cloudflare Workers",
-            }
+            metadata.inbound_request_population_bound(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::ProviderUnpublished
+            )
+        );
+        assert_eq!(
+            metadata.host_ingress_memory_accounting(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::ProviderUnpublished
+            )
         );
     }
 

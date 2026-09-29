@@ -37,14 +37,24 @@ use worker::{Context, Env, Error as WorkerError, Request, Response};
 
 /// Cloudflare Workers' published per-isolate memory limit.
 pub const CLOUDFLARE_PLATFORM: edgezero_core::PlatformMetadata =
-    edgezero_core::PlatformMetadata::new(Some(edgezero_core::MemoryCeiling::new(
-        128_000_000,
-        edgezero_core::MemoryCeilingScope::PerInstance,
-        None,
-        edgezero_core::MemoryCeilingSource::PlatformLimit {
-            provider: "Cloudflare Workers",
-        },
-    )));
+    edgezero_core::PlatformMetadata::new(
+        edgezero_core::PlatformFact::known(
+            edgezero_core::MemoryCeiling::new(
+                128_000_000,
+                edgezero_core::MemoryCeilingScope::PerInstance,
+                None,
+            ),
+            edgezero_core::PlatformResourceSource::PlatformLimit {
+                provider: "Cloudflare Workers",
+            },
+        ),
+        edgezero_core::PlatformFact::unknown(
+            edgezero_core::PlatformUnknownReason::ProviderUnpublished,
+        ),
+        edgezero_core::PlatformFact::unknown(
+            edgezero_core::PlatformUnknownReason::ProviderUnpublished,
+        ),
+    );
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 fn build_app_for_dispatch<A: Hooks>() -> Result<App, WorkerError> {

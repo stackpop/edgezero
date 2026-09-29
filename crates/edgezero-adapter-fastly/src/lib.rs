@@ -45,19 +45,30 @@ use edgezero_core::http::{Extensions, Response};
 use edgezero_core::manifest::ResolvedLoggingConfig;
 #[cfg(feature = "fastly")]
 use fastly::compute_runtime::service_id;
+use std::num::NonZeroU32;
 #[cfg(feature = "fastly")]
 use std::sync::Once;
 
 /// Fastly Compute's published per-execution heap and stack limits.
-pub const FASTLY_PLATFORM: edgezero_core::PlatformMetadata =
-    edgezero_core::PlatformMetadata::new(Some(edgezero_core::MemoryCeiling::new(
-        128_000_000,
-        edgezero_core::MemoryCeilingScope::PerExecution,
-        Some(1_000_000),
-        edgezero_core::MemoryCeilingSource::PlatformLimit {
+pub const FASTLY_PLATFORM: edgezero_core::PlatformMetadata = edgezero_core::PlatformMetadata::new(
+    edgezero_core::PlatformFact::known(
+        edgezero_core::MemoryCeiling::new(
+            128_000_000,
+            edgezero_core::MemoryCeilingScope::PerExecution,
+            Some(1_000_000),
+        ),
+        edgezero_core::PlatformResourceSource::PlatformLimit {
             provider: "Fastly Compute",
         },
-    )));
+    ),
+    edgezero_core::PlatformFact::known(
+        edgezero_core::InboundRequestPopulationBound::new(NonZeroU32::MIN),
+        edgezero_core::PlatformResourceSource::PlatformLimit {
+            provider: "Fastly Compute",
+        },
+    ),
+    edgezero_core::PlatformFact::unknown(edgezero_core::PlatformUnknownReason::ProviderUnpublished),
+);
 
 #[cfg(any(feature = "fastly", all(feature = "cli", not(target_arch = "wasm32"))))]
 const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";

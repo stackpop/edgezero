@@ -27,6 +27,9 @@ pub mod cli;
 #[cfg(test)]
 pub mod test_utils;
 
-/// Native Axum has no framework-owned memory ceiling; the operator selects it.
-pub const AXUM_PLATFORM: edgezero_core::PlatformMetadata =
-    edgezero_core::PlatformMetadata::new(None);
+/// Native Axum resource limits and accounting are operator-configured.
+pub const AXUM_PLATFORM: edgezero_core::PlatformMetadata = edgezero_core::PlatformMetadata::new(
+    edgezero_core::PlatformFact::unknown(edgezero_core::PlatformUnknownReason::OperatorConfigured),
+    edgezero_core::PlatformFact::unknown(edgezero_core::PlatformUnknownReason::OperatorConfigured),
+    edgezero_core::PlatformFact::unknown(edgezero_core::PlatformUnknownReason::OperatorConfigured),
+);
