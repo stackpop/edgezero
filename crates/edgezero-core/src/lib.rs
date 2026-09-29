@@ -88,7 +88,10 @@ pub use outbound::{
     limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch, normalize_response_headers,
     rechunk_stream, validate_for_dispatch,
 };
-pub use platform::{MemoryCeiling, MemoryCeilingScope, MemoryCeilingSource, PlatformMetadata};
+pub use platform::{
+    HostIngressMemoryAccounting, InboundRequestPopulationBound, MemoryCeiling, MemoryCeilingScope,
+    MemoryEnvelope, PlatformFact, PlatformMetadata, PlatformResourceSource, PlatformUnknownReason,
+};
 pub use response_egress::{
     DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressDecision,
     DetachedResponseEgressDecisionFactory, DetachedResponseEgressHead,

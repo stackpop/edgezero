@@ -613,6 +613,7 @@ fn render_default_error_response(error: EdgeError) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -635,7 +636,9 @@ mod tests {
     use crate::manifest::BakedManifest;
     use crate::middleware::{Middleware, Next};
     use crate::platform::{
-        MemoryCeiling, MemoryCeilingScope, MemoryCeilingSource, PlatformMetadata,
+        HostIngressMemoryAccounting, InboundRequestPopulationBound, MemoryCeiling,
+        MemoryCeilingScope, PlatformFact, PlatformMetadata, PlatformResourceSource,
+        PlatformUnknownReason,
     };
     use crate::response_egress::{
         DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressDecision, ResponseEgressAttempt,
@@ -721,15 +724,13 @@ mod tests {
     )]
     impl Hooks for MemoryAwareHooks {
         fn configure(app: &mut App) -> Result<(), EdgeError> {
-            let expected = MemoryCeiling::new(
-                128_000_000,
-                MemoryCeilingScope::PerInstance,
-                None,
-                MemoryCeilingSource::PlatformLimit {
+            let expected = PlatformFact::known(
+                MemoryCeiling::new(128_000_000, MemoryCeilingScope::PerInstance, None),
+                PlatformResourceSource::PlatformLimit {
                     provider: "test-platform",
                 },
             );
-            if app.platform().memory_ceiling() == Some(expected) {
+            if app.platform().memory_ceiling() == expected {
                 Ok(())
             } else {
                 Err(EdgeError::service_unavailable(
@@ -925,27 +926,48 @@ mod tests {
 
     #[test]
     fn build_app_exposes_memory_ceiling_during_configuration() {
-        let ceiling = MemoryCeiling::new(
-            128_000_000,
-            MemoryCeilingScope::PerInstance,
-            None,
-            MemoryCeilingSource::PlatformLimit {
-                provider: "test-platform",
-            },
+        let source = PlatformResourceSource::PlatformLimit {
+            provider: "test-platform",
+        };
+        let ceiling = MemoryCeiling::new(128_000_000, MemoryCeilingScope::PerInstance, None);
+        let population = InboundRequestPopulationBound::new(NonZeroU32::MIN);
+        let host_accounting = HostIngressMemoryAccounting::OutsideCeiling;
+        let platform = PlatformMetadata::new(
+            PlatformFact::known(ceiling, source),
+            PlatformFact::known(population, source),
+            PlatformFact::known(host_accounting, source),
         );
-        let platform = PlatformMetadata::new(Some(ceiling));
 
         let app = App::build::<MemoryAwareHooks>(platform).expect("configured app");
 
         assert_eq!(app.platform(), platform);
+        assert_eq!(
+            app.platform().inbound_request_population_bound(),
+            PlatformFact::known(population, source)
+        );
+        assert_eq!(
+            app.platform().host_ingress_memory_accounting(),
+            PlatformFact::known(host_accounting, source)
+        );
     }
 
     #[test]
-    fn build_app_accepts_explicit_unknown_platform_memory() {
+    fn build_app_accepts_unknown_platform_metadata() {
         let app = App::build::<DefaultHooks>(PlatformMetadata::default()).expect("default app");
 
         assert_eq!(app.platform(), PlatformMetadata::default());
-        assert_eq!(app.platform().memory_ceiling(), None);
+        assert_eq!(
+            app.platform().memory_ceiling(),
+            PlatformFact::unknown(PlatformUnknownReason::Unspecified)
+        );
+        assert_eq!(
+            app.platform().inbound_request_population_bound(),
+            PlatformFact::unknown(PlatformUnknownReason::Unspecified)
+        );
+        assert_eq!(
+            app.platform().host_ingress_memory_accounting(),
+            PlatformFact::unknown(PlatformUnknownReason::Unspecified)
+        );
     }
 
     #[test]

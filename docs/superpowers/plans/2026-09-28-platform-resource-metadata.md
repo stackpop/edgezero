@@ -18,11 +18,11 @@
 - Modify: `crates/edgezero-core/src/app.rs`
 - Modify: `crates/edgezero-macros/tests/app_macro.rs`
 
-- [ ] Add `platform_fact_distinguishes_known_and_unknown_metadata` and `memory_envelope_accessors_preserve_declared_shape` in `platform.rs`. Use the desired public constructors and accessors so the tests fail to compile while the API is absent.
-- [ ] Run `cargo test --offline --locked -p edgezero-core platform_fact_distinguishes_known_and_unknown_metadata` and confirm the missing-type failure.
-- [ ] Add `PlatformFact<T>`, `PlatformResourceSource`, `PlatformUnknownReason`, `InboundRequestPopulationBound`, `HostIngressMemoryAccounting`, and scope-tagged `MemoryEnvelope` with const constructors/accessors. Hard-cut `MemoryCeiling::new` to remove provenance and move it into `PlatformFact::Known`.
-- [ ] Run the two focused tests and `cargo test --offline --locked -p edgezero-core platform` until green.
-- [ ] Update app and macro tests to construct three explicit platform facts; run `cargo test --offline --locked -p edgezero-core app::tests` and `cargo test --offline --locked -p edgezero-macros --test app_macro` until green.
+- [x] Add `platform_fact_distinguishes_known_and_unknown_metadata` and `memory_envelope_accessors_preserve_declared_shape` in `platform.rs`. Use the desired public constructors and accessors so the tests fail to compile while the API is absent.
+- [x] Run `cargo test --offline --locked -p edgezero-core platform_fact_distinguishes_known_and_unknown_metadata` and confirm the missing-type failure.
+- [x] Add `PlatformFact<T>`, `PlatformResourceSource`, `PlatformUnknownReason`, `InboundRequestPopulationBound`, `HostIngressMemoryAccounting`, and scope-tagged `MemoryEnvelope` with const constructors/accessors. Hard-cut `MemoryCeiling::new` to remove provenance and move it into `PlatformFact::Known`.
+- [x] Run the two focused tests and `cargo test --offline --locked -p edgezero-core platform` until green.
+- [x] Update app and macro tests to construct three explicit platform facts; run `cargo test --offline --locked -p edgezero-core app::tests` and `cargo test --offline --locked -p edgezero-macros --test app_macro` until green.
 
 ### Task 2: Fail-closed memory validation
 

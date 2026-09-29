@@ -106,19 +106,25 @@ mod failing_configured_app {
 
 #[cfg(test)]
 mod platform_configured_app {
+    use std::num::NonZeroU32;
+
     use edgezero_core::app::App;
     use edgezero_core::{
-        EdgeError, MemoryCeiling, MemoryCeilingScope, MemoryCeilingSource, PlatformMetadata,
+        EdgeError, HostIngressMemoryAccounting, InboundRequestPopulationBound, MemoryCeiling,
+        MemoryCeilingScope, PlatformFact, PlatformMetadata, PlatformResourceSource,
     };
 
-    const TEST_PLATFORM: PlatformMetadata = PlatformMetadata::new(Some(MemoryCeiling::new(
-        64_000_000,
-        MemoryCeilingScope::PerExecution,
-        None,
-        MemoryCeilingSource::PlatformLimit {
-            provider: "macro-test",
-        },
-    )));
+    const SOURCE: PlatformResourceSource = PlatformResourceSource::PlatformLimit {
+        provider: "macro-test",
+    };
+    const TEST_PLATFORM: PlatformMetadata = PlatformMetadata::new(
+        PlatformFact::known(
+            MemoryCeiling::new(64_000_000, MemoryCeilingScope::PerExecution, None),
+            SOURCE,
+        ),
+        PlatformFact::known(InboundRequestPopulationBound::new(NonZeroU32::MIN), SOURCE),
+        PlatformFact::known(HostIngressMemoryAccounting::OutsideCeiling, SOURCE),
+    );
 
     fn configure_app(app: &mut App) -> Result<(), EdgeError> {
         if app.platform() == TEST_PLATFORM {
