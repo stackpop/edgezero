@@ -320,18 +320,18 @@ mod spin_impl {
         fn prepare_batch(
             request: OutboundRequest,
             started_at: MonotonicInstant,
-            cutoff: Deadline,
+            observation_cutoff: Deadline,
         ) -> Result<PreparedRequest, EdgeError> {
             super::validate_batch_request(&request)?;
-            Self::prepare_validated(request, started_at, Some(cutoff))
+            Self::prepare_validated(request, started_at, Some(observation_cutoff))
         }
 
         fn prepare_validated(
             mut request: OutboundRequest,
             started_at: MonotonicInstant,
-            batch_cutoff: Option<Deadline>,
+            observation_cutoff: Option<Deadline>,
         ) -> Result<PreparedRequest, EdgeError> {
-            let budget = dispatch_budget(&request, started_at, batch_cutoff)?;
+            let budget = dispatch_budget(&request, started_at, observation_cutoff)?;
             normalize_for_dispatch(&mut request)?;
             Ok(PreparedRequest {
                 budget,
@@ -422,18 +422,18 @@ mod spin_impl {
         fn start_batch_until(
             &self,
             requests: Vec<OutboundRequest>,
-            cutoff: Deadline,
+            observation_cutoff: Deadline,
         ) -> OutboundBatch {
             let batch_started_at = self.clock.now();
             let slot_count = requests.len();
-            if cutoff.is_expired_at(batch_started_at) {
+            if observation_cutoff.is_expired_at(batch_started_at) {
                 return OutboundBatch::cutoff(slot_count);
             }
 
             let mut completed = Vec::new();
             let pending_slots = FuturesUnordered::<LocalBoxFuture<'static, _>>::new();
             for (index, request) in requests.into_iter().enumerate() {
-                match Self::prepare_batch(request, batch_started_at, cutoff) {
+                match Self::prepare_batch(request, batch_started_at, observation_cutoff) {
                     Ok(prepared) => {
                         let client = self.clone();
                         pending_slots.push(
@@ -466,7 +466,7 @@ mod spin_impl {
                         index,
                         batch_started_at,
                         completed_at,
-                        cutoff,
+                        observation_cutoff,
                         outcome,
                     ) else {
                         yield OutboundBatchDriverEvent::Cutoff;
@@ -480,7 +480,7 @@ mod spin_impl {
                         index,
                         batch_started_at,
                         completed_at,
-                        cutoff,
+                        observation_cutoff,
                         outcome,
                     ) else {
                         yield OutboundBatchDriverEvent::Cutoff;

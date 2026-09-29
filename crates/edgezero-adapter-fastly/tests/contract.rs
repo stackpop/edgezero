@@ -1310,7 +1310,7 @@ mod outbound_contract_tests {
         }
 
         #[test]
-        fn already_expired_batch_reports_cutoff() {
+        fn expired_observation_cutoff_leaves_slot_unresolved() {
             let now = edgezero_core::MonotonicInstant::now();
             let client =
                 FastlyOutboundClient::with_clock(edgezero_core::MonotonicClock::new(move || now));

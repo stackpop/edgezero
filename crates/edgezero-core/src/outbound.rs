@@ -232,8 +232,8 @@ impl OutboundBatch {
 
     /// Builds an already-cut-off batch without polling adapter transport work.
     ///
-    /// Adapters use this when the method-level cutoff is expired at batch entry. Every input index
-    /// remains unresolved.
+    /// Adapters use this when the method-level observation cutoff is expired at batch entry. Every
+    /// input index remains unresolved.
     #[must_use]
     #[inline]
     pub fn cutoff(slot_count: usize) -> Self {
@@ -348,7 +348,15 @@ pub trait OutboundHttpClient: Send + Sync {
     /// The returned batch yields terminal results in observed completion order with original input
     /// indices. Dropping it stops observation and applies the adapter's strongest available
     /// teardown without undoing already-issued network side effects.
-    fn start_batch_until(&self, requests: Vec<OutboundRequest>, cutoff: Deadline) -> OutboundBatch;
+    ///
+    /// The observation cutoff stops batch observation regardless of any remaining per-request
+    /// budget or later per-request deadline.
+    /// Passing an earlier observation cutoff intentionally leaves unresolved slots.
+    fn start_batch_until(
+        &self,
+        requests: Vec<OutboundRequest>,
+        observation_cutoff: Deadline,
+    ) -> OutboundBatch;
 }
 
 #[derive(Debug)]
@@ -466,9 +474,11 @@ impl HttpClient {
     pub async fn send_all_until(
         &self,
         requests: Vec<OutboundRequest>,
-        cutoff: Deadline,
+        observation_cutoff: Deadline,
     ) -> Result<OutboundBatchResults, OutboundBatchFailure> {
-        self.start_batch_until(requests, cutoff).collect().await
+        self.start_batch_until(requests, observation_cutoff)
+            .collect()
+            .await
     }
 
     #[must_use]
@@ -476,9 +486,9 @@ impl HttpClient {
     pub fn start_batch_until(
         &self,
         requests: Vec<OutboundRequest>,
-        cutoff: Deadline,
+        observation_cutoff: Deadline,
     ) -> OutboundBatch {
-        self.inner.start_batch_until(requests, cutoff)
+        self.inner.start_batch_until(requests, observation_cutoff)
     }
 
     #[inline]
@@ -1078,19 +1088,19 @@ impl OutboundRequest {
 /// Converts one adapter-observed terminal batch outcome into its indexed public result.
 ///
 /// Adapters must pass samples from the batch's shared monotonic clock. `None` means the terminal
-/// observation was at or past the method-level cutoff. Timeout provenance alone never terminates
-/// the batch. A backward terminal sample remains a terminal item with zero elapsed time and an
-/// internal invariant error so it cannot enlarge or bypass the batch budget.
+/// observation was at or past the method-level observation cutoff. Timeout provenance alone never
+/// terminates the batch. A backward terminal sample remains a terminal item with zero elapsed time
+/// and an internal invariant error so it cannot enlarge or bypass the batch budget.
 #[must_use]
 #[inline]
 pub fn finish_batch_item(
     index: usize,
     started_at: MonotonicInstant,
     completed_at: MonotonicInstant,
-    cutoff: Deadline,
+    observation_cutoff: Deadline,
     outcome: Result<OutboundResponse, EdgeError>,
 ) -> Option<OutboundBatchItem> {
-    if cutoff.is_expired_at(completed_at) {
+    if observation_cutoff.is_expired_at(completed_at) {
         return None;
     }
     let result = match completed_at.checked_duration_since(started_at) {
@@ -1731,7 +1741,7 @@ mod tests {
         fn start_batch_until(
             &self,
             requests: Vec<OutboundRequest>,
-            _cutoff: Deadline,
+            _observation_cutoff: Deadline,
         ) -> OutboundBatch {
             self.batch_calls.fetch_add(1, Ordering::Relaxed);
             let slot_count = requests.len();
@@ -1785,7 +1795,7 @@ mod tests {
         let completed_at = started_at
             .checked_add(Duration::from_millis(7))
             .expect("completion instant");
-        let cutoff = Deadline::at_instant(
+        let observation_cutoff = Deadline::at_instant(
             started_at
                 .checked_add(Duration::from_millis(10))
                 .expect("cutoff instant"),
@@ -1795,7 +1805,7 @@ mod tests {
             3,
             started_at,
             completed_at,
-            cutoff,
+            observation_cutoff,
             Ok(response_with_body(Body::empty())),
         )
         .expect("on-time outcome");
@@ -1806,17 +1816,17 @@ mod tests {
     }
 
     #[test]
-    fn finish_batch_item_rejects_an_outcome_observed_at_cutoff() {
+    fn finish_batch_item_rejects_an_outcome_observed_at_observation_cutoff() {
         let started_at = MonotonicInstant::now();
-        let cutoff_at = started_at
+        let observation_cutoff_at = started_at
             .checked_add(Duration::from_millis(10))
             .expect("cutoff instant");
 
         let item = finish_batch_item(
             0,
             started_at,
-            cutoff_at,
-            Deadline::at_instant(cutoff_at),
+            observation_cutoff_at,
+            Deadline::at_instant(observation_cutoff_at),
             Err(EdgeError::bad_gateway("late")),
         );
 
@@ -1824,12 +1834,12 @@ mod tests {
     }
 
     #[test]
-    fn finish_batch_item_preserves_an_early_batch_cutoff_attributed_timeout() {
+    fn finish_batch_item_preserves_an_early_observation_cutoff_attributed_timeout() {
         let started_at = MonotonicInstant::now();
         let completed_at = started_at
             .checked_add(Duration::from_millis(1))
             .expect("completion instant");
-        let cutoff = Deadline::at_instant(
+        let observation_cutoff = Deadline::at_instant(
             started_at
                 .checked_add(Duration::from_millis(10))
                 .expect("cutoff instant"),
@@ -1839,7 +1849,7 @@ mod tests {
             0,
             started_at,
             completed_at,
-            cutoff,
+            observation_cutoff,
             Err(EdgeError::gateway_timeout_caused(
                 "batch cutoff",
                 BudgetSource::BatchCutoff,
@@ -1863,7 +1873,7 @@ mod tests {
         let completed_at = started_at
             .checked_sub(Duration::from_millis(1))
             .expect("earlier instant");
-        let cutoff = Deadline::at_instant(
+        let observation_cutoff = Deadline::at_instant(
             started_at
                 .checked_add(Duration::from_millis(10))
                 .expect("cutoff instant"),
@@ -1873,7 +1883,7 @@ mod tests {
             4,
             started_at,
             completed_at,
-            cutoff,
+            observation_cutoff,
             Ok(response_with_body(Body::empty())),
         )
         .expect("clock fault remains terminal");
@@ -2037,19 +2047,21 @@ mod tests {
         assert_eq!(budget.duration, DEADLINE_FAR_FUTURE);
         assert_eq!(budget.cause, BudgetSource::RequestDeadline);
 
-        let cutoff = Deadline::at_instant(
+        let observation_cutoff = Deadline::at_instant(
             now.checked_add(Duration::from_secs(1))
                 .expect("cutoff instant"),
         );
-        let budget = dispatch_budget(&default, now, Some(cutoff)).expect("batch cutoff");
+        let budget =
+            dispatch_budget(&default, now, Some(observation_cutoff)).expect("batch cutoff");
         assert_eq!(budget.cause, BudgetSource::BatchCutoff);
-        assert_eq!(budget.deadline.instant(), cutoff.instant());
+        assert_eq!(budget.deadline.instant(), observation_cutoff.instant());
 
-        let cutoff_tie = OutboundRequest::get("https://example.com")
+        let observation_cutoff_tie = OutboundRequest::get("https://example.com")
             .expect("request")
             .timeout(Duration::from_secs(1))
-            .deadline(cutoff);
-        let budget = dispatch_budget(&cutoff_tie, now, Some(cutoff)).expect("cutoff tie");
+            .deadline(observation_cutoff);
+        let budget = dispatch_budget(&observation_cutoff_tie, now, Some(observation_cutoff))
+            .expect("cutoff tie");
         assert_eq!(budget.cause, BudgetSource::BatchCutoff);
 
         let error = dispatch_budget(&default, now, Some(Deadline::at_instant(now)))
@@ -2166,8 +2178,8 @@ mod tests {
             OutboundRequest::post("https://example.com/three").expect("three"),
         ];
 
-        let cutoff = Deadline::after(Duration::from_secs(1));
-        let mut batch = client.start_batch_until(requests, cutoff);
+        let observation_cutoff = Deadline::after(Duration::from_secs(1));
+        let mut batch = client.start_batch_until(requests, observation_cutoff);
         let OutboundBatchNext::Item(first) = block_on(batch.next()).expect("valid batch driver")
         else {
             panic!("expected first completion");
@@ -2199,8 +2211,8 @@ mod tests {
                 .expect("two"),
             OutboundRequest::post("https://example.com/three").expect("three"),
         ];
-        let results =
-            block_on(client.send_all_until(requests, cutoff)).expect("valid batch driver");
+        let results = block_on(client.send_all_until(requests, observation_cutoff))
+            .expect("valid batch driver");
         assert_eq!(results.termination, OutboundBatchTermination::Completed);
         assert_eq!(results.slots.len(), 3);
         assert_eq!(

@@ -18,6 +18,22 @@ const outboundAdapterPaths = [
   'crates/edgezero-adapter-fastly/src/outbound.rs',
   'crates/edgezero-adapter-spin/src/outbound.rs',
 ]
+const templateHandlersPath =
+  'crates/edgezero-cli/src/templates/core/src/handlers.rs.hbs'
+const demoHandlersPath =
+  'examples/app-demo/crates/app-demo-core/src/handlers.rs'
+const observationCutoffSourcePaths = [
+  outboundCorePath,
+  'crates/edgezero-core/src/context.rs',
+  'crates/edgezero-core/src/time.rs',
+  ...outboundAdapterPaths,
+  ...['axum', 'cloudflare', 'fastly', 'spin'].map(
+    (adapter) => `crates/edgezero-adapter-${adapter}/tests/contract.rs`,
+  ),
+  templateHandlersPath,
+  demoHandlersPath,
+  proxyGuidePath,
+]
 const brotliAuditPath =
   'docs/audits/2026-09-27-brotli-decoder-memory-accounting.md'
 const outboundSpecPath =
@@ -327,6 +343,288 @@ function formatBinaryBytes(bytes) {
   return `${bytes} bytes`
 }
 
+const qualifiedDeadline = String.raw`(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*Deadline`
+const optionalDeadline = String.raw`Option\s*<\s*${qualifiedDeadline}\s*>`
+const deadlineType = String.raw`(?:${qualifiedDeadline}|${optionalDeadline})`
+
+function maskObservationCutoffNonCode(source) {
+  const masked = source.split('')
+  const blank = (start, end) => {
+    for (let index = start; index < end; index += 1) {
+      if (!/[\r\n]/u.test(masked[index])) masked[index] = ' '
+    }
+  }
+  let index = 0
+  while (index < source.length) {
+    if (source.startsWith('//', index)) {
+      const newline = source.indexOf('\n', index + 2)
+      const end = newline === -1 ? source.length : newline
+      blank(index, end)
+      index = end
+      continue
+    }
+    if (source.startsWith('/*', index)) {
+      let depth = 1
+      let end = index + 2
+      while (end < source.length && depth > 0) {
+        if (source.startsWith('/*', end)) {
+          depth += 1
+          end += 2
+        } else if (source.startsWith('*/', end)) {
+          depth -= 1
+          end += 2
+        } else {
+          end += 1
+        }
+      }
+      blank(index, end)
+      index = end
+      continue
+    }
+    const rest = source.slice(index)
+    const rawStart = rest.match(/^(?:b|c)?r(#{0,255})"/u)
+    if (rawStart !== null) {
+      const delimiter = `"${rawStart[1]}`
+      const closing = source.indexOf(delimiter, index + rawStart[0].length)
+      const end = closing === -1 ? source.length : closing + delimiter.length
+      blank(index, end)
+      index = end
+      continue
+    }
+    const quoted = rest.match(
+      /^(?:(?:b|c)?"(?:\\[\s\S]|[^"\\])*"|b?'(?:\\(?:u\{[0-9A-Fa-f_]+\}|x[0-9A-Fa-f]{2}|.)|[^'\\\r\n])')/u,
+    )
+    if (quoted !== null) {
+      blank(index, index + quoted[0].length)
+      index += quoted[0].length
+      continue
+    }
+    index += 1
+  }
+  return masked.join('')
+}
+
+function closingDelimiter(source, open) {
+  const pairs = new Map([
+    ['(', ')'],
+    ['[', ']'],
+    ['{', '}'],
+  ])
+  const stack = [pairs.get(source[open])]
+  for (let index = open + 1; index < source.length; index += 1) {
+    if (pairs.has(source[index])) stack.push(pairs.get(source[index]))
+    else if (source[index] === stack.at(-1)) {
+      stack.pop()
+      if (stack.length === 0) return index
+    }
+  }
+  return -1
+}
+
+function topLevelArguments(source, open, close) {
+  const argumentsList = []
+  let start = open + 1
+  for (let index = start; index <= close; index += 1) {
+    if (index === close || source[index] === ',') {
+      const argument = source.slice(start, index).trim()
+      if (argument !== '') argumentsList.push(argument)
+      start = index + 1
+    } else if ('([{'.includes(source[index])) {
+      index = closingDelimiter(source, index)
+      if (index === -1) return []
+    }
+  }
+  return argumentsList
+}
+
+function signatureContractError(source, name, count, typeShape, unusedCount = 0) {
+  const code = maskObservationCutoffNonCode(source)
+  const signatures =
+    code.match(new RegExp(String.raw`\bfn\s+${name}\s*\([^)]*\)`, 'gu')) ?? []
+  const expectedType = typeShape === 'optional' ? optionalDeadline : qualifiedDeadline
+  const parameterCount = (parameter) =>
+    signatures.filter((signature) =>
+      new RegExp(
+        String.raw`(?:^|,)\s*${parameter}\s*:\s*${expectedType}\s*(?=,|\))`,
+        'u',
+      ).test(signature.slice(signature.indexOf('(') + 1)),
+    ).length
+  const staleParameter = new RegExp(
+    String.raw`(?:^|,)\s*(?:cutoff|_cutoff|batch_cutoff)\s*:\s*${deadlineType}\s*(?=,|\))`,
+    'u',
+  )
+  return signatures.some((signature) => staleParameter.test(signature)) ||
+    signatures.length !== count ||
+    parameterCount('observation_cutoff') !== count - unusedCount ||
+    parameterCount('_observation_cutoff') !== unusedCount
+    ? `${name} must use ${typeShape} observation_cutoff: Deadline in ${count} signature(s)`
+    : null
+}
+
+function exampleContractError(path, source) {
+  const rustSource = path.endsWith('.md')
+    ? [...source.matchAll(/```(?:rust|rs)(?:,[^\r\n`]*)?\s*\r?\n([\s\S]*?)```/gu)]
+        .map((match) => match[1])
+        .join('\n')
+    : source
+  const code = maskObservationCutoffNonCode(rustSource)
+  const staleName = String.raw`(?:cutoff|_cutoff|batch_cutoff)`
+  const staleBinding = new RegExp(
+    String.raw`^\s*let\s+(?:mut\s+)?${staleName}\b`,
+    'mu',
+  )
+  if (staleBinding.test(code)) return 'a stale cutoff binding'
+  const batchCall = /\b(?:start_batch_until|send_all_until)\s*\(/gu
+  for (const match of code.matchAll(batchCall)) {
+    const open = match.index + match[0].lastIndexOf('(')
+    const close = closingDelimiter(code, open)
+    if (close === -1) continue
+    const finalArgument = topLevelArguments(code, open, close).at(-1)
+    if (new RegExp(String.raw`^${staleName}$`, 'u').test(finalArgument ?? '')) {
+      return 'a stale batch cutoff argument'
+    }
+  }
+  return null
+}
+
+function runObservationCutoffContractSelfTests() {
+  for (const [parameters, typeShape, valid] of [
+    ['observation_cutoff: Deadline', 'plain', true],
+    ['observation_cutoff: edgezero_core :: Deadline', 'plain', true],
+    [
+      'observation_cutoff: Option < edgezero_core :: Deadline >',
+      'optional',
+      true,
+    ],
+    ['observation_cutoff: Option<Deadline>', 'plain', false],
+    ['observation_cutoff: Deadline', 'optional', false],
+    ['cutoff: Deadline', 'plain', false],
+    ['_cutoff: edgezero_core::Deadline', 'plain', false],
+    ['batch_cutoff: Option < Deadline >', 'optional', false],
+    [
+      'cutoff: Deadline, observation_cutoff: Deadline',
+      'plain',
+      false,
+    ],
+  ]) {
+    const source = `fn dispatch_budget(request: Request, ${parameters}) {}`
+    const passed =
+      signatureContractError(source, 'dispatch_budget', 1, typeShape) ===
+      null
+    if (passed !== valid) {
+      fail(`observation cutoff signature self-test failed for ${parameters}`)
+    }
+  }
+  for (const [name, source, valid] of [
+    ['mutable binding', 'let mut cutoff = deadline();', false],
+    ['ignored binding', 'let _cutoff = deadline();', false],
+    ['batch binding', 'let batch_cutoff = deadline();', false],
+    ['start call', 'client.start_batch_until(vec![request()], cutoff);', false],
+    ['ignored call', 'client.send_all_until(x, _cutoff);', false],
+    ['send call', 'client.send_all_until(x, batch_cutoff);', false],
+    [
+      'multiline trailing call',
+      'client.start_batch_until(\n    make_requests(),\n    cutoff,\n);',
+      false,
+    ],
+    [
+      'nested cutoff',
+      'client.start_batch_until(make_requests(x, cutoff), observation_cutoff);',
+      true,
+    ],
+    ['comment', '// let mut cutoff = deadline();', true],
+    ['string', 'const TEXT: &str = "send_all_until(requests, cutoff)";', true],
+    ['budget source', 'let source = BudgetSource::BatchCutoff;', true],
+    ['constructor', 'let batch = OutboundBatch::cutoff(2);', true],
+  ]) {
+    if ((exampleContractError('fixture.rs', source) === null) !== valid) {
+      fail(`observation cutoff example self-test failed for ${name}`)
+    }
+  }
+  if (
+    exampleContractError(
+      'fixture.md',
+      'Prose: send_all_until(requests, cutoff)\n```rust\nlet observation_cutoff = deadline();\n```',
+    ) !== null
+  ) {
+    fail('observation cutoff self-test rejected Markdown prose')
+  }
+  if (
+    exampleContractError(
+      'fixture.md',
+      '```rust,no_run\nlet cutoff = deadline();\n```',
+    ) === null
+  ) {
+    fail('observation cutoff self-test missed a modified Rust fence')
+  }
+  for (const [name, source] of [
+    [
+      'block comment',
+      'fn dispatch_budget(x: Request, observation_cutoff: Deadline) {}\n/*\nlet cutoff = deadline();\nfn dispatch_budget(x: Request, cutoff: Deadline) {}\n*/',
+    ],
+    [
+      'raw string',
+      'fn dispatch_budget(x: Request, observation_cutoff: Deadline) {}\nconst TEXT: &str = r#"\nlet cutoff = deadline();\nfn dispatch_budget(x: Request, cutoff: Deadline) {}\n"#;',
+    ],
+  ]) {
+    if (
+      signatureContractError(source, 'dispatch_budget', 1, 'plain') !== null ||
+      exampleContractError('fixture.rs', source) !== null
+    ) {
+      fail(`observation cutoff self-test rejected ${name}`)
+    }
+  }
+}
+
+function observationCutoffContract(outboundCoreSource) {
+  const publicRustdoc = outboundCoreSource.match(
+    /(?<rustdoc>(?:\s*\/\/\/[^\n]*\n)+)\s*fn start_batch_until\(/u,
+  )?.groups?.rustdoc
+  if (publicRustdoc === undefined) fail('missing start_batch_until Rustdoc')
+  const normalizedPublicRustdoc = publicRustdoc
+    .replaceAll(/\s*\/\/\/\s?/gu, ' ')
+    .replaceAll(/\s+/gu, ' ')
+    .trim()
+  for (const requiredFragment of [
+    'The observation cutoff stops batch observation regardless of any remaining per-request budget or later per-request deadline.',
+    'Passing an earlier observation cutoff intentionally leaves unresolved slots.',
+  ]) {
+    if (!normalizedPublicRustdoc.includes(requiredFragment)) {
+      fail(`public batch Rustdoc is missing: ${requiredFragment}`)
+    }
+  }
+
+  const signatureContracts = [
+    [outboundCorePath, 'start_batch_until', 3, 'plain', 1],
+    [outboundCorePath, 'send_all_until', 1, 'plain'],
+    [outboundCorePath, 'finish_batch_item', 1, 'plain'],
+    ['crates/edgezero-core/src/context.rs', 'start_batch_until', 1, 'plain', 1],
+    ['crates/edgezero-core/src/time.rs', 'dispatch_budget', 1, 'optional'],
+    ...outboundAdapterPaths.flatMap((path) => [
+      [path, 'prepare_batch', 1, 'plain'],
+      [path, 'prepare_validated', 1, 'optional'],
+      [path, 'start_batch_until', 1, 'plain'],
+    ]),
+    [outboundAdapterPaths[2], 'finish_fastly_batch_observation', 1, 'plain'],
+    [templateHandlersPath, 'start_batch_until', 1, 'plain'],
+    [demoHandlersPath, 'start_batch_until', 1, 'plain'],
+  ]
+  for (const [path, name, count, typeShape, unusedCount] of signatureContracts) {
+    const source = readFileSync(path, 'utf8')
+    const error = signatureContractError(source, name, count, typeShape, unusedCount)
+    if (error !== null) fail(`${path}: ${error}`)
+  }
+  for (const path of observationCutoffSourcePaths) {
+    const error = exampleContractError(path, readFileSync(path, 'utf8'))
+    if (error !== null) fail(`${path} contains ${error}`)
+  }
+}
+
+runObservationCutoffContractSelfTests()
+if (process.argv.includes('--observation-cutoff-self-test')) {
+  process.exit(0)
+}
+
 let capabilitySource
 try {
   capabilitySource = readFileSync(capabilityPath, 'utf8')
@@ -565,7 +863,7 @@ for (const requiredFragment of [
   'OutboundBatchTermination::Completed',
   'OutboundBatchTermination::Cutoff',
   'OutboundBatchFailure',
-  'send_all_until(requests, cutoff).await',
+  'send_all_until(requests, observation_cutoff)',
 ]) {
   if (!hardCutSurfaces[2][1].includes(requiredFragment)) {
     fail(`${proxyGuidePath} is missing typed batch contract: ${requiredFragment}`)
@@ -574,7 +872,7 @@ for (const requiredFragment of [
 if (
   !hardCutSurfaces[2][1].includes('.deadline_after(Duration::from_secs(2))') ||
   hardCutSurfaces[2][1].includes(
-    'let cutoff = Deadline::after(Duration::from_secs(2))',
+    'let observation_cutoff = Deadline::after(Duration::from_secs(2))',
   )
 ) {
   fail(`${proxyGuidePath} must anchor batch cutoffs to the request clock`)
@@ -1107,6 +1405,7 @@ try {
 } catch (error) {
   fail(`cannot read ${outboundCorePath}: ${error.message}`)
 }
+observationCutoffContract(outboundCoreSource)
 if (
   !/#\[non_exhaustive\]\s*pub enum OutboundBatchDriverEvent\s*\{/u.test(
     outboundCoreSource,

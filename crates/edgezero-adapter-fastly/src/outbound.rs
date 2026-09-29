@@ -149,10 +149,10 @@ fn finish_fastly_batch_observation(
     index: usize,
     started_at: MonotonicInstant,
     completed_at: MonotonicInstant,
-    cutoff: Deadline,
+    observation_cutoff: Deadline,
     outcome: Result<OutboundResponse, EdgeError>,
 ) -> FastlyBatchObservation {
-    match finish_batch_item(index, started_at, completed_at, cutoff, outcome) {
+    match finish_batch_item(index, started_at, completed_at, observation_cutoff, outcome) {
         Some(item) => FastlyBatchObservation::Continue(item),
         None => FastlyBatchObservation::Cutoff,
     }
@@ -367,20 +367,20 @@ mod fastly_impl {
             &self,
             request: OutboundRequest,
             started_at: MonotonicInstant,
-            cutoff: Deadline,
+            observation_cutoff: Deadline,
         ) -> Result<PreparedRequest, EdgeError> {
             validate_batch_request(&request)?;
-            self.prepare_validated(request, started_at, Some(cutoff), true)
+            self.prepare_validated(request, started_at, Some(observation_cutoff), true)
         }
 
         fn prepare_validated(
             &self,
             mut request: OutboundRequest,
             started_at: MonotonicInstant,
-            batch_cutoff: Option<Deadline>,
+            observation_cutoff: Option<Deadline>,
             enforce_batch_slack: bool,
         ) -> Result<PreparedRequest, EdgeError> {
-            let budget = dispatch_budget(&request, started_at, batch_cutoff)?;
+            let budget = dispatch_budget(&request, started_at, observation_cutoff)?;
             normalize_fastly_request(&mut request)?;
             budget_remaining(budget, &self.clock)?;
             let backend =
@@ -549,20 +549,20 @@ mod fastly_impl {
         fn start_batch_until(
             &self,
             requests: Vec<OutboundRequest>,
-            cutoff: Deadline,
+            observation_cutoff: Deadline,
         ) -> OutboundBatch {
             let batch_started_at = self.clock.now();
             let slot_count = requests.len();
-            if cutoff.is_expired_at(batch_started_at) {
+            if observation_cutoff.is_expired_at(batch_started_at) {
                 return OutboundBatch::cutoff(slot_count);
             }
 
             let mut completed = Vec::new();
             let mut pending = Vec::new();
-            let mut cutoff_reached = false;
+            let mut observation_cutoff_reached = false;
             for (index, request) in requests.into_iter().enumerate() {
                 let prepared = self
-                    .prepare_batch(request, batch_started_at, cutoff)
+                    .prepare_batch(request, batch_started_at, observation_cutoff)
                     .and_then(|prepared| self.dispatch_batch_slot(index, prepared));
                 match prepared {
                     Ok(slot) => pending.push(slot),
@@ -572,12 +572,12 @@ mod fastly_impl {
                             index,
                             batch_started_at,
                             completed_at,
-                            cutoff,
+                            observation_cutoff,
                             Err(error),
                         ) {
                             FastlyBatchObservation::Continue(item) => completed.push(item),
                             FastlyBatchObservation::Cutoff => {
-                                cutoff_reached = true;
+                                observation_cutoff_reached = true;
                                 break;
                             }
                         }
@@ -591,12 +591,12 @@ mod fastly_impl {
                     yield OutboundBatchDriverEvent::Item(item);
                 }
 
-                if cutoff_reached {
+                if observation_cutoff_reached {
                     yield OutboundBatchDriverEvent::Cutoff;
                     return;
                 }
 
-                while !pending.is_empty() && !cutoff.is_expired_at(clock.now()) {
+                while !pending.is_empty() && !observation_cutoff.is_expired_at(clock.now()) {
                     let (selection, metadata) = match select_pending_slot(&mut pending) {
                         Ok(selected) => selected,
                         Err(error) => {
@@ -611,7 +611,7 @@ mod fastly_impl {
                         index,
                         batch_started_at,
                         completed_at,
-                        cutoff,
+                        observation_cutoff,
                         outcome,
                     ) {
                         FastlyBatchObservation::Continue(item) => {
@@ -2595,9 +2595,9 @@ mod send_failure_policy_tests {
     }
 
     #[test]
-    fn early_batch_cutoff_timeout_preserves_a_later_sibling() {
+    fn early_observation_cutoff_attributed_timeout_preserves_a_later_sibling() {
         let started_at = MonotonicInstant::now();
-        let cutoff = Deadline::at_instant(
+        let observation_cutoff = Deadline::at_instant(
             started_at
                 .checked_add(Duration::from_millis(10))
                 .expect("cutoff instant"),
@@ -2608,7 +2608,7 @@ mod send_failure_policy_tests {
             started_at
                 .checked_add(Duration::from_millis(1))
                 .expect("early completion"),
-            cutoff,
+            observation_cutoff,
             Err(timeout_error(BudgetSource::BatchCutoff)),
         );
         let sibling = finish_fastly_batch_observation(
@@ -2617,7 +2617,7 @@ mod send_failure_policy_tests {
             started_at
                 .checked_add(Duration::from_millis(2))
                 .expect("sibling completion"),
-            cutoff,
+            observation_cutoff,
             Err(EdgeError::bad_gateway("sibling completed")),
         );
         let events = [early_timeout, sibling].map(|observation| match observation {

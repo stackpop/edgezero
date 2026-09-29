@@ -75,11 +75,11 @@
 - Modify: `docs/guide/proxying.md`
 - Modify: `scripts/check_outbound_docs_contract.mjs`
 
-- [ ] Run the existing early-observation-cutoff adapter contract as a passing characterization test; do not claim it is a TDD red test.
-- [ ] Add a failing docs/source contract named `observationCutoffContract` that requires the public Rustdoc warning and rejects stale public/example parameter names that use bare `cutoff`.
-- [ ] Run `node scripts/check_outbound_docs_contract.mjs` and confirm the new contract fails for missing wording.
-- [ ] Rename parameters and example variables to `observation_cutoff` across the exact files above. Keep `start_batch_until`, `send_all_until`, and `BudgetSource::BatchCutoff`; add no debug assertion.
-- [ ] Run the docs contract, core outbound tests, and all four focused adapter contract tests until green.
+- [x] Run the existing early-observation-cutoff adapter contract as a passing characterization test; do not claim it is a TDD red test.
+- [x] Add a failing docs/source contract named `observationCutoffContract` that requires the public Rustdoc warning and rejects stale public/example parameter names that use bare `cutoff`.
+- [x] Run `node scripts/check_outbound_docs_contract.mjs` and confirm the new contract fails for missing wording.
+- [x] Rename parameters and example variables to `observation_cutoff` across the exact files above. Keep `start_batch_until`, `send_all_until`, and `BudgetSource::BatchCutoff`; add no debug assertion.
+- [x] Run the docs contract, core outbound tests, and all four focused adapter contract tests until green.
 
 ### Task 5: Documentation, migration, demo, and generated-project drift
 

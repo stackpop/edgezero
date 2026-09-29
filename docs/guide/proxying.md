@@ -104,17 +104,17 @@ backing allocation, and a provider SDK may allocate the source chunk before Edge
 
 `start_batch_until` accepts buffered request bodies and buffered response mode only. It yields
 terminal slots in observed completion order while retaining each original input index. This lets
-an application keep completed results when its own cutoff wins:
+an application keep completed results when its own observation cutoff wins:
 
 ```rust
 use std::time::Duration;
 
 use edgezero_core::{EdgeError, OutboundBatchNext, OutboundBatchTermination};
 
-let cutoff = ctx
+let observation_cutoff = ctx
     .monotonic_clock()
     .deadline_after(Duration::from_secs(2));
-let mut batch = client.start_batch_until(requests, cutoff);
+let mut batch = client.start_batch_until(requests, observation_cutoff);
 let termination = loop {
     match batch.next().await? {
         OutboundBatchNext::Item(item) => match item.result.outcome {
@@ -131,18 +131,23 @@ assert!(matches!(
 ));
 ```
 
-Anchor relative cutoffs through the request clock as shown. `Deadline::after` uses the process
-default clock and is intended only for code that also uses the default clock.
+Anchor relative observation cutoffs through the request clock as shown. `Deadline::after` uses the
+process default clock and is intended only for code that also uses the default clock. The
+observation cutoff stops batch observation regardless of any remaining per-request budget or later
+per-request deadline. Passing an earlier observation cutoff intentionally leaves unresolved slots.
 
-`client.send_all_until(requests, cutoff).await` collects the same driver into an index-aligned
-`Vec<Option<OutboundSlotResult>>` plus `results.termination`. `Completed` guarantees every slot is
-present. Only `Cutoff` permits `None` in a successful result, meaning that slot was unresolved when
-the method cutoff won. A premature, malformed, or explicitly failed adapter driver returns
-`OutboundBatchFailure` instead. Its `error` is the precise batch-level failure, and its `slots`
-retains every terminal result collected before that failure:
+`client.send_all_until(requests, observation_cutoff).await` collects the same driver into an
+index-aligned `Vec<Option<OutboundSlotResult>>` plus `results.termination`. `Completed` guarantees
+every slot is present. Only `Cutoff` permits `None` in a successful result, meaning that slot was
+unresolved when the observation cutoff won. A premature, malformed, or explicitly failed adapter
+driver returns `OutboundBatchFailure` instead. Its `error` is the precise batch-level failure, and
+its `slots` retains every terminal result collected before that failure:
 
 ```rust
-let results = match client.send_all_until(requests, cutoff).await {
+let results = match client
+    .send_all_until(requests, observation_cutoff)
+    .await
+{
     Ok(results) => results,
     Err(failure) => {
         for (index, slot) in failure.slots.into_iter().enumerate() {
@@ -162,9 +167,9 @@ EdgeZero intentionally has no global batch-concurrency or memory cap.
 
 On Axum, Cloudflare, and Spin, each child samples its terminal instant synchronously when it is
 observed ready. Those samples follow poll-observation order in the shared monotonic clock domain,
-so after one observation reaches the cutoff a later observation cannot be on time unless an
-injected clock moves backwards. Fastly's provider-selected completion path remains BestEffort as
-documented in the capability matrix.
+so after one observation reaches the observation cutoff a later observation cannot be on time
+unless an injected clock moves backwards. Fastly's provider-selected completion path remains
+BestEffort as documented in the capability matrix.
 
 ## Platform Behavior
 

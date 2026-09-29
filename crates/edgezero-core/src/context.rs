@@ -744,7 +744,7 @@ mod tests {
         fn start_batch_until(
             &self,
             requests: Vec<OutboundRequest>,
-            _cutoff: crate::Deadline,
+            _observation_cutoff: crate::Deadline,
         ) -> OutboundBatch {
             let slot_count = requests.len();
             OutboundBatch::from_driver(

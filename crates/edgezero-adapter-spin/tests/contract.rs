@@ -648,14 +648,14 @@ mod tests {
             let forward_request = OutboundRequest::get("https://example.com/")
                 .expect("request")
                 .stream_response();
-            let cutoff = Deadline::at_instant(
+            let observation_cutoff = Deadline::at_instant(
                 start
                     .checked_add(Duration::from_secs(1))
                     .expect("cutoff instant"),
             );
             let forward_results = block_on(
                 forward_client
-                    .start_batch_until(vec![forward_request], cutoff)
+                    .start_batch_until(vec![forward_request], observation_cutoff)
                     .collect(),
             )
             .expect("valid batch driver");
@@ -683,7 +683,7 @@ mod tests {
                 .stream_response();
             let backwards_results = block_on(
                 backwards_client
-                    .start_batch_until(vec![backwards_request], cutoff)
+                    .start_batch_until(vec![backwards_request], observation_cutoff)
                     .collect(),
             )
             .expect("valid batch driver");
@@ -703,7 +703,7 @@ mod tests {
         }
 
         #[test]
-        fn already_expired_batch_reports_cutoff() {
+        fn expired_observation_cutoff_leaves_slot_unresolved() {
             let now = MonotonicInstant::now();
             let client = SpinOutboundClient::with_clock(MonotonicClock::new(move || now));
             let request = OutboundRequest::get("https://example.com/").expect("request");

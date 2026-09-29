@@ -654,7 +654,7 @@ mod tests {
         fn start_batch_until(
             &self,
             requests: Vec<OutboundRequest>,
-            cutoff: Deadline,
+            observation_cutoff: Deadline,
         ) -> OutboundBatch {
             let mut observed_deadline = None;
             let slot_count = requests.len();
@@ -677,7 +677,7 @@ mod tests {
                 ));
             }
             if let Some(batch_deadline) = observed_deadline {
-                assert_eq!(batch_deadline, cutoff.instant());
+                assert_eq!(batch_deadline, observation_cutoff.instant());
             }
             OutboundBatch::from_driver(
                 slot_count,

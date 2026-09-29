@@ -265,7 +265,7 @@ async fn batch_yields_complete_exchanges_in_completion_order() {
 }
 
 #[tokio::test]
-async fn batch_cutoff_preserves_completed_slots_and_leaves_pending_none() {
+async fn early_observation_cutoff_preserves_completed_slots_and_leaves_pending_none() {
     let origin = start_origin(
         Router::new()
             .route("/fast", get(|| async { "fast" }))
