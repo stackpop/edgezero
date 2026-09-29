@@ -63,42 +63,37 @@ impl<Value> PlatformFact<Value> {
         Self::Known { value, source }
     }
 
+    /// Return the source of a known fact.
+    #[must_use]
+    #[inline]
+    pub const fn source(&self) -> Option<PlatformResourceSource> {
+        match self {
+            Self::Known { source, .. } => Some(*source),
+            Self::Unknown { .. } => None,
+        }
+    }
+
     /// Construct an unknown platform fact.
     #[must_use]
     #[inline]
     pub const fn unknown(reason: PlatformUnknownReason) -> Self {
         Self::Unknown { reason }
     }
-}
-
-impl<Value> PlatformFact<Value>
-where
-    Value: Copy,
-{
-    /// Return the source of a known fact.
-    #[must_use]
-    #[inline]
-    pub const fn source(self) -> Option<PlatformResourceSource> {
-        match self {
-            Self::Known { source, .. } => Some(source),
-            Self::Unknown { .. } => None,
-        }
-    }
 
     /// Return the reason for an unknown fact.
     #[must_use]
     #[inline]
-    pub const fn unknown_reason(self) -> Option<PlatformUnknownReason> {
+    pub const fn unknown_reason(&self) -> Option<PlatformUnknownReason> {
         match self {
             Self::Known { .. } => None,
-            Self::Unknown { reason } => Some(reason),
+            Self::Unknown { reason } => Some(*reason),
         }
     }
 
     /// Return the known value, if present.
     #[must_use]
     #[inline]
-    pub const fn value(self) -> Option<Value> {
+    pub fn value(self) -> Option<Value> {
         match self {
             Self::Known { value, .. } => Some(value),
             Self::Unknown { .. } => None,
@@ -583,6 +578,22 @@ mod tests {
         assert_eq!(
             UNKNOWN.unknown_reason(),
             Some(PlatformUnknownReason::ProviderUnpublished)
+        );
+    }
+
+    #[test]
+    fn platform_fact_accessors_support_non_copy_values() {
+        assert_eq!(
+            PlatformFact::known(String::from("value"), TEST_SOURCE).source(),
+            Some(TEST_SOURCE)
+        );
+        assert_eq!(
+            PlatformFact::known(String::from("value"), TEST_SOURCE).unknown_reason(),
+            None
+        );
+        assert_eq!(
+            PlatformFact::known(String::from("value"), TEST_SOURCE).value(),
+            Some(String::from("value"))
         );
     }
 
