@@ -1041,7 +1041,7 @@ pub enum ResponseBodyDisposition {
 /// cannot soundly compare wire length with either output cap.
 pub fn enforce_payload_content_length(
     headers: &HeaderMap,
-    encoding: ContentEncoding,
+    encoding: &ContentEncoding,
     max_buffered_bytes: Option<u64>,
     max_decoded_bytes: Option<u64>,
     max_encoded_bytes: Option<u64>,
@@ -4987,9 +4987,12 @@ fn start_batch_until(
   backend mapping, and a hit
   reuses the cached `Backend` while a miss calls `Backend::builder(..).finish()`
   exactly once. Because EdgeZero hashes every relevant property into the
-  backend name (`ez_{sha256_128(identity)}`), distinct identities map to
+  backend name (`ez_{sha256_128(identity)}_{client_namespace}`), distinct identities map to
   distinct names — so a 50 ms slot and a 3 s slot to the same host get distinct
   backends by construction, not by SDK-side property comparison. A
+  process-local atomic counter assigns a distinct namespace to every client instance;
+  this prevents two separately constructed clients in one host session from reusing
+  an uninspectable registration. Clones of one client retain the same cache and namespace.
   `NameInUse` on a name **not** in the adapter's collision map can therefore
   only mean an externally-registered backend (a static service backend, or another
   component in **this** session — NOT a prior session, whose names are gone) is squatting the name — fail-closed `EdgeError::internal` because
@@ -5008,11 +5011,11 @@ fn start_batch_until(
     bound a *cross-request* thread-local cache, but that cache model was wrong. Dynamic
     backend registration names are session-scoped. Connection pooling is a separate SDK
     feature. Fastly 0.13.1 reuses a connection only when both the backend name and every
-    backend setting are identical; the name below already incorporates the exact rounded
-    budget, host, port, scheme, and TLS mode, while timer/TLS settings are deterministic from
-    that identity. EdgeZero therefore leaves the SDK default pooling enabled: reuse cannot
-    cross a budget or TLS identity, and disabling it would only forgo connection reuse. Within
-    one session a `send_all_until`
+    backend setting are identical; the name below incorporates the exact rounded
+    budget, host, port, scheme, TLS mode, and client namespace. EdgeZero leaves the SDK
+    default pooling enabled, but a newly constructed client does not intentionally reuse a
+    previous client's connection by name. Within one client instance,
+    `send_all_until`
     shares a single `batch_now`, so same-budget slots to the same host compute the
     **same** `budget_ms` → one backend; distinct budgets → distinct backends. The cache
     is therefore bounded by the number of distinct `(host, budget)` pairs in the
@@ -5035,10 +5038,11 @@ fn start_batch_until(
   genuinely differ. Within one `send_all_until`, same-budget slots share `batch_now` → identical
   `budget_ms` → one backend.
 
-  Name = `format!("ez_{:032x}", sha256_128(identity))` — the first 128 bits of a
-  SHA-256 digest, collision-resistant in any realistic deployment (the previous
-  64-bit FNV-1a draft was not). The name fits inside Fastly's backend-name length
-  limit (`ez_` + 32 hex chars = 35 chars) and is valid for any host. In a
+  Name = `format!("ez_{:032x}_{client_namespace}", sha256_128(identity))` — the first
+  128 bits of a SHA-256 digest plus a process-local per-client counter. The digest
+  is collision-resistant in any realistic deployment (the previous 64-bit FNV-1a
+  draft was not). The name fits inside Fastly's backend-name length limit and is
+  valid for any host. In a
   homogeneous-budget batch all slots targeting the same host
   share one backend — **but only because `send_all_until` takes a single `now` snapshot
   and passes it to every per-slot `dispatch_budget` call** (§3.3.2). Without that,
@@ -5213,14 +5217,15 @@ fn start_batch_until(
   docs: dynamic-backend *registration* is per-session — each session registers into its
   own namespace, so a `NameInUse` applies to the active session). The SDK separately
   enables same-name/exact-same-settings connection pooling across sessions by default;
-  EdgeZero retains that default because the deterministic backend identity and settings
-  prevent cross-budget or cross-TLS reuse. `FastlyOutboundClient` is constructed for
+  EdgeZero leaves pooling enabled, but the per-client namespace prevents intentional
+  same-name reuse across newly constructed clients. `FastlyOutboundClient` is constructed for
   each EdgeZero request context (`crates/edgezero-adapter-fastly/src/request.rs`), receives
   a fresh cache, and must not be retained beyond that context. The cache is therefore a
   field on the client whose intended lifetime is the active request/session:
 
   ```rust
   struct FastlyOutboundClient {
+      backend_namespace: u64,
       // Per-request/per-session dedup map. MUST be Mutex, not RefCell:
       // OutboundHttpClient: Send + Sync (stored as Arc<dyn ..> in http::Extensions),
       // and RefCell is !Sync. The Mutex is uncontended on the single-threaded WASM
@@ -5311,7 +5316,7 @@ fn start_batch_until(
      the external registration — is exactly the "you should be careful to only
      use this capability in situations in which you are 100% sure that this
      name will always lead to the same place" caveat that Fastly's docs
-     attach to `from_str`. Since EdgeZero owns the `ez_{sha256_128(identity)}`
+     attach to `from_str`. Since EdgeZero owns the `ez_{sha256_128(identity)}_{client_namespace}`
      naming scheme, a `NameInUse` for a name **absent from this session's map**
      can only mean one of: (a) a **static service backend** is configured with
      that name (the SDK's uniqueness rule spans static + dynamic within the
@@ -6871,7 +6876,7 @@ Adapter-specific work:
   Workers does not transform the payload. Replace the crate-local stale Preview-1 Cargo
   config with `wasm32-unknown-unknown` plus `wasm-bindgen-test-runner`, and execute one
   crate-local nonzero WASM gate without target/runner overrides in CI.
-- **Fastly:** derive deterministic dynamic-backend names; configure connect,
+- **Fastly:** derive client-namespaced dynamic-backend names; configure connect,
   first-byte, and between-bytes host timers from the remaining budget; retain the
   documented service-entitlement, cold-registration, upload-write, pending-handle selection, and
   selected-body-drain

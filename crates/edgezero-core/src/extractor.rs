@@ -915,13 +915,7 @@ impl ConfigExtractionBudget {
         value_length: Option<usize>,
         max_value_bytes: u64,
     ) -> Result<(), EdgeError> {
-        if self.deadline.is_expired_at(self.clock.now()) {
-            return Err(store_extraction_error(
-                StoreExtractionReason::DeadlineExceeded,
-                "typed app-config extraction deadline exceeded",
-                None,
-            ));
-        }
+        self.check_deadline()?;
 
         let converted_value_bytes = value_length
             .map(u64::try_from)
@@ -949,6 +943,17 @@ impl ConfigExtractionBudget {
                         None,
                     )
                 })?;
+        }
+        Ok(())
+    }
+
+    fn check_deadline(&self) -> Result<(), EdgeError> {
+        if self.deadline.is_expired_at(self.clock.now()) {
+            return Err(store_extraction_error(
+                StoreExtractionReason::DeadlineExceeded,
+                "typed app-config extraction deadline exceeded",
+                None,
+            ));
         }
         Ok(())
     }
@@ -1097,54 +1102,66 @@ where
     })?;
 
     // Neither parsing nor verification diagnostics may echo stored values.
-    if let Some(reason) = future_format_reason(&raw) {
-        return Err(store_extraction_error(
-            StoreExtractionReason::UnsupportedVersion,
-            format!(
-                "typed app-config blob uses {reason}, which this build does not understand; redeploy this service with an updated build"
+    let parsed = (|| {
+        if let Some(reason) = future_format_reason(&raw) {
+            return Err(store_extraction_error(
+                StoreExtractionReason::UnsupportedVersion,
+                format!(
+                    "typed app-config blob uses {reason}, which this build does not understand; redeploy this service with an updated build"
+                ),
+                None,
+            ));
+        }
+        let envelope: BlobEnvelope = serde_json::from_str(&raw).map_err(|_err| {
+            store_extraction_error(
+                StoreExtractionReason::MalformedEnvelope,
+                "typed app-config blob is not a valid envelope (details redacted)",
+                None,
+            )
+        })?;
+        envelope.verify().map_err(|err| match err {
+            BlobEnvelopeError::UnknownVersion(version) => store_extraction_error(
+                StoreExtractionReason::UnsupportedVersion,
+                format!(
+                    "typed app-config blob uses envelope version {version}, which this build does not understand; redeploy this service with an updated build"
+                ),
+                None,
             ),
-            None,
-        ));
-    }
-    let envelope: BlobEnvelope = serde_json::from_str(&raw).map_err(|_err| {
-        store_extraction_error(
-            StoreExtractionReason::MalformedEnvelope,
-            "typed app-config blob is not a valid envelope (details redacted)",
-            None,
-        )
-    })?;
-    envelope.verify().map_err(|err| match err {
-        BlobEnvelopeError::UnknownVersion(version) => store_extraction_error(
-            StoreExtractionReason::UnsupportedVersion,
-            format!(
-                "typed app-config blob uses envelope version {version}, which this build does not understand; redeploy this service with an updated build"
+            BlobEnvelopeError::ShaMismatch { .. } => store_extraction_error(
+                StoreExtractionReason::IntegrityMismatch,
+                "typed app-config blob failed its integrity check (details redacted)",
+                None,
             ),
-            None,
-        ),
-        BlobEnvelopeError::ShaMismatch { .. } => store_extraction_error(
-            StoreExtractionReason::IntegrityMismatch,
-            "typed app-config blob failed its integrity check (details redacted)",
-            None,
-        ),
-    })?;
-    let mut data = envelope.into_data();
-    secret_walk::<C>(ctx, &mut budget, &mut data).await?;
-    let cfg: C = serde_path_to_error::deserialize(data.into_deserializer())
-        .map_err(|serde_error| EdgeError::store_deserialization_from_serde(&serde_error))?;
-    cfg.validate().map_err(|err| {
-        let field = first_violating_field(&err).unwrap_or_default();
-        let message = if field.is_empty() {
-            "app config failed validation".to_owned()
-        } else {
-            format!("app config failed validation for field `{field}`")
-        };
-        store_extraction_error(
-            StoreExtractionReason::Validation,
-            message,
-            (!field.is_empty()).then_some(field),
-        )
-    })?;
-    Ok(cfg)
+        })?;
+        Ok::<_, EdgeError>(envelope.into_data())
+    })();
+    budget.check_deadline()?;
+    let mut data = parsed?;
+
+    let resolved = secret_walk::<C>(ctx, &mut budget, &mut data).await;
+    budget.check_deadline()?;
+    resolved?;
+
+    let configured = (|| {
+        let cfg: C = serde_path_to_error::deserialize(data.into_deserializer())
+            .map_err(|serde_error| EdgeError::store_deserialization_from_serde(&serde_error))?;
+        cfg.validate().map_err(|err| {
+            let field = first_violating_field(&err).unwrap_or_default();
+            let message = if field.is_empty() {
+                "app config failed validation".to_owned()
+            } else {
+                format!("app config failed validation for field `{field}`")
+            };
+            store_extraction_error(
+                StoreExtractionReason::Validation,
+                message,
+                (!field.is_empty()).then_some(field),
+            )
+        })?;
+        Ok::<_, EdgeError>(cfg)
+    })();
+    budget.check_deadline()?;
+    configured
 }
 
 fn map_config_store_error(err: &ConfigStoreError) -> EdgeError {
@@ -2640,6 +2657,17 @@ mod tests {
 
         assert!(matches!(
             error,
+            EdgeError::StoreExtraction {
+                reason: StoreExtractionReason::DeadlineExceeded,
+                ..
+            }
+        ));
+
+        let deadline_error = budget
+            .check_deadline()
+            .expect_err("CPU work also observes the same deadline");
+        assert!(matches!(
+            deadline_error,
             EdgeError::StoreExtraction {
                 reason: StoreExtractionReason::DeadlineExceeded,
                 ..

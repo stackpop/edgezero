@@ -191,14 +191,13 @@ default = "app_config"
 ids = ["default"]
 default = "default"
 
-# [environment]
-#
-# [[environment.variables]]
-# name = "API_BASE_URL"
-# description = "Base URL for upstream API calls"
-# env = "API_BASE_URL"
-# value = "https://example.com/api"
-#
+[environment]
+
+[[environment.variables]]
+name = "API_BASE_URL"
+description = "Base URL for upstream API calls"
+env = "API_BASE_URL"
+
 # [[environment.secrets]]
 # name = "API_TOKEN"
 # description = "Secret token used when calling the upstream API"

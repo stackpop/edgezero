@@ -1663,15 +1663,23 @@ mod tests {
             "generated outbound example must use the generalized decoder budget",
         );
         assert!(
-            handlers.contains("ResponseEgressDeadline::at(deadline)")
+            handlers.contains("ResponseEgressDeadline::after(RESPONSE_EGRESS_BUDGET)")
                 && !handlers.contains(concat!("ResponseEgressDeadline::", "new(")),
-            "generated responses must use the explicit absolute deadline constructor",
+            "generated responses must use an egress-start-relative deadline",
+        );
+        assert!(
+            handlers.contains(".variable(\"API_BASE_URL\")"),
+            "generated handlers must read runtime variables through the request context",
         );
     }
 
     fn assert_generated_route_and_provider_manifests(project_dir: &Path) {
         let manifest =
             fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
+        assert!(
+            manifest.contains("[[environment.variables]]\nname = \"API_BASE_URL\""),
+            "generated manifest must declare the upstream runtime variable",
+        );
         assert!(
             manifest.contains("path = \"/admission\"")
                 && manifest.contains("class = \"diagnostic\""),

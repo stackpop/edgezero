@@ -215,7 +215,7 @@ for `ResponseBodyDisposition::Payload`:
 ```rust
 pub fn enforce_payload_content_length(
     headers: &HeaderMap,
-    encoding: ContentEncoding,
+    encoding: &ContentEncoding,
     max_buffered_bytes: Option<u64>,
     max_decoded_bytes: Option<u64>,
     max_encoded_bytes: Option<u64>,

@@ -269,12 +269,12 @@ Each `OutboundRequest` owns independent limits:
 | ---------------------------- | ---------------------------------------------------------------------------------------------- | ------- |
 | `max_request_body_bytes`     | Buffered or streamed request bytes                                                             | 8 MiB   |
 | `max_encoded_response_bytes` | Upstream transport bytes before decoding                                                       | Unset   |
-| `max_decoded_response_bytes` | Identity or EdgeZero-decoded gzip/deflate/Brotli output                                         | Unset   |
+| `max_decoded_response_bytes` | Identity or EdgeZero-decoded gzip/deflate/Brotli output                                        | Unset   |
 | `max_response_bytes`         | Final buffered response, including raw passthrough                                             | 1 MiB   |
 | `max_response_header_bytes`  | Adapter-visible upstream header name/value bytes before normalization, plus `x-edgezero-proxy` | Unset   |
 | `max_response_header_count`  | Adapter-visible upstream header fields before normalization, plus `x-edgezero-proxy`           | Unset   |
 | `max_brotli_window_bits`     | Brotli stream header checked before decoder allocation                                         | 24      |
-| `max_decoder_bytes`          | Pinned policy charge for Brotli/gzip/deflate decoder state                                      | 32 MiB  |
+| `max_decoder_bytes`          | Pinned policy charge for Brotli/gzip/deflate decoder state                                     | 32 MiB  |
 | `max_chunk_bytes`            | Maximum emitted item size after decoding or passthrough                                        | Unset   |
 
 The encoded counter applies to every response path. The decoded counter applies to identity

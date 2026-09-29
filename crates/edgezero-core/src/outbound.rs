@@ -1127,11 +1127,17 @@ fn invalid_host_authority_override() -> EdgeError {
 fn validate_host_authority_override(authority: Authority) -> Result<Authority, EdgeError> {
     let raw = authority.as_str();
     let host = authority.host();
+    let invalid_port = match raw.strip_prefix(host) {
+        Some("") => false,
+        Some(suffix) if suffix.starts_with(':') => authority.port_u16().is_none(),
+        _ => true,
+    };
     let unbracketed_ipv6 = raw.bytes().filter(|byte| *byte == b':').count() > 1
         && !(raw.starts_with('[') && raw.contains(']'));
     if raw.is_empty()
         || host.is_empty()
         || raw.contains('@')
+        || invalid_port
         || unbracketed_ipv6
         || HeaderValue::from_str(raw).is_err()
     {
@@ -1474,7 +1480,7 @@ fn connection_nominations(
             malformed_connection(response, "connection header value is not valid UTF-8")
         })?;
         for raw_token in raw_value.split(',') {
-            let token = raw_token.trim();
+            let token = raw_token.trim_matches([' ', '\t']);
             if token.is_empty() {
                 return Err(malformed_connection(
                     response,
@@ -1550,7 +1556,7 @@ fn parse_content_length(headers: &HeaderMap) -> Result<Option<u64>, EdgeError> {
         if raw.contains(',') {
             return Err(protocol_content_length());
         }
-        let trimmed = raw.trim();
+        let trimmed = raw.trim_matches([' ', '\t']);
         if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(protocol_content_length());
         }
@@ -2524,6 +2530,14 @@ mod tests {
             enforce_payload_content_length(&headers, &ContentEncoding::Identity, None, None, None)
                 .expect_err("malformed content-length");
         }
+
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "content-length",
+            HeaderValue::from_bytes(b"\xc2\xa05").expect("opaque whitespace"),
+        );
+        enforce_payload_content_length(&headers, &ContentEncoding::Identity, None, None, None)
+            .expect_err("non-HTTP whitespace must be rejected");
     }
 
     #[test]
@@ -3189,6 +3203,21 @@ mod tests {
             HeaderValue::from_bytes(b"x-private,\xff").expect("opaque header"),
         );
         normalize_for_dispatch(&mut request).expect_err("opaque connection nomination");
+
+        let mut request = OutboundRequest::get("https://example.com").expect("request");
+        request.headers_mut().append(
+            "connection",
+            HeaderValue::from_bytes(b"\xc2\xa0x-private").expect("UTF-8 header value"),
+        );
+        normalize_for_dispatch(&mut request).expect_err("non-HTTP whitespace nomination");
+
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "connection",
+            HeaderValue::from_bytes(b"\xc2\xa0x-private").expect("UTF-8 header value"),
+        );
+        normalize_response_headers(&Method::GET, StatusCode::OK, &mut headers)
+            .expect_err("non-HTTP whitespace response nomination");
     }
 
     #[test]
@@ -3305,6 +3334,7 @@ mod tests {
         for authority in [
             "api.example.com",
             "api.example.com:8443",
+            "api.example.com:65535",
             "192.0.2.1:8080",
             "[2001:db8::1]",
             "[2001:db8::1]:8443",
@@ -3328,6 +3358,11 @@ mod tests {
             "api example.com",
             "api.example.com\r\nx-added: value",
             "2001:db8::1",
+            "api.example.com:",
+            "api.example.com:abc",
+            "api.example.com:65536",
+            "[2001:db8::1]:abc",
+            "[2001:db8::1]:65536",
         ] {
             let error = OutboundRequest::get("https://origin.example")
                 .expect("request")

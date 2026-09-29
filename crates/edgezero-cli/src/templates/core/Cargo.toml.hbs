@@ -22,7 +22,5 @@ validator = { workspace = true }
 
 [dev-dependencies]
 async-trait = "0.1"
-# `test-utils` exposes `edgezero_core::test_env`, the shared RAII env guards the
-# handler tests below use to override `API_BASE_URL` without racing each other.
-edgezero-core = { workspace = true, features = ["test-utils"] }
+edgezero-core = { workspace = true }
 serde_json = "1"

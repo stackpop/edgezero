@@ -11,7 +11,6 @@ use edgezero_core::outbound::{
 };
 use edgezero_core::response::Text;
 use futures::{StreamExt as _, stream};
-use std::env;
 use std::io::Error as IoError;
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -30,6 +29,7 @@ const MAX_RESPONSE_HEADER_BYTES: u64 = 0x0001_0000;
 const MAX_RESPONSE_HEADER_COUNT: u64 = 100;
 const OUTBOUND_BATCH_BUDGET: Duration = Duration::from_secs(5);
 const OUTBOUND_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const RESPONSE_EGRESS_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(serde::Serialize)]
 struct AdmissionView {
@@ -137,7 +137,9 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
         )));
     }
 
-    let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_owned());
+    let base = ctx
+        .variable("API_BASE_URL")
+        .unwrap_or_else(|| DEFAULT_PROXY_BASE.to_owned());
     let deadline = ctx.monotonic_clock().deadline_after(OUTBOUND_BATCH_BUDGET);
     let source_uri = Uri::from_static("/fanout");
     let requests = input
@@ -163,7 +165,7 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
     let mut response = json_response(&output)?;
     response
         .extensions_mut()
-        .insert(ResponseEgressDeadline::at(deadline));
+        .insert(ResponseEgressDeadline::after(RESPONSE_EGRESS_BUDGET));
     Ok(response)
 }
 
@@ -171,8 +173,10 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
 pub async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ProxyPath = ctx.path()?;
     let http_client = ctx.http_client();
+    let base = ctx
+        .variable("API_BASE_URL")
+        .unwrap_or_else(|| DEFAULT_PROXY_BASE.to_owned());
     let request = ctx.into_request()?;
-    let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_owned());
     let target = build_proxy_target(&base, &params.rest, request.uri())?;
     let outbound_request = outbound_policy(OutboundRequest::from_request(request, target)?);
 
@@ -317,7 +321,6 @@ mod tests {
     };
     use edgezero_core::params::PathParams;
     use edgezero_core::response::IntoResponse as _;
-    use edgezero_core::test_env::env_lock;
     use edgezero_core::{
         BudgetSource, Deadline, MonotonicClock, MonotonicInstant, OutboundBatchDriverEvent,
     };
@@ -569,7 +572,6 @@ mod tests {
 
     #[test]
     fn proxy_demo_without_handle_returns_placeholder() {
-        let _lock = env_lock().lock().expect("env lock");
         let ctx = context_with_params("/proxy/status/200", &[("rest", "status/200")]);
         let response = block_on(proxy_demo(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
@@ -577,8 +579,6 @@ mod tests {
 
     #[test]
     fn generated_outbound_http_smoke() {
-        let _lock = env_lock().lock().expect("env lock");
-
         let mut request = request_builder()
             .method(Method::GET)
             .uri("/proxy/status/201")

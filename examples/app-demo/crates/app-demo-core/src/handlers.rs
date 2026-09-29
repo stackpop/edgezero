@@ -1,4 +1,3 @@
-use std::env;
 use std::io::Error as IoError;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -41,6 +40,7 @@ const MAX_RESPONSE_HEADER_COUNT: u64 = 100;
 const MAX_NOTE_ID_LEN: u64 = 507;
 const OUTBOUND_BATCH_BUDGET: Duration = Duration::from_secs(5);
 const OUTBOUND_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const RESPONSE_EGRESS_BUDGET: Duration = Duration::from_secs(2);
 const SMOKE_SECRET_MISSING_NAME: &str = "SMOKE_SECRET_MISSING";
 const SMOKE_SECRET_NAME: &str = "SMOKE_SECRET";
 
@@ -177,7 +177,9 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
         )));
     }
 
-    let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_owned());
+    let base = ctx
+        .variable("API_BASE_URL")
+        .unwrap_or_else(|| DEFAULT_PROXY_BASE.to_owned());
     let deadline = ctx.monotonic_clock().deadline_after(OUTBOUND_BATCH_BUDGET);
     let source_uri = Uri::from_static("/fanout");
     let requests = input
@@ -203,7 +205,7 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
     let mut response = json_response(&output)?;
     response
         .extensions_mut()
-        .insert(ResponseEgressDeadline::at(deadline));
+        .insert(ResponseEgressDeadline::after(RESPONSE_EGRESS_BUDGET));
     Ok(response)
 }
 
@@ -211,8 +213,10 @@ pub async fn fanout(RequestContext(ctx): RequestContext) -> Result<Response, Edg
 pub async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ProxyPath = ctx.path()?;
     let http_client = ctx.http_client();
+    let base = ctx
+        .variable("API_BASE_URL")
+        .unwrap_or_else(|| DEFAULT_PROXY_BASE.to_owned());
     let request = ctx.into_request()?;
-    let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_owned());
     let target = build_proxy_target(&base, &params.rest, request.uri())?;
     let outbound_request = outbound_policy(OutboundRequest::from_request(request, target)?);
 

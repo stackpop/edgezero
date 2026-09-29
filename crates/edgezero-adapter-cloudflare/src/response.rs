@@ -12,6 +12,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use edgezero_core::body::{Body, BodyStream};
 use edgezero_core::error::EdgeError;
+use edgezero_core::http::header::CONTENT_ENCODING;
 use edgezero_core::http::{HeaderMap, Method, Response, StatusCode};
 use edgezero_core::response_egress::{
     RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt,
@@ -425,12 +426,17 @@ fn fallback_response(cause: ResponseEgressOutcome) -> Response {
     response
 }
 
+fn manual_response_encoding(headers: &HeaderMap, transmits_body: bool) -> bool {
+    transmits_body && headers.contains_key(CONTENT_ENCODING)
+}
+
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod platform {
     use super::{
         BodyStream, Bytes, CloudflareEgressCommitter, CloudflareEgressIo, Deadline, DeliveryError,
         Duration, EdgeError, EgressKind, HeaderMap, IoFailure, IoFailureKind, LocalBoxFuture,
-        MonotonicClock, StartOutcome, StatusCode, ensure_deadline, start_fallback, start_prepared,
+        MonotonicClock, StartOutcome, StatusCode, ensure_deadline, manual_response_encoding,
+        start_fallback, start_prepared,
     };
     use std::future::Future;
     use std::sync::Arc;
@@ -441,7 +447,7 @@ mod platform {
     use worker::js_sys::{BigInt, Uint8Array};
     use worker::wasm_bindgen_futures::JsFuture;
     use worker::worker_sys::FixedLengthStream;
-    use worker::{AbortSignal, Context, Delay, Response as CfResponse};
+    use worker::{AbortSignal, Context, Delay, EncodeBody, Response as CfResponse};
 
     use crate::outbound::copy_header_values;
 
@@ -494,9 +500,12 @@ mod platform {
                 ))
             })
             .map_err(|_error| DeliveryError::Conversion)?;
-            let builder = CfResponse::builder()
+            let mut builder = CfResponse::builder()
                 .with_status(status.as_u16())
                 .with_headers(worker_headers);
+            if manual_response_encoding(headers, transmits_body) {
+                builder = builder.with_encode_body(EncodeBody::Manual);
+            }
             if !transmits_body {
                 return Ok((
                     builder.empty(),
@@ -834,6 +843,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
 
+    use edgezero_core::http::header::CONTENT_ENCODING;
     use edgezero_core::http::{Version, response_builder};
     use edgezero_core::response_egress::{
         ResponseEgressBodyKind, ResponseEgressCompletion, ResponseEgressHead,
@@ -1264,5 +1274,14 @@ mod tests {
                 assert_eq!(reports[0].elapsed, Duration::from_secs(10));
             }
         }
+    }
+
+    #[test]
+    fn preencoded_payload_uses_manual_worker_encoding() {
+        let mut headers = HeaderMap::new();
+        assert!(!manual_response_encoding(&headers, true));
+        headers.insert(CONTENT_ENCODING, "zstd".parse().expect("encoding"));
+        assert!(manual_response_encoding(&headers, true));
+        assert!(!manual_response_encoding(&headers, false));
     }
 }

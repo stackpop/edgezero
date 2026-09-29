@@ -373,6 +373,10 @@ impl Drop for AxumEgressBody {
         if self.active.is_none() {
             return;
         }
+        if let Some(outcome) = self.requested_failure() {
+            self.fail(outcome);
+            return;
+        }
         if matches!(
             self.source,
             ResponseSource::Done | ResponseSource::Once(None)
@@ -380,10 +384,7 @@ impl Drop for AxumEgressBody {
             self.finish();
             return;
         }
-        let outcome = self
-            .requested_failure()
-            .unwrap_or(ResponseEgressOutcome::TransportError);
-        self.fail(outcome);
+        self.fail(ResponseEgressOutcome::TransportError);
     }
 }
 
@@ -746,6 +747,45 @@ mod tests {
         let reports = observer.0.lock().expect("reports lock");
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].bytes_written, 0);
+        assert_eq!(reports[0].outcome, ResponseEgressOutcome::TransportError);
+        assert!(connection.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_handed_off_frame_after_connection_abort_reports_transport_error() {
+        let observer = RecordingObserver::default();
+        let now = MonotonicInstant::now();
+        let clock = MonotonicClock::new(move || now);
+        let deadline =
+            Deadline::at_instant(now.checked_add(Duration::from_secs(1)).expect("deadline"));
+        let connection = EgressConnection::default();
+        let body_result = AxumEgressBody::application(
+            Body::from(Bytes::from_static(b"sent to Hyper")),
+            deadline,
+            clock,
+            attempt(&observer, now),
+            &connection,
+        );
+        let Ok(body) = body_result else {
+            panic!("register body");
+        };
+        let mut pinned_body = Box::pin(body);
+
+        let frame = poll_future(|cx| pinned_body.as_mut().poll_frame(cx))
+            .await
+            .expect("one frame")
+            .expect("data frame");
+        assert_eq!(
+            frame.into_data().expect("data"),
+            Bytes::from_static(b"sent to Hyper")
+        );
+        assert!(observer.0.lock().expect("reports lock").is_empty());
+
+        connection.signal_transport_error();
+        drop(pinned_body);
+
+        let reports = observer.0.lock().expect("reports lock");
+        assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].outcome, ResponseEgressOutcome::TransportError);
         assert!(connection.is_empty());
     }

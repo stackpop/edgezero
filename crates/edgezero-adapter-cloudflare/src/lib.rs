@@ -28,10 +28,16 @@ pub mod secret_store;
 use edgezero_core::app::StoresMetadata;
 #[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
 use edgezero_core::app::{App, Hooks};
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+use edgezero_core::context::RuntimeVariables;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
 use edgezero_core::error::EdgeError;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+use edgezero_core::manifest::BakedManifest;
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+use edgezero_core::manifest::ResolvedEnvironmentBinding;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use worker::{Context, Env, Error as WorkerError, Request, Response};
 
@@ -134,6 +140,18 @@ fn env_config_from_worker(env: &Env, stores: StoresMetadata) -> EnvConfig {
     EnvConfig::from_vars(vars)
 }
 
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+fn collect_worker_variables(
+    bindings: &[ResolvedEnvironmentBinding],
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> RuntimeVariables {
+    RuntimeVariables::from_vars(bindings.iter().filter_map(|binding| {
+        lookup(&binding.env)
+            .or_else(|| binding.value.clone())
+            .map(|value| (binding.name.clone(), value))
+    }))
+}
+
 /// Entry point for a Cloudflare Workers application.
 ///
 /// Portable store config is baked into `A` by the `app!` macro; adapter-specific
@@ -159,6 +177,20 @@ pub async fn run_app<A: Hooks>(
     }
     let stores = A::stores();
     let env_config = env_config_from_worker(&env, stores);
+    let runtime_variables = match A::manifest() {
+        BakedManifest::Absent => RuntimeVariables::default(),
+        BakedManifest::Present(manifest) => {
+            let resolved = manifest.environment_for("cloudflare");
+            collect_worker_variables(&resolved.variables, |key| {
+                env.var(key).ok().map(|value| value.to_string())
+            })
+        }
+        BakedManifest::Malformed(_) | _ => {
+            return Err(WorkerError::RustError(
+                "application manifest is invalid".to_owned(),
+            ));
+        }
+    };
     request::dispatch_with_registries(
         &app,
         req,
@@ -169,6 +201,7 @@ pub async fn run_app<A: Hooks>(
             kv_meta: stores.kv,
             secret_meta: stores.secrets,
             env_config: &env_config,
+            runtime_variables,
         },
     )
     .await
@@ -178,6 +211,7 @@ pub async fn run_app<A: Hooks>(
 mod platform_tests {
     use edgezero_core::app::{App, Hooks};
     use edgezero_core::error::EdgeError;
+    use edgezero_core::manifest::ResolvedEnvironmentBinding;
     use edgezero_core::router::RouterService;
 
     struct PlatformAwareConfiguration;
@@ -206,5 +240,34 @@ mod platform_tests {
             .expect("configured application");
 
         assert_eq!(app.platform(), crate::CLOUDFLARE_PLATFORM);
+    }
+
+    #[test]
+    fn declared_worker_variables_prefer_binding_then_manifest_default() {
+        let bindings = [
+            ResolvedEnvironmentBinding {
+                description: None,
+                env: "UPSTREAM_ORIGIN".to_owned(),
+                name: "API_BASE_URL".to_owned(),
+                value: Some("https://default.example".to_owned()),
+            },
+            ResolvedEnvironmentBinding {
+                description: None,
+                env: "OPTIONAL_BINDING".to_owned(),
+                name: "OPTIONAL".to_owned(),
+                value: None,
+            },
+        ];
+        let runtime = super::collect_worker_variables(&bindings, |key| {
+            (key == "UPSTREAM_ORIGIN").then(|| "https://worker.example".to_owned())
+        });
+        assert_eq!(runtime.get("API_BASE_URL"), Some("https://worker.example"));
+        assert_eq!(runtime.get("OPTIONAL"), None);
+
+        let defaulted = super::collect_worker_variables(&bindings, |_| None);
+        assert_eq!(
+            defaulted.get("API_BASE_URL"),
+            Some("https://default.example")
+        );
     }
 }

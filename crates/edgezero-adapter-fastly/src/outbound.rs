@@ -13,6 +13,8 @@
     )
 )]
 
+#[cfg(any(feature = "fastly", test))]
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -29,6 +31,19 @@ use edgezero_core::outbound::{OutboundRequest, validate_for_dispatch};
 use edgezero_core::time::Deadline;
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::time::{DispatchBudget, MonotonicInstant};
+
+#[cfg(any(feature = "fastly", test))]
+static NEXT_BACKEND_NAMESPACE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(feature = "fastly", test))]
+fn next_backend_namespace() -> u64 {
+    NEXT_BACKEND_NAMESPACE.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(any(feature = "fastly", test))]
+fn namespaced_backend_name(identity_name: &str, namespace: u64) -> String {
+    format!("{identity_name}_{namespace}")
+}
 
 #[cfg(any(feature = "fastly", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,7 +218,8 @@ mod fastly_impl {
 
     use super::{
         FastlyBatchObservation, driver_selection_failure, finish_fastly_batch_observation,
-        reassociate_selection, timeout_error, validate_batch_request,
+        namespaced_backend_name, next_backend_namespace, reassociate_selection, timeout_error,
+        validate_batch_request,
     };
 
     pub const DYNAMIC_BACKENDS_DISABLED_MESSAGE: &str = "Fastly dynamic backends are not enabled on this service; enable them in the service configuration";
@@ -274,6 +290,7 @@ mod fastly_impl {
 
     /// Native outbound HTTP implementation for Fastly Compute.
     pub struct FastlyOutboundClient {
+        backend_namespace: u64,
         backends: Mutex<HashMap<String, (BackendIdentity, Backend)>>,
         clock: MonotonicClock,
     }
@@ -290,9 +307,14 @@ mod fastly_impl {
         #[inline]
         pub fn with_clock(clock: MonotonicClock) -> Self {
             Self {
+                backend_namespace: next_backend_namespace(),
                 backends: Mutex::new(HashMap::new()),
                 clock,
             }
+        }
+
+        fn backend_name(&self, identity: &BackendIdentity) -> String {
+            namespaced_backend_name(&backend_name(identity), self.backend_namespace)
         }
 
         fn ensure_backend(
@@ -302,7 +324,7 @@ mod fastly_impl {
             batch_started_at: Option<MonotonicInstant>,
         ) -> Result<Backend, EdgeError> {
             let identity = backend_identity(request, budget)?;
-            let name = backend_name(&identity);
+            let name = self.backend_name(&identity);
             {
                 let cache = self.backends.lock().map_err(|_poisoned| {
                     EdgeError::internal(anyhow::anyhow!("Fastly backend cache was poisoned"))
@@ -2505,6 +2527,22 @@ mod send_failure_policy_tests {
     use futures_util::stream;
 
     use super::*;
+
+    #[test]
+    fn independent_clients_use_distinct_backend_names() {
+        let first = next_backend_namespace();
+        let second = next_backend_namespace();
+        let identity_name = "ez_1e145c6e3d9e9dd28342de004f8b6954";
+
+        assert_eq!(
+            namespaced_backend_name(identity_name, first),
+            namespaced_backend_name(identity_name, first)
+        );
+        assert_ne!(
+            namespaced_backend_name(identity_name, first),
+            namespaced_backend_name(identity_name, second)
+        );
+    }
 
     #[test]
     fn selection_metadata_follows_host_returned_handle_order() {

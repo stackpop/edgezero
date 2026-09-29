@@ -14,6 +14,7 @@ use bytes::Bytes;
 use edgezero_core::app::{App, StoreMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::context::RuntimeVariables;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Method as CoreMethod, Request, Uri, request_builder};
@@ -62,6 +63,7 @@ pub(crate) struct Stores {
     config_store: Option<ConfigStoreHandle>,
     kv: Option<KvHandle>,
     kv_registry: Option<KvRegistry>,
+    runtime_variables: Option<RuntimeVariables>,
     secret_registry: Option<SecretRegistry>,
     secrets: Option<SecretHandle>,
 }
@@ -256,6 +258,7 @@ pub(crate) struct RegistryInputs<'env> {
     pub config_meta: Option<StoreMetadata>,
     pub env_config: &'env EnvConfig,
     pub kv_meta: Option<StoreMetadata>,
+    pub runtime_variables: RuntimeVariables,
     pub secret_meta: Option<StoreMetadata>,
 }
 
@@ -673,6 +676,7 @@ pub(crate) async fn dispatch_with_registries(
             config_registry,
             kv_registry,
             secret_registry,
+            runtime_variables: Some(inputs.runtime_variables),
             ..Default::default()
         },
         request_start,
@@ -801,7 +805,7 @@ fn build_secret_registry(
 async fn dispatch_core_request<Output, Deliver>(
     app: &App,
     mut core_request: Request,
-    stores: Stores,
+    mut stores: Stores,
     prepared: PreparedIngress,
     deliver: Deliver,
 ) -> Result<Output, WorkerError>
@@ -812,6 +816,9 @@ where
     // for the rationale. Only registries go into extensions —
     // legacy bare handles are synthesised into a one-id registry
     // at the dispatch boundary.
+    if let Some(variables) = stores.runtime_variables.take() {
+        core_request.extensions_mut().insert(variables);
+    }
     let (config_registry, kv_registry, secret_registry) = synthesise_store_registries(stores);
     if let Some(registry) = config_registry {
         core_request.extensions_mut().insert(registry);

@@ -1,4 +1,4 @@
-use std::{cell::RefCell, mem};
+use std::{cell::RefCell, collections::BTreeMap, env, mem};
 
 use crate::body::Body;
 use crate::config_store::ConfigExtractionLimits;
@@ -32,6 +32,24 @@ pub enum BodyKind {
     Initial,
     Poisoned,
     Taken,
+}
+
+/// Request-owned variable values supplied by an adapter that cannot expose process environment.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeVariables(BTreeMap<String, String>);
+
+impl RuntimeVariables {
+    #[must_use]
+    #[inline]
+    pub fn from_vars<I: IntoIterator<Item = (String, String)>>(vars: I) -> Self {
+        Self(vars.into_iter().collect())
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).map(String::as_str)
+    }
 }
 
 enum BodyState {
@@ -576,6 +594,16 @@ impl RequestContext {
         &self.parts.uri
     }
 
+    /// Reads a request-scoped variable, or the process environment when the adapter provides none.
+    #[must_use]
+    #[inline]
+    pub fn variable(&self, name: &str) -> Option<String> {
+        if let Some(variables) = self.parts.extensions.get::<RuntimeVariables>() {
+            return variables.get(name).map(str::to_owned);
+        }
+        env::var(name).ok()
+    }
+
     #[must_use]
     #[inline]
     pub fn version(&self) -> Version {
@@ -769,6 +797,28 @@ mod tests {
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect::<HashMap<_, _>>();
         PathParams::new(inner)
+    }
+
+    #[test]
+    fn variable_reads_request_scoped_values() {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/variables")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(RuntimeVariables::from_vars([(
+                "API_BASE_URL".to_owned(),
+                "https://api.example.com".to_owned(),
+            )]));
+        let ctx = RequestContext::new(request, PathParams::default());
+
+        assert_eq!(
+            ctx.variable("API_BASE_URL").as_deref(),
+            Some("https://api.example.com")
+        );
+        assert_eq!(ctx.variable("UNKNOWN_VARIABLE"), None);
     }
 
     // `RequestContext::config_handle()` was removed. The
