@@ -36,16 +36,6 @@ use edgezero_core::time::{DispatchBudget, MonotonicInstant};
 static NEXT_BACKEND_NAMESPACE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(any(feature = "fastly", test))]
-fn next_backend_namespace() -> u64 {
-    NEXT_BACKEND_NAMESPACE.fetch_add(1, Ordering::Relaxed)
-}
-
-#[cfg(any(feature = "fastly", test))]
-fn namespaced_backend_name(identity_name: &str, namespace: u64) -> String {
-    format!("{identity_name}_{namespace}")
-}
-
-#[cfg(any(feature = "fastly", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SendFailure {
     BudgetedTimeout,
@@ -62,6 +52,16 @@ enum SendFailure {
 enum FastlyBatchObservation {
     Continue(OutboundBatchItem),
     Cutoff,
+}
+
+#[cfg(any(feature = "fastly", test))]
+fn next_backend_namespace() -> u64 {
+    NEXT_BACKEND_NAMESPACE.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(any(feature = "fastly", test))]
+fn namespaced_backend_name(identity_name: &str, namespace: u64) -> String {
+    format!("{identity_name}_{namespace}")
 }
 
 #[cfg(any(feature = "fastly", test))]
