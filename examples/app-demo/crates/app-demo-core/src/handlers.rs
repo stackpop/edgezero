@@ -24,7 +24,7 @@ use crate::{config::AppDemoConfig, AdmissionLease};
 
 const ALLOWED_CONFIG_KEYS: &[&str] = &["greeting", "feature.new_checkout", "service.timeout_ms"];
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
-const MAX_BROTLI_DECODER_BYTES: u64 = 0x0200_0000;
+const MAX_DECODER_BYTES: u64 = 0x0200_0000;
 const MAX_BROTLI_WINDOW_BITS: u8 = 24;
 /// Maximum request body size (25 MB, matches KV value limit).
 const MAX_BODY_SIZE: usize = 25 * 1024 * 1024;
@@ -273,7 +273,7 @@ fn fanout_slot(
 fn outbound_policy(request: OutboundRequest) -> OutboundRequest {
     request
         .cache_policy(OutboundCachePolicy::Bypass)
-        .max_brotli_decoder_bytes(MAX_BROTLI_DECODER_BYTES)
+        .max_decoder_bytes(MAX_DECODER_BYTES)
         .max_brotli_window_bits(MAX_BROTLI_WINDOW_BITS)
         .max_decoded_response_bytes(MAX_DECODED_RESPONSE_BYTES)
         .max_encoded_response_bytes(MAX_ENCODED_RESPONSE_BYTES)
@@ -776,7 +776,7 @@ mod tests {
             Some(NonZeroU64::new(MAX_RESPONSE_CHUNK_BYTES).unwrap_or(NonZeroU64::MIN))
         );
         assert_eq!(parts.max_brotli_window_bits, MAX_BROTLI_WINDOW_BITS);
-        assert_eq!(parts.max_brotli_decoder_bytes, MAX_BROTLI_DECODER_BYTES);
+        assert_eq!(parts.max_decoder_bytes, MAX_DECODER_BYTES);
     }
 
     fn response_for(

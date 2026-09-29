@@ -74,6 +74,9 @@ jobs:
       - name: Brotli dependency contract
         run: node scripts/check_brotli_dependency_contract.mjs
 
+      - name: Flate dependency contract
+        run: node scripts/check_flate_dependency_contract.mjs
+
       - name: Serde JSON map contract
         run: node scripts/check_serde_json_map_contract.mjs
 

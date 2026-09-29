@@ -14,6 +14,7 @@ const fastlyGuidePath = 'docs/guide/adapters/fastly.md'
 const scaffoldReadmePath =
   'crates/edgezero-cli/src/templates/root/README.md.hbs'
 const outboundCorePath = 'crates/edgezero-core/src/outbound.rs'
+const compressionCorePath = 'crates/edgezero-core/src/compression.rs'
 const outboundAdapterPaths = [
   'crates/edgezero-adapter-axum/src/outbound.rs',
   'crates/edgezero-adapter-cloudflare/src/outbound.rs',
@@ -205,7 +206,7 @@ const expectedLimitRows = [
   ],
   [
     'max_decoded_response_bytes',
-    'Identity or EdgeZero-decoded gzip/Brotli output',
+    'Identity or EdgeZero-decoded gzip/deflate/Brotli output',
     'Unset',
   ],
   [
@@ -229,8 +230,8 @@ const expectedLimitRows = [
     '24',
   ],
   [
-    'max_brotli_decoder_bytes',
-    'Pinned policy charge for Brotli decoder state',
+    'max_decoder_bytes',
+    'Pinned policy charge for Brotli/gzip/deflate decoder state',
     '32 MiB',
   ],
   [
@@ -1452,10 +1453,15 @@ for (const currentRow of [
 
 for (const dependency of [
   'async-compression 0.4.43',
+  'adler2 = "=2.0.1"',
   'brotli 8.0.4',
   'brotli-decompressor 5.0.1',
   'compression-codecs 0.4.38',
   'compression-core 0.4.32',
+  'crc32fast = "=1.5.0"',
+  'flate2 = "=1.1.9"',
+  'miniz_oxide = "=0.8.9"',
+  'simd-adler32 = "=0.3.9"',
 ]) {
   if (!outboundSpecSource.includes(`\`${dependency}\``)) {
     fail(
@@ -1679,6 +1685,36 @@ try {
 } catch (error) {
   fail(`cannot read ${outboundCorePath}: ${error.message}`)
 }
+let compressionCoreSource
+try {
+  compressionCoreSource = readFileSync(compressionCorePath, 'utf8')
+} catch (error) {
+  fail(`cannot read ${compressionCorePath}: ${error.message}`)
+}
+for (const requiredFragment of [
+  'Deflate,',
+  'Passthrough(PassthroughReason)',
+  'pub enum PassthroughReason',
+  'PassthroughReason::Stacked',
+  'PassthroughReason::Malformed',
+  'PassthroughReason::Unsupported(token)',
+  'pub fn decode_deflate_stream',
+]) {
+  if (!compressionCoreSource.includes(requiredFragment)) {
+    fail(`${compressionCorePath} is missing the content-encoding contract: ${requiredFragment}`)
+  }
+}
+for (const requiredFragment of [
+  'single `deflate`',
+  'Passthrough `Unsupported(token)`',
+  'Passthrough `Stacked`',
+  'Passthrough `Malformed`',
+  'decode_deflate_stream',
+]) {
+  if (!outboundSpecSource.includes(requiredFragment)) {
+    fail(`${outboundSpecPath} is missing the content-encoding documentation: ${requiredFragment}`)
+  }
+}
 observationCutoffContract(outboundCoreSource)
 if (
   !/#\[non_exhaustive\]\s*pub enum OutboundBatchDriverEvent\s*\{/u.test(
@@ -1721,7 +1757,7 @@ const documentedDefaults = new Map(
 for (const [control, constant] of [
   ['max_request_body_bytes', 'DEFAULT_OUTBOUND_REQUEST_BODY_BYTES'],
   ['max_response_bytes', 'DEFAULT_MAX_RESPONSE_BYTES'],
-  ['max_brotli_decoder_bytes', 'DEFAULT_MAX_BROTLI_DECODER_BYTES'],
+  ['max_decoder_bytes', 'DEFAULT_MAX_DECODER_BYTES'],
 ]) {
   const rustDefault = formatBinaryBytes(
     readRustU64Constant(outboundCoreSource, constant),

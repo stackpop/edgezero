@@ -173,7 +173,8 @@ mod fastly_impl {
     use bytes::Bytes;
     use edgezero_core::body::{Body, BodyStream};
     use edgezero_core::compression::{
-        ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_gzip_stream,
+        ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_deflate_stream,
+        decode_gzip_stream,
     };
     use edgezero_core::error::{BadGatewayReason, EdgeError};
     use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH};
@@ -260,7 +261,7 @@ mod fastly_impl {
     struct PendingSlotMetadata {
         index: usize,
         budget: DispatchBudget,
-        max_brotli_decoder_bytes: u64,
+        max_decoder_bytes: u64,
         max_brotli_window_bits: u8,
         max_chunk_bytes: Option<NonZeroU64>,
         max_decoded_response_bytes: Option<u64>,
@@ -405,7 +406,7 @@ mod fastly_impl {
                 body,
                 cache_policy,
                 headers,
-                max_brotli_decoder_bytes,
+                max_decoder_bytes,
                 max_brotli_window_bits,
                 max_chunk_bytes,
                 max_decoded_response_bytes,
@@ -448,7 +449,7 @@ mod fastly_impl {
                 method,
                 response_mode,
                 budget,
-                max_brotli_decoder_bytes,
+                max_decoder_bytes,
                 max_brotli_window_bits,
                 max_chunk_bytes,
                 max_decoded_response_bytes,
@@ -475,7 +476,7 @@ mod fastly_impl {
                 body,
                 cache_policy,
                 headers,
-                max_brotli_decoder_bytes,
+                max_decoder_bytes,
                 max_brotli_window_bits,
                 max_chunk_bytes,
                 max_decoded_response_bytes,
@@ -510,7 +511,7 @@ mod fastly_impl {
                 metadata: PendingSlotMetadata {
                     index,
                     budget,
-                    max_brotli_decoder_bytes,
+                    max_decoder_bytes,
                     max_brotli_window_bits,
                     max_chunk_bytes,
                     max_decoded_response_bytes,
@@ -820,7 +821,7 @@ mod fastly_impl {
     ) -> Result<OutboundResponse, EdgeError> {
         let PendingSlotMetadata {
             budget,
-            max_brotli_decoder_bytes,
+            max_decoder_bytes,
             max_brotli_window_bits,
             max_chunk_bytes,
             max_decoded_response_bytes,
@@ -840,7 +841,7 @@ mod fastly_impl {
             request_method,
             response_mode,
             budget,
-            max_brotli_decoder_bytes,
+            max_decoder_bytes,
             max_brotli_window_bits,
             max_chunk_bytes,
             max_decoded_response_bytes,
@@ -963,12 +964,16 @@ mod fastly_impl {
         clippy::too_many_arguments,
         reason = "the adapter consumes independent response-policy fields"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the response conversion keeps framing, coding, limits, and deadline ownership together"
+    )]
     async fn process_response(
         mut response: FastlyResponse,
         request_method: Method,
         response_mode: ResponseMode,
         budget: DispatchBudget,
-        max_brotli_decoder_bytes: u64,
+        max_decoder_bytes: u64,
         max_brotli_window_bits: u8,
         max_chunk_bytes: Option<NonZeroU64>,
         max_decoded_response_bytes: Option<u64>,
@@ -1035,28 +1040,35 @@ mod fastly_impl {
         };
         enforce_payload_content_length(
             &headers,
-            encoding,
+            &encoding,
             max_buffered,
             max_decoded_response_bytes,
             max_encoded_response_bytes,
         )?;
         let encoded = limit_encoded_stream(native, max_encoded_response_bytes);
-        let decoded = match encoding {
+        let decoded = match &encoding {
             ContentEncoding::Brotli => {
-                decode_brotli_stream(encoded, max_brotli_window_bits, max_brotli_decoder_bytes)
+                decode_brotli_stream(encoded, max_brotli_window_bits, max_decoder_bytes)
             }
-            ContentEncoding::Gzip => decode_gzip_stream(encoded),
-            ContentEncoding::Identity | ContentEncoding::Passthrough => encoded,
+            ContentEncoding::Deflate => decode_deflate_stream(encoded, max_decoder_bytes),
+            ContentEncoding::Gzip => decode_gzip_stream(encoded, max_decoder_bytes),
+            ContentEncoding::Identity | ContentEncoding::Passthrough(_) => encoded,
         };
-        if matches!(encoding, ContentEncoding::Brotli | ContentEncoding::Gzip) {
+        if matches!(
+            &encoding,
+            ContentEncoding::Brotli | ContentEncoding::Deflate | ContentEncoding::Gzip
+        ) {
             headers.remove(CONTENT_ENCODING);
             headers.remove(CONTENT_LENGTH);
         }
-        let output = match encoding {
-            ContentEncoding::Brotli | ContentEncoding::Gzip | ContentEncoding::Identity => {
+        let output = match &encoding {
+            ContentEncoding::Brotli
+            | ContentEncoding::Deflate
+            | ContentEncoding::Gzip
+            | ContentEncoding::Identity => {
                 limit_decoded_stream(decoded, max_decoded_response_bytes)
             }
-            ContentEncoding::Passthrough => decoded,
+            ContentEncoding::Passthrough(_) => decoded,
         };
         let shaped = rechunk_stream(output, max_chunk_bytes);
         let deadline_bound = deadline_stream(shaped, budget, clock);

@@ -29,7 +29,7 @@ edgezero/
 - **Extractors** - `Json<T>`, `Path<T>`, `Query<T>`, `Form<T>`, `Headers`, `Host`, `ForwardedHost`, and `Validated*` variants
 - **Middleware** - Composable middleware chain with async support
 - **Manifest** - `edgezero.toml` parsing and validation
-- **Compression** - Shared gzip/brotli stream decoders
+- **Compression** - Shared gzip/deflate/brotli stream decoders and typed passthrough classification
 - **Outbound HTTP** - Typed requests, responses, limits, deadlines, batching, and capability contracts
 
 Handlers in your core crate only depend on `edgezero-core`, keeping them portable.

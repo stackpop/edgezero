@@ -37,6 +37,7 @@ run cargo test --workspace --all-targets
 
 section "Dependency Contracts"
 run node scripts/check_serde_json_map_contract.mjs
+run node scripts/check_flate_dependency_contract.mjs
 
 section "Outbound Contract Tests"
 run scripts/run_test_nonzero.sh batch_preflight_precedence_and_indices cargo test --offline --locked -p edgezero-adapter-axum --no-default-features --features axum,test-utils --test contract

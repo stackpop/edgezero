@@ -6,7 +6,8 @@ use core::task::Poll;
 use core::time::Duration;
 use edgezero_core::body::{Body, BodyStream};
 use edgezero_core::compression::{
-    ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_gzip_stream,
+    ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_deflate_stream,
+    decode_gzip_stream,
 };
 use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError};
 use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HOST};
@@ -48,7 +49,7 @@ impl AxumOutboundClient {
             body,
             mut headers,
             host_authority_override,
-            max_brotli_decoder_bytes,
+            max_decoder_bytes,
             max_brotli_window_bits,
             max_chunk_bytes,
             max_decoded_response_bytes,
@@ -87,7 +88,7 @@ impl AxumOutboundClient {
             method,
             response_mode,
             budget,
-            max_brotli_decoder_bytes,
+            max_decoder_bytes,
             max_brotli_window_bits,
             max_chunk_bytes,
             max_decoded_response_bytes,
@@ -355,7 +356,7 @@ async fn process_response(
     request_method: Method,
     response_mode: ResponseMode,
     budget: DispatchBudget,
-    max_brotli_decoder_bytes: u64,
+    max_decoder_bytes: u64,
     max_brotli_window_bits: u8,
     max_chunk_bytes: Option<NonZeroU64>,
     max_decoded_response_bytes: Option<u64>,
@@ -418,28 +419,33 @@ async fn process_response(
     };
     enforce_payload_content_length(
         &headers,
-        encoding,
+        &encoding,
         max_buffered,
         max_decoded_response_bytes,
         max_encoded_response_bytes,
     )?;
     let encoded = limit_encoded_stream(native, max_encoded_response_bytes);
-    let decoded = match encoding {
+    let decoded = match &encoding {
         ContentEncoding::Brotli => {
-            decode_brotli_stream(encoded, max_brotli_window_bits, max_brotli_decoder_bytes)
+            decode_brotli_stream(encoded, max_brotli_window_bits, max_decoder_bytes)
         }
-        ContentEncoding::Gzip => decode_gzip_stream(encoded),
-        ContentEncoding::Identity | ContentEncoding::Passthrough => encoded,
+        ContentEncoding::Deflate => decode_deflate_stream(encoded, max_decoder_bytes),
+        ContentEncoding::Gzip => decode_gzip_stream(encoded, max_decoder_bytes),
+        ContentEncoding::Identity | ContentEncoding::Passthrough(_) => encoded,
     };
-    if matches!(encoding, ContentEncoding::Brotli | ContentEncoding::Gzip) {
+    if matches!(
+        &encoding,
+        ContentEncoding::Brotli | ContentEncoding::Deflate | ContentEncoding::Gzip
+    ) {
         headers.remove(CONTENT_ENCODING);
         headers.remove(CONTENT_LENGTH);
     }
-    let output = match encoding {
-        ContentEncoding::Brotli | ContentEncoding::Gzip | ContentEncoding::Identity => {
-            limit_decoded_stream(decoded, max_decoded_response_bytes)
-        }
-        ContentEncoding::Passthrough => decoded,
+    let output = match &encoding {
+        ContentEncoding::Brotli
+        | ContentEncoding::Deflate
+        | ContentEncoding::Gzip
+        | ContentEncoding::Identity => limit_decoded_stream(decoded, max_decoded_response_bytes),
+        ContentEncoding::Passthrough(_) => decoded,
     };
     let shaped = rechunk_stream(output, max_chunk_bytes);
     let deadline_bound = deadline_stream(shaped, budget, clock);

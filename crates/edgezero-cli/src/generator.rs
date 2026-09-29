@@ -1632,7 +1632,7 @@ mod tests {
             ".max_response_header_count(",
             ".max_chunk_bytes(",
             ".max_brotli_window_bits(",
-            ".max_brotli_decoder_bytes(",
+            ".max_decoder_bytes(",
             ".timeout(",
             "send_all_until(",
             "map_err(|failure| failure.error)",
@@ -1656,6 +1656,11 @@ mod tests {
         assert!(
             !handlers.contains(".send_all("),
             "generated outbound example must not retain the removed send_all API",
+        );
+        assert!(
+            !handlers.contains("max_brotli_decoder_bytes")
+                && !handlers.contains("MAX_BROTLI_DECODER_BYTES"),
+            "generated outbound example must use the generalized decoder budget",
         );
         assert!(
             handlers.contains("ResponseEgressDeadline::at(deadline)")

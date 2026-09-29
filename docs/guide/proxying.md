@@ -79,7 +79,7 @@ let request = OutboundRequest::post("https://api.example.com/events")?
     .max_response_header_count(100)
     .max_chunk_bytes(NonZeroU64::new(64 * 1024).unwrap_or(NonZeroU64::MIN))
     .max_brotli_window_bits(24)
-    .max_brotli_decoder_bytes(32 * 1024 * 1024)
+    .max_decoder_bytes(32 * 1024 * 1024)
     .header("accept", "application/json")?
     .json(&payload)?;
 let response = client.send(request).await?;

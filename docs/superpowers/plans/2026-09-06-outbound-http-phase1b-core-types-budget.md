@@ -56,7 +56,7 @@ pub struct OutboundRequest {
     body: Body,
     deadline: Option<Deadline>,
     headers: HeaderMap,
-    max_brotli_decoder_bytes: u64,
+    max_decoder_bytes: u64,
     max_brotli_window_bits: u8,
     max_chunk_bytes: Option<NonZeroU64>,
     max_decoded_response_bytes: Option<u64>,
@@ -74,7 +74,7 @@ pub struct OutboundRequestParts {
     pub body: Body,
     pub deadline: Option<Deadline>,
     pub headers: HeaderMap,
-    pub max_brotli_decoder_bytes: u64,
+    pub max_decoder_bytes: u64,
     pub max_brotli_window_bits: u8,
     pub max_chunk_bytes: Option<NonZeroU64>,
     pub max_decoded_response_bytes: Option<u64>,
@@ -105,7 +105,7 @@ impl OutboundRequest {
     pub fn headers_mut(&mut self) -> &mut HeaderMap;
     pub fn into_parts(self) -> OutboundRequestParts;
     pub fn json<T: Serialize>(self, value: &T) -> Result<Self, EdgeError>;
-    pub fn max_brotli_decoder_bytes(self, bytes: u64) -> Self;
+    pub fn max_decoder_bytes(self, bytes: u64) -> Self;
     pub fn max_brotli_window_bits(self, bits: u8) -> Self;
     pub fn max_chunk_bytes(self, bytes: NonZeroU64) -> Self;
     pub fn max_decoded_response_bytes(self, bytes: u64) -> Self;

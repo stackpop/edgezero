@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Outbound content encoding
+
+`ContentEncoding::Passthrough` is now `Passthrough(PassthroughReason)`, and the public decoder
+budget is now `max_decoder_bytes`. A single zlib-wrapped `deflate` response is decoded and its
+compressed headers are removed, while stacked, unsupported, and malformed values retain their
+typed passthrough reason. This is a hard API migration with no compatibility aliases.
+
 ### Platform resource metadata
 
 Applications and adapter implementations must migrate to the current platform-fact and response

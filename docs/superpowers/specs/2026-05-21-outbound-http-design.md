@@ -247,7 +247,7 @@ pub trait OutboundHttpClient: Send + Sync {
  /// chunk reads come from the deadline-aware stream wrapper
  /// as `Err(EdgeError::..)` chunks.
  /// - A configured **decoded-output cap** wraps effective identity and EdgeZero-decoded
- /// gzip/Brotli output in both response modes, but never raw passthrough. It can yield
+ /// gzip/deflate/Brotli output in both response modes, but never raw passthrough. It can yield
  /// `ResponseLimitReason::DecodedBody` from the returned stream. A later bounded helper
  /// (`OutboundResponse::into_bytes_bounded(max)`, `into_bytes_bounded_until`, or
  /// `json_bounded[_until]`) owns a distinct final collection cap and reports
@@ -470,7 +470,7 @@ pub struct OutboundRequest {
     deadline: Option<Deadline>,          // shared absolute cap; copy one value into every target request, do not recompute per request (see §3.3.2)
     headers: HeaderMap,
     host_authority_override: Option<Authority>, // validated wire authority only
-    max_brotli_decoder_bytes: u64,        // source-audited decoder-state charge cap; default 32 MiB
+    max_decoder_bytes: u64,               // source-audited decoder-state charge cap; default 32 MiB
     max_brotli_window_bits: u8,          // advertised-window cap; default 24, valid 10..=30
     max_chunk_bytes: Option<NonZeroU64>, // opt-in Streamed output rechunker
     max_decoded_response_bytes: Option<u64>, // identity/EdgeZero-decoded output only
@@ -687,7 +687,7 @@ impl OutboundRequest {
     /// port. Schemes, userinfo, paths, queries, fragments, whitespace, controls, malformed
     /// brackets, and invalid ports are rejected as `bad_request`.
     pub fn host_authority_override(self, authority: &str) -> Result<Self, EdgeError>;
-    pub fn max_brotli_decoder_bytes(self, max: u64) -> Self;
+    pub fn max_decoder_bytes(self, max: u64) -> Self;
     pub fn max_brotli_window_bits(self, bits: u8) -> Self; // 10..=30 at dispatch
     pub fn max_chunk_bytes(self, max: NonZeroU64) -> Self;   // Streamed emitted-item size
     pub fn max_decoded_response_bytes(self, max: u64) -> Self;
@@ -913,16 +913,29 @@ impl From<Bytes> for Body {
 // preserving exact typed source errors and making the pipeline skeleton buildable.
 // `edgezero_core::compression` items, in module order:
 pub const BROTLI_DECODER_FIXED_CHARGE_BYTES: u64 = 16_777_216;
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub const FLATE_DECODER_FIXED_CHARGE_BYTES: u64 = 1_048_576; // 1 MiB; see the flate memory audit
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContentEncoding {
     /// One bare, case-insensitive `br` field.
     Brotli,
+    /// One bare, case-insensitive `deflate` field. The body uses RFC 1950 zlib framing.
+    Deflate,
     /// One bare, case-insensitive `gzip` field.
     Gzip,
     /// No visible `content-encoding`, or one bare `identity` field.
     Identity,
-    /// Repeated, stacked, parameterized, malformed, non-UTF-8, or unknown coding.
-    Passthrough,
+    /// A coding EdgeZero deliberately preserves as raw bytes.
+    Passthrough(PassthroughReason),
+}
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PassthroughReason {
+    /// Invalid token syntax, empty elements, parameters, or non-UTF-8 bytes.
+    Malformed,
+    /// More than one field, or one valid comma-separated coding list.
+    Stacked,
+    /// One valid but unsupported coding token, normalized to ASCII lowercase.
+    Unsupported(String),
 }
 // A direct call with bits outside 10..=30 is invalid caller policy and returns BadRequest;
 // checked accounting overflow retains ResponseLimitReason::DecoderMemory.
@@ -936,7 +949,8 @@ pub fn decode_brotli_stream(
     max_window_bits: u8,
     max_decoder_bytes: u64,
 ) -> BodyStream;
-pub fn decode_gzip_stream(stream: BodyStream) -> BodyStream;
+pub fn decode_deflate_stream(stream: BodyStream, max_decoder_bytes: u64) -> BodyStream;
+pub fn decode_gzip_stream(stream: BodyStream, max_decoder_bytes: u64) -> BodyStream;
 
 // `edgezero_core::outbound` items, in module order:
 pub fn finish_batch_item(
@@ -968,7 +982,7 @@ pub struct OutboundRequestParts {
     pub deadline: Option<Deadline>,
     pub headers: HeaderMap,
     pub host_authority_override: Option<Authority>,
-    pub max_brotli_decoder_bytes: u64,
+    pub max_decoder_bytes: u64,
     pub max_brotli_window_bits: u8,
     pub max_chunk_bytes: Option<NonZeroU64>,
     pub max_decoded_response_bytes: Option<u64>,
@@ -1023,7 +1037,7 @@ pub enum ResponseBodyDisposition {
 /// only for Buffered mode; the independent decoded cap may also be present in Streamed.
 /// Malformed, comma-list, or conflicting lengths are protocol 502. The encoded cap applies
 /// to every coding. Effective identity compares decoded and Buffered caps too; raw
-/// passthrough compares the Buffered cap but never the decoded cap; gzip/Brotli-to-decode
+/// passthrough compares the Buffered cap but never the decoded cap; gzip/deflate/Brotli-to-decode
 /// cannot soundly compare wire length with either output cap.
 pub fn enforce_payload_content_length(
     headers: &HeaderMap,
@@ -1112,7 +1126,7 @@ impl OutboundResponse {
  /// and maps over-cap to `response_too_large` with reason `BufferedBody`
  /// (distinct kind, 502 — §3.4.1; consistent with the top of this doc,
  /// NOT `bad_gateway`).
- /// For effective identity or EdgeZero-decoded gzip/Brotli, the request's independent
+ /// For effective identity or EdgeZero-decoded gzip/deflate/Brotli, the request's independent
  /// `max_decoded_response_bytes` policy has already wrapped the response stream. For raw
  /// passthrough, this helper counts the delivered encoded bytes and does not invent a
  /// decoded interpretation.
@@ -1331,7 +1345,7 @@ impl OutboundResponse {
 ```
 
 The complete builder surface — `new`/`get`/`post`/`from_request`/`header`/`headers_mut`/
-`body`/`json`/`timeout`/`deadline`/`max_brotli_decoder_bytes`/
+`body`/`json`/`timeout`/`deadline`/`max_decoder_bytes`/
 `max_brotli_window_bits`/`max_chunk_bytes`/`max_decoded_response_bytes`/
 `max_encoded_response_bytes`/`max_request_body_bytes`/`max_response_header_bytes`/
 `max_response_header_count`/`max_response_bytes`/`stream_response`. Every fallible step
@@ -2426,7 +2440,7 @@ nominations (§3.1.4), a response that is bodyless by HTTP framing — the respo
 though HEAD/304 MAY legitimately carry `Content-Encoding` and a *representation*
 `Content-Length` (e.g. a `HEAD` echoing what a `GET` would return; a `304` echoing the cached
 representation's metadata). For these:
-- **Do NOT attempt to decode.** There are no body bytes; feeding EOF to the gzip/br decoder
+- **Do NOT attempt to decode.** There are no body bytes; feeding EOF to a compressed decoder
   would error and produce a **false `bad_gateway` (502)**. Skip the decoder entirely.
 - **Framing headers are status-dependent (RFC 9110 §8.6 / RFC 9112 §6.2).** For a
   **`HEAD` response and `304`**, `content-encoding` and a *representation* `content-length`
@@ -2488,7 +2502,7 @@ decode/cap rules below apply to payload-bearing responses.
 In `Buffered` mode, `max_response_bytes` (default `DEFAULT_MAX_RESPONSE_BYTES = 1 MiB`)
 caps the final collected `Body::Once` for every coding disposition. The independent
 `max_decoded_response_bytes` cap is measured only in effective-identity or
-EdgeZero-decoded gzip/Brotli output. Every adapter **must enforce that decoded cap
+EdgeZero-decoded gzip/deflate/Brotli output. Every adapter **must enforce that decoded cap
 incrementally** and abort as soon as output exceeds it; this closes the decompression-bomb
 gap while allowing a caller to set a larger final buffer for an intentionally retained raw
 passthrough body. Decoded over-cap →
@@ -2557,10 +2571,10 @@ Decoded-output-cap responsibility per adapter:
   using `encodeResponseBody: "manual"` (§4.2). Only then can the shared decoder apply
   this policy and its independent decoded-output cap. Existing explicit decoding alone does
   not prevent workerd from decoding the subrequest body first.
-- **Fastly, Spin** — already decompress gzip/br explicitly today; the cap obligation
+- **Fastly, Spin** — already decompress gzip/deflate/br explicitly today; the cap obligation
   applies in-line in their decode paths.
 - **Axum** — the workspace `reqwest` dependency is currently
-  `default-features = false` and does not enable gzip/brotli decoding. This migration
+  `default-features = false` and does not enable gzip/deflate/brotli decoding. This migration
   does **NOT** enable reqwest's `gzip`/`brotli` auto-decoding. Axum inserts
   `accept-encoding: identity` only when the normalized request does not already contain
   `accept-encoding`; a caller-supplied value is preserved and its response is processed by
@@ -2577,7 +2591,7 @@ all four adapters for the values and field structure visible to the guest. Exact
 of malformed raw bytes or field lines that workerd has already joined is guaranteed only by
 `outbound-header-fidelity`; Cloudflare applies the table to its post-workerd representation.
 Every adapter calls the public core `classify_content_encoding(&HeaderMap)` helper and uses
-its four-state `ContentEncoding::{Brotli, Gzip, Identity, Passthrough}` result. `Identity`
+its typed `ContentEncoding::{Brotli, Deflate, Gzip, Identity, Passthrough(reason)}` result. `Identity`
 is distinct from `Passthrough` internally even though neither decodes: only `Identity` lets
 `enforce_payload_content_length` compare the visible length with the decoded cap before the
 first body poll. Unknown/stacked passthrough bytes may still be encoded, so their encoded
@@ -2588,20 +2602,25 @@ cap and, in Buffered mode, raw final-buffer cap are sound; the decoded cap is no
 | absent, or `identity` | **Identity delivery** — no codec runs and bytes are delivered as-is, but the independent decoded-output counter applies because these are already representation bytes. `identity` is treated exactly as absent. |
 | a single `gzip` | **Decode** one gzip layer; strip `content-encoding` + `content-length`. |
 | a single `br` | **Decode** one brotli layer; strip `content-encoding` + `content-length`. |
-| anything else — an **unknown** token (`zstd`, `deflate`, `compress`, …) **or a stacked list** (`gzip, br`, `br, gzip`, …) | **Passthrough, untouched** — do **not** attempt to decode; deliver the raw bytes **and leave `content-encoding` / `content-length` intact** so the app can decode itself. Never a hard failure. |
+| a single `deflate` | **Decode** one RFC 1950 zlib-wrapped DEFLATE layer; strip `content-encoding` + `content-length`. Raw RFC 1951 streams without the zlib wrapper are malformed compressed content and fail as `Decode(Deflate)`. |
+| one valid unsupported token (`zstd`, `compress`, …) | **Passthrough `Unsupported(token)`**, untouched; preserve the normalized lowercase token for application policy. |
+| more than one field, or one valid coding list (`gzip, deflate`, `br, gzip`, …) | **Passthrough `Stacked`**, untouched. |
+| invalid token syntax, an empty list element, a parameterized value, or non-UTF-8 bytes | **Passthrough `Malformed`**, untouched. |
 
 - **Matching is case-insensitive** on the token (`GZIP` == `gzip`) and tolerant of
   optional ASCII space/tab surrounding whitespace. The classifier examines every value
   returned by `HeaderMap::get_all`; exactly one field is required for `identity`, `gzip`,
-  or `br`. Two or more fields are `Passthrough`, even if each field contains the same token.
-  A comma in the sole field is a stacked list and therefore `Passthrough`; an empty,
-  non-UTF-8, or otherwise malformed value is also `Passthrough`, never a decode attempt.
+  `deflate`, or `br`. Two or more fields are `Passthrough(Stacked)`, even if each field
+  contains the same token. A sole field containing two or more valid comma-separated tokens
+  is also `Stacked`; an empty element, non-UTF-8 byte, or otherwise invalid token syntax is
+  `Malformed`, never a decode attempt. One valid unknown token is lowercased and retained in
+  `Unsupported(token)`.
   **`Content-Encoding` is a bare content-coding token
   (RFC 9110 §8.4.1) and carries NO `q=` weight** — quality values belong to
   `Accept-Encoding`, not `Content-Encoding`. A value bearing any parameter (`gzip;q=0.5`,
   `gzip;x=1`) is therefore **not** the bare `gzip`/`br` form: it falls through to
-  **passthrough**, exactly like an unknown token — never decoded. Only the two known
-  bare single-layer forms decode; everything else passes through.
+  **`Passthrough(Malformed)`**, never decoded. Only the three known bare single-layer forms
+  decode; every other valid single token or valid stack passes through with its typed reason.
 - **A repeated `content-encoding` field** (two header lines) is treated as the stacked
   case → passthrough untouched.
 - Passthrough here means `max_encoded_response_bytes` still counts the raw transport body
@@ -2612,7 +2631,7 @@ cap and, in Buffered mode, raw final-buffer cap are sound; the decoded cap is no
   edge fan-out; failing them hard (`502`) would break apps that can decode a `zstd` body
   themselves. Passthrough is deterministic and never worse than "the app got the bytes."
 
-Whenever an adapter **does** decompress (the two known single-layer cases above), the
+Whenever an adapter **does** decompress (the three known single-layer cases above), the
 `OutboundResponse.headers` it returns MUST have
 both `content-encoding` and `content-length` removed — the original values describe
 compressed wire bytes and no longer match the app-visible body. This applies in both
@@ -2685,7 +2704,7 @@ keeps transport failure distinguishable from every limit outcome.
 wrapper.** After adapter-visible upstream header limits and bodyless disposition, payload layers compose
 in exactly one order:
 `platform raw/completion stream → encoded-byte counter → optional Brotli prefix gate →
-EdgeError/io::Error carrier bridge → gzip/br decoder + native-EOF validation → exact carrier
+EdgeError/io::Error carrier bridge → gzip/deflate/br decoder + native-EOF validation → exact carrier
 restoration → decoded-byte cap → optional rechunker → absolute-deadline/cancellation wrapper →
 consumer`. Unknown/stacked encodings bypass only the prefix/decoder/carrier stages and decoded
 cap; they still pass through raw counting, rechunking, and the deadline. The outer deadline sees
@@ -2782,7 +2801,7 @@ every target (§3.4.1), never as a whole-body decode. When an outbound response 
 response-egress coordinator continues polling that same portable stream lazily.
 
 In `Streamed` mode a configured `max_decoded_response_bytes` is enforced incrementally on
-effective identity and EdgeZero-decoded gzip/Brotli output before each item reaches the app.
+effective identity and EdgeZero-decoded gzip/deflate/Brotli output before each item reaches the app.
 If that optional policy is unset, there is no default decoded-output cap. A caller may still
 apply a distinct final collection cap later with
 `OutboundResponse::into_bytes_bounded(max)`. The independent encoded, header, and
@@ -2936,7 +2955,7 @@ worst-case LOGICAL PAYLOAD bytes   =  persistent + transient
 // `Vec`/`BytesMut` spare capacity (amortised growth over-allocates), shared `Bytes` backing
 // allocations not yet freed, gzip decoder state, Brotli state other than the separately
 // bounded source-audited decoder-state charge, and allocator overhead/fragmentation. During active Brotli
-// decodes, add up to each slot's `max_brotli_decoder_bytes` to this logical payload number;
+// decodes, add up to each slot's `max_decoder_bytes` to this logical payload number;
 // even that sum remains narrower than RSS. Actual RSS also includes adapter/host buffering
 // and every opaque term listed below (§ send_all_until rustdoc).
 
@@ -2978,7 +2997,7 @@ EdgeZero's contract — **persistent** (post-append, retained) vs **transient**
   `max_response_bytesᵢ` denote slot `i`'s buffered request body length and its
   per-request response cap respectively); *transient* adds
   `Σⱼ current_chunkⱼ.len()` over actively-draining slots, source-controlled, plus up to
-  `Σₖ max_brotli_decoder_bytesₖ` over actively decoding Brotli slots. This remains a set of
+  `Σₖ max_decoder_bytesₖ` over actively decoding Brotli, gzip, or deflate slots. This remains a set of
   enforceable guest terms rather than a complete memory bound.
   For typical fan-out workloads this is intrinsic — `N` is the fixed, configured target count and
   target responses are small JSON. The spec deliberately does **not** add a
@@ -2999,9 +3018,9 @@ passthrough representation:
 
 | Builder | Default | Measures | Typed overflow/rejection reason |
 | --- | --- | --- | --- |
-| `max_brotli_decoder_bytes(u64)` | `DEFAULT_MAX_BROTLI_DECODER_BYTES = 32 MiB` | conservative decoder-state charge `BROTLI_DECODER_FIXED_CHARGE_BYTES + 2^WBITS`, checked before decoder construction | `ResponseLimitReason::DecoderMemory` |
+| `max_decoder_bytes(u64)` | `DEFAULT_MAX_DECODER_BYTES = 32 MiB` | conservative decoder-state charge for Brotli, gzip, or deflate, checked before decoder construction | `ResponseLimitReason::DecoderMemory` |
 | `max_encoded_response_bytes(u64)` | unset | cumulative guest-visible body bytes before content decoding | `ResponseLimitReason::EncodedBody` |
-| `max_decoded_response_bytes(u64)` | unset | cumulative identity or EdgeZero-decoded gzip/Brotli output; never raw passthrough | `ResponseLimitReason::DecodedBody` |
+| `max_decoded_response_bytes(u64)` | unset | cumulative identity or EdgeZero-decoded gzip/deflate/Brotli output; never raw passthrough | `ResponseLimitReason::DecodedBody` |
 | `max_response_header_bytes(u64)` | unset | sum of each adapter-visible upstream field name length plus value length before normalization, plus EdgeZero's synthetic `x-edgezero-proxy` marker | `ResponseLimitReason::HeaderBytes` |
 | `max_response_header_count(u64)` | unset | adapter-visible upstream name/value entries before normalization, including repeated values, plus EdgeZero's synthetic `x-edgezero-proxy` marker | `ResponseLimitReason::HeaderCount` |
 | `max_brotli_window_bits(u8)` | `DEFAULT_MAX_BROTLI_WINDOW_BITS = 24` | advertised Brotli window bits, valid configured range `10..=30` | `ResponseLimitReason::BrotliWindow` |
@@ -3073,14 +3092,14 @@ These are per-response controls, not aggregate batch limits.
    dependency upgrade must repeat the audit and may raise the constant; it may not retain the old
    charge on test evidence alone. Reject with
    `DecoderMemory` before constructing the decoder when the charge exceeds
-   `max_brotli_decoder_bytes`. The default 32 MiB cap therefore admits the default WBITS 24
+   `max_decoder_bytes`. The default 32 MiB cap therefore admits the default WBITS 24
    and rejects a raised window unless the caller also raises the memory policy. This is a
    conservative reservation charge, not a claim that the process reserves or uses exactly
    that many bytes. It excludes allocator metadata, fragmentation, output/body buffers,
    task stacks, adapter/SDK buffers, and host RSS; `outbound-complete-resource-accounting`
    remains Unsupported because those terms are not portable (§3.5.2).
 6. Apply `max_decoded_response_bytes` only to effective identity and EdgeZero-decoded
-   gzip/Brotli output. Unknown, parameterized, stacked, or otherwise passthrough encodings
+  gzip/deflate/Brotli output. Unknown, parameterized, stacked, or otherwise passthrough encodings
    bypass this decoded counter. The encoded counter still applies to every path.
 7. For Streamed output apply the optional rechunker, then wrap the stream in the adapter's
    absolute deadline/cancellation owner. For Buffered output, collect under
@@ -4646,7 +4665,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
      abort through the guard.** Dropping the underlying fetch future alone does not
      cancel the in-flight subrequest; dropping the guarded send future cancels it through
      the guard's `Drop`. Return `gateway_timeout_caused(.., budget.cause)` on expiry.
-     The existing gzip/br
+     The existing gzip/deflate/br
      decompression path is kept; the independent decoded-output cap is enforced
      incrementally for identity and EdgeZero-decoded output (§3.4.1). The final Buffered
      collection cap is enforced separately for every coding disposition.
@@ -4745,7 +4764,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   `worker::fetch` DNS/TLS/connection-establishment failures before a response head →
   `bad_gateway_with_reason(.., Unreachable)` when provider evidence establishes that
   category, otherwise `Unspecified`; later transport failures → `Transport`; invalid
-  visible upstream framing/completion → `Protocol`; shared JSON/gzip/Brotli failures →
+  visible upstream framing/completion → `Protocol`; shared JSON/gzip/deflate/Brotli failures →
   `Decode(Json)` / `Decode(Gzip)` / `Decode(Brotli)`; **request**-body over-cap →
   `bad_request` (400); response-resource failures preserve their exact
   `ResponseLimitReason`. A provider error with no defensible narrower category uses
@@ -4777,7 +4796,7 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   response-out converter MUST then select `worker::EncodeBody::Manual` (via
   `Response::with_encode_body`) whenever it forwards an already encoded body; leaving the
   default automatic mode lets Workers transform bytes that EdgeZero promised to pass
-  through unchanged. Known gzip/br responses decoded by EdgeZero have their encoding
+  through unchanged. Known gzip/deflate/br responses decoded by EdgeZero have their encoding
   header removed and use the normal automatic/identity path. Workers can recompute or
   ignore a user `content-length` for a streamed response, so exact downstream-wire
   `Content-Length` retention is part of Cloudflare's documented
@@ -4845,7 +4864,7 @@ struct PendingSlot {
 struct PendingSlotMetadata {
     index: usize,
     budget: DispatchBudget,
-    max_brotli_decoder_bytes: u64,
+    max_decoder_bytes: u64,
     max_brotli_window_bits: u8,
     max_decoded_response_bytes: Option<u64>,
     max_encoded_response_bytes: Option<u64>,
@@ -6186,7 +6205,7 @@ this operation. `run_app_with_hooks` is the advanced auto-receiving wrapper. The
   §3.3.3 wrapper), so upload time is included in the batch budget rather than added on top.
   (An earlier draft prescribed this second race unconditionally, contradicting the buffered
   single-race flow — corrected to Streamed-only here.)
-- Existing gzip/br decompression is kept; the independent decoded-output cap is enforced
+- Existing gzip/deflate/br decompression is kept; the independent decoded-output cap is enforced
   incrementally for identity and EdgeZero-decoded output (§3.4.1), while the final
   Buffered cap remains separate. `Streamed` mode wraps the response body as `Body::Stream`.
 - **Errors — `map_spin_send_err(err, deadline, cause)` classifies the WASI `ErrorCode`,
@@ -6425,7 +6444,7 @@ Each adapter crate tests its shipped conversion and classification seams.
 | Response conversion | Every adapter enforces adapter-visible upstream header limits before normalization, including fields normalization later strips, accounts the synthetic proxy marker after normalization, then applies body/decode caps, calls the shared four-state content-encoding classifier, passes the originating method and retained clock into `OutboundResponse`, and settles native body handles for framing-bodyless and 205 responses; repeated `Set-Cookie` survives. HEAD/304 malformed, conflicting, comma-list, and `u64`-overflow `Content-Length` fail as protocol 502 before body polling while valid representation lengths are retained; 1xx/204 remove the field. Effective identity includes absent or exactly one bare `identity`, and its decoded over-cap `Content-Length` rejects before body polling. Encoded, decoded, header-byte/count, and Brotli-window failures preserve typed reasons and cleanup. |
 | 205 settlement | Test declared-body immediate abort, one in-budget clean EOF, observed non-empty bytes, read failure, and deadline precedence. Where the SDK exposes empty items, one empty item aborts without another read; on Fastly a non-empty read buffer returning zero is EOF. Cloudflare additionally tests null-body host suppression with absent/zero and positive visible lengths without claiming hidden-byte visibility. Assert native-handle cleanup and Spin completion signalling using observable results, never synthetic wire-frame visibility. |
 | Header fidelity | Axum/Fastly/Spin preserve repeated outbound request field lines and exercise raw malformed response nomination/encoding lines. Cloudflare tests request list semantics and the visible response-string baseline without asserting unavailable octets/line boundaries. Cloudflare encoded passthrough uses `EncodeBody::Manual`; its streamed downstream `Content-Length` is asserted only to the documented BestEffort scope. |
-| Decoder integration | Each adapter uses the shared decoder/carrier/deadline pipeline; gzip/br stalls before output, midstream, and after codec completion but before native EOF produce attributed 504 rather than hanging or degrading to 502/500. Exercise both Buffered and Streamed modes, multi-member gzip/cumulative caps, trailing data, and late typed source/completion errors. No guard disarm or Spin caller-result success occurs solely because a decoder reached its end marker. |
+| Decoder integration | Each adapter uses the shared decoder/carrier/deadline pipeline; gzip/deflate/br stalls before output, midstream, and after codec completion but before native EOF produce attributed 504 rather than hanging or degrading to 502/500. Exercise both Buffered and Streamed modes, multi-member gzip/cumulative caps, trailing data, and late typed source/completion errors. No guard disarm or Spin caller-result success occurs solely because a decoder reached its end marker. |
 | Response-egress fallback | Every adapter uses the same live attempt for a bounded precommit fallback, preserves the original cause and fallback metadata, and never replaces a response after commit. |
 | Axum response-out scheduling | A connection-local `LocalSet` drives the private non-`Send` Hyper body without a blocking bridge. Raw-socket tests prove lazy frames, a zero-read client's independent deadline close, disconnect/drop handling, and deterministic collateral HTTP/1 pipeline attribution. |
 | Lazy response-out | Every adapter's local pump emits the first chunk before source EOF. Axum and Cloudflare have target-appropriate proof and report Native. Fastly and Spin remain BestEffort pending the production-runtime evidence in footnotes 6/7. |
@@ -6448,7 +6467,7 @@ Each adapter crate tests its shipped conversion and classification seams.
 
 ### 5.3 Tier 3 — live host behavior
 
-- **Axum:** a loopback origin verifies real methods/bodies/headers, gzip/br decode stacks,
+- **Axum:** a loopback origin verifies real methods/bodies/headers, gzip/deflate/br decode stacks,
   bodyless responses, non-2xx pass-through, response stalls, upload stalls, cap errors,
   timeout provenance, and deterministic request/body/source future drop. HTTP/1 closure and
   HTTP/2 stream reset are tested separately; pooled-connection teardown and bounded origin
@@ -6461,7 +6480,7 @@ Each adapter crate tests its shipped conversion and classification seams.
   send-future cancellation, and early streamed-body drop, plus lazy streamed-response
   delivery. Use origins that keep sending or stall after the triggering result so the
   test distinguishes cancellation from normal EOF. In both Buffered and Streamed modes,
-  gzip/br decode exactly once and respect decompressed caps; unknown, parameterized,
+  gzip/deflate/br decode exactly once and respect decompressed caps; unknown, parameterized,
   stacked, and repeated visible encodings preserve the original wire bytes and visible
   encoding/length metadata through the portable policy. Pin the harness version and
   compatibility settings, including the production template's exact compatibility date/flags
@@ -6617,6 +6636,12 @@ Required gates for implementation changes:
 
 Version-specific behavior is a manifest contract, not merely a property of whichever lockfile
 was inspected. The implementation phases pin `async-compression = "=0.4.43"`,
+`compression-codecs = "=0.4.38"`, `compression-core = "=0.4.32"`,
+`flate2 = "=1.1.9"`, `miniz_oxide = "=0.8.9"`, `adler2 = "=2.0.1"`,
+`crc32fast = "=1.5.0"`, and `simd-adler32 = "=0.3.9"` for the shared
+gzip/deflate decoder graph. The fixed flate decoder charge and checksum/source contract are
+recorded in `docs/audits/2026-09-29-flate-decoder-memory-accounting.md` and enforced by the
+separate flate dependency audit.
 `reqwest = "=0.13.4"`, `worker = "=0.8.5"`, `spin-sdk = "=7.0.0"`, `fastly = "=0.13.1"`,
 `fastly-shared = "=0.13.1"`, `fastly-sys = "=0.13.1"`, and
 `log-fastly = "=0.13.1"` in the workspace manifests that own those dependencies, refresh
@@ -6749,7 +6774,7 @@ the durable anchors.
   `Body::from_stream` is the typed `EdgeError` constructor used by adapters,
   decoders, and deadline wrappers; `Body::from_external_stream` is the explicit
   arbitrary-error boundary and maps every source error to `internal`.
-- `src/compression.rs` keeps one shared gzip/br decoder implementation. An exact typed
+- `src/compression.rs` keeps one shared gzip/deflate/br decoder implementation. An exact typed
   carrier crosses the `io::Error`-based decoder boundary and restores the original
   `EdgeError`. Extend the helpers for concatenated gzip members, strict Brotli/trailing
   data handling, and native-EOF validation without losing buffered read-ahead or late
@@ -6832,7 +6857,7 @@ Adapter-specific work:
 
 - **Axum:** use the remaining `DispatchBudget` for reqwest's whole-operation timeout;
   race every streamed request-source pull and apply the absolute post-ready deadline
-  check before accepting chunk/EOF/error; disable reqwest auto gzip/br; use the shared
+  check before accepting chunk/EOF/error; disable reqwest auto gzip/deflate/br; use the shared
   decoder and normalization. Keep header fidelity Native.
 - **Cloudflare:** add the private `fetch_raw_with_signal` bridge using worker's existing
   JS/Web API re-exports. Set `encodeResponseBody: "manual"` and the guard's signal on the

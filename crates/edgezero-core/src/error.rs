@@ -17,6 +17,7 @@ use crate::response::{IntoResponse, response_with_body};
 #[non_exhaustive]
 pub enum BadGatewayDecodeReason {
     Brotli,
+    Deflate,
     Gzip,
     Json,
 }
@@ -771,6 +772,7 @@ mod tests {
     fn bad_gateway_decode_reason_is_not_serialized() {
         for reason in [
             BadGatewayDecodeReason::Brotli,
+            BadGatewayDecodeReason::Deflate,
             BadGatewayDecodeReason::Gzip,
             BadGatewayDecodeReason::Json,
         ] {
@@ -878,6 +880,7 @@ mod tests {
 
         for expected in [
             BadGatewayReason::Decode(BadGatewayDecodeReason::Brotli),
+            BadGatewayReason::Decode(BadGatewayDecodeReason::Deflate),
             BadGatewayReason::Decode(BadGatewayDecodeReason::Gzip),
             BadGatewayReason::Decode(BadGatewayDecodeReason::Json),
             BadGatewayReason::Protocol,

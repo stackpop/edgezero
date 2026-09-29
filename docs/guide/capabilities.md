@@ -269,16 +269,16 @@ Each `OutboundRequest` owns independent limits:
 | ---------------------------- | ---------------------------------------------------------------------------------------------- | ------- |
 | `max_request_body_bytes`     | Buffered or streamed request bytes                                                             | 8 MiB   |
 | `max_encoded_response_bytes` | Upstream transport bytes before decoding                                                       | Unset   |
-| `max_decoded_response_bytes` | Identity or EdgeZero-decoded gzip/Brotli output                                                | Unset   |
+| `max_decoded_response_bytes` | Identity or EdgeZero-decoded gzip/deflate/Brotli output                                         | Unset   |
 | `max_response_bytes`         | Final buffered response, including raw passthrough                                             | 1 MiB   |
 | `max_response_header_bytes`  | Adapter-visible upstream header name/value bytes before normalization, plus `x-edgezero-proxy` | Unset   |
 | `max_response_header_count`  | Adapter-visible upstream header fields before normalization, plus `x-edgezero-proxy`           | Unset   |
 | `max_brotli_window_bits`     | Brotli stream header checked before decoder allocation                                         | 24      |
-| `max_brotli_decoder_bytes`   | Pinned policy charge for Brotli decoder state                                                  | 32 MiB  |
+| `max_decoder_bytes`          | Pinned policy charge for Brotli/gzip/deflate decoder state                                      | 32 MiB  |
 | `max_chunk_bytes`            | Maximum emitted item size after decoding or passthrough                                        | Unset   |
 
 The encoded counter applies to every response path. The decoded counter applies to identity
-and gzip/Brotli data decoded by EdgeZero, but not to unknown, stacked, parameterized, or other
+and gzip/deflate/Brotli data decoded by EdgeZero, but not to unknown, stacked, parameterized, or other
 raw passthrough encodings. The final buffered cap is independent of both. This separation lets
 an application permit a larger raw body while keeping decoded expansion small.
 
@@ -298,9 +298,11 @@ that formula.
 ## Encoding Boundaries
 
 An application-provided request body is sent with its declared `Content-Encoding`; EdgeZero
-does not silently recompress it. Response decoding is automatic only for a single bare `gzip`
-or `br` coding. Multi-member gzip is drained through the final member and transport EOF.
-Unknown or compound codings remain encoded and retain `Content-Encoding`.
+does not silently recompress it. Response decoding is automatic only for a single bare `gzip`,
+`deflate`, or `br` coding. Multi-member gzip is drained through the final member and transport EOF.
+Unknown codings are typed as `Passthrough(Unsupported(token))`, compound codings as
+`Passthrough(Stacked)`, and malformed values as `Passthrough(Malformed)`; all remain encoded
+and retain `Content-Encoding`.
 
 Cloudflare has two separate manual-encoding controls. The outbound fetch requests raw encoded
 response bytes so EdgeZero can enforce transport and decode limits. When those bytes are later

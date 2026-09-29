@@ -220,6 +220,7 @@ pub fn response_egress_source_error_category(error: &EdgeError) -> &'static str 
         EdgeError::BadGateway { reason, .. } => match reason {
             BadGatewayReason::Decode(decode) => match decode {
                 BadGatewayDecodeReason::Brotli => "bad_gateway_decode_brotli",
+                BadGatewayDecodeReason::Deflate => "bad_gateway_decode_deflate",
                 BadGatewayDecodeReason::Gzip => "bad_gateway_decode_gzip",
                 BadGatewayDecodeReason::Json => "bad_gateway_decode_json",
             },
@@ -857,6 +858,13 @@ mod tests {
                     BadGatewayReason::Decode(BadGatewayDecodeReason::Brotli),
                 ),
                 "bad_gateway_decode_brotli",
+            ),
+            (
+                EdgeError::bad_gateway_with_reason(
+                    "private token=secret",
+                    BadGatewayReason::Decode(BadGatewayDecodeReason::Deflate),
+                ),
+                "bad_gateway_decode_deflate",
             ),
             (
                 EdgeError::internal(anyhow::anyhow!("private token=secret")),

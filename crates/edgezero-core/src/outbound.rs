@@ -27,7 +27,7 @@ use crate::http::{
 };
 use crate::time::{Deadline, MonotonicClock, MonotonicInstant};
 
-pub const DEFAULT_MAX_BROTLI_DECODER_BYTES: u64 = 32 * 1024 * 1024;
+pub const DEFAULT_MAX_DECODER_BYTES: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 pub const DEFAULT_OUTBOUND_REQUEST_BODY_BYTES: u64 = 8 * 1024 * 1024;
 /// Response header identifying the adapter that completed an outbound request.
@@ -46,10 +46,10 @@ pub struct OutboundRequest {
     deadline: Option<Deadline>,
     headers: HeaderMap,
     host_authority_override: Option<Authority>,
-    max_brotli_decoder_bytes: u64,
     max_brotli_window_bits: u8,
     max_chunk_bytes: Option<NonZeroU64>,
     max_decoded_response_bytes: Option<u64>,
+    max_decoder_bytes: u64,
     max_encoded_response_bytes: Option<u64>,
     max_request_body_bytes: u64,
     max_response_header_bytes: Option<u64>,
@@ -68,10 +68,10 @@ pub struct OutboundRequestParts {
     pub deadline: Option<Deadline>,
     pub headers: HeaderMap,
     pub host_authority_override: Option<Authority>,
-    pub max_brotli_decoder_bytes: u64,
     pub max_brotli_window_bits: u8,
     pub max_chunk_bytes: Option<NonZeroU64>,
     pub max_decoded_response_bytes: Option<u64>,
+    pub max_decoder_bytes: u64,
     pub max_encoded_response_bytes: Option<u64>,
     pub max_request_body_bytes: u64,
     pub max_response_header_bytes: Option<u64>,
@@ -744,7 +744,7 @@ impl OutboundRequest {
                 .host_authority_override
                 .map(validate_host_authority_override)
                 .transpose()?,
-            max_brotli_decoder_bytes: parts.max_brotli_decoder_bytes,
+            max_decoder_bytes: parts.max_decoder_bytes,
             max_brotli_window_bits: parts.max_brotli_window_bits,
             max_chunk_bytes: parts.max_chunk_bytes,
             max_decoded_response_bytes: parts.max_decoded_response_bytes,
@@ -879,7 +879,7 @@ impl OutboundRequest {
             deadline: self.deadline,
             headers: self.headers,
             host_authority_override: self.host_authority_override,
-            max_brotli_decoder_bytes: self.max_brotli_decoder_bytes,
+            max_decoder_bytes: self.max_decoder_bytes,
             max_brotli_window_bits: self.max_brotli_window_bits,
             max_chunk_bytes: self.max_chunk_bytes,
             max_decoded_response_bytes: self.max_decoded_response_bytes,
@@ -922,13 +922,6 @@ impl OutboundRequest {
 
     #[must_use]
     #[inline]
-    pub fn max_brotli_decoder_bytes(mut self, bytes: u64) -> Self {
-        self.max_brotli_decoder_bytes = bytes;
-        self
-    }
-
-    #[must_use]
-    #[inline]
     pub fn max_brotli_window_bits(mut self, bits: u8) -> Self {
         self.max_brotli_window_bits = bits;
         self
@@ -945,6 +938,13 @@ impl OutboundRequest {
     #[inline]
     pub fn max_decoded_response_bytes(mut self, bytes: u64) -> Self {
         self.max_decoded_response_bytes = Some(bytes);
+        self
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn max_decoder_bytes(mut self, bytes: u64) -> Self {
+        self.max_decoder_bytes = bytes;
         self
     }
 
@@ -1067,7 +1067,7 @@ impl OutboundRequest {
             deadline: None,
             headers: HeaderMap::new(),
             host_authority_override: None,
-            max_brotli_decoder_bytes: DEFAULT_MAX_BROTLI_DECODER_BYTES,
+            max_decoder_bytes: DEFAULT_MAX_DECODER_BYTES,
             max_brotli_window_bits: 24,
             max_chunk_bytes: None,
             max_decoded_response_bytes: None,
@@ -1157,7 +1157,7 @@ pub async fn collect_response_stream(stream: BodyStream, max: u64) -> Result<Byt
 #[inline]
 pub fn enforce_payload_content_length(
     headers: &HeaderMap,
-    encoding: ContentEncoding,
+    encoding: &ContentEncoding,
     max_buffered_bytes: Option<u64>,
     max_decoded_bytes: Option<u64>,
     max_encoded_bytes: Option<u64>,
@@ -1177,12 +1177,12 @@ pub fn enforce_payload_content_length(
                 return Err(response_limit_error(ResponseLimitReason::BufferedBody));
             }
         }
-        ContentEncoding::Passthrough => {
+        ContentEncoding::Passthrough(_) => {
             if max_buffered_bytes.is_some_and(|max| length > max) {
                 return Err(response_limit_error(ResponseLimitReason::BufferedBody));
             }
         }
-        ContentEncoding::Brotli | ContentEncoding::Gzip => {}
+        ContentEncoding::Brotli | ContentEncoding::Deflate | ContentEncoding::Gzip => {}
     }
     Ok(())
 }
@@ -1690,7 +1690,7 @@ mod tests {
     use futures_util::{StreamExt as _, stream};
 
     use crate::body::Body;
-    use crate::compression::{ContentEncoding, classify_content_encoding};
+    use crate::compression::{ContentEncoding, PassthroughReason, classify_content_encoding};
     use crate::error::{
         BadGatewayDecodeReason, BadGatewayReason, BudgetSource, EdgeError, ResponseLimitReason,
     };
@@ -2450,7 +2450,7 @@ mod tests {
         headers.append("content-length", HeaderValue::from_static("11"));
         let error = enforce_payload_content_length(
             &headers,
-            ContentEncoding::Identity,
+            &ContentEncoding::Identity,
             Some(20),
             Some(10),
             Some(20),
@@ -2471,7 +2471,7 @@ mod tests {
         headers.append("content-length", HeaderValue::from_static("15"));
         enforce_payload_content_length(
             &headers,
-            ContentEncoding::Passthrough,
+            &ContentEncoding::Passthrough(PassthroughReason::Unsupported(String::from("zstd"))),
             Some(20),
             Some(10),
             Some(20),
@@ -2480,7 +2480,7 @@ mod tests {
 
         let error = enforce_payload_content_length(
             &headers,
-            ContentEncoding::Passthrough,
+            &ContentEncoding::Passthrough(PassthroughReason::Unsupported(String::from("zstd"))),
             Some(14),
             Some(100),
             Some(20),
@@ -2501,7 +2501,7 @@ mod tests {
         headers.append("content-length", HeaderValue::from_static("21"));
         let error = enforce_payload_content_length(
             &headers,
-            ContentEncoding::Identity,
+            &ContentEncoding::Identity,
             Some(30),
             Some(30),
             Some(20),
@@ -2521,7 +2521,7 @@ mod tests {
                 "content-length",
                 HeaderValue::from_bytes(value.as_bytes()).expect("header"),
             );
-            enforce_payload_content_length(&headers, ContentEncoding::Identity, None, None, None)
+            enforce_payload_content_length(&headers, &ContentEncoding::Identity, None, None, None)
                 .expect_err("malformed content-length");
         }
     }
@@ -2531,7 +2531,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.append("content-length", HeaderValue::from_static("100"));
         for encoding in [ContentEncoding::Brotli, ContentEncoding::Gzip] {
-            enforce_payload_content_length(&headers, encoding, Some(1), Some(1), Some(100))
+            enforce_payload_content_length(&headers, &encoding, Some(1), Some(1), Some(100))
                 .expect("wire length is not output length");
         }
     }
@@ -2879,7 +2879,7 @@ mod tests {
             .expect("invalid encoding sibling must remain visible to classification");
         assert_eq!(
             classify_content_encoding(&ambiguous_encoding),
-            ContentEncoding::Passthrough
+            ContentEncoding::Passthrough(PassthroughReason::Stacked)
         );
         assert_eq!(
             ambiguous_encoding
@@ -3220,7 +3220,7 @@ mod tests {
             .expect("header")
             .host_authority_override("[2001:db8::1]:8443")
             .expect("authority override")
-            .max_brotli_decoder_bytes(40 * 1024 * 1024)
+            .max_decoder_bytes(40 * 1024 * 1024)
             .max_brotli_window_bits(23)
             .max_chunk_bytes(NonZeroU64::new(4096).expect("nonzero"))
             .max_decoded_response_bytes(2_000_000)
@@ -3251,7 +3251,7 @@ mod tests {
             parts.headers.get("x-test"),
             Some(&HeaderValue::from_static("one"))
         );
-        assert_eq!(parts.max_brotli_decoder_bytes, 40 * 1024 * 1024);
+        assert_eq!(parts.max_decoder_bytes, 40 * 1024 * 1024);
         assert_eq!(parts.max_brotli_window_bits, 23);
         assert_eq!(parts.max_chunk_bytes.map(NonZeroU64::get), Some(4096));
         assert_eq!(parts.max_decoded_response_bytes, Some(2_000_000));
@@ -3281,7 +3281,7 @@ mod tests {
         let defaults = OutboundRequest::get("https://example.com")
             .expect("defaults")
             .into_parts();
-        assert_eq!(defaults.max_brotli_decoder_bytes, 0x0200_0000);
+        assert_eq!(defaults.max_decoder_bytes, 0x0200_0000);
         assert_eq!(defaults.max_brotli_window_bits, 24);
         assert_eq!(defaults.max_request_body_bytes, 0x0080_0000);
         assert_eq!(defaults.cache_policy, OutboundCachePolicy::PlatformDefault);

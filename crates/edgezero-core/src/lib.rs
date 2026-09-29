@@ -51,8 +51,9 @@ pub mod time;
 
 pub use body::{Body, BodyStream};
 pub use compression::{
-    BROTLI_DECODER_FIXED_CHARGE_BYTES, ContentEncoding, brotli_decoder_memory_charge,
-    classify_content_encoding, decode_brotli_stream, decode_gzip_stream,
+    BROTLI_DECODER_FIXED_CHARGE_BYTES, ContentEncoding, FLATE_DECODER_FIXED_CHARGE_BYTES,
+    PassthroughReason, brotli_decoder_memory_charge, classify_content_encoding,
+    decode_brotli_stream, decode_deflate_stream, decode_gzip_stream,
 };
 pub use config_store::{
     BoundedStoreRead, ConfigExtractionLimits, DEFAULT_CONFIG_BACKEND_BYTES,
@@ -78,15 +79,15 @@ pub use manifest::{
     canonicalize_outbound_host,
 };
 pub use outbound::{
-    DEFAULT_MAX_BROTLI_DECODER_BYTES, DEFAULT_MAX_RESPONSE_BYTES,
-    DEFAULT_OUTBOUND_REQUEST_BODY_BYTES, HttpClient, OutboundBatch, OutboundBatchDriverEvent,
-    OutboundBatchFailure, OutboundBatchItem, OutboundBatchNext, OutboundBatchResults,
-    OutboundBatchTermination, OutboundCachePolicy, OutboundHttpClient, OutboundRequest,
-    OutboundRequestParts, OutboundResponse, OutboundSlotResult, PROXY_HEADER,
-    ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode, collect_response_stream,
-    collect_response_stream_until_with_clock, enforce_payload_content_length, insert_proxy_header,
-    limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch, normalize_response_headers,
-    rechunk_stream, validate_for_dispatch,
+    DEFAULT_MAX_DECODER_BYTES, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_OUTBOUND_REQUEST_BODY_BYTES,
+    HttpClient, OutboundBatch, OutboundBatchDriverEvent, OutboundBatchFailure, OutboundBatchItem,
+    OutboundBatchNext, OutboundBatchResults, OutboundBatchTermination, OutboundCachePolicy,
+    OutboundHttpClient, OutboundRequest, OutboundRequestParts, OutboundResponse,
+    OutboundSlotResult, PROXY_HEADER, ResponseBodyDisposition, ResponseHeaderLimiter, ResponseMode,
+    collect_response_stream, collect_response_stream_until_with_clock,
+    enforce_payload_content_length, insert_proxy_header, limit_decoded_stream,
+    limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
+    validate_for_dispatch,
 };
 pub use platform::{
     HostIngressMemoryAccounting, InboundRequestPopulationBound, MemoryCeiling, MemoryCeilingScope,

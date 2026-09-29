@@ -13,7 +13,7 @@ use async_stream::stream as async_body_stream;
 use axum::Router;
 use axum::body::Body;
 use axum::http::HeaderValue;
-use axum::http::header::{CACHE_CONTROL, CONTENT_ENCODING, HOST, SET_COOKIE};
+use axum::http::header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, HOST, SET_COOKIE};
 use axum::response::Response;
 use axum::routing::get;
 use bytes::Bytes;
@@ -23,11 +23,11 @@ use edgezero_core::error::{BadGatewayReason, BudgetSource, EdgeError, ResponseLi
 use edgezero_core::http::{HeaderMap, Method, StatusCode};
 use edgezero_core::time::Deadline;
 use edgezero_core::{
-    OutboundBatchNext, OutboundBatchTermination, OutboundCachePolicy, OutboundHttpClient as _,
-    OutboundRequest, PROXY_HEADER,
+    FLATE_DECODER_FIXED_CHARGE_BYTES, OutboundBatchNext, OutboundBatchTermination,
+    OutboundCachePolicy, OutboundHttpClient as _, OutboundRequest, PROXY_HEADER,
 };
 use flate2::Compression;
-use flate2::write::GzEncoder;
+use flate2::write::{GzEncoder, ZlibEncoder};
 use futures_util::stream;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
@@ -36,6 +36,12 @@ fn gzip(input: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(input).expect("gzip input");
     encoder.finish().expect("gzip output")
+}
+
+fn zlib(input: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(input).expect("deflate input");
+    encoder.finish().expect("deflate output")
 }
 
 async fn start_origin(router: Router) -> String {
@@ -420,6 +426,64 @@ async fn encoded_and_decoded_limits_report_independent_origins() {
         encoded_error,
         EdgeError::ResponseTooLarge {
             reason: ResponseLimitReason::EncodedBody,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn deflate_response_is_decoded_stripped_and_bounded() {
+    let decoded = vec![b'd'; 4_096];
+    let encoded = zlib(&decoded);
+    let origin_body = encoded.clone();
+    let origin = start_origin(Router::new().route(
+        "/",
+        get(move || {
+            let bytes = origin_body.clone();
+            async move {
+                Response::builder()
+                    .header(CONTENT_ENCODING, "deflate")
+                    .header(CONTENT_LENGTH, bytes.len())
+                    .body(Body::from(bytes))
+                    .expect("origin response")
+            }
+        }),
+    ))
+    .await;
+    let client = AxumOutboundClient::try_new().expect("client");
+
+    let response = client
+        .send(
+            OutboundRequest::get(format!("{origin}/"))
+                .expect("request")
+                .max_decoder_bytes(FLATE_DECODER_FIXED_CHARGE_BYTES)
+                .max_encoded_response_bytes(u64::try_from(encoded.len()).expect("encoded length"))
+                .max_decoded_response_bytes(u64::try_from(decoded.len()).expect("decoded length")),
+        )
+        .await
+        .expect("decoded response");
+    assert!(response.headers().get(CONTENT_ENCODING).is_none());
+    assert!(response.headers().get(CONTENT_LENGTH).is_none());
+    assert_eq!(
+        response
+            .into_bytes_bounded(u64::try_from(decoded.len()).expect("decoded length"))
+            .await
+            .expect("decoded body"),
+        decoded
+    );
+
+    let decoded_error = client
+        .send(
+            OutboundRequest::get(format!("{origin}/"))
+                .expect("request")
+                .max_decoded_response_bytes(128),
+        )
+        .await
+        .expect_err("decoded response must exceed its limit");
+    assert!(matches!(
+        decoded_error,
+        EdgeError::ResponseTooLarge {
+            reason: ResponseLimitReason::DecodedBody,
             ..
         }
     ));
