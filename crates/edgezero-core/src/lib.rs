@@ -90,7 +90,9 @@ pub use outbound::{
 };
 pub use platform::{
     HostIngressMemoryAccounting, InboundRequestPopulationBound, MemoryCeiling, MemoryCeilingScope,
-    MemoryEnvelope, PlatformFact, PlatformMetadata, PlatformResourceSource, PlatformUnknownReason,
+    MemoryEnvelope, MemoryEnvelopeValidation, MemoryEnvelopeValidationError, MemoryResource,
+    MemoryValidationIndeterminateReason, PlatformFact, PlatformMetadata, PlatformResourceSource,
+    PlatformUnknownReason,
 };
 pub use response_egress::{
     DEFAULT_RESPONSE_WRITE_BUDGET, DetachedResponseEgressDecision,

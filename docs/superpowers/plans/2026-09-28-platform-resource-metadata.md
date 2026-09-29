@@ -30,12 +30,12 @@
 - Modify: `crates/edgezero-core/src/platform.rs`
 - Modify: `crates/edgezero-core/src/lib.rs`
 
-- [ ] Add failing tests named `validation_fits_per_execution_with_counted_host_memory`, `validation_fits_per_instance_with_host_memory_outside_ceiling`, `validation_reports_primary_or_stack_excess`, `validation_unknown_ceiling_is_indeterminate`, `validation_unknown_population_is_indeterminate`, `validation_unknown_host_accounting_is_indeterminate`, `validation_missing_published_stack_requirement_is_indeterminate`, `validation_known_minimum_excess_precedes_unknown_facts`, `validation_rejects_scope_mismatch`, `validation_rejects_primary_arithmetic_overflow`, `validation_rejects_unknown_population_lower_bound_overflow`, `validation_rejects_stack_shape_mismatch`, and `validation_rejects_non_unit_per_execution_population`.
-- [ ] Make zero population unrepresentable by requiring `NonZeroU32` in `InboundRequestPopulationBound::new`; test the constructor signature and round-trip a value of one rather than adding a runtime zero branch.
-- [ ] Run `cargo test --offline --locked -p edgezero-core platform::tests::validation_` and confirm failure because validation types and methods are absent.
-- [ ] Implement `MemoryEnvelopeValidation::{Fits, Exceeds, Indeterminate}`, typed indeterminate reasons, `MemoryEnvelopeValidationError`, and `PlatformMetadata::validate_memory_envelope`.
-- [ ] For unknown per-instance population, compute `fixed + per_request * 1` with checked arithmetic only as a lower-bound overflow proof; otherwise return `Indeterminate`. Check a separate stack allowance independently and require an explicit stack requirement before returning `Fits`.
-- [ ] Run `cargo test --offline --locked -p edgezero-core platform::tests::validation_` and `cargo test --offline --locked -p edgezero-core` until green.
+- [x] Add failing tests named `validation_fits_per_execution_with_counted_host_memory`, `validation_fits_per_instance_with_host_memory_outside_ceiling`, `validation_reports_primary_or_stack_excess`, `validation_unknown_ceiling_is_indeterminate`, `validation_unknown_population_is_indeterminate`, `validation_unknown_host_accounting_is_indeterminate`, `validation_missing_published_stack_requirement_is_indeterminate`, `validation_known_minimum_excess_precedes_unknown_facts`, `validation_rejects_scope_mismatch`, `validation_rejects_primary_arithmetic_overflow`, `validation_rejects_unknown_population_lower_bound_overflow`, `validation_rejects_stack_shape_mismatch`, and `validation_rejects_non_unit_per_execution_population`.
+- [x] Make zero population unrepresentable by requiring `NonZeroU32` in `InboundRequestPopulationBound::new`; test the constructor signature and round-trip a value of one rather than adding a runtime zero branch.
+- [x] Run `cargo test --offline --locked -p edgezero-core platform::tests::validation_` and confirm failure because validation types and methods are absent.
+- [x] Implement `MemoryEnvelopeValidation::{Fits, Exceeds, Indeterminate}`, typed indeterminate reasons, `MemoryEnvelopeValidationError`, and `PlatformMetadata::validate_memory_envelope`.
+- [x] For unknown per-instance population, compute `fixed + per_request * 1` with checked arithmetic only as a lower-bound overflow proof; otherwise return `Indeterminate`. Check a separate stack allowance independently and require an explicit stack requirement before returning `Fits`.
+- [x] Run `cargo test --offline --locked -p edgezero-core platform::tests::validation_` and `cargo test --offline --locked -p edgezero-core` until green.
 
 ### Task 3: Canonical adapter metadata hard cut
 
