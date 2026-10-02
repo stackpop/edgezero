@@ -11,7 +11,6 @@ use std::{
     task::Poll,
 };
 
-use anyhow::Context as _;
 #[cfg(feature = "test-utils")]
 use bytes::Bytes;
 
@@ -403,7 +402,7 @@ pub async fn dispatch(app: &App, req: SpinRequest) -> anyhow::Result<SpinRespons
 /// a Spin-compatible response, opening the KV store under `kv_label`.
 ///
 /// Injects all available stores into request extensions:
-/// - `ConfigStoreHandle` backed by `SpinConfigStore` opened on `kv_label`
+/// - `ConfigStoreHandle` backed by `SpinConfigStore` bound to `kv_label`
 ///   (KV-backed since 2026-Q3; was variables-backed before that). The
 ///   same label opens the config-store backend as the KV store on this
 ///   low-level path — registry-aware callers should use [`run_app`]
@@ -417,8 +416,8 @@ pub async fn dispatch(app: &App, req: SpinRequest) -> anyhow::Result<SpinRespons
 ///
 /// # Errors
 /// Returns [`anyhow::Error`] if KV open fails when the store is required,
-/// if the config-store open fails, if the request cannot be converted, if
-/// the router dispatch fails, or if response translation fails.
+/// if the request cannot be converted, if the router dispatch fails, or if
+/// response translation fails. Config opening occurs during extraction.
 #[inline]
 pub async fn dispatch_with_kv_label(
     app: &App,
@@ -436,7 +435,7 @@ async fn dispatch_with_kv_label_at(
     request_start: MonotonicInstant,
 ) -> anyhow::Result<SpinResponse> {
     let stores = Stores {
-        config_store: resolve_config_handle(kv_label).await?,
+        config_store: Some(config_handle(kv_label.to_owned())),
         kv: resolve_kv_handle(kv_label, false).await?,
         secrets: resolve_secret_handle(true),
         ..Default::default()
@@ -611,7 +610,7 @@ where
 /// - KV: **Multi** — each declared id opens its own [`SpinKvStore`] under the
 ///   label resolved from `EDGEZERO__STORES__KV__<ID>__NAME`. Optional
 ///   `EDGEZERO__STORES__KV__<ID>__MAX_LIST_KEYS` overrides the paging cap.
-/// - Config: **Multi** — each declared id opens its own [`SpinConfigStore`]
+/// - Config: **Multi** — each declared id binds its own [`SpinConfigStore`]
 ///   under the label resolved from `EDGEZERO__STORES__CONFIG__<ID>__NAME`.
 ///   KV-backed under the hood (was variables-backed up through 2026-Q2).
 /// - Secrets: **Single** — every declared id maps to the one shared
@@ -626,7 +625,7 @@ pub(crate) async fn dispatch_with_registries(
 ) -> anyhow::Result<SpinResponse> {
     let request_start = app.monotonic_now();
     let kv_registry = build_kv_registry(kv_meta, env).await?;
-    let config_registry = build_config_registry(config_meta, env).await?;
+    let config_registry = build_config_registry(config_meta, env);
     let secret_registry = build_secret_registry(secret_meta, env);
     dispatch_with_handles(
         app,
@@ -717,40 +716,25 @@ async fn build_kv_registry(
     Ok(StoreRegistry::from_parts(by_id, meta.default.to_owned()))
 }
 
-async fn build_config_registry(
+fn build_config_registry(
     config_meta: Option<StoreMetadata>,
     env: &EnvConfig,
-) -> anyhow::Result<Option<ConfigRegistry>> {
-    let Some(meta) = config_meta else {
-        return Ok(None);
-    };
-    // Spin is `Multi` for config (KV-backed): each declared id opens its
-    // own `key_value::Store` under the label resolved from
-    // `EDGEZERO__STORES__CONFIG__<ID>__NAME`. Mirrors `build_kv_registry`
-    // so missing `key_value_stores = [...]` declarations surface at
-    // dispatch setup, not on first config read.
-    // Preserve the `ConfigStoreError` as the anyhow source so the
-    // caller can downcast to distinguish `Internal` (structural —
-    // label not declared / registered) from `Unavailable` (transient
-    // hostcall failure). `with_context` chains rather than
-    // stringifying.
+) -> Option<ConfigRegistry> {
+    let meta = config_meta?;
+    // Bind every declared id without host calls. Opening inside `get_bounded`
+    // lets admission run first and subjects the open to extraction's deadline.
     let mut by_id: BTreeMap<String, ConfigStoreBinding> = BTreeMap::new();
     for id in meta.ids {
         let label = env.store_name("config", id);
-        let store = SpinConfigStore::open(label.clone())
-            .await
-            .with_context(|| format!("config store id `{id}` (label `{label}`) failed to open"))?;
         by_id.insert(
             (*id).to_owned(),
             ConfigStoreBinding {
-                handle: ConfigStoreHandle::new(Arc::new(store)),
+                handle: config_handle(label),
                 default_key: env.store_key("config", id),
             },
         );
     }
-    // Every id is required to open (any failure returns Err above), so
-    // `from_parts` is guaranteed to have the default id present.
-    Ok(StoreRegistry::from_parts(by_id, meta.default.to_owned()))
+    StoreRegistry::from_parts(by_id, meta.default.to_owned())
 }
 
 fn build_secret_registry(
@@ -775,15 +759,8 @@ fn build_secret_registry(
     StoreRegistry::from_parts(by_id, meta.default.to_owned())
 }
 
-async fn resolve_config_handle(label: &str) -> anyhow::Result<Option<ConfigStoreHandle>> {
-    // Low-level path (`dispatch` / `dispatch_with_kv_label`): open the
-    // KV-backed config store under the same label used for KV. Registry
-    // callers (`dispatch_with_registries`) use `build_config_registry`
-    // instead, which resolves per-id labels via env.
-    let store = SpinConfigStore::open(label.to_owned())
-        .await
-        .with_context(|| format!("low-level dispatch: open config store `{label}`"))?;
-    Ok(Some(ConfigStoreHandle::new(Arc::new(store))))
+fn config_handle(label: String) -> ConfigStoreHandle {
+    ConfigStoreHandle::new(Arc::new(SpinConfigStore::for_label(label)))
 }
 
 async fn resolve_kv_handle(kv_label: &str, kv_required: bool) -> anyhow::Result<Option<KvHandle>> {
@@ -999,9 +976,8 @@ mod synthesis_tests {
     /// Spec 12.7 / plan line 1526: `EDGEZERO__STORES__CONFIG__<ID>__KEY`
     /// must surface as `ConfigStoreBinding.default_key`.
     ///
-    /// `build_config_registry` calls `SpinConfigStore::open` which requires
-    /// the Spin executor and cannot be unit-tested here; this test exercises
-    /// the env-resolution layer that `build_config_registry` reads from.
+    /// `build_config_registry` binds labels without opening the host store;
+    /// this test exercises the env-resolution layer used by that builder.
     /// Platform-integration coverage relies on the E2 smoke scripts.
     #[test]
     fn config_default_key_env_override_resolved() {

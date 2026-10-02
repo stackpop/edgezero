@@ -134,7 +134,9 @@ guest futures against native timers. A timer wake is checked against the injecte
 when it arrives early. This bounds EdgeZero's return but does not prove host-side cancellation. Axum
 and Fastly provider operations are synchronous and guest-nonpreemptible. No provider operation is
 proved cancellable within a finite wall-clock interval, so every adapter reports `BestEffort` for
-`config-read-deadlines`. The
+`config-read-deadlines`. Spin opens declared config labels inside that timed read, after ingress
+admission; Cloudflare and Fastly retain failed declared bindings as typed failing handles rather
+than treating them as absent. The
 [configuration design](https://github.com/stackpop/edgezero/blob/main/docs/superpowers/specs/2026-06-16-blob-app-config.md#632-bounded-capability-scoped-extraction-reads)
 defines the normative accounting, cancellation, error, and promotion requirements.
 

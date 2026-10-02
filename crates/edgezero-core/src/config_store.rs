@@ -272,6 +272,28 @@ impl ConfigStoreError {
     }
 }
 
+/// Classification retained when a declared config store cannot be opened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigStoreOpenFailure {
+    /// The declared binding or store name is invalid or missing.
+    InvalidConfiguration,
+    /// The provider could not resolve or serve the declared binding.
+    Unavailable,
+}
+
+impl ConfigStoreOpenFailure {
+    fn as_error(self) -> ConfigStoreError {
+        match self {
+            Self::Unavailable => {
+                ConfigStoreError::unavailable("declared config store is unavailable")
+            }
+            Self::InvalidConfiguration => ConfigStoreError::internal(anyhow::anyhow!(
+                "declared config store could not be opened"
+            )),
+        }
+    }
+}
+
 /// Result of one bounded store lookup, including all bytes exposed to guest code.
 #[derive(Debug)]
 pub struct BoundedStoreRead<T> {
@@ -386,6 +408,15 @@ impl fmt::Debug for ConfigStoreHandle {
 }
 
 impl ConfigStoreHandle {
+    /// Keep a declared binding resolvable when its provider open fails.
+    ///
+    /// Provider diagnostics should be logged by the adapter, not stored in this handle.
+    #[inline]
+    #[must_use]
+    pub fn failed_open(failure: ConfigStoreOpenFailure) -> Self {
+        Self::new(Arc::new(FailedOpenConfigStore { failure }))
+    }
+
     /// Get a config value by key.
     ///
     /// # Errors
@@ -417,6 +448,34 @@ impl ConfigStoreHandle {
     #[inline]
     pub fn new(store: Arc<dyn ConfigStore>) -> Self {
         Self { store }
+    }
+}
+
+struct FailedOpenConfigStore {
+    failure: ConfigStoreOpenFailure,
+}
+
+#[async_trait(?Send)]
+impl ConfigStore for FailedOpenConfigStore {
+    async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+        Err(self.failure.as_error())
+    }
+
+    async fn get_bounded(
+        &self,
+        _key: &str,
+        clock: &MonotonicClock,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        finish_bounded_config_read(
+            Err(self.failure.as_error()),
+            clock,
+            deadline,
+            max_backend_bytes,
+            max_value_bytes,
+        )
     }
 }
 
@@ -670,6 +729,103 @@ mod tests {
         let handle = ConfigStoreHandle::new(Arc::new(FailingConfigStore));
         let err = block_on(handle.get("feature.checkout")).expect_err("expected backend error");
         assert!(matches!(err, ConfigStoreError::Unavailable { .. }));
+    }
+
+    #[test]
+    fn declared_failed_open_remains_resolvable_and_typed() {
+        use crate::store_registry::{ConfigStoreBinding, StoreRegistry};
+
+        let binding = ConfigStoreBinding {
+            handle: ConfigStoreHandle::failed_open(ConfigStoreOpenFailure::Unavailable),
+            default_key: "config".to_owned(),
+        };
+        let registry = StoreRegistry::from_parts(
+            [("primary".to_owned(), binding)].into(),
+            "primary".to_owned(),
+        )
+        .expect("declared binding remains registered");
+
+        assert_eq!(registry.ids().collect::<Vec<_>>(), vec!["primary"]);
+        let clock = MonotonicClock::default();
+        let error = block_on(
+            registry
+                .default()
+                .expect("default handle")
+                .handle
+                .get_bounded(
+                    "config",
+                    &clock,
+                    Deadline::after(Duration::from_secs(1)),
+                    1,
+                    1,
+                ),
+        )
+        .expect_err("failed open is not a missing key");
+        assert!(matches!(error, ConfigStoreError::Unavailable { .. }));
+    }
+
+    #[test]
+    fn failed_named_open_does_not_disappear_beside_healthy_default() {
+        use crate::store_registry::{ConfigStoreBinding, StoreRegistry};
+
+        let registry = StoreRegistry::from_parts(
+            [
+                (
+                    "default".to_owned(),
+                    ConfigStoreBinding {
+                        handle: handle(&[("config", "ready")]),
+                        default_key: "config".to_owned(),
+                    },
+                ),
+                (
+                    "named".to_owned(),
+                    ConfigStoreBinding {
+                        handle: ConfigStoreHandle::failed_open(
+                            ConfigStoreOpenFailure::InvalidConfiguration,
+                        ),
+                        default_key: "config".to_owned(),
+                    },
+                ),
+            ]
+            .into(),
+            "default".to_owned(),
+        )
+        .expect("healthy default registry");
+
+        assert_eq!(registry.ids().collect::<Vec<_>>(), vec!["default", "named"]);
+        let clock = MonotonicClock::default();
+        let error = block_on(
+            registry
+                .named("named")
+                .expect("failed declared id remains present")
+                .handle
+                .get_bounded(
+                    "config",
+                    &clock,
+                    Deadline::after(Duration::from_secs(1)),
+                    1,
+                    1,
+                ),
+        )
+        .expect_err("named open failed");
+        assert!(matches!(error, ConfigStoreError::Internal { .. }));
+    }
+
+    #[test]
+    fn failed_open_bounded_read_preserves_deadline_precedence() {
+        let handle = ConfigStoreHandle::failed_open(ConfigStoreOpenFailure::InvalidConfiguration);
+        let clock = MonotonicClock::default();
+        let deadline = Deadline::at_instant(clock.now());
+        let error = block_on(handle.get_bounded("config", &clock, deadline, 1, 1))
+            .expect_err("expired deadline wins");
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+    }
+
+    #[test]
+    fn failed_open_structural_failure_is_typed() {
+        let handle = ConfigStoreHandle::failed_open(ConfigStoreOpenFailure::InvalidConfiguration);
+        let error = block_on(handle.get("config")).expect_err("open failure");
+        assert!(matches!(error, ConfigStoreError::Internal { .. }));
     }
 
     #[test]

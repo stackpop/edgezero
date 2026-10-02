@@ -3876,6 +3876,16 @@ fallback is centralised in `EnvConfig` so all four adapters
 share identical
 behaviour.
 
+A declared config id remains present in the registry when its provider binding
+cannot be opened. Cloudflare and Fastly retain a typed failing handle rather
+than dropping the id; extraction reports `BackendUnavailable` or
+`BackendFailure`, respectively, not `MissingRegistry` or `MissingBlob`.
+Provider diagnostics stay in adapter logs, not the public error message.
+Spin binds labels without opening them during dispatch. It opens the store
+inside `get_bounded`, after ingress admission and within the extraction timer
+race, so an unavailable or never-ready config open cannot block unrelated
+routes before admission. This bounds guest return, not provider cancellation.
+
 **Extractor consumption.** The extractor reads through the
 registry:
 

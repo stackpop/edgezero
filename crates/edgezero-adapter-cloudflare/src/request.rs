@@ -13,7 +13,7 @@ use std::{
 use bytes::Bytes;
 use edgezero_core::app::{App, StoreMetadata};
 use edgezero_core::body::Body;
-use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::config_store::{ConfigStoreHandle, ConfigStoreOpenFailure};
 use edgezero_core::context::RuntimeVariables;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
@@ -134,7 +134,7 @@ impl<'app> CloudflareService<'app> {
     ) -> Result<CfResponse, WorkerError> {
         let request_start = self.app.monotonic_now();
         let config_store = match self.config {
-            ConfigSource::Binding(binding) => open_config_or_warn(&env, &binding),
+            ConfigSource::Binding(binding) => Some(open_config_handle(&env, &binding)),
             ConfigSource::Handle(handle) => Some(handle),
             ConfigSource::None => None,
         };
@@ -732,23 +732,15 @@ fn build_config_registry(
     let mut by_id: BTreeMap<String, ConfigStoreBinding> = BTreeMap::new();
     for id in meta.ids {
         let binding_name = env_config.store_name("config", id);
-        if let Some(handle) = open_config_or_warn(env, &binding_name) {
-            by_id.insert(
-                (*id).to_owned(),
-                ConfigStoreBinding {
-                    handle,
-                    default_key: env_config.store_key("config", id),
-                },
-            );
-        }
-    }
-    let default_id = meta.default.to_owned();
-    if !by_id.contains_key(&default_id) {
-        log::warn!(
-            "config registry default id `{default_id}` could not be opened; dropping the config registry"
+        by_id.insert(
+            (*id).to_owned(),
+            ConfigStoreBinding {
+                handle: open_config_handle(env, &binding_name),
+                default_key: env_config.store_key("config", id),
+            },
         );
     }
-    StoreRegistry::from_parts(by_id, default_id)
+    StoreRegistry::from_parts(by_id, meta.default.to_owned())
 }
 
 fn build_kv_registry(
@@ -848,12 +840,12 @@ fn into_core_method(method: &Method) -> CoreMethod {
     })
 }
 
-fn open_config_or_warn(env: &Env, binding_name: &str) -> Option<ConfigStoreHandle> {
+fn open_config_handle(env: &Env, binding_name: &str) -> ConfigStoreHandle {
     match CloudflareConfigStore::from_env(env, binding_name) {
-        Ok(store) => Some(ConfigStoreHandle::new(Arc::new(store))),
+        Ok(store) => ConfigStoreHandle::new(Arc::new(store)),
         Err(err) => {
             warn_missing_config_binding_once(binding_name, &err.to_string());
-            None
+            ConfigStoreHandle::failed_open(ConfigStoreOpenFailure::Unavailable)
         }
     }
 }

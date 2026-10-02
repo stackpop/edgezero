@@ -5,7 +5,8 @@
 //! Spin KV API accepts arbitrary key bytes, so no `.→__` translation
 //! is needed. The per-id platform store name is supplied at construction
 //! by [`crate::request::build_config_registry`], which resolves it
-//! through `EDGEZERO__STORES__CONFIG__<ID>__NAME`.
+//! through `EDGEZERO__STORES__CONFIG__<ID>__NAME`. Opening occurs inside
+//! the bounded read, after ingress admission.
 
 use std::future::Future;
 #[cfg(test)]
@@ -34,13 +35,21 @@ enum SpinConfigBackend {
     #[cfg(test)]
     InMemory(BTreeMap<String, bytes::Bytes>),
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-    Spin {
-        label: String,
-        store: SpinSdkKvStore,
-    },
+    Label(String),
 }
 
 impl SpinConfigStore {
+    /// Bind a declared label without opening the platform store. Opening is
+    /// deferred until `get` or `get_bounded` so ingress can run first.
+    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+    #[inline]
+    #[must_use]
+    pub fn for_label(label: String) -> Self {
+        Self {
+            inner: SpinConfigBackend::Label(label),
+        }
+    }
+
     /// Build an in-memory fixture from `(key, bytes)` pairs.
     ///
     /// Bytes are stored verbatim — `get` strictly decodes UTF-8, mirroring
@@ -51,33 +60,6 @@ impl SpinConfigStore {
         Self {
             inner: SpinConfigBackend::InMemory(entries.into_iter().collect()),
         }
-    }
-
-    /// Open the platform store once. Called from
-    /// [`crate::request::build_config_registry`] during dispatch setup so
-    /// missing `key_value_stores = [...]` declarations surface as a clean
-    /// dispatch error instead of on first config read.
-    ///
-    /// # Errors
-    /// Returns [`ConfigStoreError::internal`] when the underlying
-    /// `SpinSdkKvStore::open` fails — typically because the label isn't
-    /// declared in the component's `key_value_stores = [...]` AND
-    /// registered with a backend in `runtime-config.toml`. This is a
-    /// structural / permanent failure (operator config drift), not a
-    /// transient backend hiccup, so we report `Internal` rather than
-    /// `Unavailable` so observability alerts on it and callers don't
-    /// retry pointlessly.
-    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-    #[inline]
-    pub async fn open(label: String) -> Result<Self, ConfigStoreError> {
-        let store = SpinSdkKvStore::open(&label).await.map_err(|err| {
-            ConfigStoreError::internal(anyhow::anyhow!(
-                "open `{label}`: {err} (is the label declared in spin.toml's `key_value_stores` AND registered in runtime-config.toml?)"
-            ))
-        })?;
-        Ok(Self {
-            inner: SpinConfigBackend::Spin { label, store },
-        })
     }
 }
 
@@ -97,17 +79,31 @@ impl ConfigStore for SpinConfigStore {
                 None => Ok(None),
             },
             #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-            SpinConfigBackend::Spin { label, store } => match store.get(key).await {
-                Ok(Some(bytes)) => String::from_utf8(bytes).map(Some).map_err(|err| {
-                    ConfigStoreError::unavailable(format!(
-                        "store `{label}`: non-utf8 value for `{key}`: {err}"
-                    ))
-                }),
-                Ok(None) => Ok(None),
-                Err(err) => Err(ConfigStoreError::unavailable(format!(
-                    "store `{label}`: {err}"
-                ))),
-            },
+            SpinConfigBackend::Label(label) => {
+                open_then_get(
+                    async {
+                        SpinSdkKvStore::open(label).await.map_err(|err| {
+                            ConfigStoreError::internal(anyhow::anyhow!(
+                                "open `{label}`: {err} (is the label declared in spin.toml's `key_value_stores` AND registered in runtime-config.toml?)"
+                            ))
+                        })
+                    },
+                    |store| async move {
+                        match store.get(key).await {
+                            Ok(Some(bytes)) => String::from_utf8(bytes).map(Some).map_err(|err| {
+                                ConfigStoreError::unavailable(format!(
+                                    "store `{label}`: non-utf8 value for `{key}`: {err}"
+                                ))
+                            }),
+                            Ok(None) => Ok(None),
+                            Err(err) => Err(ConfigStoreError::unavailable(format!(
+                                "store `{label}`: {err}"
+                            ))),
+                        }
+                    },
+                )
+                .await
+            }
         }
     }
 
@@ -129,6 +125,18 @@ impl ConfigStore for SpinConfigStore {
         )
         .await
     }
+}
+
+async fn open_then_get<Store, Open, Get, Read>(
+    open: Open,
+    get: Get,
+) -> Result<Option<String>, ConfigStoreError>
+where
+    Open: Future<Output = Result<Store, ConfigStoreError>>,
+    Get: FnOnce(Store) -> Read,
+    Read: Future<Output = Result<Option<String>, ConfigStoreError>>,
+{
+    get(open.await?).await
 }
 
 // Spin KV returns a complete value, so the byte bounds apply after host
@@ -279,6 +287,33 @@ mod tests {
             |_| ready(()),
         ))
         .expect_err("timer must terminate a pending config read");
+
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn bounded_read_timer_cancels_pending_store_open() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let guard = DropProbe(Arc::clone(&drops));
+        let opening = async move {
+            let _guard = guard;
+            pending::<Result<(), ConfigStoreError>>().await
+        };
+        let read = open_then_get(opening, |()| async {
+            panic!("lookup must not start before the store opens")
+        });
+        let (clock, deadline) = clock_reaching_deadline();
+
+        let error = block_on(bounded_config_read_with_timer(
+            read,
+            &clock,
+            deadline,
+            1,
+            1,
+            |_| ready(()),
+        ))
+        .expect_err("timer must terminate a pending store open");
 
         assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
         assert_eq!(drops.load(Ordering::SeqCst), 1);

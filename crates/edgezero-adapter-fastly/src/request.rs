@@ -9,7 +9,7 @@ use std::task::Poll;
 use bytes::Bytes;
 use edgezero_core::app::{App, StoreMetadata, StoresMetadata};
 use edgezero_core::body::Body;
-use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::config_store::{ConfigStoreHandle, ConfigStoreOpenFailure};
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 #[cfg(all(feature = "test-utils", target_arch = "wasm32"))]
@@ -167,13 +167,7 @@ impl<'app> FastlyService<'app> {
         let request_start = self.app.monotonic_now();
         let config_store = match self.config {
             ConfigSource::Handle(handle) => Some(handle),
-            ConfigSource::Name(name) => match FastlyConfigStore::try_open(&name) {
-                Ok(store) => Some(ConfigStoreHandle::new(Arc::new(store))),
-                Err(err) => {
-                    warn_missing_store_once(&name, &err.to_string());
-                    None
-                }
-            },
+            ConfigSource::Name(name) => Some(open_config_handle(&name)),
             ConfigSource::None => None,
         };
         let kv = match self.kv {
@@ -639,26 +633,25 @@ fn build_config_registry(
     let mut by_id: BTreeMap<String, ConfigStoreBinding> = BTreeMap::new();
     for id in meta.ids {
         let store_name = env.store_name("config", id);
-        match FastlyConfigStore::try_open(&store_name) {
-            Ok(store) => {
-                by_id.insert(
-                    (*id).to_owned(),
-                    ConfigStoreBinding {
-                        handle: ConfigStoreHandle::new(Arc::new(store)),
-                        default_key: env.store_key("config", id),
-                    },
-                );
-            }
-            Err(err) => warn_missing_store_once(&store_name, &err.to_string()),
-        }
-    }
-    let default_id = meta.default.to_owned();
-    if !by_id.contains_key(&default_id) {
-        log::warn!(
-            "config registry default id `{default_id}` could not be opened; dropping the config registry"
+        by_id.insert(
+            (*id).to_owned(),
+            ConfigStoreBinding {
+                handle: open_config_handle(&store_name),
+                default_key: env.store_key("config", id),
+            },
         );
     }
-    StoreRegistry::from_parts(by_id, default_id)
+    StoreRegistry::from_parts(by_id, meta.default.to_owned())
+}
+
+fn open_config_handle(store_name: &str) -> ConfigStoreHandle {
+    match FastlyConfigStore::try_open(store_name) {
+        Ok(store) => ConfigStoreHandle::new(Arc::new(store)),
+        Err(err) => {
+            warn_missing_store_once(store_name, &err.to_string());
+            ConfigStoreHandle::failed_open(ConfigStoreOpenFailure::InvalidConfiguration)
+        }
+    }
 }
 
 fn build_secret_registry(
