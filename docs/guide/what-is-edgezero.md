@@ -33,6 +33,7 @@ This architecture means you can:
 | ------------------- | ------------------------ | ------ |
 | Fastly Compute@Edge | `wasm32-wasip1`          | Stable |
 | Cloudflare Workers  | `wasm32-unknown-unknown` | Stable |
+| Fermyon Spin        | `wasm32-wasip2`          | Stable |
 | Axum/Tokio (native) | Native host              | Stable |
 
 ## Use Cases
