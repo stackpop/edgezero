@@ -82,9 +82,9 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
 
 This path takes bindings verbatim and does not resolve `EDGEZERO__STORES__*`
 selectors, so prefer `run_app` unless you are mocking a backend.
-`run_app` dispatches through an internal registry-based path; unlike Fastly's
-`dispatch_with_registries`, it is not part of the Cloudflare adapter's public
-API.
+`run_app` delegates to the public `dispatch_app::<A>` registry-aware path.
+Use [application retention](#retaining-an-application) with that function when the
+caller owns a prebuilt app and wants fresh per-request store bindings.
 
 ## Building
 
@@ -309,6 +309,44 @@ Configure the Cloudflare adapter in `edgezero.toml`. See [Configuration](/guide/
 | Storage           | KV, Durable Objects, R2  | KV Store, Object Store              |
 | Logging           | `console.log`            | Log endpoints                       |
 | CLI               | Wrangler                 | Fastly CLI                          |
+
+## Retaining an application
+
+For explicit retention, keep a cache owned by one concrete application and pass
+select its `Hooks` type on every fetch:
+
+```rust
+use edgezero_core::app::{App, Hooks};
+use std::sync::OnceLock;
+
+static APP: OnceLock<App> = OnceLock::new();
+
+#[worker::event(fetch)]
+async fn fetch(req: worker::Request, env: worker::Env, ctx: worker::Context)
+    -> worker::Result<worker::Response>
+{
+    edgezero_adapter_cloudflare::dispatch_app::<MyApp>(
+        APP.get_or_init(MyApp::build_app), req, env, ctx,
+    ).await
+}
+```
+
+Repeated response headers such as multiple `Set-Cookie` values are preserved;
+the first application value replaces any body-generated default. This correction
+also applies to existing `run_app` users.
+
+`dispatch_app::<MyApp>` reads `MyApp::stores()` and does not initialize logging
+or construct an app. Pass an app built from the same `Hooks` type. The caller owns
+initialization before construction. It resolves configuration and bindings for
+each invocation; never retain `Env`, `Context`, request bodies, or registries in
+this cache. The initializer is synchronous and must not recursively access the
+cache or block waiting for async initialization. Apps needing fallible or async
+initialization own that state machine and publish only a complete snapshot.
+
+Fetch invocations may overlap. Verify isolation while two requests are actually
+in flight in the same instance. A serialized test or two separate instances does
+not establish this property. Restore the existing `run_app` entry point to remove
+explicit retention. The generated default remains unchanged.
 
 ## Next Steps
 

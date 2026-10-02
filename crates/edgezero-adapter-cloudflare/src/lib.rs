@@ -17,11 +17,13 @@ pub mod proxy;
 pub mod request;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod response;
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+mod response_headers;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod secret_store;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-use edgezero_core::app::{Hooks, StoresMetadata};
+use edgezero_core::app::{App, Hooks, StoresMetadata};
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
@@ -106,11 +108,32 @@ pub async fn run_app<A: Hooks>(
     if !A::owns_logging() {
         drop(init_logger());
     }
+    let app = A::build_app();
+    dispatch_app::<A>(&app, req, env, ctx).await
+}
+
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+/// Dispatch a caller-owned app using `A::stores()` for fresh request bindings.
+///
+/// This does not build or cache an app or install logging. The caller must pass
+/// an app built from `A`; `App` erases its construction type, so this pairing
+/// remains a caller precondition. Retain only application-owned values and keep
+/// native handles and pending work request-local. Shared state must support
+/// overlapping invocations.
+///
+/// # Errors
+/// Returns conversion or dispatch errors from the existing adapter boundary.
+#[inline]
+pub async fn dispatch_app<A: Hooks>(
+    app: &App,
+    req: Request,
+    env: Env,
+    ctx: Context,
+) -> Result<Response, WorkerError> {
     let stores = A::stores();
     let env_config = env_config_from_worker(&env, stores);
-    let app = A::build_app();
     request::dispatch_with_registries(
-        &app,
+        app,
         req,
         env,
         ctx,

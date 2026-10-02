@@ -274,6 +274,10 @@ non-zero with a one-line diagnostic on error.
 
 ### edgezero config validate
 
+`config validate` checks every adapter declared in the manifest and compiled
+into this CLI. With `--strict`, it checks that adapter set's capability limits.
+Spin secret-reference validation reports fields and rules without printing values.
+
 Validate `edgezero.toml` together with the typed `<name>.toml` app
 config (see [Application config](/guide/configuration#application-config)).
 
@@ -307,6 +311,10 @@ app-demo-cli config validate --strict
 **Exit codes:** `0` on success, non-zero with a one-line diagnostic on the first failure (the loader / validator returns early at the first mismatch).
 
 ### edgezero config push
+
+`--adapter <name>` is case-insensitive and limits adapter-specific checks to
+`<name>`. Shared schema and secret-presence checks still apply. A passing push
+does not prove portability; run `config validate --strict` in CI for that.
 
 Push the resolved `<name>.toml` app-config into the target adapter's
 config store (spec §13). Same dispatch shape as the other commands:
@@ -379,6 +387,10 @@ A successful non-dry-run push also emits `pushed-key=<key>` and
 `pushed-store=<logical-store-id>` for wrappers to capture.
 
 ### edgezero config diff
+
+`--adapter <name>` is case-insensitive and limits adapter-specific checks to
+`<name>`. Shared schema and secret-presence checks still apply. A passing push
+does not prove portability; run `config validate --strict` in CI for that.
 
 Show what `config push` _would_ change: builds the local blob envelope
 from your typed `<name>.toml` and compares it against the remote (or

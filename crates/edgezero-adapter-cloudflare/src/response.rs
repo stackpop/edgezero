@@ -1,3 +1,4 @@
+use crate::response_headers::copy_headers;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::Response;
@@ -9,8 +10,8 @@ use worker::{Error as WorkerError, Response as CfResponse};
 /// # Errors
 /// Returns an [`EdgeError`] if the response body cannot be materialised
 /// into a Workers response (empty body construction failure, byte body
-/// conversion failure, stream adoption failure) or if any response
-/// header is non-UTF-8 and the Workers header table rejects it.
+/// conversion failure, stream adoption failure) or the Workers header table
+/// rejects a text header. Non-text header values are skipped.
 #[inline]
 pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
     let (parts, body) = response.into_parts();
@@ -33,13 +34,14 @@ pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
 
     let mut cf_response = body_response.with_status(parts.status.as_u16());
     let headers = cf_response.headers_mut();
-    for (name, value) in &parts.headers {
-        if let Ok(value_str) = value.to_str() {
-            headers
-                .set(name.as_str(), value_str)
-                .map_err(EdgeError::internal)?;
+    copy_headers(&parts.headers, |name, value, replace| {
+        if replace {
+            headers.set(name, value)
+        } else {
+            headers.append(name, value)
         }
-    }
+    })
+    .map_err(EdgeError::internal)?;
     Ok(cf_response)
 }
 
