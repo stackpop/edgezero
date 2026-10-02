@@ -212,6 +212,7 @@ main() {
 
   require_linux_x86_64
   require_cmd cargo
+  require_cmd rustc
   require_cmd rustup
   require_cmd jq
   require_cmd tar
@@ -280,10 +281,20 @@ main() {
   if [[ -z "$cached_target_dir" ]]; then
     reset_owned_dir "$build_target_dir" "$runner_temp"
   fi
-  run_untrusted CARGO_TARGET_DIR="$build_target_dir" cargo +"$rust_toolchain" build \
-    --locked --release -p "$cli_package" --bin "$cli_bin"
 
-  local bin_path="$build_target_dir/release/$cli_bin"
+  # Name the native target explicitly. A command-line `--target` overrides any
+  # `build.target` the application configures (adapter scaffolds set a WASM one),
+  # and it fixes Cargo's output path. Without it, a configured target sends the
+  # fresh executable to `<triple>/release` while a restored cache can still hold
+  # an older root-level `release/$cli_bin`, which would then be packaged.
+  local host_triple
+  host_triple=$(rustc +"$rust_toolchain" -vV | sed -n 's/^host: //p') ||
+    fail "could not query the Rust host triple"
+  [[ -n "$host_triple" ]] || fail "could not determine the Rust host triple"
+  run_untrusted CARGO_TARGET_DIR="$build_target_dir" cargo +"$rust_toolchain" build \
+    --locked --release --target "$host_triple" -p "$cli_package" --bin "$cli_bin"
+
+  local bin_path="$build_target_dir/$host_triple/release/$cli_bin"
   [[ -x "$bin_path" ]] || fail "build did not produce an executable at $bin_path"
   run_untrusted "$bin_path" --help >/dev/null 2>&1 || fail "built CLI '$cli_bin' did not run '$cli_bin --help'"
 
