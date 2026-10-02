@@ -9,3 +9,6 @@ fixture-core.workspace = true
 edgezero-core.workspace = true
 edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 anyhow = "1"
+
+[lints]
+workspace = true

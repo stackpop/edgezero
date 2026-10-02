@@ -5,10 +5,10 @@ normal generated entry points. Run from the repository root:
 
 ```sh
 cargo test --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-harness -p fixture-core
-./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke --require-runtime
-./scripts/smoke_test_reusable_app.sh --adapter cloudflare --suite smoke --require-runtime
-./scripts/smoke_test_reusable_app.sh --adapter spin --suite smoke --require-runtime
-./scripts/smoke_test_reusable_app.sh --adapter axum --suite smoke --require-runtime
+./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke
+./scripts/smoke_test_reusable_app.sh --adapter cloudflare --suite smoke
+./scripts/smoke_test_reusable_app.sh --adapter spin --suite smoke
+./scripts/smoke_test_reusable_app.sh --adapter axum --suite smoke
 ```
 
 The driver is the native Rust `fixture-harness` crate. Its HTTP clients, controlled
@@ -50,12 +50,12 @@ With the pinned Viceroy installed, run a small synthetic comparison:
 
 ```sh
 ./scripts/smoke_test_reusable_app.sh --adapter fastly --suite benchmark \
-  --requests 20 --repetitions 1 --construction-rounds 10000 --require-runtime
+  --requests 20 --repetitions 1 --construction-rounds 10000
 ```
 
 The reported evidence directory contains `events.jsonl` and `summary.json`.
 For matched probe responses, inspect `guest.instance`, `guest.ordinal`,
-`guest.builds`, and `guest.configures`:
+`guest.builds`, `guest.configures`, and `guest.shared`:
 
 - A: a new instance, ordinal 1, and one build on every request.
 - B: the same instance can have ordinal 2 and two builds.
@@ -64,20 +64,28 @@ For matched probe responses, inspect `guest.instance`, `guest.ordinal`,
 Compare B and C's reused-request latency to see the construction cost being
 removed. The extra JSON parsing deliberately makes that cost visible; it is not
 a prediction of an application's production performance. Token, path, and body
-checks confirm that each request still sees its own data.
+checks confirm that each request still sees its own data. Shared state equals the
+ordinal in retained probe sequences and one in per-request modes.
 
 For production code, read `serve_app_with_request_extensions` in the Fastly
 adapter: it owns one app and performs request setup inside the SDK callback.
 Cloudflare and Spin instead expose `dispatch_app` and let the caller retain a
 concrete app. Axum already retains its app. Existing entry points keep their
-current behavior until an application explicitly adopts retention.
+lifecycle defaults until an application explicitly adopts retention. The
+Cloudflare header correction also affects the default response conversion.
+
+Builds use `$CARGO` (falling back to `cargo`) and pin `CARGO_TARGET_DIR` to this
+workspace's `target/`, regardless of external Cargo target-dir settings. Update
+this workspace's lockfile alongside the root and app-demo lockfiles when bumping
+shared dependencies, and keep its Fastly SDK requirement aligned with the root.
 
 Select executables with `VICEROY_BIN`, `WORKER_BUILD_BIN`, `WRANGLER_BIN`, and
 `SPIN_BIN`. Install tools explicitly; the runner never deploys or installs them.
-Worker's build command also uses `worker-build` through PATH; select the same
-binary there. The inspected worker-build 0.8.5 passes a flag unsupported by the
-locked wasm-bindgen 0.2.122 CLI. Worker-build 0.8.3 successfully builds this fixture.
-The checked-in Worker compatibility date is supported by the inspected local host.
+Use a worker-build version compatible with the locked wasm-bindgen CLI
+(worker-build 0.8.3 is compatible with the current lockfile). The runner builds
+once with the selected `WORKER_BUILD_BIN`, then starts Wrangler with a snapshot
+that disables automatic rebuilding. Axum's executable path is read from Cargo's
+artifact output, so configured build targets cannot select a stale default binary.
 
 The runner binds loopback servers, uses synthetic values, seeds only local stores,
 and creates an ignored `.runs/<unique-id>` directory. An explicit `--output` must
@@ -108,14 +116,14 @@ preservation and isolation rather than merely setting a constant header.
 - B: `Serve`, once-only logging, app construction on each callback.
 - C: production retained-app helper.
 - Custom A/B/C: EdgeZero `lifecycle::run_custom` / `serve_custom` and `Sandbox<App>`
-  own the serving boundary and successful-only initialization. Arm B uses a fresh
+  own the serving boundary and successful-only initialization. Per-request mode uses a fresh
   state slot per callback; C uses the retained slot. Raw request mutation/conversion, response-extension finalization,
   appended headers, progressive stream pumping with explicit flush/finish, and
   completed post-send work.
 
 ```sh
-./scripts/smoke_test_reusable_app.sh --adapter fastly --suite benchmark --require-runtime
-./scripts/smoke_test_reusable_app.sh --adapter fastly --suite benchmark --construction-rounds 10000 --require-runtime
+./scripts/smoke_test_reusable_app.sh --adapter fastly --suite benchmark
+./scripts/smoke_test_reusable_app.sh --adapter fastly --suite benchmark --construction-rounds 10000
 ```
 
 Defaults are three repetitions of 100 probes per variant, with randomized order
@@ -136,69 +144,24 @@ keys from an observed guest service ID and distinguish `fixture-logs ::` endpoin
 records from echoed stdout. The negative control verifies that naively wrapping
 `run_app` with an enabled global logger fails on its second installation.
 
-## Local evidence and remaining limitations
+## Runtime and measurement limits
 
-Observed with Viceroy 0.17.0: A/B/C guest reuse and initialization distinctions,
-custom streaming, duplicate cookies, binding reads, and later named-endpoint log
-receipt pass. Configured limit 10 does not guarantee ten callbacks; observed
-guests can terminate earlier. The repeated expensive-construction run completed
-300 matched probes per variant. Raw run artifacts are intentionally not committed.
+The pinned Viceroy 0.17.0 admits at most six requests per guest: one initial
+request plus five `next_request` accepts. Raising `--max-requests` cannot extend
+that local host ceiling. Verify deployed eviction and long-lived memory behavior
+separately. The runner checks the Viceroy version against `.tool-versions` and
+reports a mismatch as unverified.
 
-Axum's retained app and overlapping-request isolation pass. Its store files are
-isolated under the run directory.
+Cloudflare and Spin may select different guests during overlap or recovery tests;
+those observations are unverified. A success requires the same instance and the
+specific injected failure. `max_inflight` is a guest-lifetime high-water mark;
+overlap checks use the current `before.inflight` observations for the tested pair.
 
-With Wrangler 4.83.0 and worker-build 0.8.3, sequential retention, binding reads,
-same-instance overlap, and duplicate cookies pass in both modes. Verification
-found an existing header-conversion bug: repeated values overwrote each other.
-The converter now replaces each generated header default once, then appends
-additional application values. This focused fix applies to default and retained
-entry points; it does not enable retention by default.
-
-Spin 4.0.0 demonstrates sequential reuse and overlapping requests in the same
-retained instance. A run may still select separate instances; the runner reports
-that run as unverified. The selected runtime's help is saved with its evidence;
-the inspected version exposes no explicit request-reuse or callback-concurrency
-control, so the fixture uses its defaults.
-
-The final all-provider smoke run also passed injected required-binding recovery
-in the same retained guest on Cloudflare and Spin. It exited 2 because Spin's
-per-request overlap control selected different guests on all three attempts;
-retained-mode overlap passed. This is incomplete observation, not an assertion
-failure or evidence that the host cannot overlap requests.
-
-### Matched local measurements
-
-Both runs below used three repetitions of 100 probes per variant, seed 856,
-release builds, and a configured request limit of 10. Standard and custom paths
-are separate comparisons. Values are client completion p50 in milliseconds for
-reused guests; each cell contains 249 samples. Each variant also has 51 cold
-samples (A has 300 cold samples and no reused samples).
-
-| Construction                                        | Standard B | Standard C | Custom B | Custom C |
-| --------------------------------------------------- | ---------: | ---------: | -------: | -------: |
-| Cheap (`--construction-rounds 0`)                   |      0.232 |      0.197 |    0.225 |    0.194 |
-| Synthetic expensive (`--construction-rounds 10000`) |      7.698 |      0.208 |    7.667 |    0.204 |
-
-Evidence directories: `18d5774746f44488-d6d5-0` and
-`18d57754ea36d748-e01c-0`. B rebuilt on each callback; C initialized once per
-observed guest. The observed guest span was at most six requests despite the
-configured limit of ten. Rounded heap snapshots peaked at 2 MiB and showed zero
-change over these spans. The synthetic result demonstrates removal of fixture
-construction work; it does not predict another application's gain. Small cheap
-workload differences and SDK CPU samples are not production performance claims.
-
-The longer-limit run (`18d57768669e26e8-ebd5-0`) completed 300 probes per variant
-with `--max-requests 100` and exited 0. The host still admitted at most six
-requests per observed guest. Retained standard and custom samples again peaked
-at 2 MiB with zero observed change. Thus the larger configured limit did not
-provide a longer per-instance memory observation; long-lived growth remains
-unverified in this environment.
-
-The ceiling is explained by Viceroy 0.17.0's `session.rs`: its
-`NEXT_REQ_ACCEPT_MAX` constant permits five subsequent requests after the first.
-The installed CLI and local-server configuration expose no override. A larger
-SDK limit cannot extend this host ceiling. A patched host would be a separate,
-instrumented experiment and would not establish deployed reuse behavior.
+Quantiles summarize successful matched probes only. Health replies and injected
+errors are excluded. Each cohort includes per-repetition sample counts and
+quantiles so changes between repetitions remain visible. Pooled quantiles alone
+are not a variance estimate or evidence of production gains. Rounded memory
+snapshots over short guest lifetimes cannot establish absence of small leaks.
 
 ## Failure and measurement evidence
 
@@ -231,7 +194,7 @@ A larger, still bounded observation run can use:
 
 ```sh
 ./scripts/smoke_test_reusable_app.sh --adapter fastly --suite benchmark \
-  --requests 300 --repetitions 1 --max-requests 100 --require-runtime
+  --requests 300 --repetitions 1 --max-requests 100
 ```
 
 `--max-requests` defaults to 10 and accepts 1–1000. Host eviction can shorten any

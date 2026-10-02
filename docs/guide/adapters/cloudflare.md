@@ -248,15 +248,10 @@ Configure the Cloudflare adapter in `edgezero.toml`. See [Configuration](/guide/
 | Logging           | `console.log`            | Log endpoints                       |
 | CLI               | Wrangler                 | Fastly CLI                          |
 
-## Next Steps
-
-- Learn about [Fastly Compute](/guide/adapters/fastly) as an alternative
-- Explore the [Axum adapter](/guide/adapters/axum) for local development
-
 ## Retaining an application
 
 For explicit retention, keep a cache owned by one concrete application and pass
-its store metadata on every fetch:
+select its `Hooks` type on every fetch:
 
 ```rust
 use edgezero_core::app::{App, Hooks};
@@ -268,13 +263,18 @@ static APP: OnceLock<App> = OnceLock::new();
 async fn fetch(req: worker::Request, env: worker::Env, ctx: worker::Context)
     -> worker::Result<worker::Response>
 {
-    edgezero_adapter_cloudflare::dispatch_app(
-        APP.get_or_init(MyApp::build_app), MyApp::stores(), req, env, ctx,
+    edgezero_adapter_cloudflare::dispatch_app::<MyApp>(
+        APP.get_or_init(MyApp::build_app), req, env, ctx,
     ).await
 }
 ```
 
-`dispatch_app` does not initialize logging or construct an app. The caller owns
+Repeated response headers such as multiple `Set-Cookie` values are preserved;
+the first application value replaces any body-generated default. This correction
+also applies to existing `run_app` users.
+
+`dispatch_app::<MyApp>` reads `MyApp::stores()` and does not initialize logging
+or construct an app. Pass an app built from the same `Hooks` type. The caller owns
 initialization before construction. It resolves configuration and bindings for
 each invocation; never retain `Env`, `Context`, request bodies, or registries in
 this cache. The initializer is synchronous and must not recursively access the
@@ -285,3 +285,8 @@ Fetch invocations may overlap. Verify isolation while two requests are actually
 in flight in the same instance. A serialized test or two separate instances does
 not establish this property. Restore the existing `run_app` entry point to remove
 explicit retention. The generated default remains unchanged.
+
+## Next Steps
+
+- Learn about [Fastly Compute](/guide/adapters/fastly) as an alternative
+- Explore the [Axum adapter](/guide/adapters/axum) for local development

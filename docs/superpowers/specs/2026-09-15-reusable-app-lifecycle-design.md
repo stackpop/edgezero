@@ -1,10 +1,28 @@
 # Opt-in reusable application lifecycle
 
-- **Status:** Proposed; implementation requires approval.
+- **Status:** Implemented; updated for PR #379 review.
 - **Date:** 2026-09-15
 - **Source baseline:** EdgeZero `593fc9282a1c56e12bae15f91eef2162f4b6a1b7`.
 - **Scope:** Core application ownership and the Fastly, Cloudflare, Spin, and Axum adapter surfaces, including custom dispatch, examples, documentation, and validation.
-- **Evidence:** Source inspection and provider documentation. No lifecycle experiment or performance result is claimed by this spec.
+- **Evidence:** Host contracts and local provider fixtures; deployed lifetimes and application performance remain unverified.
+
+The original private-helper design in §§8/9.1 is superseded by
+[the custom serving lifecycle plan](../plans/2026-09-17-custom-serving-lifecycle.md).
+The implemented `lifecycle::{Sandbox, serve_custom, run_custom}` surface, including
+its observation counters, is public. No provider-independent scheduler is added.
+
+### Included compatibility and CLI changes
+
+The following focused changes accompany retention and apply to existing users:
+
+- Cloudflare preserves repeated response headers, including every `Set-Cookie`;
+  its first application value replaces a body-generated default.
+- `config push` and `config diff` limit adapter-specific checks to the selected
+  adapter, case-insensitively. Shared schema and secret-presence checks remain;
+  `config validate --strict` checks portability across declared registered adapters.
+- Spin CLI secret-reference validation reports fields and rules without including
+  secret-reference values. This is an explicit exception to the original
+  error-redaction non-goal and does not change runtime error policy.
 
 ## 1. Objective
 
@@ -79,7 +97,7 @@ These distinctions prohibit a universal sequential serving loop in core.
 - No new core `Hooks` methods, macro arguments, manifest keys, CLI reuse switch, or provider-independent scheduler.
 - No framework singleton registry keyed by application type.
 - No SDK upgrade solely for this feature; Fastly 0.12.1 already provides `Serve`.
-- No changes to body buffering, stream caps, error redaction, or response translation semantics.
+- Standard dispatch retains body buffering and stream caps. The header-preservation and CLI diagnostic corrections listed above are explicit scope exceptions; custom callbacks own progressive response streaming.
 - No durable cache, automatic configuration refresh, parsed-key cache, or application-specific finalization hook.
 - No deployment, publishing, or external issue/PR activity as part of implementing this spec.
 
@@ -145,45 +163,43 @@ The example deliberately uses ordinary `main`, not `#[fastly::main]`. Existing g
 
 Use `lifecycle::serve_custom(Serve, callback)` for EdgeZero-owned custom lifecycle mechanics, or direct SDK serving as an escape hatch. Preserve access to the SDK's `HandlerResult` trait through its existing SDK path; a new framework callback trait is unnecessary.
 
-A callback receives an owned native request and may mutate it, capture metadata, convert it with `request::into_core_request`, dispatch through a retained router, inspect core response extensions, finalize the response, send or stream it explicitly, and finish request-owned post-send work before returning.
+A callback receives an owned native request and may mutate it, capture metadata, convert it with `request::into_core_request_with_registries`, dispatch through a retained router, inspect core response extensions, finalize the response, send or stream it explicitly, and finish request-owned post-send work before returning.
 
 Applications may capture retained state in a closure or pass it through `run_with_context`. Host-dependent or fallible initialization belongs inside the callback. A lightweight health response may bypass expensive initialization; retaining state must not require eager construction before every callback can run.
 
-Existing public `runtime_env_config` and `request::dispatch_with_registries` remain the complete prebuilt-app path when standard response translation is appropriate. The immutable extensions callback is not a substitute for mutable raw-request custom dispatch.
+Existing public `runtime_env_config` and `request::dispatch_with_registries` remain the complete prebuilt-app path when standard response translation is appropriate. `into_core_request_with_registries` exposes the request half for custom streaming; bare `into_core_request` injects no stores. Drive router dispatch with `futures::executor::block_on` in a synchronous callback. The immutable extensions callback is not a substitute for mutable raw-request custom dispatch.
 
 The custom lifecycle extension adds `lifecycle::Sandbox<T>`: an application-owned payload in a framework-owned successful-only slot, attempted-callback and initialization counters, and an independent successful setup guard. `initialize` returns errors unchanged and leaves the slot empty so a later call can retry; applications decide whether to respond and continue. `run_custom` creates fresh state for a single received request without entering `Serve`. Both wrappers complete `HandlerResult` exactly once. State decision logic is feature-independent for host tests; SDK wrappers require `fastly`. No teardown hook or response-finalization pipeline is introduced. Default generated entry points remain unchanged.
 
 ### 4.4 Cloudflare and Spin prebuilt dispatch
 
-Add public root-level dispatch helpers that take metadata explicitly:
+Public root-level dispatch helpers select metadata from the caller's `Hooks` type:
 
 ```rust,ignore
 // edgezero-adapter-cloudflare
-pub async fn dispatch_app(
+pub async fn dispatch_app<A: Hooks>(
     app: &App,
-    stores: StoresMetadata,
     req: worker::Request,
     env: worker::Env,
     ctx: worker::Context,
 ) -> Result<worker::Response, worker::Error>;
 
 // edgezero-adapter-spin
-pub async fn dispatch_app(
+pub async fn dispatch_app<A: Hooks>(
     app: &App,
-    stores: StoresMetadata,
     req: spin_sdk::http::Request,
 ) -> anyhow::Result<SpinFullResponse>;
 ```
 
 Use the same feature and target gates as each adapter's existing `run_app`.
 
-These functions do not build an app, install logging, or cache anything. They resolve runtime configuration for that invocation, build registries using the supplied metadata, and call the existing internal registry-aware dispatcher. Metadata must describe the supplied app's intended store bindings; normal callers pass `MyApp::stores()`.
+These functions do not build an app, install logging, or cache anything. They resolve runtime configuration for that invocation, build registries using `A::stores()`, and call the existing internal registry-aware dispatcher. Callers must supply an app constructed from `A`; `App` erases its type, so the function cannot verify provenance.
 
 For Cloudflare, derive `EnvConfig` before moving `env` into the dispatcher and keep the configuration alive through the awaited call that borrows it in `RegistryInputs`. For Spin, unpack `stores.config`, `stores.kv`, and `stores.secrets` into the existing dispatcher's separate metadata arguments. These are adapter wrappers, not changes to internal dispatcher signatures.
 
-Explicit metadata avoids silently losing store wiring and avoids pretending `&App` contains a `Hooks` implementation. Logging is excluded intentionally: a dispatcher must be safe to call repeatedly, and the caller controls initialization before constructing the app.
+The explicit `Hooks` type avoids silently losing store wiring without pretending `&App` contains its construction metadata. Logging is excluded intentionally: a dispatcher must be safe to call repeatedly, and the caller controls initialization before constructing the app.
 
-Existing `run_app` may delegate its dispatch portion to the new function if doing so preserves logger-before-build ordering, environment-resolution behavior, error behavior, and exactly one build per call. Do not refactor unrelated code for symmetry.
+Existing `run_app` delegates its dispatch portion to the new function, preserving logger-before-build ordering, environment-resolution behavior, error behavior, and exactly one build per call.
 
 Do not route these helpers through the manual Cloudflare builder or Spin `AppExt::dispatch`: those paths do not preserve all metadata-aware behavior.
 
@@ -202,7 +218,7 @@ fn retained_app() -> &'static App {
 }
 ```
 
-The fetch/HTTP callback obtains this reference synchronously and passes it, `MyApp::stores()`, and the current request arguments to `dispatch_app`.
+The fetch/HTTP callback obtains this reference synchronously and passes it and the current request arguments to `dispatch_app::<MyApp>`.
 
 Requirements for the example and API documentation:
 
@@ -307,11 +323,12 @@ These are validation gates, not permission to silently broaden implementation sc
 
 Expected production changes:
 
-- `crates/edgezero-adapter-fastly/src/lib.rs`: SDK exports, two opt-in standard lifecycle helpers, and a small private feature-independent lifecycle state/helper with colocated host tests. This may remain in `lib.rs`; split a private module only if needed for clarity.
-- `crates/edgezero-adapter-cloudflare/src/lib.rs`: explicit-metadata prebuilt dispatcher.
+- `crates/edgezero-adapter-fastly/src/lib.rs`: SDK exports and opt-in standard lifecycle helpers; public feature-independent `lifecycle::Sandbox<T>` plus `serve_custom`/`run_custom` wrappers live in `src/lifecycle.rs` with host tests (superseding the original private helper).
+- `crates/edgezero-adapter-cloudflare/src/lib.rs`: `Hooks`-typed prebuilt dispatcher shared with `run_app`.
 - `crates/edgezero-adapter-cloudflare/src/response.rs`: the duplicate-header correction described in §6.1.
-- `crates/edgezero-adapter-spin/src/lib.rs`: explicit-metadata prebuilt dispatcher.
-- Existing request modules: reuse registry logic; change only if necessary to share it without duplication.
+- `crates/edgezero-adapter-spin/src/lib.rs`: `Hooks`-typed prebuilt dispatcher shared with `run_app`.
+- Fastly `src/request.rs`: public registry-aware request conversion shared with buffered dispatch.
+- CLI `src/config.rs` and Spin `src/cli.rs`: selected-adapter validation and diagnostic redaction listed above.
 - `crates/edgezero-core/src/app.rs` or existing core tests: compile-time retained-object bounds and shared-state contract coverage; no new core production abstraction.
 
 Documentation changes during implementation:
@@ -325,7 +342,7 @@ Documentation changes during implementation:
 
 Keep generated templates and default demo entry points unchanged. Add opt-in examples as dedicated fixtures under `tests/fixtures/reusable-app/` with a standalone Cargo workspace, per-provider packages/configuration, and no production credentials. Add `scripts/smoke_test_reusable_app.sh` to build/run selected local providers, collect results, and report explicit skips. Record exact fixture paths in the implementation plan after confirming provider build-tool requirements.
 
-The current spec is the only file authorized for this design step; the listed implementation files are proposed work.
+The listed surfaces are implemented; the original design-step authorization checkpoint has been superseded by implementation approval.
 
 ## 9. Validation design
 
@@ -335,7 +352,7 @@ The current spec is the only file authorized for this design step; the listed im
 
 The current Fastly crate does not link native host tests when its `fastly` feature is enabled. Verification with `cargo test -p edgezero-adapter-fastly --features fastly --lib --offline` failed on arm64 with unresolved Fastly hostcalls, including `_uri_get`. This is pre-existing: the default workspace test gate omits that feature, while the feature-enabled `cargo check` gate type-checks without linking. Do not require native feature-enabled tests or add fake hostcall symbols to make them pass.
 
-Factor the initialization/retention state used by `serve_app` into a small private helper compiled under `cfg(any(feature = "fastly", test))`, with no dependency on Fastly SDK types or hostcalls. Its production wrapper supplies runtime configuration, logging/build operations, and SDK dispatch. Host tests must exercise the same state transitions used in production, with counted injected operations or a counted real core app builder; a separate model that merely repeats the expected decisions is insufficient. Keep this extraction private and local to the Fastly adapter; no public lifecycle abstraction is needed.
+The original private-helper plan is superseded by [the custom serving lifecycle plan](../plans/2026-09-17-custom-serving-lifecycle.md). Public `lifecycle::Sandbox<T>` contains feature-independent retention state with no Fastly SDK types or hostcalls; `serve_app` also retains private standard-initialization policy. Its production wrapper supplies runtime configuration, logging/build operations, and SDK dispatch. Host tests must exercise the same state transitions used in production, with counted injected operations or a counted real core app builder; a separate model that merely repeats the expected decisions is insufficient. Keep these mechanics local to the Fastly adapter; the public custom helpers do not introduce a cross-provider lifecycle abstraction.
 
 Assign verification explicitly:
 
@@ -415,13 +432,13 @@ cargo check -p edgezero-adapter-cloudflare --target wasm32-unknown-unknown --fea
 cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
 ```
 
-Also build and run the dedicated provider fixtures. Run documentation formatting/lint and the VitePress build when public guide changes are made. This design-document-only change does not claim any Rust test execution.
+Also build and run the dedicated provider fixtures. Run documentation formatting/lint and the VitePress build when public guide changes are made. Implementation verification is recorded in the plans and PR; unsupported runtime evidence is kept explicit.
 
 ## 10. Acceptance and delivery
 
 The implementation is acceptable when:
 
-- Existing generated/default entry points retain their behavior.
+- Existing generated/default entry points retain their lifecycle defaults, with the separately listed compatibility and CLI corrections.
 - Fastly standard apps can opt into a bounded SDK serving lifecycle with exactly one successful app initialization per sandbox.
 - Custom Fastly callbacks can retain their own state, mutate raw requests, preserve response extensions, explicitly stream, and complete post-send work.
 - Cloudflare and Spin can use concrete retained apps with full metadata-aware per-request dispatch and tested overlapping-request isolation.
@@ -440,7 +457,7 @@ Rollback is an entry-point choice: return to the existing `run_app` path and rem
 Independent reviews checked the adapter/core design and a custom-dispatch integration. The selected approach incorporates these corrections:
 
 - App ownership is portable, but scheduling and concurrency remain provider-specific.
-- Prebuilt dispatch needs explicit store metadata because `App` does not contain it.
+- Prebuilt dispatch derives store metadata from an explicit `Hooks` type because `App` does not contain it.
 - Concrete application-owned caches avoid generic-static cross-application contamination.
 - Mutable native-request handling and response-extension finalization require the raw callback path.
 - Progressive client streaming differs from collecting a stream into a response body.

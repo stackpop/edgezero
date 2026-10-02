@@ -234,12 +234,6 @@ A typical development workflow:
 While Axum provides a convenient development environment, always test on actual edge platforms before deploying. Some edge-specific features (KV stores, geolocation) aren't available in the Axum adapter.
 :::
 
-## Next Steps
-
-- Deploy to [Fastly Compute](/guide/adapters/fastly) for production
-- Deploy to [Cloudflare Workers](/guide/adapters/cloudflare) as an alternative
-- Explore [Configuration](/guide/configuration) for manifest options
-
 ## Application lifetime
 
 `dev_server::run_app` already constructs one app per server startup and serves
@@ -248,3 +242,9 @@ state must support concurrent requests; each request retains its own metadata,
 extensions, and body. Restarting the server creates a fresh app. Native Axum
 measurements are a useful ownership reference but do not establish WASM runtime
 performance or resource lifetimes.
+
+## Next Steps
+
+- Deploy to [Fastly Compute](/guide/adapters/fastly) for production
+- Deploy to [Cloudflare Workers](/guide/adapters/cloudflare) as an alternative
+- Explore [Configuration](/guide/configuration) for manifest options

@@ -37,12 +37,9 @@ impl Args {
         };
         let mut args = std::env::args().skip(1);
         while let Some(key) = args.next() {
-            if key == "--require-runtime" {
-                continue;
-            }
             if key == "--help" || key == "-h" {
                 println!(
-                    "fixture-harness [--adapter fastly|cloudflare|spin|axum|all] [--suite smoke|benchmark] [--output EMPTY_DIR] [--requests 100] [--repetitions 3] [--seed 856] [--construction-rounds 0] [--max-requests 10] [--require-runtime]"
+                    "fixture-harness [--adapter fastly|cloudflare|spin|axum|all] [--suite smoke|benchmark] [--output EMPTY_DIR] [--requests 100] [--repetitions 3] [--seed 856] [--construction-rounds 0] [--max-requests 10]"
                 );
                 std::process::exit(0);
             }
@@ -168,6 +165,11 @@ pub fn checked(command: &mut Command) -> Result<()> {
 pub struct Process(Child);
 impl Process {
     pub fn start(command: &mut Command, log: &Path, port: u16) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         let file = fs::File::create(log)?;
         let mut p = Self(
             command
@@ -194,16 +196,30 @@ impl Process {
 }
 impl Drop for Process {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        let target = format!("-{}", self.0.id());
+        #[cfg(not(unix))]
+        let target = self.0.id().to_string();
         let _ = Command::new("kill")
-            .args(["-TERM", &self.0.id().to_string()])
+            .args(["-TERM", "--", &target])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             if matches!(self.0.try_wait(), Ok(Some(_))) {
-                return;
+                break;
             }
             thread::sleep(Duration::from_millis(50));
         }
+        // The parent may have exited while a descendant still holds sockets.
+        #[cfg(unix)]
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &target])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        #[cfg(not(unix))]
         let _ = self.0.kill();
         let _ = self.0.wait();
     }

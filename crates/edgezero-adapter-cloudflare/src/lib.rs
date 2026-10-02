@@ -108,48 +108,29 @@ pub async fn run_app<A: Hooks>(
     if !A::owns_logging() {
         drop(init_logger());
     }
-    let stores = A::stores();
-    let env_config = env_config_from_worker(&env, stores);
     let app = A::build_app();
-    request::dispatch_with_registries(
-        &app,
-        req,
-        env,
-        ctx,
-        request::RegistryInputs {
-            config_meta: stores.config,
-            kv_meta: stores.kv,
-            secret_meta: stores.secrets,
-            env_config: &env_config,
-        },
-    )
-    .await
+    dispatch_app::<A>(&app, req, env, ctx).await
 }
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-/// Dispatch a caller-owned app with explicit store metadata.
+/// Dispatch a caller-owned app using `A::stores()` for fresh request bindings.
 ///
-/// Resolves configuration and request resources for this invocation without
-/// building or caching an app or installing logging. Pass metadata matching
-/// the app (normally `MyApp::stores()`). Retain only application-owned values;
-/// native handles and pending work belong to the request. Shared app state
-/// must support overlapping invocations.
-///
-/// Store metadata is a caller precondition: `App` carries no store provenance,
-/// so this function cannot validate the pairing. Mismatched metadata can fail
-/// binding resolution or select unintended bindings. Keep the app and its
-/// construction metadata together; normally both come from the same `Hooks` type.
+/// This does not build or cache an app or install logging. The caller must pass
+/// an app built from `A`; `App` erases its construction type, so this pairing
+/// remains a caller precondition. Retain only application-owned values and keep
+/// native handles and pending work request-local. Shared state must support
+/// overlapping invocations.
 ///
 /// # Errors
 /// Returns conversion or dispatch errors from the existing adapter boundary.
 #[inline]
-pub async fn dispatch_app(
+pub async fn dispatch_app<A: Hooks>(
     app: &App,
-    stores: StoresMetadata,
     req: Request,
     env: Env,
     ctx: Context,
 ) -> Result<Response, WorkerError> {
+    let stores = A::stores();
     let env_config = env_config_from_worker(&env, stores);
     request::dispatch_with_registries(
         app,

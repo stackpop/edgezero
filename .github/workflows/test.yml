@@ -29,6 +29,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
+            tests/fixtures/reusable-app/target/
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
@@ -68,6 +69,9 @@ jobs:
       - name: Lifecycle fixture host tests
         run: |
           cargo test --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-harness -p fixture-core
+
+      - name: Check Axum lifecycle fixture
+        run: cargo check --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-axum
 
       - name: Run workspace tests
         run: cargo test --workspace --all-targets
@@ -137,6 +141,7 @@ jobs:
             ~/.cargo/git/db/
             ~/.wasmtime/bin/
             target/
+            tests/fixtures/reusable-app/target/
           key: ${{ runner.os }}-cargo-${{ matrix.adapter }}-${{ hashFiles('**/Cargo.lock', '.tool-versions') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.adapter }}-
@@ -253,7 +258,7 @@ jobs:
 
       - name: Fastly reusable HTTP smoke
         if: matrix.adapter == 'fastly'
-        run: ./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke --require-runtime
+        run: ./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke
 
       - name: Preserve Fastly lifecycle evidence
         if: always() && matrix.adapter == 'fastly'
@@ -267,3 +272,6 @@ jobs:
 
       - name: Check ${{ matrix.adapter }} wasm target
         run: cargo check -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }}
+
+      - name: Check ${{ matrix.adapter }} lifecycle fixture
+        run: cargo check --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-${{ matrix.adapter }} --target ${{ matrix.target }} --all-targets

@@ -251,18 +251,11 @@ surfaces before `provision` / `config push` run.
 Configure the Spin adapter in `edgezero.toml`. See
 [Configuration](/guide/configuration) for the full manifest reference.
 
-## Next Steps
-
-- [Migration guide](/guide/manifest-store-migration) — moving from the
-  pre-rewrite store schema
-- [Adapters overview](/guide/adapters/overview) — cross-adapter contracts
-- [Configuration](/guide/configuration) — full manifest reference
-
 ## Retaining an application
 
 Use a concrete application-owned `OnceLock<App>` and call
-`edgezero_adapter_spin::dispatch_app(app, MyApp::stores(), req).await` on each
-invocation. This resolves fresh request resources with explicit metadata and does
+`edgezero_adapter_spin::dispatch_app::<MyApp>(app, req).await` on each
+invocation. This resolves fresh request resources from `MyApp::stores()` and does
 not install logging, construct an app, or cache native resources. Initialize any
 application logging before the cache's synchronous app constructor. Do not use a
 generic unkeyed static or hold a lock across an await.
@@ -277,7 +270,7 @@ static APP: OnceLock<App> = OnceLock::new();
 #[http_service]
 async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
     let app = APP.get_or_init(MyApp::build_app);
-    edgezero_adapter_spin::dispatch_app(app, MyApp::stores(), req).await
+    edgezero_adapter_spin::dispatch_app::<MyApp>(app, req).await
 }
 ```
 
@@ -291,3 +284,10 @@ Different guest instances are not evidence of concurrent isolation. Keep
 request/response bodies and pending operations invocation-local. Existing
 response buffering and stream collection limits still apply. Restore `run_app`
 and remove the cache to roll back; default generated entry points are unchanged.
+
+## Next Steps
+
+- [Migration guide](/guide/manifest-store-migration) — moving from the
+  pre-rewrite store schema
+- [Adapters overview](/guide/adapters/overview) — cross-adapter contracts
+- [Configuration](/guide/configuration) — full manifest reference

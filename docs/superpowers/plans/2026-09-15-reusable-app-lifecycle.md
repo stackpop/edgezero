@@ -1,5 +1,10 @@
 # Reusable Application Lifecycle Implementation Plan
 
+> Historical implementation plan. The private-helper design and custom callback
+> choices are superseded by [the custom serving lifecycle plan](2026-09-17-custom-serving-lifecycle.md).
+> The implemented public `Sandbox` and `Hooks`-typed Cloudflare/Spin dispatch APIs
+> are described in the updated [spec](../specs/2026-09-15-reusable-app-lifecycle-design.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkboxes for tracking; exceptions and evidence limits are recorded in the execution checkpoint.
 
 **Goal:** Add explicit application retention for Fastly, Cloudflare, and Spin while preserving existing defaults and Axum's retained-router behavior.
@@ -325,7 +330,7 @@ pub async fn dispatch_app(
 - [x] **7.7 Configure local backends and stores.** Derive runtime configuration's service-scoped keys from the guest's actual service ID, following `scripts/smoke_test_config_key_override.sh`. Keep config, KV, and secret fixtures isolated. Capture a named logging endpoint distinctly from echoed stdout; if the selected runtime cannot expose endpoint-specific evidence, report that assertion unavailable.
 - [x] **7.8 Add terminal and continuing cases.** Rendered handler errors should allow later callbacks in the same instance. Required-KV open errors, inbound conversion errors, response collection errors, and error-rendering failure are separate escaping paths. Test controlled reachable failures; label injected/unavailable cases honestly. Add constructor panic, pre-commit failure, post-commit stream failure, and a later fresh-owner initialization case.
 - [x] **7.9 Add the logger negative control.** Naively wrapping enabled-logger `run_app` in `Serve` should expose the second-installation failure. Keep this out of B's performance samples. Add the degraded-first-read/recovered-selector case where runtime controls permit; otherwise retain host injection evidence and mark the provider scenario unverified.
-- [x] **7.10 Build and run the fixtures.** From the fixture workspace run `cargo build --locked --release -p fixture-fastly --bins --target wasm32-wasip1`. Launch the selected executable with `viceroy serve --addr 127.0.0.1:<port> --config <run-config> <absolute-wasm-path>`. Account for readiness callbacks or restart before measuring. Run `./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke --require-runtime`.
+- [x] **7.10 Build and run the fixtures.** From the fixture workspace run `cargo build --locked --release -p fixture-fastly --bins --target wasm32-wasip1`. Launch the selected executable with `viceroy serve --addr 127.0.0.1:<port> --config <run-config> <absolute-wasm-path>`. Account for readiness callbacks or restart before measuring. Run `./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke`.
 - [x] **7.11 Assert actual reuse before accepting comparisons.** Stable guest marker plus increasing ordinal is required. A builds once per fresh invocation; B builds each reused callback; C builds once per retained owner. Check cookies, buffering versus progressive streaming, request isolation, limit 1/10, idle exit, and restart. Compare standard A/B/C and custom A/B/C separately.
 - [x] **7.12 Run existing Fastly tests on their proper runners.** Run default host `cargo test -p edgezero-adapter-fastly --lib`. With the selected Viceroy on PATH, run `CARGO_TARGET_WASM32_WASIP1_RUNNER="viceroy run" cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --test contract`, and repeat with `--lib`. Native feature-enabled linking is not a required test route. Checkpoint: `test(fastly): verify reusable sandbox lifecycle over HTTP`.
 
@@ -341,14 +346,14 @@ pub async fn dispatch_app(
 - [x] **8.6 Run sequential ownership and binding assertions on both providers.** Compare per-request versus retained builds, verify different concrete apps return different routes, and check named/default metadata, cookies, bodies, and rendered errors. Restart to prove cold initialization remains correct.
 - [ ] **8.7 Force overlapping requests on the same guest.** Hold two distinct requests at the backend barrier, verify both arrivals, release them, and assert stable guest identity, maximum in-flight count at least two, and unchanged per-request fields after awaiting. Different instances or serialized delivery are incomplete evidence, not a pass; retry only within a bounded deadline. Retained Spin and both Cloudflare modes passed; the latest Spin per-request control selected separate guests in all three attempts, so this full matrix criterion remains unverified.
 - [x] **8.8 Verify recoverable binding failures where controllable.** A relaunch with changed bindings proves fresh initialization, not same-instance refresh. Record injected versus observed transitions and unavailable host failure modes separately.
-- [x] **8.9 Run scoped host tests, actual-target checks, and each HTTP smoke command.** Use `cargo test -p edgezero-adapter-cloudflare`, `cargo test -p edgezero-adapter-spin`, and the Task 12 target checks. Run the script once with `--adapter cloudflare` and once with `--adapter spin`, both `--suite smoke --require-runtime`. Checkpoint: `test(adapters): verify retained app isolation on Workers and Spin`.
+- [x] **8.9 Run scoped host tests, actual-target checks, and each HTTP smoke command.** Use `cargo test -p edgezero-adapter-cloudflare`, `cargo test -p edgezero-adapter-spin`, and the Task 12 target checks. Run the script once with `--adapter cloudflare` and once with `--adapter spin`, both `--suite smoke`. Checkpoint: `test(adapters): verify retained app isolation on Workers and Spin`.
 
 ## Task 9: Verify Axum and integrate runnable CI evidence
 
 **Files:** `tests/fixtures/reusable-app/crates/fixture-axum/{Cargo.toml,src/main.rs}`, harness Axum orchestration, `.github/workflows/test.yml`.
 
 - [x] **9.1 Add the native reference fixture.** Use existing `dev_server::run_app::<FixtureApp>()` with an allocated host/port and isolated local-store configuration. Add no new Axum lifecycle API. Run the same probe and overlap workload, expecting one build per server start and another after restart.
-- [x] **9.2 Run the native fixture.** Build `fixture-axum` with the fixture manifest and `--locked`; run `cargo test -p edgezero-adapter-axum` and `./scripts/smoke_test_reusable_app.sh --adapter axum --suite smoke --require-runtime`. Axum timings do not stand in for WASM results.
+- [x] **9.2 Run the native fixture.** Build `fixture-axum` with the fixture manifest and `--locked`; run `cargo test -p edgezero-adapter-axum` and `./scripts/smoke_test_reusable_app.sh --adapter axum --suite smoke`. Axum timings do not stand in for WASM results.
 - [x] **9.3 Add Rust harness unit tests and portable fixture tests to CI.** The root workspace excludes this fixture workspace, so explicitly invoke its locked `fixture-core` tests. Preserve all existing root tests.
 - [x] **9.4 Add the Fastly HTTP smoke step to the existing Fastly WASM matrix job.** Reuse its Viceroy installation and version from `.tool-versions`; do not add a competing download. Require the runtime and actual multi-request evidence. Keep existing WASM contract and library tests: they cover different behavior from a live multi-request fixture.
 - [x] **9.5 Check CI command parity locally.** Cloudflare/Spin HTTP runtime provisioning is not currently supplied by the existing contract matrix; retain explicit manual commands and report unavailable evidence. Do not label their WASM contract success as overlapping live-request validation. Checkpoint: `ci: run reusable Fastly HTTP smoke fixtures`.
@@ -384,7 +389,7 @@ pub async fn dispatch_app(
 
 **Files:** no planned new implementation files; fix only findings in the files above.
 
-- [x] **12.1 Review the final diff against the spec.** Confirm unchanged default entry points and generation, core traits and macro grammar, request/response conversion semantics (with the documented Cloudflare duplicate-header correction), header duplication, existing stream caps, and error policy. Production changes remain limited to the three adapter library files and the focused Cloudflare response-header fix, plus tests/docs.
+- [x] **12.1 Review the final diff against the spec.** Confirm unchanged default entry points and generation, core traits and macro grammar, request/response conversion semantics (with the documented Cloudflare duplicate-header correction), header duplication, existing stream caps, and error policy. Production changes include adapter entry points, the public Fastly lifecycle module and registry-aware request conversion, Cloudflare response headers, selected-adapter CLI validation and Spin CLI diagnostic redaction; the updated spec records these scope exceptions.
 - [x] **12.2 Run all repository gates.** Expected: each command exits successfully; record unavailable targets/tools separately rather than claiming success.
 
 ```sh
@@ -419,14 +424,14 @@ cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
 | Sandbox identity versus request correlation                    | Tasks 7.5a, 11.2                                |
 | Local versus deployed evidence                                 | Tasks 6–12                                      |
 
-The planning review compared two focused proposals: a private Fastly state helper with thin wrappers, and a standalone provider fixture workspace that reuses existing CI runtime setup. The selected approach keeps SDK calls out of host unit tests while testing the same production initialization state. It preserves existing dispatcher ordering and avoids a new public lifecycle abstraction. Independent complete-plan review approved this plan after two corrections: unique candidate instance tokens on every request, and explicit unsupported/unverified status when no SDK heap-hostcall failure mechanism is available. Implementation outcomes are checked below; these marks do not assert that a suggested commit was made or that unavailable provider evidence passed.
+The planning review compared two focused proposals: a private Fastly state helper with thin wrappers, and a standalone provider fixture workspace that reuses existing CI runtime setup. The selected approach keeps SDK calls out of host unit tests while testing the same production initialization state. It preserves existing dispatcher ordering and originally avoided a public helper. That private-helper choice is superseded by [the custom serving lifecycle plan](2026-09-17-custom-serving-lifecycle.md). Independent complete-plan review approved this plan after two corrections: unique candidate instance tokens on every request, and explicit unsupported/unverified status when no SDK heap-hostcall failure mechanism is available. Implementation outcomes are checked below; these marks do not assert that a suggested commit was made or that unavailable provider evidence passed.
 
 A subsequent independent alignment review found two verification omissions from spec §6.3. Tasks 1.6a–1.6b now schedule the persistent-state audit and supported cleanup checks; Tasks 7.5a and 11.2 explicitly cover request correlation and its fallback. These are verification/documentation additions, not evidence of a production defect or a change to lifecycle ownership.
 
 ## Execution checkpoint
 
 Implementation is on `feat/reusable-app-lifecycle` in the original checkout.
-Changes remain uncommitted. Existing default entry points, generated templates,
+The implementation is committed on this branch. Existing default entry points, generated templates,
 macro grammar, and lifecycle error policy are unchanged. One targeted compatibility
 fix is included: Cloudflare now preserves repeated application response headers,
 including `Set-Cookie`, while still replacing generated defaults with the first
@@ -434,7 +439,8 @@ application value. Live tests reproduced the original loss and pass with the fix
 
 Tasks 1–9 and 11–12 have implementation and local verification, subject to the
 explicit full-matrix exception in 8.7. Task 10 has the measurement implementation
-and controlled runs recorded in the fixture README. Checkmarks denote completed
+and historical controlled-run observations recorded in this plan and the PR.
+The fixture README describes reproducible commands and assertions. Checkmarks denote completed
 implementation/verification work, including an explicit capability disposition;
 they do not turn unsupported behavior into a passing provider assertion.
 
@@ -475,7 +481,7 @@ The HTTP driver is Rust. Source files use descriptive names; A/B/C are experimen
 labels only. Raw evidence stays under ignored `.runs/` directories. Independent
 measurement and diff reviews led to explicit unknown metrics, consistent request
 correlation, and phase-specific CPU/memory reporting; the final review found no
-further actionable issue. No deployment, commit, or external comment was made.
+further actionable issue. That validation checkpoint made no deployment or external comment. The implementation was subsequently committed and submitted as PR #379.
 
 The follow-up risk review added a core cancellation regression: dropping a
 suspended request releases its extension resources while retaining the router,

@@ -21,6 +21,12 @@ fn main() -> Result<(), fastly::Error> {
         fixture_fastly::serving().with_max_lifetime(Duration::from_millis(50)),
         fixture_fastly::extend,
     );
-    assert!(summary.time_handler() >= Duration::from_millis(50));
-    fixture_fastly::finish(summary)
+    let elapsed = summary.time_handler() >= Duration::from_millis(50);
+    fixture_fastly::finish(summary)?;
+    if !elapsed {
+        return Err(fastly::Error::msg(
+            "lifetime fixture did not reach its elapsed bound",
+        ));
+    }
+    Ok(())
 }

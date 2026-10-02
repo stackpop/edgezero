@@ -56,3 +56,6 @@ path = "src/bin/limit_memory.rs"
 [[bin]]
 name = "fixture-fastly-faults"
 path = "src/bin/faults.rs"
+
+[lints]
+workspace = true

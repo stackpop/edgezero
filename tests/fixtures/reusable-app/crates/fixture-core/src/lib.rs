@@ -61,6 +61,7 @@ static BUILDS: AtomicUsize = AtomicUsize::new(0);
 static CONFIGURES: AtomicUsize = AtomicUsize::new(0);
 static ORDINAL: AtomicUsize = AtomicUsize::new(0);
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+// Guest-lifetime high-water mark; pair overlap uses the current before.inflight.
 static MAX_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn instance_id() -> Option<&'static str> {
@@ -178,6 +179,7 @@ fn record(ctx: &RequestContext) -> serde_json::Value {
         "mutated": req.headers().get("x-fixture-mutated").is_some(),
         "body": String::from_utf8_lossy(ctx.body().as_bytes().unwrap_or_default()),
         "shared": shared, "max_inflight": MAX_INFLIGHT.load(Ordering::SeqCst),
+        "inflight": INFLIGHT.load(Ordering::SeqCst),
     })
 }
 
@@ -231,7 +233,7 @@ async fn fetch_backend(ctx: &RequestContext) -> Result<Response, EdgeError> {
         return Err(EdgeError::bad_request("backend must be loopback HTTP"));
     }
     ctx.proxy_handle()
-        .ok_or_else(|| EdgeError::bad_request("missing proxy"))?
+        .ok_or_else(|| EdgeError::internal(std::io::Error::other("missing proxy")))?
         .forward(ProxyRequest::new(Method::GET, uri))
         .await
 }

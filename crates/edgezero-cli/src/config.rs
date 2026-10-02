@@ -633,7 +633,6 @@ where
     let local_sha = local_envelope.sha256.clone();
 
     // Resolve adapter + store + key (mirrors the push flow).
-    ensure_adapter_defined(&args.adapter, Some(&ctx.manifest_loader))?;
     let adapter = adapter_registry::get_adapter(&args.adapter).ok_or_else(|| {
         format!(
             "adapter `{}` is declared in {} but not registered in this build",
@@ -4119,18 +4118,9 @@ timeout_ms = 50
 
     // ---------- push runs the strict preflight (regression) ----------
 
-    /// Push must run the same shared adapter checks `config
-    /// validate` runs (strict pre-flight). Pre-fix,
-    /// `load_push_context` synthesised `ConfigValidateArgs { strict:
-    /// false }` and `run_config_push*` never called
-    /// `run_shared_checks`, so an adapter-specific shape error
-    /// only surfaced inside `Adapter::push_config_entries` —
-    /// risking a partial mutation in any future adapter without
-    /// the same belt-and-braces guard. We probe via Spin's
-    /// `validate_adapter_manifest`, which fails when the
-    /// referenced spin.toml has no `[component.*]` declarations.
     #[test]
     fn selected_adapter_strict_checks_preserve_portability_validation() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let manifest_text = format!(
             "{}\n[adapters.spin.adapter]\ncrate = \"unused\"\nmanifest = \"spin.toml\"\n",
             PUSH_MANIFEST
@@ -4153,10 +4143,9 @@ timeout_ms = 50
         }
     }
 
-    /// The `--adapter` filter must fold case the same way
-    /// `Manifest::adapter_entry` and the adapter registry do. Pre-fix the
-    /// filters compared raw strings, so `[adapters.Spin]` + `--adapter spin`
-    /// (or the reverse) skipped the selected adapter's own checks entirely.
+    /// Selection folds case the same way `Manifest::adapter_entry` and the
+    /// registry do, so `[adapters.Spin]` with `--adapter spin` (or the reverse)
+    /// still runs the selected adapter's checks.
     #[test]
     fn selected_adapter_filter_matches_manifest_key_case_insensitively() {
         let _lock = manifest_guard().lock().expect("manifest guard");
@@ -4219,6 +4208,16 @@ timeout_ms = 50
         }
     }
 
+    /// Push must run the same shared adapter checks `config
+    /// validate` runs (strict pre-flight). Pre-fix,
+    /// `load_push_context` synthesised `ConfigValidateArgs { strict:
+    /// false }` and `run_config_push*` never called
+    /// `run_shared_checks`, so an adapter-specific shape error
+    /// only surfaced inside `Adapter::push_config_entries` —
+    /// risking a partial mutation in any future adapter without
+    /// the same belt-and-braces guard. We probe via Spin's
+    /// `validate_adapter_manifest`, which fails when the
+    /// referenced spin.toml has no `[component.*]` declarations.
     #[test]
     fn typed_push_runs_spin_adapter_manifest_check_before_push() {
         let _lock = manifest_guard().lock().expect("manifest guard");

@@ -22,7 +22,7 @@ Keep the default entry points unchanged.
 
 ## Other adapters
 
-Cloudflare and Spin already expose `dispatch_app` with explicit store metadata
+Cloudflare and Spin expose `dispatch_app::<A>` with metadata from `A::stores()`
 and freshly resolved request resources. Their callers own retention compatible
 with host concurrency and invocation lifetime. Axum constructs its app once for
 the running server. Fastly's bounded receive loop is not portable to these hosts;

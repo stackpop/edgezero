@@ -16,7 +16,9 @@ mod secret_store_compile_check {
 mod tests {
     use bytes::Bytes;
     use edgezero_adapter_fastly::context::FastlyRequestContext;
-    use edgezero_adapter_fastly::request::{FastlyService, into_core_request};
+    use edgezero_adapter_fastly::request::{
+        FastlyService, into_core_request, into_core_request_with_registries,
+    };
     use edgezero_adapter_fastly::response::from_core_response;
     use edgezero_core::app::App;
     use edgezero_core::body::Body;
@@ -27,6 +29,7 @@ mod tests {
     use edgezero_core::router::RouterService;
     use fastly::Request as FastlyRequest;
     use fastly::http::{Method as FastlyMethod, StatusCode as FastlyStatus};
+    use futures::executor::block_on;
     use futures::stream;
     use std::sync::Arc;
 
@@ -139,6 +142,36 @@ mod tests {
 
         let context = FastlyRequestContext::get(&core_request).expect("context");
         assert_eq!(context.client_ip, expected_ip);
+    }
+
+    #[test]
+    fn registry_conversion_preserves_extensions_without_collecting_a_response() {
+        use edgezero_core::app::{StoreMetadata, StoresMetadata};
+        use edgezero_core::env_config::EnvConfig;
+        use edgezero_core::store_registry::SecretRegistry;
+        let request = fastly_request(FastlyMethod::GET, "/stream", None);
+        let core = into_core_request_with_registries(
+            request,
+            StoresMetadata {
+                secrets: Some(StoreMetadata {
+                    default: "fixture",
+                    ids: &["fixture"],
+                }),
+                ..Default::default()
+            },
+            &EnvConfig::default(),
+            |raw, extensions| {
+                extensions.insert(raw.get_url_str().to_owned());
+            },
+        )
+        .expect("registry-aware conversion");
+        assert!(core.extensions().get::<SecretRegistry>().is_some());
+        assert_eq!(
+            core.extensions().get::<String>().unwrap(),
+            "http://example.com/stream"
+        );
+        let response = block_on(build_test_app().router().oneshot(core)).unwrap();
+        assert!(matches!(response.body(), Body::Stream(_)));
     }
 
     #[test]

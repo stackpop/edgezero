@@ -127,6 +127,10 @@ Adapters that fulfil these steps can be dropped into the EdgeZero CLI without re
 
 ## Opt-in application retention
 
+Use retention when measurements show that constructing the app is expensive.
+Keep per-request construction when `configure` or `app_state` reads values that
+can change and no refresh policy has been defined.
+
 Application ownership and request scheduling are separate. An `App` can be
 retained by its caller; each adapter still controls how requests arrive:
 
@@ -148,7 +152,8 @@ Applications own refresh, invalidation, key rotation, initialization-failure
 policy, and workload benchmarks. Publish complete snapshots; overlapping requests
 keep the snapshot they acquired. Never put an unkeyed static in a generic cache
 function: that static would be shared between application types. Existing macros,
-manifest settings, and generated entry points keep their current behavior.
+manifest settings, and generated entry points retain their lifecycle defaults.
+The Cloudflare response-header correction applies to both default and retained apps.
 
 ### Preparing an application for retention
 

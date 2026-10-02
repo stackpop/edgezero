@@ -1,5 +1,44 @@
 use crate::{evidence::*, net::Backend, *};
 use std::collections::HashMap;
+fn cargo_build() -> Command {
+    let mut command = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    command
+        .current_dir(root())
+        .env("CARGO_TARGET_DIR", root().join("target"));
+    command
+}
+
+fn built_executable(output: &[u8], name: &str) -> Result<PathBuf> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|record| {
+            (record["reason"] == "compiler-artifact" && record["target"]["name"] == name)
+                .then(|| record["executable"].as_str().map(PathBuf::from))
+                .flatten()
+        })
+        .ok_or_else(|| format!("Cargo did not report an executable for {name}").into())
+}
+fn wrangler_runtime_config(package: &Path) -> Result<String> {
+    let config = fs::read_to_string(package.join("wrangler.toml"))?;
+    let mut skip = false;
+    let mut lines = Vec::new();
+    for line in config.lines() {
+        if line.trim().starts_with('[') {
+            skip = line.trim() == "[build]";
+        }
+        if skip {
+            continue;
+        }
+        lines.push(if line.starts_with("main =") {
+            format!("main = {:?}", package.join("build/worker/shim.mjs"))
+        } else {
+            line.to_owned()
+        });
+    }
+    Ok(lines.join("\n") + "\n")
+}
+
 fn wasm(variant: &str) -> PathBuf {
     let name = match variant {
         "a" => "single-request",
@@ -81,6 +120,16 @@ fn custom_initialization_contract(
         records.push(json!({"assertion":"custom_lazy_initialization_recovery", "status":if instances.iter().all(|id| id == &instances[0]) {"pass"} else {"unverified"}, "reason":"recovery requires all five callbacks in the same guest"}))
     })();
     drop(process);
+    records.collect_clients(json!({"variant":"custom-initialization","repetition":0}))?;
+    for event in logs(&run.join("custom-initialization.log")) {
+        records.push(annotate(
+            event,
+            json!({"variant":"custom-initialization","repetition":0}),
+        ))?;
+    }
+    if let Err(error) = &outcome {
+        records.push(json!({"status":"fail","adapter":"fastly","variant":"custom-initialization","repetition":0,"error":error.to_string()}))?;
+    }
     outcome
 }
 
@@ -88,8 +137,20 @@ pub fn fastly(args: &Args, run: &Path, records: &mut Records) -> Result<()> {
     let Some(exe) = executable("VICEROY_BIN", "viceroy") else {
         return records.push(json!({"status":"unsupported","reason":"Viceroy unavailable"}));
     };
+    let version = Command::new(&exe).arg("--version").output()?;
+    require(version.status.success(), "Viceroy version command failed")?;
+    let version = String::from_utf8(version.stdout)?.trim().to_owned();
+    let pins = fs::read_to_string(root().join("../../../.tool-versions"))?;
+    let pin = pins
+        .lines()
+        .find_map(|line| line.strip_prefix("viceroy "))
+        .ok_or("missing Viceroy pin")?;
+    records.push(json!({"event":"runtime","adapter":"fastly","executable":exe,"version":version,"expected":pin}))?;
+    if version.split_whitespace().nth(1) != Some(pin) {
+        return records.push(json!({"status":"unverified","adapter":"fastly","reason":format!("Viceroy version {version} does not match pinned {pin}")}));
+    }
     checked(
-        Command::new("cargo")
+        cargo_build()
             .args([
                 "build",
                 "--locked",
@@ -104,7 +165,6 @@ pub fn fastly(args: &Args, run: &Path, records: &mut Records) -> Result<()> {
             .env("FIXTURE_BUILD_ROUNDS", args.construction_rounds.to_string())
             .env("FIXTURE_MAX_REQUESTS", args.max_requests.to_string()),
     )?;
-    records.push(json!({"event":"runtime","adapter":"fastly","executable":exe,"version":String::from_utf8_lossy(&Command::new(&exe).arg("--version").output()?.stdout).trim()}))?;
     let config_snapshot = run.join("fastly.toml");
     fs::copy(
         root().join("crates/fixture-fastly/fastly.toml"),
@@ -134,9 +194,9 @@ pub fn fastly(args: &Args, run: &Path, records: &mut Records) -> Result<()> {
             .push(json!({"event":"variant_order","repetition":repetition,"variants":variants}))?;
         for variant in &variants {
             records.push(json!({"event":"build","variant":variant,"repetition":repetition,"target":"wasm32-wasip1","artifact":artifact(&wasm(variant))?,"config":artifact(&config_snapshot)?}))?;
+            let backend = Backend::start()?;
             let port = net::port()?;
             let log = run.join(format!("{variant}-{repetition}.log"));
-            let backend = Backend::start()?;
             let process = Process::start(
                 &mut fastly_command(&exe, &config_snapshot, variant, port),
                 &log,
@@ -200,17 +260,18 @@ pub fn fastly(args: &Args, run: &Path, records: &mut Records) -> Result<()> {
                             "single-request initialization mismatch",
                         )?,
                     }
+                    validate_shared_state(&value, ["c", "custom-c"].contains(variant))?;
                     seen.insert(value["instance"].as_str().unwrap().into(), value.clone());
                     records.push(annotate(
                         reply,
-                        json!({"variant":variant,"repetition":repetition,"guest":value}),
+                        json!({"variant":variant,"repetition":repetition,"guest":value,"workload":"probe"}),
                     ))?;
                 }
                 if ["b", "c", "custom-b", "custom-c"].contains(variant) && !reused {
                     records.push(json!({"status":"unverified","variant":variant,"repetition":repetition,"reason":"no actual guest reuse observed"}))?;
                 }
                 if ["c", "custom-c"].contains(variant) {
-                    thread::sleep(Duration::from_millis(800));
+                    thread::sleep(Duration::from_secs(2));
                     let reply = req(port, "/probe/after-idle")?;
                     require(
                         !seen.contains_key(
@@ -225,13 +286,16 @@ pub fn fastly(args: &Args, run: &Path, records: &mut Records) -> Result<()> {
                         json!({"variant":variant,"repetition":repetition,"assertion":"idle_fresh_initialization"}),
                     ))?;
                 }
-                if !variant.starts_with("custom-") {
-                    require(
-                        guest(&req(port, "/bindings")?)?
-                            == json!({"config":true,"kv":true,"secrets":true,"unknown":false}),
-                        "binding mismatch",
-                    )?;
-                }
+                let bindings = req(port, "/bindings")?;
+                require(
+                    guest(&bindings)?
+                        == json!({"config":true,"kv":true,"secrets":true,"unknown":false}),
+                    "binding mismatch",
+                )?;
+                records.push(annotate(
+                    bindings,
+                    json!({"variant":variant,"repetition":repetition,"assertion":"binding_reads"}),
+                ))?;
                 require(
                     cookie_values(&req(port, "/cookies")?["headers"])
                         == vec!["first=1; Path=/", "second=2; Path=/"],
@@ -296,8 +360,16 @@ pub fn fastly(args: &Args, run: &Path, records: &mut Records) -> Result<()> {
                         &failure_token,
                         Some(&backend.url(&format!("/abort?token={failure_token}"))),
                         None,
-                    )
-                    .expect_err("interrupted stream unexpectedly completed");
+                    );
+                    let failure = match failure {
+                        Ok(reply) => {
+                            return Err(format!(
+                                "interrupted stream unexpectedly completed: {reply}"
+                            )
+                            .into());
+                        }
+                        Err(error) => error,
+                    };
                     let partial = failure.downcast_ref::<net::InterruptedResponse>().ok_or(
                         "stream failure occurred before response body: not post-commit evidence",
                     )?;
@@ -348,7 +420,7 @@ pub fn fastly(args: &Args, run: &Path, records: &mut Records) -> Result<()> {
                             json!({"variant":variant,"repetition":repetition,"assertion":"bounded_distinct_origin"}),
                         ))?;
                     }
-                    if variant.starts_with("custom-") {
+                    if ["custom-b", "custom-c"].contains(variant) {
                         let token = token();
                         if let Ok(failed) = net::request(port, "/panic", &token, None, None) {
                             require(
@@ -382,10 +454,13 @@ pub fn fastly(args: &Args, run: &Path, records: &mut Records) -> Result<()> {
             for event in logs(&log) {
                 records.push(annotate(
                     event,
-                    json!({"variant":variant,"repetition":repetition,"repetition":repetition}),
+                    json!({"variant":variant,"repetition":repetition}),
                 ))?;
             }
-            outcome?;
+            if let Err(error) = outcome {
+                records.push(json!({"status":"fail","adapter":"fastly","variant":variant,"repetition":repetition,"error":error.to_string()}))?;
+                return Err(error);
+            }
         }
     }
     if args.suite == "smoke" {
@@ -422,11 +497,36 @@ fn logging(exe: &Path, run: &Path, records: &mut Records) -> Result<()> {
         let port = net::port()?;
         let log = run.join(format!("logging-{variant}.log"));
         let process = Process::start(&mut fastly_command(exe, &config, variant, port), &log, port)?;
-        let mut replies = Vec::new();
-        for _ in 0..if variant == "logger-negative" { 2 } else { 3 } {
-            replies.push(req(port, "/probe/log")?);
-        }
-        drop(process);
+        let outcome = (|| -> Result<()> {
+            let mut replies = Vec::new();
+            for _ in 0..if variant == "logger-negative" { 2 } else { 3 } {
+                replies.push(req(port, "/probe/log")?);
+            }
+            drop(process);
+            records.push(json!({"event":"logging_check","variant":variant,"statuses":replies.iter().map(|r|r["status"].clone()).collect::<Vec<_>>(),"log_file":log.file_name()}))?;
+            if variant == "logger-negative" {
+                let starts = logs(&log)
+                    .into_iter()
+                    .filter(|e| e["event"] == "request_start")
+                    .collect::<Vec<_>>();
+                let status = validate_negative_logging(&replies, &starts)?;
+                records.push(json!({"status":status,"assertion":"repeated_logger_installation","variant":variant}))?;
+            } else {
+                let guests = replies.iter().map(guest).collect::<Result<Vec<_>>>()?;
+                let text = fs::read_to_string(&log)?;
+                let delivered = text
+                    .lines()
+                    .filter(|l| l.starts_with("fixture-logs :: "))
+                    .filter_map(|l| {
+                        l.rsplit_once("fixture request ")
+                            .map(|(_, v)| v.trim().to_owned())
+                    })
+                    .collect::<Vec<_>>();
+                let status = validate_logging(&guests, &delivered)?;
+                records.push(json!({"status":status,"assertion":"named_endpoint_receipt","variant":variant,"received":delivered.len()}))?;
+            }
+            Ok(())
+        })();
         records.collect_clients(json!({"variant":format!("logging-{variant}"),"repetition":0}))?;
         for event in logs(&log) {
             records.push(annotate(
@@ -434,27 +534,9 @@ fn logging(exe: &Path, run: &Path, records: &mut Records) -> Result<()> {
                 json!({"variant":format!("logging-{variant}"),"repetition":0}),
             ))?;
         }
-        records.push(json!({"event":"logging_check","variant":variant,"statuses":replies.iter().map(|r|r["status"].clone()).collect::<Vec<_>>(),"log_file":log.file_name()}))?;
-        if variant == "logger-negative" {
-            let starts = logs(&log)
-                .into_iter()
-                .filter(|e| e["event"] == "request_start")
-                .collect::<Vec<_>>();
-            let status = validate_negative_logging(&replies, &starts)?;
-            records.push(json!({"status":status,"assertion":"repeated_logger_installation","variant":variant}))?;
-        } else {
-            let guests = replies.iter().map(guest).collect::<Result<Vec<_>>>()?;
-            let text = fs::read_to_string(&log)?;
-            let delivered = text
-                .lines()
-                .filter(|l| l.starts_with("fixture-logs :: "))
-                .filter_map(|l| {
-                    l.rsplit_once("fixture request ")
-                        .map(|(_, v)| v.trim().to_owned())
-                })
-                .collect::<Vec<_>>();
-            let status = validate_logging(&guests, &delivered)?;
-            records.push(json!({"status":status,"assertion":"named_endpoint_receipt","variant":variant,"received":delivered.len()}))?;
+        if let Err(error) = outcome {
+            records.push(json!({"status":"fail","adapter":"fastly","variant":format!("logging-{variant}"),"repetition":0,"error":error.to_string()}))?;
+            return Err(error);
         }
     }
     Ok(())
@@ -462,12 +544,18 @@ fn logging(exe: &Path, run: &Path, records: &mut Records) -> Result<()> {
 pub fn provider(name: &str, args: &Args, run: &Path, records: &mut Records) -> Result<()> {
     let package = root().join("crates").join(format!("fixture-{name}"));
     let exe = if name == "axum" {
-        checked(
-            Command::new("cargo")
-                .args(["build", "--locked", "-p", "fixture-axum"])
-                .current_dir(root()),
-        )?;
-        root().join("target/debug/fixture-axum")
+        let output = cargo_build()
+            .args([
+                "build",
+                "--locked",
+                "-p",
+                "fixture-axum",
+                "--message-format=json-render-diagnostics",
+            ])
+            .stderr(Stdio::inherit())
+            .output()?;
+        require(output.status.success(), "Axum fixture build failed")?;
+        built_executable(&output.stdout, "fixture-axum")?
     } else {
         let (variable, tool) = if name == "cloudflare" {
             ("WRANGLER_BIN", "wrangler")
@@ -484,7 +572,7 @@ pub fn provider(name: &str, args: &Args, run: &Path, records: &mut Records) -> R
             records.push(json!({"event":"runtime_controls","adapter":"spin","selected":"host defaults","source":"spin-up-help.txt"}))?;
 
             checked(
-                Command::new("cargo")
+                cargo_build()
                     .args([
                         "build",
                         "--locked",
@@ -504,13 +592,14 @@ pub fn provider(name: &str, args: &Args, run: &Path, records: &mut Records) -> R
             checked(
                 Command::new(builder)
                     .args(["--release", ".", "--", "--locked"])
+                    .env("CARGO_TARGET_DIR", root().join("target"))
                     .current_dir(&package),
             )?;
         }
         exe
     };
     let built = match name {
-        "axum" => root().join("target/debug/fixture-axum"),
+        "axum" => exe.clone(),
         "spin" => root().join("target/wasm32-wasip2/release/fixture_spin.wasm"),
         _ => package.join("build/index_bg.wasm"),
     };
@@ -521,7 +610,12 @@ pub fn provider(name: &str, args: &Args, run: &Path, records: &mut Records) -> R
         } else {
             "wrangler.toml"
         };
-        fs::copy(package.join(filename), run.join(filename))?;
+        if name == "cloudflare" {
+            // Only the explicit builder runs before artifact fingerprinting.
+            fs::write(run.join(filename), wrangler_runtime_config(&package)?)?;
+        } else {
+            fs::copy(package.join(filename), run.join(filename))?;
+        }
     }
     let modes = if name == "axum" {
         vec!["retained"]
@@ -532,6 +626,7 @@ pub fn provider(name: &str, args: &Args, run: &Path, records: &mut Records) -> R
         let port = net::port()?;
         let mut command = Command::new(&exe);
         command
+            .env("CARGO_TARGET_DIR", root().join("target"))
             .current_dir(&package)
             .env("EDGEZERO__ADAPTER__HOST", "127.0.0.1")
             .env("EDGEZERO__ADAPTER__PORT", port.to_string());
@@ -564,6 +659,8 @@ pub fn provider(name: &str, args: &Args, run: &Path, records: &mut Records) -> R
                     .current_dir(&package),
             )?;
             command
+                .arg("--config")
+                .arg(run.join("wrangler.toml"))
                 .args([
                     "dev",
                     "--local",
@@ -597,6 +694,7 @@ pub fn provider(name: &str, args: &Args, run: &Path, records: &mut Records) -> R
         let log = run.join(format!("{name}-{mode}.log"));
 
         let process = Process::start(&mut command, &log, port)?;
+        let mut last_repetition = 0;
         let outcome = (|| -> Result<()> {
             let mut seen: HashMap<String, Value> = HashMap::new();
             let mut reused = false;
@@ -611,6 +709,7 @@ pub fn provider(name: &str, args: &Args, run: &Path, records: &mut Records) -> R
                 5
             };
             for repetition in 0..repetitions {
+                last_repetition = repetition;
                 for _ in 0..requests {
                     let token = token();
                     let reply = net::request(port, &format!("/probe/{token}"), &token, None, None)?;
@@ -625,6 +724,7 @@ pub fn provider(name: &str, args: &Args, run: &Path, records: &mut Records) -> R
                             "retained initialization mismatch",
                         )?;
                     }
+                    validate_shared_state(&value, mode == "retained")?;
                     let instance = value["instance"].as_str().ok_or("missing instance")?;
                     if let Some(previous) = seen.get(instance) {
                         reused = true;
@@ -642,7 +742,7 @@ pub fn provider(name: &str, args: &Args, run: &Path, records: &mut Records) -> R
                     seen.insert(instance.into(), value.clone());
                     records.push(annotate(
                         reply,
-                        json!({"guest":value,"adapter":name,"mode":mode,"repetition":repetition}),
+                        json!({"guest":value,"adapter":name,"mode":mode,"repetition":repetition,"workload":"probe"}),
                     ))?;
                 }
             }
@@ -656,6 +756,12 @@ pub fn provider(name: &str, args: &Args, run: &Path, records: &mut Records) -> R
                     "injected required binding did not fail",
                 )?;
                 let failed_guest: Value = serde_json::from_str(failed["body"].as_str().unwrap())?;
+                require(
+                    failed_guest["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("missing_fixture_kv")),
+                    "binding failure did not identify the injected missing KV binding",
+                )?;
                 let recovered = guest(&req(port, "/probe/after-binding-failure")?)?;
                 require(
                     recovered["builds"] == 1,
@@ -742,7 +848,12 @@ pub fn provider(name: &str, args: &Args, run: &Path, records: &mut Records) -> R
         for event in logs(&log) {
             records.push(annotate(event, json!({"adapter":name,"mode":mode})))?;
         }
-        outcome?;
+        if let Err(error) = outcome {
+            records.push(
+                json!({"status":"fail","adapter":name,"mode":mode,"repetition":last_repetition,"error":error.to_string()}),
+            )?;
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -865,7 +976,51 @@ fn faults(exe: &Path, run: &Path, records: &mut Records) -> Result<()> {
                 json!({"variant":"faults","repetition":index}),
             ))?;
         }
-        outcome?;
+        if let Err(error) = outcome {
+            records.push(json!({"status":"fail","adapter":"fastly","variant":"faults","repetition":index,"path":path,"error":error.to_string()}))?;
+            return Err(error);
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cargo_artifacts_select_the_fresh_executable_in_a_configured_target() {
+        let output = concat!(
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"dependency\"},\"executable\":null}\n",
+            "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"fixture-axum\"},\"executable\":\"/tmp/target/host-triple/debug/fixture-axum\"}\n",
+            "{\"reason\":\"build-finished\",\"success\":true}\n",
+        );
+        assert_eq!(
+            built_executable(output.as_bytes(), "fixture-axum").unwrap(),
+            PathBuf::from("/tmp/target/host-triple/debug/fixture-axum")
+        );
+        assert!(built_executable(b"", "fixture-axum").is_err());
+    }
+    #[test]
+    fn wrangler_runtime_configuration_does_not_rebuild_fingerprinted_artifacts() {
+        let package = root().join("crates/fixture-cloudflare");
+        let config = wrangler_runtime_config(&package).unwrap();
+        assert!(!config.contains("[build]") && !config.contains("worker-build"));
+        assert!(config.contains(&format!(
+            "main = {:?}",
+            package.join("build/worker/shim.mjs")
+        )));
+        assert!(config.contains("binding = \"fixture_kv\""));
+    }
+    #[test]
+    fn builds_and_artifact_lookups_share_a_fixed_target_directory() {
+        let command = cargo_build();
+        let target = root().join("target");
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "CARGO_TARGET_DIR" && value == Some(target.as_os_str()))
+        );
+        assert_eq!(command.get_current_dir(), Some(root().as_path()));
+        assert!(wasm("c").starts_with(target));
+    }
 }

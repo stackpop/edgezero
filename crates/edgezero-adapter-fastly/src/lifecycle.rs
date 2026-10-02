@@ -112,6 +112,7 @@ impl<T> Sandbox<T> {
 /// SDK limits are upper bounds, not a guarantee of reuse. This function does not
 /// read configuration or enable reuse in existing entry points.
 #[cfg(feature = "fastly")]
+#[must_use = "inspect the serving summary or call into_result() to handle terminal errors"]
 #[inline]
 pub fn serve_custom<T, F, R>(serve: Serve, mut handler: F) -> ServeSummary<R::Error>
 where

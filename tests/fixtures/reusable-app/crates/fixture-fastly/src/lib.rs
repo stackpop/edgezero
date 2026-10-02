@@ -137,17 +137,9 @@ fn custom_dispatch(
         .get_header_str("x-fixture-backend")
         .map(|uri| uri.replace("/chunks", "/post-send"));
     req.set_header("x-fixture-mutated", "true");
-    if req.get_path() == "/constructor-panic" {
-        PANIC_IN_CONSTRUCTOR.store(true, Ordering::SeqCst);
-    }
-    // Arm B deliberately scopes application state to the current callback.
-    // The panic fixture also needs a fresh constructor even after initialization.
+    // Per-request mode scopes application state to the current callback.
     let mut per_request = edgezero_adapter_fastly::lifecycle::Sandbox::default();
-    let state = if reuse_app && req.get_path() != "/constructor-panic" {
-        sandbox
-    } else {
-        &mut per_request
-    };
+    let state = if reuse_app { sandbox } else { &mut per_request };
     let result = state.initialize(|| {
         if req.get_path() == "/initialization-error" {
             Err(Error::msg("injected initialization failure"))
@@ -167,8 +159,16 @@ fn custom_dispatch(
         return Ok(());
     }
     initialized(&observation, &token);
-    let mut core = edgezero_adapter_fastly::request::into_core_request(req)?;
-    core.extensions_mut().insert(observation.clone());
+    let stores = MeasuredApp::stores();
+    let env = edgezero_adapter_fastly::runtime_env_config(stores);
+    let core = edgezero_adapter_fastly::request::into_core_request_with_registries(
+        req,
+        stores,
+        &env,
+        |_, extensions| {
+            extensions.insert(observation.clone());
+        },
+    )?;
     let proxy = core
         .extensions()
         .get::<edgezero_core::proxy::ProxyHandle>()

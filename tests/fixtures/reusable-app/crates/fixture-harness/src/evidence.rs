@@ -9,6 +9,17 @@ pub fn require(condition: bool, message: impl Into<String>) -> Result<()> {
         Err(message.into().into())
     }
 }
+pub fn validate_shared_state(guest: &Value, retained: bool) -> Result<()> {
+    let expected = if retained {
+        guest["ordinal"].as_u64()
+    } else {
+        Some(1)
+    };
+    require(
+        expected.is_some() && guest["shared"].as_u64() == expected,
+        format!("shared app state does not match its lifetime: {guest}"),
+    )
+}
 pub fn validate_logging(guests: &[Value], delivered: &[String]) -> Result<&'static str> {
     let mut seen = HashMap::new();
     let mut reused = false;
@@ -54,6 +65,14 @@ pub fn validate_negative_logging(replies: &[Value], starts: &[Value]) -> Result<
             reply["status"] == if repeated { 500 } else { 200 },
             "unexpected negative logger status",
         )?;
+        if repeated {
+            require(
+                reply["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains("already initialized")),
+                "missing repeated logger initialization error",
+            )?;
+        }
         reused |= repeated;
     }
     Ok(if reused { "pass" } else { "unverified" })
@@ -103,12 +122,12 @@ pub fn validate_overlap(left: &Value, right: &Value) -> Result<()> {
         "different guests do not prove overlap",
     )?;
     require(
-        left["max_inflight"]
+        left["before"]["inflight"]
             .as_u64()
             .unwrap_or(0)
-            .min(right["max_inflight"].as_u64().unwrap_or(0))
+            .max(right["before"]["inflight"].as_u64().unwrap_or(0))
             >= 2,
-        "callbacks did not overlap",
+        "this pair did not observe overlapping callbacks",
     )
 }
 #[cfg(test)]
@@ -291,7 +310,7 @@ pub fn summarize(records: &[Value]) -> Value {
     let mut builds = BTreeMap::new();
     let mut mixed_builds = false;
     for record in records.iter().filter(|r| r["event"] == "build") {
-        let key = (variant(record), record["repetition"].to_string());
+        let key = variant(record);
         if let Some(previous) = builds.insert(key, record["artifact"]["fnv1a64"].clone()) {
             mixed_builds |= previous != record["artifact"]["fnv1a64"];
         }
@@ -299,7 +318,11 @@ pub fn summarize(records: &[Value]) -> Value {
     let mut groups: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
     let mut memory: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for r in records {
-        if r["event"] == "client_completed" && r.get("guest").is_some() {
+        if r["event"] == "client_completed"
+            && r["workload"] == "probe"
+            && r["status"] == 200
+            && r.get("guest").is_some()
+        {
             let cohort = if r["guest"]["ordinal"] == 1 {
                 "cold"
             } else {
@@ -335,6 +358,31 @@ pub fn summarize(records: &[Value]) -> Value {
         }
         result["variants"][&key] =
             json!({"samples":values.len(), "completion_ns":quantiles(values)});
+        let mut repetitions: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+        for row in &rows {
+            repetitions
+                .entry(row["repetition"].to_string())
+                .or_default()
+                .push(row);
+        }
+        for (repetition, samples) in repetitions {
+            let completion = samples
+                .iter()
+                .filter_map(|r| r["complete_ns"].as_u64())
+                .collect::<Vec<_>>();
+            if !completion.is_empty() {
+                result["variants"][&key]["repetitions"][&repetition] =
+                    json!({"samples":completion.len(),"completion_ns":quantiles(completion)});
+            }
+            let first_bytes = samples
+                .iter()
+                .filter_map(|r| r["first_byte_ns"].as_u64())
+                .collect::<Vec<_>>();
+            if !first_bytes.is_empty() {
+                result["variants"][&key]["repetitions"][&repetition]["first_byte_ns"] =
+                    quantiles(first_bytes);
+            }
+        }
         let first = rows
             .iter()
             .filter_map(|r| r["first_byte_ns"].as_u64())
@@ -361,7 +409,7 @@ mod tests {
         let summary = summarize(&[
             json!({"event":"request_start","variant":"c","instance":"one","ordinal":1,"token":"a"}),
             json!({"event":"build","variant":"c","repetition":0,"artifact":{"fnv1a64":"a"}}),
-            json!({"event":"build","variant":"c","repetition":0,"artifact":{"fnv1a64":"b"}}),
+            json!({"event":"build","variant":"c","repetition":1,"artifact":{"fnv1a64":"b"}}),
         ]);
         assert!(summary["guests"][0]["requests"][0]["response_committed"].is_null());
         assert_eq!(summary["build_identity"]["status"], "invalid");
@@ -489,32 +537,64 @@ mod tests {
     }
     #[test]
     fn overlap_requires_same_guest_and_concurrency() {
-        let left = json!({"instance":"a","max_inflight":2});
+        let left = json!({"instance":"a","max_inflight":2,"before":{"inflight":1}});
         for right in [
-            json!({"instance":"b","max_inflight":2}),
-            json!({"instance":"a","max_inflight":1}),
+            json!({"instance":"b","max_inflight":2,"before":{"inflight":2}}),
+            json!({"instance":"a","max_inflight":2,"before":{"inflight":1}}),
         ] {
             assert!(validate_overlap(&left, &right).is_err());
         }
-        validate_overlap(&left, &left).unwrap();
+        validate_overlap(
+            &left,
+            &json!({"instance":"a","max_inflight":2,"before":{"inflight":2}}),
+        )
+        .unwrap();
     }
     #[test]
     fn unmatched_workloads_excluded() {
         let s = summarize(&[
-            json!({"event":"client_completed","variant":"c","guest":{"ordinal":1},"complete_ns":10}),
-            json!({"event":"client_completed","variant":"c","guest":{"ordinal":2},"complete_ns":20}),
+            json!({"event":"client_completed","variant":"c","workload":"probe","status":200,"guest":{"ordinal":1},"complete_ns":10}),
+            json!({"event":"client_completed","variant":"c","workload":"probe","status":200,"guest":{"ordinal":2},"complete_ns":20}),
             json!({"event":"client_completed","variant":"c","assertion":"idle","complete_ns":999}),
+            json!({"event":"client_completed","variant":"c","guest":{"ordinal":2},"status":200,"complete_ns":999}),
+            json!({"event":"client_completed","variant":"c","workload":"probe","guest":{"ordinal":2},"status":503,"complete_ns":999}),
         ]);
+        assert_eq!(s["variants"]["c:probe:reused"]["samples"], 1);
         assert_eq!(s["variants"]["c:probe:cold"]["completion_ns"]["p50"], 10);
         assert_eq!(s["variants"]["c:probe:reused"]["completion_ns"]["p50"], 20);
     }
     #[test]
     fn provider_modes_separate() {
-        let records=["retained","per-request"].map(|mode|json!({"event":"client_completed","adapter":"spin","mode":mode,"guest":{"ordinal":2},"complete_ns":10}));
+        let records=["retained","per-request"].map(|mode|json!({"event":"client_completed","adapter":"spin","mode":mode,"workload":"probe","status":200,"guest":{"ordinal":2},"complete_ns":10}));
         assert_eq!(
             summarize(&records)["variants"].as_object().unwrap().len(),
             2
         );
+    }
+    #[test]
+    fn probe_quantiles_keep_repetitions_separate() {
+        let records = [10, 100]
+            .into_iter()
+            .enumerate()
+            .map(|(repetition, latency)| {
+                json!({"event":"client_completed","variant":"c","workload":"probe","status":200,
+                "guest":{"ordinal":2},"repetition":repetition,"complete_ns":latency})
+            })
+            .collect::<Vec<_>>();
+        let summary = summarize(&records);
+        let repetitions = &summary["variants"]["c:probe:reused"]["repetitions"];
+        assert_eq!(repetitions["0"]["completion_ns"]["p50"], 10);
+        assert_eq!(repetitions["1"]["completion_ns"]["p50"], 100);
+    }
+    #[test]
+    fn shared_state_matches_retained_and_per_request_lifetimes() {
+        let value = json!({"ordinal":3,"shared":3});
+        validate_shared_state(&value, true).unwrap();
+        assert!(validate_shared_state(&value, false).is_err());
+        let fresh = json!({"ordinal":3,"shared":1});
+        validate_shared_state(&fresh, false).unwrap();
+        assert!(validate_shared_state(&fresh, true).is_err());
+        assert!(validate_shared_state(&json!({}), true).is_err());
     }
     #[test]
     fn logging_requires_reuse_and_correlated_delivery() {
@@ -546,6 +626,9 @@ mod tests {
         starts[1]["instance"] = json!("one");
         assert!(validate_negative_logging(&replies, &starts).is_err());
         replies[1]["status"] = json!(500);
+        replies[1]["body"] = json!("unrelated KV registry failure");
+        assert!(validate_negative_logging(&replies, &starts).is_err());
+        replies[1]["body"] = json!("logging system was already initialized");
         assert_eq!(
             validate_negative_logging(&replies, &starts).unwrap(),
             "pass"

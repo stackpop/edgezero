@@ -104,6 +104,7 @@ fn serve(
     signal: Signal,
     barrier: Arc<(Mutex<usize>, Condvar)>,
 ) -> Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
@@ -306,6 +307,32 @@ pub fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nonblocking_connection_waits_for_request_bytes() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let worker = thread::spawn(move || {
+            serve(
+                server,
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new((Mutex::new(false), Condvar::new())),
+                Arc::new((Mutex::new(0), Condvar::new())),
+            )
+        });
+        thread::sleep(Duration::from_millis(100));
+        client
+            .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200"));
+    }
     #[test]
     fn progressive_body_and_abort() {
         let backend = Backend::start().unwrap();
