@@ -3246,8 +3246,10 @@ test_build_app_cli_archive() {
   local app_dir="$dir/workspace/app"
   local action_ws="$dir/runner/invocation"
   local cached_target="$dir/runner/edgezero-rust-cache/example-app/target"
-  mkdir -p "$app_dir" "$dir/bin" "$action_ws" "$cached_target"
+  mkdir -p "$app_dir" "$dir/bin" "$action_ws" "$cached_target/release"
   touch "$cached_target/restored-cache-entry"
+  printf '#!/usr/bin/env bash\n# stale cached CLI\nexit 0\n' >"$cached_target/release/fixture-cli"
+  chmod +x "$cached_target/release/fixture-cli"
   printf '[package]\nname = "fixture-cli"\nversion = "1.2.3"\nedition = "2021"\n' \
     >"$app_dir/Cargo.toml"
   printf 'version = 3\n' >"$app_dir/Cargo.lock"
@@ -3264,6 +3266,12 @@ EOF
 #!/usr/bin/env bash
 exit 0
 EOF
+  cat >"$dir/bin/rustc" <<'EOF'
+#!/usr/bin/env bash
+printf 'rustc 1.95.0\nhost: x86_64-unknown-linux-gnu\n'
+EOF
+  # Models Cargo's output layout: `--target` beats CARGO_BUILD_TARGET, and any
+  # selected target nests the profile directory under the triple.
   cat >"$dir/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -3273,21 +3281,28 @@ case " $* " in
       '{workspace_root:$root,packages:[{name:"fixture-cli",version:"1.2.3",manifest_path:($root + "/Cargo.toml"),targets:[{kind:["bin"],name:"fixture-cli"}]}]}'
     ;;
   *" build "*)
-    mkdir -p "$CARGO_TARGET_DIR/release"
-    cat >"$CARGO_TARGET_DIR/release/fixture-cli" <<'CLI'
+    target="${CARGO_BUILD_TARGET:-}"
+    while (($#)); do
+      [[ "$1" != --target ]] || target="$2"
+      shift
+    done
+    out="$CARGO_TARGET_DIR/${target:+$target/}release"
+    mkdir -p "$out"
+    cat >"$out/fixture-cli" <<'CLI'
 #!/usr/bin/env bash
+# fresh build
 test "${1:-}" = --help
 CLI
-    chmod +x "$CARGO_TARGET_DIR/release/fixture-cli"
+    chmod +x "$out/fixture-cli"
     ;;
   *) exit 2 ;;
 esac
 EOF
-  chmod +x "$dir/bin/uname" "$dir/bin/rustup" "$dir/bin/cargo"
+  chmod +x "$dir/bin/uname" "$dir/bin/rustup" "$dir/bin/rustc" "$dir/bin/cargo"
 
   local handoff="$dir/build-outputs" published="$dir/published-outputs"
   assert_succeeds "build-app-cli produces its archive with a fake toolchain" \
-    env PATH="$dir/bin:$PATH" FAKE_APP_DIR="$app_dir" \
+    env PATH="$dir/bin:$PATH" FAKE_APP_DIR="$app_dir" CARGO_BUILD_TARGET=wasm32-wasip1 \
     GITHUB_WORKSPACE="$dir/workspace" RUNNER_TEMP="$dir/runner" \
     EDGEZERO__ACTION__ROOT="$REPO_ROOT" \
     EDGEZERO__ACTION__WORKSPACE="$action_ws" \
@@ -3312,10 +3327,12 @@ EOF
     $'app-cli-meta.json\nfixture-cli' "$(tar -tf "$tarball" | sort)"
   assert_succeeds "the configurable GitHub artifact name is preserved" \
     grep -qx 'app-cli-artifact=fixture-upload-name' "$published"
-  assert_succeeds "build-app-cli uses the restored Cargo target directory" \
-    test -x "$cached_target/release/fixture-cli"
+  assert_succeeds "build-app-cli builds the native target in the restored Cargo target directory" \
+    test -x "$cached_target/x86_64-unknown-linux-gnu/release/fixture-cli"
   assert_succeeds "build-app-cli preserves restored Cargo target artifacts" \
     test -f "$cached_target/restored-cache-entry"
+  assert_equals "build-app-cli packages this build's executable, not a stale cached one" \
+    "# fresh build" "$(tar -xOf "$tarball" fixture-cli | sed -n 2p)"
   assert_succeeds "the upload step consumes the published tarball-path" \
     grep -Fq "path: \${{ steps.build.outputs['tarball-path'] }}" \
     "$ACTIONS_DIR/build-app-cli/action.yml"
