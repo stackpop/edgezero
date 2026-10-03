@@ -74,6 +74,7 @@ pub enum StoreExtractionReason {
     MissingRegistry,
     MissingSecret,
     SecretBackendUnavailable,
+    StructuralLimit,
     UnknownStore,
     UnsupportedVersion,
     Validation,
@@ -88,6 +89,7 @@ impl StoreExtractionReason {
             | Self::InvalidSecretValue
             | Self::MalformedEnvelope
             | Self::MissingRegistry
+            | Self::StructuralLimit
             | Self::UnsupportedVersion
             | Self::UnknownStore
             | Self::ValueTooLarge => "internal",
@@ -108,6 +110,7 @@ impl StoreExtractionReason {
             | Self::InvalidSecretValue
             | Self::MalformedEnvelope
             | Self::MissingRegistry
+            | Self::StructuralLimit
             | Self::UnsupportedVersion
             | Self::UnknownStore
             | Self::ValueTooLarge => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1439,6 +1442,12 @@ mod tests {
                 StoreExtractionReason::SecretBackendUnavailable,
                 503_u16,
                 "service_unavailable",
+                false,
+            ),
+            (
+                StoreExtractionReason::StructuralLimit,
+                500_u16,
+                "internal",
                 false,
             ),
             (

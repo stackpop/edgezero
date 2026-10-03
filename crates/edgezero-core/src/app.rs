@@ -1098,6 +1098,8 @@ mod tests {
             max_blob_bytes: 32,
             max_secret_bytes: 16,
             max_total_bytes: 48,
+            max_json_depth: 8,
+            max_json_nodes: 32,
             timeout: Duration::from_secs(2),
         };
         let router = RouterService::builder()

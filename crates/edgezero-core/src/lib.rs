@@ -58,7 +58,7 @@ pub use compression::{
 pub use config_store::{
     BoundedStoreRead, ConfigExtractionLimits, DEFAULT_CONFIG_BACKEND_BYTES,
     DEFAULT_CONFIG_BLOB_BYTES, DEFAULT_CONFIG_EXTRACTION_BYTES, DEFAULT_CONFIG_EXTRACTION_TIMEOUT,
-    DEFAULT_CONFIG_SECRET_BYTES,
+    DEFAULT_CONFIG_JSON_DEPTH, DEFAULT_CONFIG_JSON_NODES, DEFAULT_CONFIG_SECRET_BYTES,
 };
 
 pub use edgezero_macros::{AppConfig, action, app};
@@ -128,6 +128,8 @@ mod public_config_extraction_contract_tests {
             crate::DEFAULT_CONFIG_BACKEND_BYTES
         );
         assert_eq!(limits.max_secret_bytes, crate::DEFAULT_CONFIG_SECRET_BYTES);
+        assert_eq!(limits.max_json_depth, crate::DEFAULT_CONFIG_JSON_DEPTH);
+        assert_eq!(limits.max_json_nodes, crate::DEFAULT_CONFIG_JSON_NODES);
         assert_eq!(
             limits.max_total_bytes,
             crate::DEFAULT_CONFIG_EXTRACTION_BYTES

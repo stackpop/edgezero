@@ -161,6 +161,8 @@ pub const DEFAULT_CONFIG_BACKEND_BYTES: u64 = 0x0100_0000;
 pub const DEFAULT_CONFIG_BLOB_BYTES: u64 = 0x0080_0000;
 pub const DEFAULT_CONFIG_EXTRACTION_BYTES: u64 = 0x0100_0000;
 pub const DEFAULT_CONFIG_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_CONFIG_JSON_DEPTH: u32 = 64;
+pub const DEFAULT_CONFIG_JSON_NODES: u32 = 8_192;
 pub const DEFAULT_CONFIG_SECRET_BYTES: u64 = 0x0010_0000;
 
 /// Per-extraction limits shared by the root config blob and every referenced secret.
@@ -168,6 +170,8 @@ pub const DEFAULT_CONFIG_SECRET_BYTES: u64 = 0x0010_0000;
 pub struct ConfigExtractionLimits {
     pub max_backend_bytes: u64,
     pub max_blob_bytes: u64,
+    pub max_json_depth: u32,
+    pub max_json_nodes: u32,
     pub max_secret_bytes: u64,
     pub max_total_bytes: u64,
     pub timeout: Duration,
@@ -194,6 +198,11 @@ impl ConfigExtractionLimits {
                 "config extraction total byte limit is below a per-value limit"
             )));
         }
+        if self.max_json_depth == 0 || self.max_json_depth > 127 || self.max_json_nodes == 0 {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "config extraction JSON structure limits must be finite and nonzero"
+            )));
+        }
         if self.timeout.is_zero() || self.timeout > DEADLINE_FAR_FUTURE {
             return Err(EdgeError::internal(anyhow::anyhow!(
                 "config extraction timeout must be finite and nonzero"
@@ -211,6 +220,8 @@ impl Default for ConfigExtractionLimits {
             max_blob_bytes: DEFAULT_CONFIG_BLOB_BYTES,
             max_secret_bytes: DEFAULT_CONFIG_SECRET_BYTES,
             max_total_bytes: DEFAULT_CONFIG_EXTRACTION_BYTES,
+            max_json_depth: DEFAULT_CONFIG_JSON_DEPTH,
+            max_json_nodes: DEFAULT_CONFIG_JSON_NODES,
             timeout: DEFAULT_CONFIG_EXTRACTION_TIMEOUT,
         }
     }
@@ -679,6 +690,8 @@ mod tests {
         assert_eq!(limits.max_backend_bytes, DEFAULT_CONFIG_BACKEND_BYTES);
         assert_eq!(limits.max_secret_bytes, DEFAULT_CONFIG_SECRET_BYTES);
         assert_eq!(limits.max_total_bytes, DEFAULT_CONFIG_EXTRACTION_BYTES);
+        assert_eq!(limits.max_json_depth, DEFAULT_CONFIG_JSON_DEPTH);
+        assert_eq!(limits.max_json_nodes, DEFAULT_CONFIG_JSON_NODES);
         assert_eq!(limits.timeout, DEFAULT_CONFIG_EXTRACTION_TIMEOUT);
         limits.validate().expect("valid defaults");
 
@@ -695,6 +708,23 @@ mod tests {
             ..limits
         };
         invalid_timeout.validate().expect_err("zero timeout");
+
+        for invalid in [
+            ConfigExtractionLimits {
+                max_json_depth: 0,
+                ..limits
+            },
+            ConfigExtractionLimits {
+                max_json_depth: 128,
+                ..limits
+            },
+            ConfigExtractionLimits {
+                max_json_nodes: 0,
+                ..limits
+            },
+        ] {
+            invalid.validate().expect_err("invalid JSON structure cap");
+        }
     }
 
     #[test]

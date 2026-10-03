@@ -4232,8 +4232,9 @@ pub enum StoreExtractionReason {
     MissingRegistry,
     MissingSecret,
     SecretBackendUnavailable,
-    UnsupportedVersion,
+    StructuralLimit,
     UnknownStore,
+    UnsupportedVersion,
     Validation,
     ValueTooLarge,
 }
@@ -4260,11 +4261,14 @@ The mapping is total and centralized in `EdgeError::{status_code, kind, response
 | `BackendUnavailable`, `DeadlineExceeded`, `SecretBackendUnavailable` | 503 / `service_unavailable` | absent | optional only for a secret field |
 | `Deserialization`, `MissingBlob`, `MissingSecret`, `Validation` | 503 / `config_out_of_date` | `60` | optional for typed-data/validation/secret failures; absent for a missing root blob |
 | `InvalidKey` | 400 / `bad_request` | absent | absent |
-| `BackendFailure`, `IntegrityMismatch`, `InvalidSecretValue`, `MalformedEnvelope`, `MissingRegistry`, `UnknownStore`, `UnsupportedVersion`, `ValueTooLarge` | 500 / `internal` | absent | optional only when a typed field selected the store/value |
+| `BackendFailure`, `IntegrityMismatch`, `InvalidSecretValue`, `MalformedEnvelope`, `MissingRegistry`, `StructuralLimit`, `UnknownStore`, `UnsupportedVersion`, `ValueTooLarge` | 500 / `internal` | absent | optional only when a typed field selected the store/value |
 
 `ValueTooLarge` covers any per-blob, per-secret, or cumulative extraction byte cap from
 §6.3.2; `DeadlineExceeded` covers the one absolute extraction deadline. A source error that
 arrives simultaneously with deadline expiry is classified as `DeadlineExceeded`.
+`StructuralLimit` covers a config-envelope JSON node or depth cap reached before either
+generic future-format or typed-envelope materialization. Invalid JSON without a breached
+structure cap remains `MalformedEnvelope`. Neither category includes stored values in diagnostics.
 Tests enumerate every known reason, assert status/kind/header/field-path policy, and prove
 the JSON envelope omits the typed reason.
 
@@ -4556,12 +4560,16 @@ pub const DEFAULT_CONFIG_BLOB_BYTES: u64 = 8 * 1024 * 1024;
 pub const DEFAULT_CONFIG_BACKEND_BYTES: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_CONFIG_EXTRACTION_BYTES: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_CONFIG_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_CONFIG_JSON_DEPTH: u32 = 64;
+pub const DEFAULT_CONFIG_JSON_NODES: u32 = 8_192;
 pub const DEFAULT_CONFIG_SECRET_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ConfigExtractionLimits {
     pub max_backend_bytes: u64,
     pub max_blob_bytes: u64,
+    pub max_json_depth: u32,
+    pub max_json_nodes: u32,
     pub max_secret_bytes: u64,
     pub max_total_bytes: u64,
     pub timeout: Duration,
@@ -4650,8 +4658,15 @@ the cause and map directly to the same-named extraction reasons (`ValueTooLarge`
 `StoreExtractionReason::ValueTooLarge`). Existing unbounded methods need not synthesize
 these variants.
 
-`ConfigExtractionLimits::default()` returns the five constants above. `App` owns one
-config-extraction-limits value, set through the fallible
+`ConfigExtractionLimits::default()` returns the seven constants above. The JSON scanner
+counts the root and every nested value, including array/object containers; the root has
+depth 1. A streaming `serde_json` visitor enforces both caps before either full JSON parse,
+without retaining a `Value` tree. Exact-cap structures are accepted. Depth must be in
+`1..=127` (below the parser's recursion ceiling), and node count must be nonzero.
+These caps bound the parsed tree's structural amplification; they do not bound transient
+string decoding, the provider-owned read buffer, canonical serialization, or total process RSS.
+
+`App` owns one config-extraction-limits value, set through the fallible
 `Hooks::configure(&mut App) -> Result<(), EdgeError>` callback; the core-owned
 `App::build::<A>(platform)` prevents request conversion, admission, body polling, or dispatch when validation fails (and prevents
 listener bind on Axum), while the adapter copies a successfully validated value into

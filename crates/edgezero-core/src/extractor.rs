@@ -1,11 +1,14 @@
 use std::any;
+use std::fmt;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 
 use async_trait::async_trait;
 use http::header;
-use serde::de::DeserializeOwned;
+use serde::de::{
+    self, DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor,
+};
 use validator::Validate;
 
 use crate::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
@@ -903,6 +906,8 @@ struct ConfigExtractionBudget {
     clock: MonotonicClock,
     deadline: Deadline,
     max_blob_bytes: u64,
+    max_json_depth: u32,
+    max_json_nodes: u32,
     max_secret_bytes: u64,
     remaining_backend_bytes: u64,
     remaining_total_bytes: u64,
@@ -997,10 +1002,110 @@ impl ConfigExtractionBudget {
             clock,
             deadline: Deadline::at_instant(deadline),
             max_blob_bytes: validated_limits.max_blob_bytes,
+            max_json_depth: validated_limits.max_json_depth,
+            max_json_nodes: validated_limits.max_json_nodes,
             max_secret_bytes: validated_limits.max_secret_bytes,
             remaining_backend_bytes: validated_limits.max_backend_bytes,
             remaining_total_bytes: validated_limits.max_total_bytes,
         })
+    }
+}
+
+struct JsonStructureBudget {
+    exceeded: bool,
+    max_depth: u32,
+    max_nodes: u32,
+    nodes: u32,
+}
+
+struct JsonStructureSeed<'budget> {
+    budget: &'budget mut JsonStructureBudget,
+    depth: u32,
+}
+
+impl<'de> DeserializeSeed<'de> for JsonStructureSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: de::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        if self.depth > self.budget.max_depth || self.budget.nodes >= self.budget.max_nodes {
+            self.budget.exceeded = true;
+            return Err(de::Error::custom("config JSON structure limit exceeded"));
+        }
+        self.budget.nodes = self.budget.nodes.saturating_add(1);
+        deserializer.deserialize_any(JsonStructureVisitor {
+            budget: self.budget,
+            depth: self.depth,
+        })
+    }
+}
+
+struct JsonStructureVisitor<'budget> {
+    budget: &'budget mut JsonStructureBudget,
+    depth: u32,
+}
+
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "serde_json only calls the JSON value visitor methods implemented below"
+)]
+impl<'de> Visitor<'de> for JsonStructureVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, _value: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E: de::Error>(self, _value: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E: de::Error>(self, _value: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while map.next_key::<IgnoredAny>()?.is_some() {
+            map.next_value_seed(JsonStructureSeed {
+                budget: self.budget,
+                depth: self.depth.saturating_add(1),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq
+            .next_element_seed(JsonStructureSeed {
+                budget: self.budget,
+                depth: self.depth.saturating_add(1),
+            })?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_str<E: de::Error>(self, _value: &str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_string<E: de::Error>(self, _value: String) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E: de::Error>(self, _value: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+        Ok(())
     }
 }
 
@@ -1018,6 +1123,35 @@ fn store_extraction_error(
     field_path: Option<String>,
 ) -> EdgeError {
     EdgeError::store_extraction(reason, message, field_path)
+}
+
+fn check_json_structure(raw: &str, max_depth: u32, max_nodes: u32) -> Result<(), EdgeError> {
+    let mut budget = JsonStructureBudget {
+        exceeded: false,
+        max_depth,
+        max_nodes,
+        nodes: 0,
+    };
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let result = JsonStructureSeed {
+        budget: &mut budget,
+        depth: 1,
+    }
+    .deserialize(&mut deserializer)
+    .and_then(|()| deserializer.end());
+    match result {
+        Ok(()) => Ok(()),
+        Err(_) if budget.exceeded => Err(store_extraction_error(
+            StoreExtractionReason::StructuralLimit,
+            "typed app-config blob exceeded its JSON structure limit",
+            None,
+        )),
+        Err(_) => Err(store_extraction_error(
+            StoreExtractionReason::MalformedEnvelope,
+            "typed app-config blob is not a valid envelope (details redacted)",
+            None,
+        )),
+    }
 }
 
 /// A redacted reason when `raw` is a NEWER format this build must not apply, or
@@ -1103,6 +1237,7 @@ where
 
     // Neither parsing nor verification diagnostics may echo stored values.
     let parsed = (|| {
+        check_json_structure(&raw, budget.max_json_depth, budget.max_json_nodes)?;
         if let Some(reason) = future_format_reason(&raw) {
             return Err(store_extraction_error(
                 StoreExtractionReason::UnsupportedVersion,
@@ -3181,6 +3316,65 @@ mod tests {
             !err.message().contains("not-json-at-all"),
             "the offending stored value must not reach the client message: {err:?}"
         );
+    }
+
+    #[test]
+    fn app_config_extractor_rejects_structural_amplification_before_materializing() {
+        struct FixedStore(String);
+        #[async_trait(?Send)]
+        impl ConfigStore for FixedStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                Ok(Some(self.0.clone()))
+            }
+
+            ready_config_store_bounded_read!();
+        }
+
+        let mut nested = serde_json::json!("SECRET_SENTINEL");
+        for _ in 0_u32..70_u32 {
+            nested = serde_json::json!({"": nested});
+        }
+        let wide = serde_json::json!(vec![(); 8_193]);
+        for data in [nested, wide] {
+            let raw = serde_json::json!({
+                "data": data,
+                "generated_at": "2026-01-01",
+                "sha256": "invalid",
+                "version": 1_u32,
+            })
+            .to_string();
+            let ctx = ctx_with_config_store(FixedStore(raw), "key");
+            let err = block_on(AppConfig::<FixtureCfg>::from_request(&ctx))
+                .expect_err("structural cap must reject before envelope materialization");
+            assert_eq!(
+                err.store_extraction_reason(),
+                Some(StoreExtractionReason::StructuralLimit)
+            );
+            assert!(err.message().contains("JSON structure"), "{err:?}");
+            assert!(!err.message().contains("SECRET_SENTINEL"));
+        }
+    }
+
+    #[test]
+    fn config_json_structure_limits_are_inclusive_and_keep_malformed_distinct() {
+        let raw = serde_json::json!({"data": [null]}).to_string();
+        check_json_structure(&raw, 3, 3).expect("exact node and depth caps accept");
+        for (depth, nodes) in [(2, 3), (3, 2)] {
+            let err = check_json_structure(&raw, depth, nodes).expect_err("cap exceeded");
+            assert_eq!(
+                err.store_extraction_reason(),
+                Some(StoreExtractionReason::StructuralLimit)
+            );
+        }
+        for malformed in [r#"{"data":}"#, "{} true"] {
+            let err = check_json_structure(malformed, 3, 3).expect_err("invalid JSON");
+            assert_eq!(
+                err.store_extraction_reason(),
+                Some(StoreExtractionReason::MalformedEnvelope)
+            );
+        }
+        check_json_structure(r#"{"edgezero_\u006bind":"future"}"#, 2, 2)
+            .expect("escaped map keys are scanned without changing their semantics");
     }
 
     #[test]
