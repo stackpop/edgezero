@@ -21,6 +21,11 @@
 
 use sha2::{Digest as _, Sha256};
 
+#[cfg(any(feature = "fastly", test))]
+use edgezero_core::config_store::ConfigStoreError;
+#[cfg(any(feature = "fastly", test))]
+use edgezero_core::{BoundedStoreRead, Deadline, MonotonicClock, MonotonicInstant};
+
 /// Per-entry value limit enforced by Fastly Config Store. Used by the CLI writer
 /// to gate direct-vs-chunked storage, and by the pointer validator (which both
 /// the CLI and the runtime resolver call) — a chunked envelope is always larger
@@ -47,6 +52,17 @@ pub(crate) const CHUNK_KEY_INFIX: &str = ".__edgezero_chunks.";
 /// BOTH the writer (when serialising the pointer) AND the resolver
 /// (when validating the parsed pointer) -- stays unconditional.
 pub(crate) const POINTER_KIND: &str = "fastly_config_chunks";
+
+#[derive(Debug, Eq, PartialEq)]
+#[cfg(any(feature = "fastly", test))]
+pub(crate) struct FastlyReadTooLarge;
+
+#[derive(Debug)]
+#[cfg(any(feature = "fastly", test))]
+pub(crate) enum SyncHostCallError<E> {
+    Backend(E),
+    DeadlineExceeded,
+}
 
 // ---------------------------------------------------------------------------
 // Private pointer schema
@@ -91,6 +107,7 @@ enum RootValueKind {
 /// pointer resolution — a v2 envelope reassembled from v1 chunks is only knowable
 /// AFTER the chunks are fetched — so it cannot be recovered from the raw value
 /// alone.
+#[derive(Debug)]
 pub(crate) enum ResolveFailure {
     /// Corrupt or incomplete state a push can repair by overwriting. Carries a
     /// redacted, human-readable message.
@@ -99,6 +116,17 @@ pub(crate) enum ResolveFailure {
     /// build does not recognise: an unknown/newer `edgezero_kind`, or a bumped
     /// envelope/pointer `version`. Carries a redacted, human-readable message.
     FutureFormat(String),
+}
+
+/// A bounded resolver failure that preserves store boundary errors instead of
+/// misclassifying them as corrupt pointer state.
+#[derive(Debug)]
+#[cfg(any(feature = "fastly", test))]
+pub(crate) enum BoundedResolveFailure {
+    Backend(ConfigStoreError),
+    DeadlineExceeded,
+    Resolve(ResolveFailure),
+    ValueTooLarge,
 }
 
 impl ResolveFailure {
@@ -111,7 +139,11 @@ impl ResolveFailure {
 
     /// Is this a newer format this build must not overwrite (vs. repairable
     /// corruption)?
-    #[cfg(any(feature = "cli", feature = "fastly", test))]
+    #[cfg(any(
+        feature = "fastly",
+        test,
+        all(feature = "cli", not(target_arch = "wasm32"))
+    ))]
     pub(crate) fn is_future_format(&self) -> bool {
         matches!(self, Self::FutureFormat(_))
     }
@@ -125,7 +157,7 @@ struct FastlyChunkRef {
 }
 
 /// A chunk reference from a validated pointer, for `config gc`.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) struct GcChunkRef {
     pub key: String,
     pub len: usize,
@@ -133,7 +165,7 @@ pub(crate) struct GcChunkRef {
 }
 
 /// A validated v1 pointer's contents, for `config gc`.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) struct GcPointer {
     /// Validated: non-empty, one generation, dense `0..n-1` in order.
     pub chunks: Vec<GcChunkRef>,
@@ -142,7 +174,7 @@ pub(crate) struct GcPointer {
 }
 
 /// What a root's value IS, once classified for `config gc`.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) enum GcRootValue {
     /// A valid v1 chunk pointer. Its METADATA is validated; its CONTENT must
     /// still be verified against the store -- see [`gc_verify_generation`].
@@ -154,6 +186,63 @@ pub(crate) enum GcRootValue {
 // ---------------------------------------------------------------------------
 // Public helpers
 // ---------------------------------------------------------------------------
+
+/// Account for the exact bytes materialized by a Fastly store operation.
+#[cfg(any(feature = "fastly", test))]
+pub(crate) fn exact_fastly_read<T>(
+    value: Option<T>,
+    max_backend_bytes: u64,
+) -> Result<BoundedStoreRead<T>, FastlyReadTooLarge>
+where
+    T: AsRef<[u8]>,
+{
+    let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+        u64::try_from(stored_value.as_ref().len()).map_err(|_length_error| FastlyReadTooLarge)
+    })?;
+    if backend_bytes > max_backend_bytes {
+        return Err(FastlyReadTooLarge);
+    }
+    Ok(BoundedStoreRead {
+        backend_bytes,
+        value,
+    })
+}
+
+/// Run one synchronous Fastly operation under cooperative deadline checks.
+///
+/// The host call itself is not preemptible. An overrun is observed immediately
+/// after the call returns and its result is discarded.
+#[cfg(any(feature = "fastly", test))]
+pub(crate) fn run_sync_host_call<T, E, F>(
+    clock: &MonotonicClock,
+    deadline: Deadline,
+    call: F,
+) -> Result<T, SyncHostCallError<E>>
+where
+    F: FnOnce() -> Result<T, E>,
+{
+    run_sync_host_call_at(deadline, || clock.now(), call)
+}
+
+#[cfg(any(feature = "fastly", test))]
+fn run_sync_host_call_at<T, E, N, F>(
+    deadline: Deadline,
+    mut now: N,
+    call: F,
+) -> Result<T, SyncHostCallError<E>>
+where
+    N: FnMut() -> MonotonicInstant,
+    F: FnOnce() -> Result<T, E>,
+{
+    if deadline.instant() <= now() {
+        return Err(SyncHostCallError::DeadlineExceeded);
+    }
+    let result = call();
+    if deadline.instant() <= now() {
+        return Err(SyncHostCallError::DeadlineExceeded);
+    }
+    result.map_err(SyncHostCallError::Backend)
+}
 
 /// Compute the lowercase-hex SHA-256 of `bytes`.
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
@@ -175,7 +264,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// characters (extremely unlikely in practice; recommends restructuring).
 /// Reject a physical Config Store key that exceeds the store's key limit,
 /// before any write is attempted.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 fn check_config_key_len(key: &str) -> Result<(), String> {
     // CHARACTERS, not bytes: Fastly's limit is a character count, so a non-ASCII
     // `--key` must be measured by `chars().count()`, not `len()` (UTF-8 bytes).
@@ -192,7 +281,7 @@ fn check_config_key_len(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn prepare_fastly_config_entries(
     root_key: &str,
     envelope_json: &str,
@@ -386,7 +475,7 @@ pub(crate) fn verify_writer_split_layout(
 /// Only the GC path (`cli.rs`) needs it; the runtime resolver inlines the same
 /// mapping, so this is gated to the `cli` feature to stay dead-code-free in the
 /// guest build.
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub(crate) fn chunk_lengths(chunks: &[GcChunkRef]) -> Vec<usize> {
     chunks.iter().map(|chunk| chunk.len).collect()
 }
@@ -572,6 +661,117 @@ where
     finalize_reconstructed_envelope(root_key, reconstructed)
 }
 
+/// Resolve a Fastly value while accounting for every materialized store byte.
+///
+/// `fetch` receives the backend allowance left after the root pointer and all
+/// prior chunks. Deadline checks are cooperative: they bracket each callback,
+/// but cannot interrupt a synchronous host call already in progress.
+#[cfg(any(feature = "fastly", test))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "root accounting, the shared clock/deadline, both byte caps, and the chunk callback are independent contract inputs"
+)]
+pub(crate) fn resolve_fastly_config_value_typed_bounded<F>(
+    root_key: &str,
+    root_value: String,
+    root_backend_bytes: u64,
+    clock: &MonotonicClock,
+    deadline: Deadline,
+    max_backend_bytes: u64,
+    max_value_bytes: u64,
+    mut fetch: F,
+) -> Result<BoundedStoreRead<String>, BoundedResolveFailure>
+where
+    F: FnMut(&str, u64) -> Result<BoundedStoreRead<String>, ConfigStoreError>,
+{
+    if deadline.is_expired_at(clock.now()) {
+        return Err(BoundedResolveFailure::DeadlineExceeded);
+    }
+
+    let root_value_bytes = u64::try_from(root_value.len())
+        .map_err(|_length_error| BoundedResolveFailure::ValueTooLarge)?;
+    if root_backend_bytes != root_value_bytes || root_backend_bytes > max_backend_bytes {
+        return Err(BoundedResolveFailure::ValueTooLarge);
+    }
+
+    let mut backend_bytes = root_backend_bytes;
+    let mut chunk_value_bytes = 0_u64;
+    let mut boundary_error = None;
+    let resolve_outcome = resolve_fastly_config_value_typed(root_key, root_value, |chunk_key| {
+        if deadline.is_expired_at(clock.now()) {
+            boundary_error = Some(BoundedResolveFailure::DeadlineExceeded);
+            return Err("bounded config read failed".to_owned());
+        }
+
+        let Some(remaining_backend_bytes) = max_backend_bytes.checked_sub(backend_bytes) else {
+            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+            return Err("bounded config read failed".to_owned());
+        };
+        let read = match fetch(chunk_key, remaining_backend_bytes) {
+            Ok(read) => read,
+            Err(error) => {
+                boundary_error = Some(BoundedResolveFailure::Backend(error));
+                return Err("bounded config read failed".to_owned());
+            }
+        };
+
+        if deadline.is_expired_at(clock.now()) {
+            boundary_error = Some(BoundedResolveFailure::DeadlineExceeded);
+            return Err("bounded config read failed".to_owned());
+        }
+
+        let value_bytes = match read.value.as_ref() {
+            Some(value) => {
+                let Ok(value_bytes) = u64::try_from(value.len()) else {
+                    boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+                    return Err("bounded config read failed".to_owned());
+                };
+                value_bytes
+            }
+            None => 0,
+        };
+        if read.backend_bytes != value_bytes || read.backend_bytes > remaining_backend_bytes {
+            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+            return Err("bounded config read failed".to_owned());
+        }
+
+        let Some(next_backend_bytes) = backend_bytes.checked_add(read.backend_bytes) else {
+            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+            return Err("bounded config read failed".to_owned());
+        };
+        let Some(next_chunk_value_bytes) = chunk_value_bytes.checked_add(value_bytes) else {
+            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+            return Err("bounded config read failed".to_owned());
+        };
+        if next_backend_bytes > max_backend_bytes || next_chunk_value_bytes > max_value_bytes {
+            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+            return Err("bounded config read failed".to_owned());
+        }
+
+        backend_bytes = next_backend_bytes;
+        chunk_value_bytes = next_chunk_value_bytes;
+        Ok(read.value)
+    });
+
+    if let Some(error) = boundary_error {
+        return Err(error);
+    }
+    let resolved_value = resolve_outcome.map_err(BoundedResolveFailure::Resolve)?;
+    if deadline.is_expired_at(clock.now()) {
+        return Err(BoundedResolveFailure::DeadlineExceeded);
+    }
+    let resolved_bytes = u64::try_from(resolved_value.len())
+        .map_err(|_length_error| BoundedResolveFailure::ValueTooLarge)?;
+    if resolved_bytes > max_value_bytes {
+        return Err(BoundedResolveFailure::ValueTooLarge);
+    }
+
+    Ok(BoundedStoreRead {
+        backend_bytes,
+        value: Some(resolved_value),
+    })
+}
+
 /// The final gate the chunked path shares with the direct one: reject a NEWER
 /// inner envelope, then parse+verify the exact v1 `BlobEnvelope`.
 ///
@@ -647,7 +847,7 @@ where
 ///   but fails validation: malformed, unsupported `version`, or a
 ///   referenced key falls outside this root's chunk prefix. Callers log
 ///   `msg` as a warning and skip GC for this root (delete nothing).
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn prior_chunk_keys(root_key: &str, raw: &str) -> Result<Vec<String>, String> {
     // 1. Parse loosely. Not-JSON, or not our pointer kind => silent.
     let value: serde_json::Value = match serde_json::from_str(raw) {
@@ -885,7 +1085,7 @@ pub(crate) fn value_is_pointer_kind(raw: &str) -> bool {
 /// a malformed object (a possible truncated/corrupt pointer whose chunk
 /// references we cannot read), an unknown-kind value, and a pointer: those must
 /// fail closed, because assuming they reference no chunks could orphan live ones.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn value_is_inert_foreign(raw: &str) -> bool {
     matches!(classify_root_value(raw), RootValueKind::Foreign)
 }
@@ -898,7 +1098,7 @@ pub(crate) fn value_is_inert_foreign(raw: &str) -> bool {
 /// envelope fragment that announces nothing, so anything that DOES announce is
 /// suspicious (a parked pointer, a future-format value) and must be classified,
 /// not blindly treated as a deletable fragment.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn value_announces_our_kind(raw: &str) -> bool {
     matches!(
         classify_root_value(raw),
@@ -980,7 +1180,7 @@ pub(crate) fn value_is_future_format(raw: &str) -> bool {
 /// every metadata check still passes while the dropped chunk silently leaves the
 /// live set. Callers MUST reconstruct the referenced chunks and put them through
 /// [`gc_verify_generation`] before trusting the live set.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<GcRootValue, String> {
     use edgezero_core::blob_envelope::BlobEnvelope;
 
@@ -1078,7 +1278,7 @@ pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<GcRootValue,
 ///   chunk list is not the true live set);
 /// - a delete candidate's generation must reconstruct a real envelope (a
 ///   necessary, but not sufficient, condition for reclaiming it).
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn gc_verify_generation(generation_sha: &str, assembled: &str) -> Result<(), String> {
     use edgezero_core::blob_envelope::BlobEnvelope;
 
@@ -1119,7 +1319,7 @@ pub(crate) fn gc_verify_generation(generation_sha: &str, assembled: &str) -> Res
 /// This is how reclamation groups the store's ACTUAL keys into generations. It
 /// validates the shape (`<root>.__edgezero_chunks.<hex-sha>.<index>`) rather
 /// than trusting it: a hand-edited or foreign key never becomes a delete target.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn chunk_key_generation(root_key: &str, key: &str) -> Option<String> {
     chunk_key_parts(root_key, key).map(|(generation, _)| generation)
 }
@@ -1130,7 +1330,7 @@ pub(crate) fn chunk_key_generation(root_key: &str, key: &str) -> Option<String> 
 /// `config gc` uses this to order a proven generation's chunks by writer index
 /// before deleting, so preview and failure-recovery order do not depend on the
 /// remote listing order.
-#[cfg(any(feature = "cli", test))]
+#[cfg(any(test, all(feature = "cli", not(target_arch = "wasm32"))))]
 pub(crate) fn chunk_key_index(root_key: &str, key: &str) -> Option<usize> {
     chunk_key_parts(root_key, key).map(|(_, index)| index)
 }
@@ -1192,8 +1392,320 @@ fn canonical_index(index: &str) -> Option<usize> {
 mod tests {
 
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use super::*;
+    use edgezero_core::blob_envelope::BlobEnvelope;
+    use edgezero_core::{BoundedStoreRead, Deadline, MonotonicInstant};
+
+    fn unexpected_chunk_fetch(
+        _key: &str,
+        _remaining_backend_bytes: u64,
+    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        Err(ConfigStoreError::unavailable("unexpected chunk fetch"))
+    }
+
+    #[test]
+    fn exact_fastly_read_accepts_exact_bytes_and_rejects_one_over() {
+        let exact = exact_fastly_read(Some(bytes::Bytes::from_static(b"secret")), 6)
+            .expect("an exact-sized value must succeed");
+        assert_eq!(exact.backend_bytes, 6);
+        assert_eq!(exact.value.as_deref(), Some(b"secret".as_slice()));
+
+        let error = exact_fastly_read(Some(bytes::Bytes::from_static(b"secret")), 5)
+            .expect_err("one byte over the cap must fail");
+        assert_eq!(error, FastlyReadTooLarge);
+    }
+
+    #[test]
+    fn synchronous_host_call_checks_deadline_before_and_after_operation() {
+        let start = MonotonicInstant::now();
+        let deadline = Deadline::at_instant(
+            start
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+        let after_deadline = start
+            .checked_add(Duration::from_secs(2))
+            .expect("post-deadline instant");
+        let mut observations = [start, after_deadline].into_iter();
+        let mut calls = 0_usize;
+
+        let error = run_sync_host_call_at(
+            deadline,
+            || observations.next().expect("clock observation"),
+            || {
+                calls += 1;
+                Ok::<_, ()>("materialized")
+            },
+        )
+        .expect_err("an operation completing after the deadline must fail");
+        assert!(matches!(error, SyncHostCallError::DeadlineExceeded));
+        assert_eq!(
+            calls, 1,
+            "the deadline elapsed while the call was in flight"
+        );
+
+        let mut backend_observations = [start, after_deadline].into_iter();
+        let backend_error = run_sync_host_call_at(
+            deadline,
+            || backend_observations.next().expect("clock observation"),
+            || Err::<(), _>("backend failed"),
+        )
+        .expect_err("post-call deadline must also be checked after backend failure");
+        assert!(matches!(backend_error, SyncHostCallError::DeadlineExceeded));
+
+        let mut called_after_expiry = false;
+        let preflight_error = run_sync_host_call_at(
+            deadline,
+            || after_deadline,
+            || {
+                called_after_expiry = true;
+                Ok::<_, ()>("unreachable")
+            },
+        )
+        .expect_err("an already-expired operation must fail");
+        assert!(matches!(
+            preflight_error,
+            SyncHostCallError::DeadlineExceeded
+        ));
+        assert!(!called_after_expiry, "an expired call must not be started");
+    }
+
+    #[test]
+    fn bounded_failures_preserve_backend_and_resolver_payloads() {
+        let backend_failure = BoundedResolveFailure::Backend(ConfigStoreError::unavailable(
+            "temporary store failure",
+        ));
+        match backend_failure {
+            BoundedResolveFailure::Backend(error) => drop(error),
+            BoundedResolveFailure::DeadlineExceeded
+            | BoundedResolveFailure::Resolve(_)
+            | BoundedResolveFailure::ValueTooLarge => {
+                panic!("backend failure variant changed");
+            }
+        }
+
+        let resolve_failure =
+            BoundedResolveFailure::Resolve(ResolveFailure::Corrupt("invalid pointer".to_owned()));
+        match resolve_failure {
+            BoundedResolveFailure::Resolve(error) => {
+                assert_eq!(error.into_message(), "invalid pointer");
+            }
+            BoundedResolveFailure::Backend(_)
+            | BoundedResolveFailure::DeadlineExceeded
+            | BoundedResolveFailure::ValueTooLarge => {
+                panic!("resolver failure variant changed");
+            }
+        }
+
+        let start = MonotonicInstant::now();
+        let deadline = Deadline::at_instant(
+            start
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+        let mut observations = [start, start].into_iter();
+        let backend_error = run_sync_host_call_at(
+            deadline,
+            || observations.next().expect("clock observation"),
+            || Err::<(), _>("backend failed"),
+        )
+        .expect_err("backend failure must remain inspectable");
+        match backend_error {
+            SyncHostCallError::Backend(message) => assert_eq!(message, "backend failed"),
+            SyncHostCallError::DeadlineExceeded => panic!("deadline must not win"),
+        }
+
+        let clock = MonotonicClock::default();
+        let wrapper_result =
+            run_sync_host_call(&clock, Deadline::after(Duration::from_secs(1)), || {
+                Ok::<_, ()>("materialized")
+            })
+            .expect("wrapper call before its deadline must succeed");
+        assert_eq!(wrapper_result, "materialized");
+    }
+
+    #[test]
+    fn bounded_resolver_accepts_exact_direct_caps_and_rejects_over_cap() {
+        let clock = MonotonicClock::default();
+        let exact = resolve_fastly_config_value_typed_bounded(
+            "root",
+            "value".to_owned(),
+            5,
+            &clock,
+            Deadline::after(Duration::from_secs(1)),
+            5,
+            5,
+            unexpected_chunk_fetch,
+        )
+        .expect("a direct value at both exact caps must succeed");
+
+        assert_eq!(exact.backend_bytes, 5);
+        assert_eq!(exact.value.as_deref(), Some("value"));
+
+        let over_backend = resolve_fastly_config_value_typed_bounded(
+            "root",
+            "value".to_owned(),
+            5,
+            &clock,
+            Deadline::after(Duration::from_secs(1)),
+            4,
+            5,
+            unexpected_chunk_fetch,
+        )
+        .expect_err("a direct value over the backend cap must fail");
+        assert!(matches!(over_backend, BoundedResolveFailure::ValueTooLarge));
+
+        let over_value = resolve_fastly_config_value_typed_bounded(
+            "root",
+            "value".to_owned(),
+            5,
+            &clock,
+            Deadline::after(Duration::from_secs(1)),
+            5,
+            4,
+            unexpected_chunk_fetch,
+        )
+        .expect_err("a direct value over the value cap must fail");
+        assert!(matches!(over_value, BoundedResolveFailure::ValueTooLarge));
+    }
+
+    #[test]
+    fn bounded_resolver_rejects_expired_deadline_without_fetching() {
+        let mut fetched = false;
+        let clock = MonotonicClock::default();
+        let error = resolve_fastly_config_value_typed_bounded(
+            "root",
+            "value".to_owned(),
+            5,
+            &clock,
+            Deadline::after(Duration::ZERO),
+            5,
+            5,
+            |_key, _remaining_backend_bytes| {
+                fetched = true;
+                Ok(BoundedStoreRead {
+                    backend_bytes: 0,
+                    value: None,
+                })
+            },
+        )
+        .expect_err("an expired deadline must fail");
+
+        assert!(matches!(error, BoundedResolveFailure::DeadlineExceeded));
+        assert!(!fetched, "an expired read must not fetch chunks");
+    }
+
+    #[test]
+    fn bounded_resolver_counts_pointer_and_chunks_with_decreasing_allowance() {
+        let clock = MonotonicClock::default();
+        let root_key = "app_config";
+        let envelope = serde_json::to_string(&BlobEnvelope::new(
+            serde_json::json!({ "pad": "x".repeat(9_000) }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        let mut entries = prepare_fastly_config_entries(root_key, &envelope).expect("entries");
+        let (_, pointer) = entries.pop().expect("root pointer");
+        let chunks: HashMap<_, _> = entries.into_iter().collect();
+        let pointer_bytes = u64::try_from(pointer.len()).expect("pointer length");
+        let maybe_chunk_bytes = chunks.values().try_fold(0_u64, |total, chunk| {
+            total.checked_add(u64::try_from(chunk.len()).ok()?)
+        });
+        let chunk_bytes = maybe_chunk_bytes.expect("chunk byte sum");
+        let total_backend_bytes = pointer_bytes
+            .checked_add(chunk_bytes)
+            .expect("backend byte sum");
+        let mut remaining_allowances = Vec::new();
+
+        let resolved = resolve_fastly_config_value_typed_bounded(
+            root_key,
+            pointer.clone(),
+            pointer_bytes,
+            &clock,
+            Deadline::after(Duration::from_secs(1)),
+            total_backend_bytes,
+            u64::try_from(envelope.len()).expect("envelope length"),
+            |chunk_key, remaining_backend_bytes| {
+                remaining_allowances.push(remaining_backend_bytes);
+                let value = chunks.get(chunk_key).cloned();
+                Ok(BoundedStoreRead {
+                    backend_bytes: value
+                        .as_ref()
+                        .map_or(0, |chunk| u64::try_from(chunk.len()).expect("chunk length")),
+                    value,
+                })
+            },
+        )
+        .expect("exact pointer and chunk caps must succeed");
+
+        assert_eq!(resolved.backend_bytes, total_backend_bytes);
+        assert_eq!(resolved.value.as_deref(), Some(envelope.as_str()));
+        assert_eq!(remaining_allowances.first(), Some(&chunk_bytes));
+        assert!(
+            remaining_allowances
+                .windows(2)
+                .all(|pair| pair[1] < pair[0]),
+            "each chunk must receive a smaller backend allowance"
+        );
+
+        let error = resolve_fastly_config_value_typed_bounded(
+            root_key,
+            pointer,
+            pointer_bytes,
+            &clock,
+            Deadline::after(Duration::from_secs(1)),
+            total_backend_bytes - 1,
+            u64::try_from(envelope.len()).expect("envelope length"),
+            |chunk_key, _remaining_backend_bytes| {
+                let value = chunks.get(chunk_key).cloned();
+                Ok(BoundedStoreRead {
+                    backend_bytes: value
+                        .as_ref()
+                        .map_or(0, |chunk| u64::try_from(chunk.len()).expect("chunk length")),
+                    value,
+                })
+            },
+        )
+        .expect_err("one byte below the aggregate backend cap must fail");
+        assert!(matches!(error, BoundedResolveFailure::ValueTooLarge));
+    }
+
+    #[test]
+    fn bounded_resolver_rejects_inconsistent_chunk_reports() {
+        let clock = MonotonicClock::default();
+        let root_key = "app_config";
+        let envelope = serde_json::to_string(&BlobEnvelope::new(
+            serde_json::json!({ "pad": "x".repeat(9_000) }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        let mut entries = prepare_fastly_config_entries(root_key, &envelope).expect("entries");
+        let (_, pointer) = entries.pop().expect("root pointer");
+        let chunks: HashMap<_, _> = entries.into_iter().collect();
+        let pointer_bytes = u64::try_from(pointer.len()).expect("pointer length");
+
+        let error = resolve_fastly_config_value_typed_bounded(
+            root_key,
+            pointer,
+            pointer_bytes,
+            &clock,
+            Deadline::after(Duration::from_secs(1)),
+            u64::MAX,
+            u64::try_from(envelope.len()).expect("envelope length"),
+            |chunk_key, _remaining_backend_bytes| {
+                let value = chunks.get(chunk_key).cloned();
+                Ok(BoundedStoreRead {
+                    backend_bytes: 0,
+                    value,
+                })
+            },
+        )
+        .expect_err("a provider report smaller than its result must fail closed");
+
+        assert!(matches!(error, BoundedResolveFailure::ValueTooLarge));
+    }
 
     /// the index must be one this writer could emit. The
     /// chunk loop counts in `usize`, so a digit run that overflows it is not
@@ -1317,8 +1829,11 @@ mod tests {
             ("empty", String::new()),
             ("whitespace", "   ".to_owned()),
             ("not json", "not-json-at-all".to_owned()),
-            ("unrelated json", r#"{"some":"value"}"#.to_owned()),
-            ("json scalar", "42".to_owned()),
+            (
+                "unrelated json",
+                serde_json::json!({"some": "value"}).to_string(),
+            ),
+            ("json scalar", serde_json::json!(42_u32).to_string()),
             ("valid-JSON partial pointer", reserialise(&partial)),
         ];
         for (label, raw) in cases {
@@ -1400,9 +1915,15 @@ mod tests {
         let root = "app_config";
         // `version` is typed `u8`; a string there makes serde quote it:
         // `invalid type: string "s3cr3t-do-not-log", expected u8`.
-        let malformed = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":"{SENTINEL}","chunks":[],"data_sha256":"","envelope_len":0,"envelope_sha256":""}}"#
-        );
+        let malformed = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": SENTINEL,
+            "chunks": [],
+            "data_sha256": "",
+            "envelope_len": 0_u32,
+            "envelope_sha256": "",
+        })
+        .to_string();
         let Err(gc_err) = gc_classify_root(root, &malformed) else {
             panic!("a malformed pointer must fail closed on the gc path");
         };
@@ -1509,7 +2030,10 @@ mod tests {
 
         for (label, value) in [
             ("plain text", "just some plain text"),
-            ("unrelated json", r#"{"some":"value"}"#),
+            (
+                "unrelated json",
+                &serde_json::json!({"some": "value"}).to_string(),
+            ),
             ("someone's real config", make_envelope_json(200).as_str()),
         ] {
             assert!(
@@ -1533,10 +2057,15 @@ mod tests {
     fn pointer_key_does_not_leak_into_diagnostics() {
         const SENTINEL: &str = "prod-db-password=hunter2";
         let root = "app_config";
-        let malformed = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{SENTINEL}","len":10,"sha256":"x"}}],"data_sha256":"","envelope_len":10,"envelope_sha256":"{}"}}"#,
-            "a".repeat(64)
-        );
+        let malformed = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": 1_u32,
+            "chunks": [{"key": SENTINEL, "len": 10_u32, "sha256": "x"}],
+            "data_sha256": "",
+            "envelope_len": 10_u32,
+            "envelope_sha256": "a".repeat(64),
+        })
+        .to_string();
         let err = prior_chunk_keys(root, &malformed).expect_err("must warn");
         assert!(
             !err.contains(SENTINEL),
@@ -1553,18 +2082,32 @@ mod tests {
         let root = "app_config";
         let sha = "a".repeat(64);
         let huge = usize::MAX;
-        let overflowing = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.0","len":{huge},"sha256":"x"}},{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.1","len":{huge},"sha256":"y"}}],"data_sha256":"","envelope_len":{huge},"envelope_sha256":"{sha}"}}"#
-        );
+        let overflowing = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": 1_u32,
+            "chunks": [
+                {"key": format!("{root}{CHUNK_KEY_INFIX}{sha}.0"), "len": huge, "sha256": "x"},
+                {"key": format!("{root}{CHUNK_KEY_INFIX}{sha}.1"), "len": huge, "sha256": "y"},
+            ],
+            "data_sha256": "",
+            "envelope_len": huge,
+            "envelope_sha256": sha,
+        })
+        .to_string();
         assert!(
             prior_chunk_keys(root, &overflowing).is_err(),
             "chunk lengths that overflow when summed must be rejected"
         );
 
         // A single absurd chunk: no overflow, but far beyond what we emit.
-        let oversized = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.0","len":{huge},"sha256":"x"}}],"data_sha256":"","envelope_len":{huge},"envelope_sha256":"{sha}"}}"#
-        );
+        let oversized = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": 1_u32,
+            "chunks": [{"key": format!("{root}{CHUNK_KEY_INFIX}{sha}.0"), "len": huge, "sha256": "x"}],
+            "data_sha256": "",
+            "envelope_len": huge,
+            "envelope_sha256": sha,
+        }).to_string();
         assert!(
             prior_chunk_keys(root, &oversized).is_err(),
             "a chunk larger than the writer's payload target must be rejected"
@@ -1591,7 +2134,9 @@ mod tests {
         );
         // Direct envelopes, unrelated JSON and non-JSON are not pointers either.
         assert!(!value_is_pointer_kind(&make_envelope_json(200)));
-        assert!(!value_is_pointer_kind(r#"{"some":"value"}"#));
+        assert!(!value_is_pointer_kind(
+            &serde_json::json!({"some": "value"}).to_string()
+        ));
         assert!(!value_is_pointer_kind("not json at all"));
     }
 
@@ -1605,7 +2150,7 @@ mod tests {
         // (raw, is_pointer, is_inert_foreign, announces_our_kind, is_unknown_kind)
         let cases: &[(&str, bool, bool, bool, bool)] = &[
             (
-                r#"{"edgezero_kind":"fastly_config_chunks"}"#,
+                &serde_json::json!({"edgezero_kind": "fastly_config_chunks"}).to_string(),
                 true,
                 false,
                 true,
@@ -1613,24 +2158,42 @@ mod tests {
             ),
             // Unknown STRING kind: claims our namespace, not inert, not our pointer.
             (
-                r#"{"edgezero_kind":"fastly_config_chunks_v2"}"#,
+                &serde_json::json!({"edgezero_kind": "fastly_config_chunks_v2"}).to_string(),
                 false,
                 false,
                 true,
                 true,
             ),
             // NON-STRING kind: still claims the namespace -- must NOT be inert.
-            (r#"{"edgezero_kind":7}"#, false, false, true, true),
-            (r#"{"edgezero_kind":null}"#, false, false, true, true),
             (
-                r#"{"edgezero_kind":{"nested":true}}"#,
+                &serde_json::json!({"edgezero_kind": 7_u64}).to_string(),
+                false,
+                false,
+                true,
+                true,
+            ),
+            (
+                &serde_json::json!({"edgezero_kind": null}).to_string(),
+                false,
+                false,
+                true,
+                true,
+            ),
+            (
+                &serde_json::json!({"edgezero_kind": {"nested": true}}).to_string(),
                 false,
                 false,
                 true,
                 true,
             ),
             // Genuinely foreign: no discriminator.
-            (r#"{"unrelated":"json"}"#, false, true, false, false),
+            (
+                &serde_json::json!({"unrelated": "json"}).to_string(),
+                false,
+                true,
+                false,
+                false,
+            ),
             ("value_a", false, true, false, false),
             ("", false, true, false, false),
             // Object-shaped but unparseable (a possible truncated pointer): none.
@@ -1678,38 +2241,48 @@ mod tests {
         // SCHEMA-CHANGING v2: a future shape that DROPS the v1 fields must still be
         // future -- detection keys on `version` alone, not the four v1 fields.
         assert!(
-            value_is_future_format(r#"{"version":2,"payload":{"k":"v"}}"#),
+            value_is_future_format(
+                &serde_json::json!({"version": 2_u64, "payload": {"k": "v"}}).to_string()
+            ),
             "schema-changing v2 (no v1 fields)"
         );
 
         // A `version` PRESENT but not EXACTLY the JSON integer 1 is future,
         // whatever its JSON type -- `as_u64()` alone would let these slip through.
         for raw in [
-            r#"{"version":"2"}"#,  // string
-            r#"{"version":-1}"#,   // negative integer
-            r#"{"version":2.5}"#,  // float
-            r#"{"version":1.0}"#,  // float, not the integer 1
-            r#"{"version":null}"#, // present but null
+            json!({"version": "2"}).to_string(),
+            json!({"version": -1_i32}).to_string(),
+            json!({"version": 2.5_f64}).to_string(),
+            json!({"version": 1.0_f64}).to_string(), // float, not the integer 1
+            json!({"version": null}).to_string(),
         ] {
             assert!(
-                value_is_future_format(raw),
+                value_is_future_format(&raw),
                 "a non-integer-1 version must be future: {raw}"
             );
         }
         // The exact JSON integer 1 (and an absent version) is NOT future.
-        assert!(!value_is_future_format(r#"{"version":1,"greeting":"hi"}"#));
-        assert!(!value_is_future_format(r#"{"greeting":"hi"}"#));
+        assert!(!value_is_future_format(
+            &json!({"version": 1_u32, "greeting": "hi"}).to_string()
+        ));
+        assert!(!value_is_future_format(
+            &serde_json::json!({"greeting": "hi"}).to_string()
+        ));
 
         // A v2 POINTER (our kind, bumped pointer version) -> future.
         assert!(
             value_is_future_format(
-                r#"{"edgezero_kind":"fastly_config_chunks","version":2,"chunks":[]}"#
+                &serde_json::json!({"edgezero_kind": "fastly_config_chunks", "version": 2_u64, "chunks": []}).to_string()
             ),
             "v2 pointer"
         );
         // Unknown/non-string kind -> future.
-        assert!(value_is_future_format(r#"{"edgezero_kind":"future"}"#));
-        assert!(value_is_future_format(r#"{"edgezero_kind":9}"#));
+        assert!(value_is_future_format(
+            &serde_json::json!({"edgezero_kind": "future"}).to_string()
+        ));
+        assert!(value_is_future_format(
+            &serde_json::json!({"edgezero_kind": 9_u64}).to_string()
+        ));
 
         // A valid v1 envelope is NOT future.
         assert!(!value_is_future_format(&v1), "v1 envelope");
@@ -1720,10 +2293,12 @@ mod tests {
         assert!(!value_is_future_format(&bad_sha.to_string()), "v1 bad sha");
         // A malformed v1 pointer MISSING its version is NOT future (repairable).
         assert!(!value_is_future_format(
-            r#"{"edgezero_kind":"fastly_config_chunks","chunks":[]}"#
+            &serde_json::json!({"edgezero_kind": "fastly_config_chunks", "chunks": []}).to_string()
         ));
         // A plain foreign value is not future.
-        assert!(!value_is_future_format(r#"{"unrelated":"json"}"#));
+        assert!(!value_is_future_format(
+            &serde_json::json!({"unrelated": "json"}).to_string()
+        ));
         assert!(!value_is_future_format("not json"));
     }
 
@@ -1768,9 +2343,17 @@ mod tests {
         // A metadata-consistent-looking pointer whose per-chunk length is far
         // over the writer's payload target (and whose envelope is too small to
         // have been chunked at all).
-        let bogus = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.0","len":99999,"sha256":"x"}},{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.1","len":1,"sha256":"y"}}],"data_sha256":"","envelope_len":100000,"envelope_sha256":"{sha}"}}"#
-        );
+        let bogus = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": 1_u32,
+            "chunks": [
+                {"key": format!("{root}{CHUNK_KEY_INFIX}{sha}.0"), "len": 99_999_u32, "sha256": "x"},
+                {"key": format!("{root}{CHUNK_KEY_INFIX}{sha}.1"), "len": 1_u32, "sha256": "y"},
+            ],
+            "data_sha256": "",
+            "envelope_len": 100_000_u32,
+            "envelope_sha256": sha,
+        }).to_string();
         // No fetch should even be attempted: fail on metadata alone.
         let mut fetched = false;
         let err = resolve_fastly_config_value(root, bogus, |_key| {
@@ -1804,24 +2387,27 @@ mod tests {
     /// fetch fan-out.
     #[test]
     fn pointer_with_many_tiny_chunks_is_rejected() {
-        use std::fmt::Write as _;
         let root = "app_config";
         let sha = "a".repeat(64);
         // 100 chunks of 100 bytes each = 10_000 bytes (> entry limit, dense).
-        let mut chunks = String::new();
-        for idx in 0..100_u32 {
-            if idx > 0 {
-                chunks.push(',');
-            }
-            write!(
-                chunks,
-                r#"{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.{idx}","len":100,"sha256":"x"}}"#
-            )
-            .expect("write to String");
-        }
-        let bogus = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{chunks}],"data_sha256":"","envelope_len":10000,"envelope_sha256":"{sha}"}}"#
-        );
+        let chunks: Vec<_> = (0..100_u32)
+            .map(|idx| {
+                serde_json::json!({
+                    "key": format!("{root}{CHUNK_KEY_INFIX}{sha}.{idx}"),
+                    "len": 100_u32,
+                    "sha256": "x",
+                })
+            })
+            .collect();
+        let bogus = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": 1_u32,
+            "chunks": chunks,
+            "data_sha256": "",
+            "envelope_len": 10_000_u32,
+            "envelope_sha256": sha,
+        })
+        .to_string();
         let mut fetched = false;
         let err = resolve_fastly_config_value(root, bogus, |_key| {
             fetched = true;
@@ -2216,7 +2802,7 @@ mod tests {
     #[test]
     fn empty_root_key_is_rejected() {
         assert!(
-            prepare_fastly_config_entries("", "{}").is_err(),
+            prepare_fastly_config_entries("", &serde_json::json!({}).to_string()).is_err(),
             "an empty key must be rejected on the direct path"
         );
         let big = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
@@ -2244,7 +2830,8 @@ mod tests {
         // A root over the limit is rejected even for a DIRECT (unchunked) value.
         let over_limit_root = "r".repeat(FASTLY_CONFIG_KEY_LIMIT.saturating_add(1));
         assert!(
-            prepare_fastly_config_entries(&over_limit_root, "{}").is_err(),
+            prepare_fastly_config_entries(&over_limit_root, &serde_json::json!({}).to_string())
+                .is_err(),
             "a root key over the limit must be rejected on the direct path too"
         );
 
@@ -2260,7 +2847,7 @@ mod tests {
             multibyte_root.len() > FASTLY_CONFIG_KEY_LIMIT,
             "fixture must be multi-byte"
         );
-        prepare_fastly_config_entries(&multibyte_root, "{}")
+        prepare_fastly_config_entries(&multibyte_root, &serde_json::json!({}).to_string())
             .expect("a key at the CHARACTER limit must be accepted regardless of byte length");
     }
 
@@ -2438,9 +3025,9 @@ mod tests {
         // it is our reserved field, so an unrecognised value in it is an error,
         // never an ordinary entry.
         for raw in [
-            r#"{"edgezero_kind":"fastly_config_chunks_v2"}"#,
-            r#"{"edgezero_kind":null}"#,
-            r#"{"edgezero_kind":7}"#,
+            &serde_json::json!({"edgezero_kind": "fastly_config_chunks_v2"}).to_string(),
+            &serde_json::json!({"edgezero_kind": null}).to_string(),
+            &serde_json::json!({"edgezero_kind": 7_u64}).to_string(),
         ] {
             let err = resolve_fastly_config_value("k", raw.to_owned(), |_chunk_key| {
                 Err("fetch must not be called".to_owned())
@@ -2688,7 +3275,7 @@ mod tests {
         // A value that ANNOUNCES our pointer kind but is missing every other
         // required field. It claims to be ours, so it must error rather than
         // pass through as an ordinary value.
-        let malformed = format!(r#"{{"edgezero_kind":"{POINTER_KIND}"}}"#);
+        let malformed = serde_json::json!({"edgezero_kind": POINTER_KIND}).to_string();
         let err = resolve_fastly_config_value("my_key", malformed, |_| Ok(None))
             .expect_err("malformed pointer must error");
         assert!(
@@ -2766,14 +3353,18 @@ mod tests {
     #[test]
     fn prior_chunk_keys_returns_empty_for_unrelated_json() {
         assert_eq!(
-            prior_chunk_keys("app_config", r#"{"hello":"world"}"#).unwrap(),
+            prior_chunk_keys(
+                "app_config",
+                &serde_json::json!({"hello": "world"}).to_string()
+            )
+            .unwrap(),
             Vec::<String>::new()
         );
     }
 
     #[test]
     fn prior_chunk_keys_returns_empty_for_wrong_kind() {
-        let raw = r#"{"edgezero_kind":"other","version":1,"chunks":[],"data_sha256":"","envelope_len":0,"envelope_sha256":""}"#;
+        let raw = &serde_json::json!({"edgezero_kind": "other", "version": 1_u64, "chunks": [], "data_sha256": "", "envelope_len": 0_u64, "envelope_sha256": ""}).to_string();
         assert_eq!(
             prior_chunk_keys("app_config", raw).unwrap(),
             Vec::<String>::new()
@@ -2890,7 +3481,8 @@ mod tests {
     // be silently dropped by a failed struct deserialize.
     #[test]
     fn prior_chunk_keys_warns_on_pointer_kind_with_missing_fields() {
-        let raw = r#"{"edgezero_kind":"fastly_config_chunks","version":2}"#;
+        let raw = &serde_json::json!({"edgezero_kind": "fastly_config_chunks", "version": 2_u64})
+            .to_string();
         let err = prior_chunk_keys("app_config", raw)
             .expect_err("pointer-kind but malformed must warn, not Ok([])");
         assert!(!err.is_empty(), "{err}");

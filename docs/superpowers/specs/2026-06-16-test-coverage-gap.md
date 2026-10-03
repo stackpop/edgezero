@@ -435,7 +435,9 @@ git commit -m "test(adapter): cover run_native_cli not-found and non-zero-exit p
         let garbage = b"this is definitely not a gzip member".to_vec();
         let stream = stream::iter(vec![Ok::<Vec<u8>, io::Error>(garbage)]);
         let result = block_on(async {
-            decode_gzip_stream(stream).try_collect::<Vec<Bytes>>().await
+            decode_gzip_stream(stream, FLATE_DECODER_FIXED_CHARGE_BYTES)
+                .try_collect::<Vec<Bytes>>()
+                .await
         });
         assert!(result.is_err(), "invalid gzip must decode to an error");
     }
@@ -446,7 +448,9 @@ git commit -m "test(adapter): cover run_native_cli not-found and non-zero-exit p
         let garbage = vec![0xFF_u8; 64];
         let stream = stream::iter(vec![Ok::<Vec<u8>, io::Error>(garbage)]);
         let result = block_on(async {
-            decode_brotli_stream(stream).try_collect::<Vec<Bytes>>().await
+            decode_brotli_stream(stream, 24, 1_u64 << 25)
+                .try_collect::<Vec<Bytes>>()
+                .await
         });
         assert!(result.is_err(), "invalid brotli must decode to an error");
     }

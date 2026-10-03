@@ -9,12 +9,12 @@
 #[cfg(target_arch = "wasm32")]
 use app_demo_core::App;
 #[cfg(target_arch = "wasm32")]
-use spin_sdk::http::{IntoResponse, Request};
+use spin_sdk::http::Request;
 #[cfg(target_arch = "wasm32")]
 use spin_sdk::http_service;
 
 #[cfg(target_arch = "wasm32")]
 #[http_service]
-async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
+async fn handle(req: Request) -> anyhow::Result<edgezero_adapter_spin::SpinResponse> {
     edgezero_adapter_spin::run_app::<App>(req).await
 }

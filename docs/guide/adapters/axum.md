@@ -41,6 +41,8 @@ variables (see [the migration guide](../manifest-store-migration.md)).
 The portable store metadata baked into `App` by the `app!` macro
 drives which logical stores are exposed; no `edgezero.toml` needs to
 be loaded by the runtime.
+If `Hooks::configure` fails, `run_app` returns the source-preserving
+`application configuration failed` error before binding the listener.
 
 ## Development Server
 
@@ -78,21 +80,19 @@ cargo build -p my-app-adapter-axum --release
 
 The binary is placed in `target/release/my-app-adapter-axum`.
 
-## Proxy Client
+## Outbound HTTP
 
-The Axum adapter provides a native HTTP client for proxying:
+The Axum adapter injects `AxumOutboundClient`, backed by `reqwest`. Application handlers use the
+portable client from `RequestContext::http_client()`; direct wiring and tests can construct the
+adapter client with `AxumOutboundClient::try_new()`.
 
-```rust
-use edgezero_adapter_axum::proxy::AxumProxyClient;
-use edgezero_core::proxy::ProxyService;
-
-let client = AxumProxyClient::try_new()?;
-let response = ProxyService::new(client).forward(request).await?;
-```
-
-This uses `reqwest` under the hood for outbound HTTP requests. `try_new` is
-fallible because it builds a `reqwest::Client`; it returns a `reqwest::Error` if
-the TLS backend cannot be initialised on the host.
+Axum provides native total deadlines, completion-order batching, pending-future cancellation,
+batch slot isolation, cache bypass, wire-authority override, elastic phase budgeting, header
+fidelity, and streamed upload cancellation. Downstream responses run on a connection-local Hyper
+HTTP/1 executor, so portable non-`Send` streams remain lazy and are polled under Hyper demand.
+The connection supervisor enforces the absolute response-write deadline, but frame acceptance is
+not proof of socket or client receipt; response-egress capabilities therefore remain BestEffort.
+See [Capabilities](/guide/capabilities).
 
 ## Logging
 
@@ -101,7 +101,7 @@ The Axum adapter's `run_app` helper installs `simple_logger` at the level read f
 unparseable. It does not read `edgezero.toml`, and `echo_stdout` has no effect on
 the runtime. To install a different logger, set `owns_logging = true` on your `app!`
 declaration so `run_app` skips its own logger, then install yours in `main`. Wiring
-`App::build_app()` and `AxumDevServer` by hand remains the fallback if you also need
+`edgezero_core::app::App::build::<App>(edgezero_adapter_axum::AXUM_PLATFORM)` and `AxumDevServer` by hand remains the fallback if you also need
 to control the bind address or store setup.
 
 ::: tip Logging status
@@ -116,12 +116,13 @@ The Axum adapter enables standard Rust testing:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use edgezero_core::app::Hooks;
+    use edgezero_core::app::App as EdgeZeroApp;
     use edgezero_core::http::{Request, Method};
 
     #[tokio::test]
     async fn test_handler() {
-        let app = App::build_app();
+        let app = EdgeZeroApp::build::<App>(edgezero_adapter_axum::AXUM_PLATFORM)
+            .expect("configured app");
         let router = app.router();
 
         let request = Request::builder()

@@ -1,6 +1,6 @@
 //! Adapter helpers for Cloudflare Workers.
 
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub mod cli;
 
 // `config_store` compiles on host for its `InMemory` test backend; the
@@ -11,21 +11,77 @@ pub mod config_store;
 pub mod context;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod key_value_store;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub mod proxy;
+#[cfg(any(
+    test,
+    feature = "test-utils",
+    all(feature = "cloudflare", target_arch = "wasm32")
+))]
+pub mod outbound;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod request;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
 pub mod response;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod secret_store;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-use edgezero_core::app::{Hooks, StoresMetadata};
+use edgezero_core::app::StoresMetadata;
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+use edgezero_core::app::{App, Hooks};
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+use edgezero_core::context::RuntimeVariables;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+use edgezero_core::error::EdgeError;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+use edgezero_core::manifest::BakedManifest;
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+use edgezero_core::manifest::ResolvedEnvironmentBinding;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use worker::{Context, Env, Error as WorkerError, Request, Response};
+
+/// Cloudflare Workers' published per-isolate memory limit.
+pub const CLOUDFLARE_PLATFORM: edgezero_core::PlatformMetadata =
+    edgezero_core::PlatformMetadata::new(
+        edgezero_core::PlatformFact::known(
+            edgezero_core::MemoryCeiling::new(
+                128_000_000,
+                edgezero_core::MemoryCeilingScope::PerInstance,
+                None,
+            ),
+            edgezero_core::PlatformResourceSource::PlatformLimit {
+                provider: "Cloudflare Workers",
+            },
+        ),
+        edgezero_core::PlatformFact::unknown(
+            edgezero_core::PlatformUnknownReason::ProviderUnpublished,
+        ),
+        edgezero_core::PlatformFact::unknown(
+            edgezero_core::PlatformUnknownReason::ProviderUnpublished,
+        ),
+    );
+
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+fn build_app_for_dispatch<A: Hooks>() -> Result<App, WorkerError> {
+    build_target_app::<A>().map_err(|error| {
+        log::error!("application configuration failed: {}", error.kind());
+        WorkerError::RustError("application configuration failed".to_owned())
+    })
+}
+
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+fn build_target_app<A: Hooks>() -> Result<App, EdgeError> {
+    App::build::<A>(CLOUDFLARE_PLATFORM)
+}
+
+/// Test seam for the production application-assembly error mapping.
+#[cfg(all(feature = "test-utils", feature = "cloudflare", target_arch = "wasm32"))]
+#[doc(hidden)]
+#[inline]
+pub fn build_app_for_test<A: Hooks>() -> Result<App, WorkerError> {
+    build_app_for_dispatch::<A>()
+}
 
 /// # Errors
 /// Never; this is currently a no-op on Cloudflare Workers (Workers manages
@@ -84,6 +140,18 @@ fn env_config_from_worker(env: &Env, stores: StoresMetadata) -> EnvConfig {
     EnvConfig::from_vars(vars)
 }
 
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
+fn collect_worker_variables(
+    bindings: &[ResolvedEnvironmentBinding],
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> RuntimeVariables {
+    RuntimeVariables::from_vars(bindings.iter().filter_map(|binding| {
+        lookup(&binding.env)
+            .or_else(|| binding.value.clone())
+            .map(|value| (binding.name.clone(), value))
+    }))
+}
+
 /// Entry point for a Cloudflare Workers application.
 ///
 /// Portable store config is baked into `A` by the `app!` macro; adapter-specific
@@ -100,6 +168,7 @@ pub async fn run_app<A: Hooks>(
     env: Env,
     ctx: Context,
 ) -> Result<Response, WorkerError> {
+    let app = build_app_for_dispatch::<A>()?;
     // Best-effort: if a logger is already installed, ignore the error rather
     // than panicking — every Worker request re-enters this function. Skipped
     // entirely when the app owns logging.
@@ -108,7 +177,20 @@ pub async fn run_app<A: Hooks>(
     }
     let stores = A::stores();
     let env_config = env_config_from_worker(&env, stores);
-    let app = A::build_app();
+    let runtime_variables = match A::manifest() {
+        BakedManifest::Absent => RuntimeVariables::default(),
+        BakedManifest::Present(manifest) => {
+            let resolved = manifest.environment_for("cloudflare");
+            collect_worker_variables(&resolved.variables, |key| {
+                env.var(key).ok().map(|value| value.to_string())
+            })
+        }
+        BakedManifest::Malformed(_) | _ => {
+            return Err(WorkerError::RustError(
+                "application manifest is invalid".to_owned(),
+            ));
+        }
+    };
     request::dispatch_with_registries(
         &app,
         req,
@@ -119,7 +201,73 @@ pub async fn run_app<A: Hooks>(
             kv_meta: stores.kv,
             secret_meta: stores.secrets,
             env_config: &env_config,
+            runtime_variables,
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use edgezero_core::app::{App, Hooks};
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::manifest::ResolvedEnvironmentBinding;
+    use edgezero_core::router::RouterService;
+
+    struct PlatformAwareConfiguration;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test hook exercises only target metadata propagation"
+    )]
+    impl Hooks for PlatformAwareConfiguration {
+        fn configure(app: &mut App) -> Result<(), EdgeError> {
+            if app.platform() == crate::CLOUDFLARE_PLATFORM {
+                Ok(())
+            } else {
+                Err(EdgeError::service_unavailable("wrong application platform"))
+            }
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[test]
+    fn application_configuration_receives_cloudflare_platform_metadata() {
+        let app = super::build_target_app::<PlatformAwareConfiguration>()
+            .expect("configured application");
+
+        assert_eq!(app.platform(), crate::CLOUDFLARE_PLATFORM);
+    }
+
+    #[test]
+    fn declared_worker_variables_prefer_binding_then_manifest_default() {
+        let bindings = [
+            ResolvedEnvironmentBinding {
+                description: None,
+                env: "UPSTREAM_ORIGIN".to_owned(),
+                name: "API_BASE_URL".to_owned(),
+                value: Some("https://default.example".to_owned()),
+            },
+            ResolvedEnvironmentBinding {
+                description: None,
+                env: "OPTIONAL_BINDING".to_owned(),
+                name: "OPTIONAL".to_owned(),
+                value: None,
+            },
+        ];
+        let runtime = super::collect_worker_variables(&bindings, |key| {
+            (key == "UPSTREAM_ORIGIN").then(|| "https://worker.example".to_owned())
+        });
+        assert_eq!(runtime.get("API_BASE_URL"), Some("https://worker.example"));
+        assert_eq!(runtime.get("OPTIONAL"), None);
+
+        let defaulted = super::collect_worker_variables(&bindings, |_| None);
+        assert_eq!(
+            defaulted.get("API_BASE_URL"),
+            Some("https://default.example")
+        );
+    }
 }

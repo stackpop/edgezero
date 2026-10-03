@@ -112,7 +112,7 @@ impl EnvConfig {
 
     /// Key for a logical store — `EDGEZERO__STORES__<KIND>__<ID>__KEY` —
     /// falling back to `id` itself when unset, blank, whitespace-only, or
-    /// containing control characters. Mirrors [`store_name`]'s filter exactly.
+    /// containing control characters. Mirrors [`Self::store_name`]'s filter exactly.
     #[must_use]
     #[inline]
     pub fn store_key(&self, kind: &str, id: &str) -> String {

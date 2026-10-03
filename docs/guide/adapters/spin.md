@@ -26,11 +26,11 @@ crates/my-app-adapter-spin/
 The Spin entrypoint wires the adapter via `#[http_service]`:
 
 ```rust
-use spin_sdk::{http::IntoResponse, http::Request, http_service};
+use spin_sdk::{http::Request, http_service};
 use my_app_core::App;
 
 #[http_service]
-async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
+async fn handle(req: Request) -> anyhow::Result<edgezero_adapter_spin::SpinResponse> {
     edgezero_adapter_spin::run_app::<App>(req).await
 }
 ```
@@ -38,6 +38,8 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
 `run_app` reads the portable store metadata baked into `App` by the `app!`
 macro plus `EDGEZERO__*` environment variables; it does not require an
 `edgezero.toml` to be present at runtime.
+If `Hooks::configure` fails, `run_app` returns the source-preserving
+`application configuration failed` error before converting or dispatching the request.
 
 ## Building
 
@@ -70,6 +72,25 @@ edgezero deploy --adapter spin
 # Or directly
 spin deploy --from crates/my-app-adapter-spin
 ```
+
+## Outbound HTTP
+
+`SpinOutboundClient` uses the WASI HTTP 0.3 interfaces directly so request-body production,
+response completion, limits, and the guest-visible deadline race share one owner. Generated
+`spin.toml` files default `allowed_outbound_hosts` to `https://*:*`; cleartext requires an explicit
+manifest declaration.
+
+Spin exposes raw header bytes and drives isolated batch slots in completion order. Cache bypass
+adds no synthetic origin header because the adapter owns no intermediary cache. A wire-authority
+override is rejected during preflight: WASI HTTP uses the same authority for connection routing,
+so Spin cannot preserve URI-owned routing and TLS identity while changing only the HTTP authority.
+Deadline, batch cancellation, and streamed-upload cancellation remain BestEffort until host
+teardown has a documented observed bound, and provider phase-timer defaults may prevent a fully
+elastic budget. Downstream response
+delivery owns the raw WASI response, body, and result writers in one coordinator and preserves
+lazy body production under host backpressure. Successful close is a host handoff, not proof of
+client receipt, so response-egress capabilities also remain BestEffort. See
+[Capabilities](/guide/capabilities).
 
 ## KV Storage
 
@@ -196,9 +217,10 @@ Schema-coupling note: the SQLite writer uses the exact `spin_key_value`
 schema and `INSERT … ON CONFLICT DO UPDATE` statement vendored from
 spinframework/spin's `crates/key-value-spin/src/store.rs`. A contract
 test in `edgezero-adapter-spin/src/cli/push_sqlite.rs` asserts
-byte-equality against the upstream string, and the workspace's
-`spin-sdk = "~6.0"` pin blocks any Spin minor bump that would change
-the schema until the operator opts in.
+byte-equality against the upstream Spin 4.1.0 strings. The workspace's
+exact `spin-sdk = "=7.0.0"` pin makes every SDK upgrade explicit, and
+the CLI warns when the installed Spin runtime major is outside the
+schema-verified 2.x through 4.x range.
 
 ```bash
 # Local dev: writes through to .spin/sqlite_key_value.db.
@@ -262,21 +284,6 @@ View output through `spin up` or your Spin host's log files.
 Spin logging is handled by the runtime; install your own `log` implementation in the
 entrypoint if you need structured output.
 :::
-
-## Proxy Client
-
-The Spin adapter forwards outbound requests through `spin_sdk::http::send`:
-
-```rust
-use edgezero_adapter_spin::proxy::SpinProxyClient;
-use edgezero_core::proxy::ProxyService;
-
-let response = ProxyService::new(SpinProxyClient).forward(request).await?;
-```
-
-Proxied responses carry `x-edgezero-proxy: spin`. Every upstream host must be listed
-in the component's `allowed_outbound_hosts` in `spin.toml` or the send fails at
-runtime.
 
 ## Context Access
 

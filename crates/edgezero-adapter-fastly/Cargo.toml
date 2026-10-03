@@ -19,7 +19,8 @@ cli = [
     "dep:toml_edit",
     "dep:walkdir",
 ]
-fastly = ["dep:fastly", "dep:log-fastly"]
+fastly = ["dep:fastly", "dep:fastly-shared", "dep:fastly-sys", "dep:log-fastly"]
+test-utils = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -33,6 +34,8 @@ brotli = { workspace = true }
 bytes = { workspace = true }
 ctor = { workspace = true, optional = true }
 fastly = { workspace = true, optional = true }
+fastly-shared = { workspace = true, optional = true }
+fastly-sys = { workspace = true, optional = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }

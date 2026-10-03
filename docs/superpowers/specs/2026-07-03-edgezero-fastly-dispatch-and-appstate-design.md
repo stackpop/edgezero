@@ -1,5 +1,9 @@
 # EdgeZero P0-C + P0-D — Fastly `run_app` dispatch fidelity + app-state injection
 
+> **Superseded lifecycle surface (2026-09-15):** The outbound design now specifies
+> `run_app_with_hooks` and `FastlyService::send_request_with_hooks`; the request-only hook named
+> below was removed in the hard cut. This document remains historical context.
+
 - **Status:** Draft for edgezero maintainer
 - **Date:** 2026-07-03
 - **Target repo:** `github.com/stackpop/edgezero` (`edgezero-adapter-fastly`, `edgezero-core`, `edgezero-macros`)
@@ -158,7 +162,7 @@ builder = builder.with_state(crate::app_state());   // #state_expr, only when `s
 // ... routes ...
 ```
 
-**`state = <expr>` is a full Rust expression** evaluating to the app-owned value, emitted **verbatim** into `.with_state(<expr>)`. It must be the call/expression, **not** a bare function path — `with_state` takes the state *value*, so `state = crate::app_state` (a fn item) would pass the function, not its result. Write `state = crate::app_state()` or `state = std::sync::Arc::new(AppState::new())`. (This mirrors nothing magical: the macro does not append `()`.) `run_app` → `A::build_app()` → `routes()` → `build_router()` already runs per request (Fastly) / once at startup (Axum), and #306's dispatch injection clones the value into each request — so `State<T>` reaches `#[action]` handlers on **all four adapters** with no adapter edits. Without the `state` argument, `build_router()` is unchanged (no state), preserving current behavior.
+**`state = <expr>` is a full Rust expression** evaluating to the app-owned value, emitted **verbatim** into `.with_state(<expr>)`. It must be the call/expression, **not** a bare function path — `with_state` takes the state *value*, so `state = crate::app_state` (a fn item) would pass the function, not its result. Write `state = crate::app_state()` or `state = std::sync::Arc::new(AppState::new())`. (This mirrors nothing magical: the macro does not append `()`.) `run_app` → `App::build::<A>(platform)` → `routes()` → `build_router()` already runs per request (Fastly) / once at startup (Axum), and #306's dispatch injection clones the value into each request — so `State<T>` reaches `#[action]` handlers on **all four adapters** with no adapter edits. Without the `state` argument, `build_router()` is unchanged (no state), preserving current behavior.
 
 **Single vs. multiple state types.** `with_state<T>` registers one `T` — a single `state = crate::app_state()` covers the `Arc<AppState>` case (what trusted-server / `app-demo` need). If multiple state types are ever required, allow repeated `state = a(), state = b()` (emit one `.with_state(...)` per occurrence) or add a `RouterBuilder::with_state_extensions(Extensions)` fed by an app-supplied `Extensions` bag. Default to the single-value form unless a concrete multi-type need appears. **The grammar below permits repeated `state`; whether repeats are accepted or rejected is a decision the plan must state** (see §`app!` argument grammar).
 

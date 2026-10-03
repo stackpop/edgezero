@@ -1,6 +1,8 @@
 # Streaming
 
-EdgeZero supports streaming responses for large payloads, real-time data, and server-sent events.
+EdgeZero preserves lazy streaming response bodies on every adapter. Each adapter owns body
+delivery through its strongest platform boundary; no standard entrypoint collects the complete
+downstream response before handoff.
 
 ## Streaming Responses
 
@@ -33,25 +35,16 @@ async fn stream_data() -> Response {
 
 ## How Streaming Works
 
-The core router passes `Body::Stream` through untouched; whether the client sees
-chunks progressively depends on the adapter:
+The router keeps `Body::Stream` intact until the adapter response coordinator:
 
 1. Your handler returns `Body::stream(...)` with a `Stream` of chunks
-2. Cloudflare wraps the stream in a `ReadableStream` (`Response::from_stream`), so
-   chunks reach the client as they are produced
-3. Spin and Axum collect the stream into a buffer, and Fastly writes each chunk
-   into a host-side body that is only sent once complete (Spin rejects streamed
-   bodies over 16 MiB), so on all three the client receives the whole body at
-   once
+2. Core validates response framing and wraps declared-length enforcement around the source
+3. The adapter polls one chunk at a time under its host's demand or write readiness
+4. Accepted bytes, deadline/abort events, and one terminal outcome are recorded by that adapter
 
-On Cloudflare, streaming also keeps memory flat, because each chunk is forwarded as
-it is produced. On the buffering adapters a streamed body is collected in full
-before the response goes out: Axum into an unbounded buffer, Spin into a buffer
-capped at 16 MiB (larger bodies fail), and Fastly into a host-side body that is
-only sent once complete. There `Body::stream` is an API-composability convenience,
-not a memory saving, and a very large streamed response can exhaust memory or be
-rejected. Only rely on progressive delivery (SSE, long-lived chunked responses) on
-Cloudflare today.
+Axum uses a connection-local Hyper body, Cloudflare a JavaScript stream writer, Fastly
+`stream_to_client`, and Spin a WASI body writer. See [Capabilities](/guide/capabilities) for the
+exact acceptance and completion boundary on each target.
 
 ## Server-Sent Events
 
@@ -81,6 +74,12 @@ async fn events() -> Response {
 }
 ```
 
+::: warning Completion semantics
+All adapters preserve progressive production, but their response-egress capability cells remain
+BestEffort because host acceptance or close does not prove end-client receipt. Fastly source polls
+and hostcalls are synchronous and cannot be preempted.
+:::
+
 ## Body Modes
 
 Routes can specify their body handling mode in the manifest. This is parsed today and reserved
@@ -99,39 +98,43 @@ body-mode = "buffered"  # or "stream"
 | `buffered` | Body is fully read into memory before handler runs    |
 | `stream`   | Body is passed as a stream for progressive processing |
 
-## Transparent Decompression
+## Outbound Response Decompression
 
-On Fastly, Cloudflare, and Spin, EdgeZero automatically decompresses gzip and brotli
-responses from upstream services (the Axum proxy client has no decode path):
+The outbound client decodes a single bare `gzip` or `br` content coding through shared
+`edgezero-core` decoders. Unknown, parameterized, or stacked codings pass through unchanged.
+Encoded transport bytes, decoded output, and final buffered bytes have independent limits; see
+[Capabilities](/guide/capabilities#limits-and-accounting).
 
 ```rust
-// Proxied response with Content-Encoding: gzip is automatically decoded
-let response = proxy.forward(request).await?;
-// response.body is now decompressed
+let request = OutboundRequest::get("https://api.example.com/data")?
+    .max_encoded_response_bytes(2 * 1024 * 1024)
+    .max_decoded_response_bytes(8 * 1024 * 1024)
+    .stream_response();
+let body = client.send(request).await?.into_body();
 ```
 
-This happens transparently in the adapter layer using shared decoders from `edgezero-core`.
+Multi-member gzip streams are decoded through every member and drained to transport EOF.
+For Brotli, the stream window is checked before decoder allocation and decoder state is charged
+against the configured policy limit.
 
 ## Memory Considerations
 
-On Cloudflare, the one adapter that forwards chunks as they are produced (see
-[How Streaming Works](#how-streaming-works)), streaming is what makes these
-workloads fit:
+Lazy streaming is useful for:
 
 - Large file downloads
 - Video/audio content
 - Real-time data feeds
 - Responses larger than available memory
 
-::: warning Platform Limits
-Edge platforms have memory constraints. A Fastly Compute instance has ~128MB by default. On Cloudflare, stream large responses rather than buffering. On Fastly, Spin, and Axum a streamed body is still collected in full before it is sent, so keep responses within the instance's memory regardless of how you build the body. Spin additionally caps streamed-body collection at 16 MiB; an already-buffered `Body::Once` bypasses that cap.
+::: warning Platform limits
+Edge platforms have finite memory. Lazy response delivery removes whole-body collection but does
+not bound provider queues, SDK allocations, source chunk size, or transport buffers. Bound source
+chunks and application work, and use the capability matrix when certifying a deployment.
 :::
 
 ## Chunked Transfer
 
-When the response size is unknown, `Body::stream` lets the adapter send without a
-`Content-Length`. Cloudflare delivers this as chunked transfer; the buffering
-adapters compute the length once the body is collected:
+Applications may omit `Content-Length` when the response size is unknown:
 
 ```rust
 #[action]
@@ -147,7 +150,11 @@ async fn dynamic_content() -> Response {
 }
 ```
 
+The provider owns the final wire framing. EdgeZero does not guarantee a particular HTTP/1 transfer
+coding; it normalizes framing and enforces the application's declared payload length before the
+adapter writes body bytes.
+
 ## Next Steps
 
-- Learn about [Proxying](/guide/proxying) for forwarding requests upstream
-- Explore adapter-specific streaming in the [Fastly](/guide/adapters/fastly), [Cloudflare](/guide/adapters/cloudflare), and [Spin](/guide/adapters/spin) guides
+- Learn about [Outbound HTTP](/guide/proxying) for upstream requests
+- Explore adapter-specific streaming in the [Fastly](/guide/adapters/fastly), [Cloudflare](/guide/adapters/cloudflare), [Spin](/guide/adapters/spin), and [Axum](/guide/adapters/axum) guides
