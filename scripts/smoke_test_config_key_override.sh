@@ -246,7 +246,8 @@ ensure_runtime_built() {
 # /config/typed handler's secret walk fails before any KEY-override
 # assertion can run. Each adapter's local-emulator secret store
 # differs:
-#   - axum:       process env var (handled inline by boot_runtime).
+#   - axum:       EDGEZERO__SECRETS__DEMO_API_TOKEN process env var
+#                 (set inline by boot_runtime).
 #   - cloudflare: .dev.vars file at the worker root.
 #   - fastly:     [local_server.secret_stores.default.contents] in
 #                 fastly.toml (mutates the tracked file -- the
@@ -262,7 +263,7 @@ seed_secret_for_adapter() {
   local adapter="$1"
   case "$adapter" in
     axum)
-      # No-op: boot_runtime sets the env var inline.
+      # No-op: boot_runtime sets EDGEZERO__SECRETS__DEMO_API_TOKEN inline.
       return 0
       ;;
     cloudflare)
@@ -308,7 +309,8 @@ TOML
 #
 # Secret seeding: see `seed_secret_for_adapter` above. The Axum
 # and Spin rows set the secret env var inline at spawn time
-# (EnvSecretStore reads from the process env); Cloudflare and
+# (Axum's EnvSecretStore reads EDGEZERO__SECRETS__DEMO_API_TOKEN;
+# Spin reads SPIN_VARIABLE_DEMO_API_TOKEN); Cloudflare and
 # Fastly read from per-adapter on-disk files written by the
 # seed helper.
 boot_runtime() {
@@ -326,7 +328,7 @@ boot_runtime() {
       # Seed `demo_api_token` so the AppConfig secret walk
       # resolves; without it, /config/typed returns
       # ConfigOutOfDate before the assertion can fire.
-      (cd "$DEMO_DIR" && demo_api_token=resolved-token \
+      (cd "$DEMO_DIR" && EDGEZERO__SECRETS__DEMO_API_TOKEN=resolved-token \
         cargo run --quiet -p app-demo-cli -- serve --adapter axum 2>&1) &
       ;;
     cloudflare)

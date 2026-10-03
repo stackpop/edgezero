@@ -647,7 +647,7 @@ install hint. A non-zero exit propagates with its stderr verbatim.
 
 ::: tip Axum is local-only
 `auth --adapter axum` is intentionally a no-op — the native dev
-server reads secrets from process env vars (`EDGEZERO__STORES__SECRETS__<ID>__…`),
+server reads secrets from process env vars (`EDGEZERO__SECRETS__<KEY>`),
 not from a remote auth provider.
 :::
 

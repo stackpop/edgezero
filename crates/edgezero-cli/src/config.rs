@@ -4779,7 +4779,7 @@ default = "one"
     #[test]
     fn c4_secret_validator_skipped_on_typed_push() {
         // A config type where `api_token` is `#[secret]` AND has a
-        // `length(min = 32)` rule. The fixture value "short-key" is 9
+        // `length(min = 32)` rule. The fixture value "short_key" is 9
         // bytes — it would fail the old path but must pass the new path.
         #[derive(Debug, Deserialize, Serialize, Validate)]
         #[serde(deny_unknown_fields)]
@@ -4800,7 +4800,7 @@ default = "one"
         }
 
         let app_config = r#"
-api_token = "short-key"
+api_token = "short_key"
 greeting = "hello"
 "#;
         let manifest = r#"

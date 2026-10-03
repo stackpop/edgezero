@@ -198,7 +198,7 @@ non-zero on a non-TTY (per spec §8.3's four-branch UX).
    echo SPIN_VARIABLE_DEMO_API_TOKEN=<value> >> .env
 
    # Axum local
-   demo_api_token=<value> cargo run -p <app-cli> -- serve --adapter axum
+   EDGEZERO__SECRETS__DEMO_API_TOKEN=<value> cargo run -p <app-cli> -- serve --adapter axum
    ```
 
 3. Push the typed config:
