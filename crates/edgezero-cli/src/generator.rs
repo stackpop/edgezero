@@ -6,7 +6,7 @@ use crate::scaffold::{
 use edgezero_adapter::scaffold;
 use edgezero_adapter::scaffold::AdapterBlueprint;
 use handlebars::Handlebars;
-use serde_json::{Map, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt::{self, Write as _};
@@ -217,7 +217,7 @@ pub fn generate_new(args: &NewArgs) -> Result<(), GeneratorError> {
 
     let adapter_artifacts = collect_adapter_data(&layout, &repo_root, &mut workspace_dependencies)?;
 
-    let mut data_map = build_base_data(
+    let mut data_value = build_base_data(
         &layout,
         &core_crate_line,
         &cli_crate_line,
@@ -225,13 +225,13 @@ pub fn generate_new(args: &NewArgs) -> Result<(), GeneratorError> {
         &workspace_dependencies,
     );
 
-    for context in &adapter_artifacts.contexts {
-        for (key, value) in &context.data_entries {
-            data_map.insert(key.clone(), Value::String(value.clone()));
+    if let Some(data_map) = data_value.as_object_mut() {
+        for context in &adapter_artifacts.contexts {
+            for (key, value) in &context.data_entries {
+                data_map.insert(key.clone(), json!(value));
+            }
         }
     }
-
-    let data_value = Value::Object(data_map);
 
     render_templates(&layout, &adapter_artifacts.contexts, &data_value)?;
     initialize_git_repo(&layout.out_dir);
@@ -564,70 +564,36 @@ fn build_base_data(
     cli_crate_line: &str,
     artifacts: &AdapterArtifacts,
     workspace_dependencies: &BTreeMap<String, String>,
-) -> Map<String, Value> {
-    let mut data = Map::new();
-    data.insert("name".into(), Value::String(layout.name.clone()));
-    data.insert("proj_core".into(), Value::String(layout.core_name.clone()));
-    data.insert("proj_cli".into(), Value::String(layout.cli_name.clone()));
-    data.insert(
-        "proj_core_mod".into(),
-        Value::String(layout.core_mod.clone()),
-    );
-    data.insert("proj_mod".into(), Value::String(layout.project_mod.clone()));
-    data.insert(
-        "NameUpperCamel".into(),
-        Value::String(layout.upper_camel.clone()),
-    );
-    data.insert("EnvPrefix".into(), Value::String(layout.env_prefix.clone()));
-    data.insert(
-        "dep_edgezero_core".into(),
-        Value::String(core_crate_line.to_owned()),
-    );
-    data.insert(
-        "dep_edgezero_cli".into(),
-        Value::String(cli_crate_line.to_owned()),
-    );
-
+) -> Value {
     let adapter_list_str = artifacts
         .adapter_ids
         .iter()
         .map(|id| format!("\"{id}\""))
         .collect::<Vec<_>>()
         .join(", ");
-    data.insert("adapter_list".into(), Value::String(adapter_list_str));
-    data.insert(
-        "workspace_members".into(),
-        Value::String(artifacts.workspace_members.join("\n")),
-    );
-    data.insert(
-        "adapter_manifest_sections".into(),
-        Value::String(artifacts.manifest_sections.clone()),
-    );
-    data.insert(
-        "readme_adapter_crates".into(),
-        Value::String(artifacts.readme_adapter_crates.clone()),
-    );
-    data.insert(
-        "readme_adapter_dev".into(),
-        Value::String(artifacts.readme_adapter_dev.clone()),
-    );
-
     let workspace_dep_lines = workspace_dependencies
         .values()
         .cloned()
         .collect::<Vec<_>>()
         .join("\n");
-    data.insert(
-        "workspace_dependencies".into(),
-        Value::String(workspace_dep_lines),
-    );
-
-    data.insert(
-        "tool_versions_contents".into(),
-        Value::String(build_tool_versions(&artifacts.adapter_ids)),
-    );
-
-    data
+    json!({
+        "name": layout.name,
+        "proj_core": layout.core_name,
+        "proj_cli": layout.cli_name,
+        "proj_core_mod": layout.core_mod,
+        "proj_mod": layout.project_mod,
+        "NameUpperCamel": layout.upper_camel,
+        "EnvPrefix": layout.env_prefix,
+        "dep_edgezero_core": core_crate_line,
+        "dep_edgezero_cli": cli_crate_line,
+        "adapter_list": adapter_list_str,
+        "workspace_members": artifacts.workspace_members.join("\n"),
+        "adapter_manifest_sections": artifacts.manifest_sections,
+        "readme_adapter_crates": artifacts.readme_adapter_crates,
+        "readme_adapter_dev": artifacts.readme_adapter_dev,
+        "workspace_dependencies": workspace_dep_lines,
+        "tool_versions_contents": build_tool_versions(&artifacts.adapter_ids),
+    })
 }
 
 /// Render the `.tool-versions` body for a scaffolded project,

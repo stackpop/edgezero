@@ -599,6 +599,7 @@ fn render_default_error_response(error: EdgeError) -> Response {
         Ok(response) => response,
         Err(render_error) => {
             log::error!("failed to render typed ingress error response: {render_error}");
+            // Keep the last-resort response independent of JSON serialization.
             let mut response = Response::new(Body::from(
                 r#"{"error":{"kind":"internal","message":"internal server error","status":500}}"#,
             ));

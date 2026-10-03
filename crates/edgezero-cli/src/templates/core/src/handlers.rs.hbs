@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn echo_json_formats_payload() {
-        let ctx = context_with_json("/echo", r#"{"name":"Edge"}"#);
+        let ctx = context_with_json("/echo", &serde_json::json!({"name": "Edge"}).to_string());
         let response = block_on(echo_json(ctx))
             .expect("handler ok")
             .into_response()
@@ -525,7 +525,9 @@ mod tests {
 
     #[test]
     fn fanout_reports_positional_elapsed_and_typed_outcomes() {
-        let ctx = fanout_context(r#"{"paths":["status/200","status/204","fail"]}"#);
+        let ctx = fanout_context(
+            &serde_json::json!({"paths": ["status/200", "status/204", "fail"]}).to_string(),
+        );
         let response = block_on(fanout(ctx)).expect("fanout response");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "application/json");
@@ -557,7 +559,7 @@ mod tests {
 
     #[test]
     fn fanout_with_empty_input_returns_an_empty_array() {
-        let ctx = fanout_context(r#"{"paths":[]}"#);
+        let ctx = fanout_context(&serde_json::json!({"paths": []}).to_string());
         let response = block_on(fanout(ctx)).expect("fanout response");
         let payload: serde_json::Value = response.body().to_json().expect("json");
         assert_eq!(payload, serde_json::json!([]));
@@ -565,7 +567,10 @@ mod tests {
 
     #[test]
     fn fanout_rejects_more_than_eight_paths() {
-        let ctx = fanout_context(r#"{"paths":["1","2","3","4","5","6","7","8","9"]}"#);
+        let ctx = fanout_context(
+            &serde_json::json!({"paths": ["1", "2", "3", "4", "5", "6", "7", "8", "9"]})
+                .to_string(),
+        );
         let error = block_on(fanout(ctx)).expect_err("oversized fanout must fail");
         assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }

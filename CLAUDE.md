@@ -159,6 +159,9 @@ differences.
 - **Async tests** use `futures::executor::block_on` (not Tokio) for WASM compat.
 - **Minimal changes**: every change should impact as little code as possible.
   Avoid unnecessary refactoring, docstrings on untouched code, or premature abstractions.
+- **JSON construction**: use `serde_json::json!` for ordinary JSON values and fixtures;
+  serialize typed structs directly. Keep raw JSON for syntax or exact-byte tests,
+  static-input APIs, and last-resort fallbacks that must avoid serialization.
 - **Feature gates**: platform-specific code goes behind `fastly`, `cloudflare`,
   `spin`, or `axum` features. Core stays `default-features = false` for WASM targets.
 - **No direct `http` crate imports** in application code — use `edgezero_core` re-exports.

@@ -240,7 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn json_content_type_stays_streaming() {
-        let json_payload = r#"{"name":"test"}"#;
+        let json_payload = serde_json::json!({"name": "test"}).to_string();
         let request = Request::builder()
             .method(Method::POST)
             .uri("/api/test")

@@ -1507,7 +1507,7 @@ mod tests {
         fs::create_dir_all(&local_dir).expect("create dir");
         fs::write(
             local_dir.join("local-config-app_config.json"),
-            r#"{"other_key": "value"}"#,
+            serde_json::json!({"other_key": "value"}).to_string(),
         )
         .expect("write");
         let result = AxumCliAdapter
@@ -1533,7 +1533,7 @@ mod tests {
         fs::create_dir_all(&local_dir).expect("create dir");
         fs::write(
             local_dir.join("local-config-app_config.json"),
-            r#"{"greeting": "hello-axum"}"#,
+            serde_json::json!({"greeting": "hello-axum"}).to_string(),
         )
         .expect("write");
         let result = AxumCliAdapter
@@ -1561,7 +1561,7 @@ mod tests {
         fs::create_dir_all(&local_dir).expect("create dir");
         fs::write(
             local_dir.join("local-config-app_config.json"),
-            r#"{"greeting": "hello-axum"}"#,
+            serde_json::json!({"greeting": "hello-axum"}).to_string(),
         )
         .expect("write");
         let store = ResolvedStoreId::from_logical("app_config");

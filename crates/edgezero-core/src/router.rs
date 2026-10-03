@@ -652,7 +652,8 @@ mod tests {
         fn manifest_and_routes_route_injects_both() {
             // Combined `#[action(manifest, routes)]` → both payloads injected.
             let seen = run_probe(
-                RouterService::builder().with_manifest_json("{\"app\":{\"name\":\"t\"}}"),
+                RouterService::builder()
+                    .with_manifest_json(serde_json::json!({"app": {"name": "t"}}).to_string()),
                 IntrospectionNeeds {
                     manifest: true,
                     routes: true,
@@ -665,7 +666,8 @@ mod tests {
         fn manifest_route_injects_only_manifest() {
             // Manifest available AND requested → ManifestJson present, RouteTable absent.
             let seen = run_probe(
-                RouterService::builder().with_manifest_json("{\"app\":{\"name\":\"t\"}}"),
+                RouterService::builder()
+                    .with_manifest_json(serde_json::json!({"app": {"name": "t"}}).to_string()),
                 IntrospectionNeeds {
                     manifest: true,
                     routes: false,
@@ -693,7 +695,7 @@ mod tests {
 
             let saw: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
             let router = RouterService::builder()
-                .with_manifest_json("{\"app\":{\"name\":\"t\"}}")
+                .with_manifest_json(serde_json::json!({"app": {"name": "t"}}).to_string())
                 .middleware(Probe(Arc::clone(&saw)))
                 .get(
                     "/",
@@ -719,7 +721,8 @@ mod tests {
         fn plain_route_injects_neither() {
             // Manifest IS baked but the route requested nothing → neither injected.
             let seen = run_probe(
-                RouterService::builder().with_manifest_json("{\"app\":{\"name\":\"t\"}}"),
+                RouterService::builder()
+                    .with_manifest_json(serde_json::json!({"app": {"name": "t"}}).to_string()),
                 IntrospectionNeeds::default(),
             );
             assert_eq!(seen, (false, false));

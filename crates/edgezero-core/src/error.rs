@@ -588,14 +588,20 @@ impl IntoResponse for EdgeError {
         let status = self.status();
         let message = self.wire_message();
 
-        let mut error_obj = serde_json::Map::new();
-        error_obj.insert("status".into(), serde_json::Value::from(status.as_u16()));
-        error_obj.insert("kind".into(), serde_json::Value::from(kind));
-        error_obj.insert("message".into(), serde_json::Value::from(message));
-        if let Some(field_path) = field_path_opt {
-            error_obj.insert("field_path".into(), serde_json::Value::from(field_path));
+        let mut payload = json!({
+            "error": {
+                "status": status.as_u16(),
+                "kind": kind,
+                "message": message,
+            },
+        });
+        if let Some(field_path) = field_path_opt
+            && let Some(error_obj) = payload
+                .get_mut("error")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            error_obj.insert("field_path".into(), json!(field_path));
         }
-        let payload = json!({ "error": serde_json::Value::Object(error_obj) });
 
         let body = json_or_text(&payload);
         let mut response = response_with_body(status, body)?;
@@ -969,8 +975,8 @@ mod tests {
 
         // Feed JSON that puts a string where u32 is expected to force a
         // type-mismatch error at path `service.timeout_ms`.
-        let json = r#"{"service": {"timeout_ms": "not-a-number"}}"#;
-        let de = &mut serde_json::Deserializer::from_str(json);
+        let json = json!({"service": {"timeout_ms": "not-a-number"}}).to_string();
+        let de = &mut serde_json::Deserializer::from_str(&json);
         let result: Result<Outer, _> = serde_path_to_error::deserialize(de);
         let serde_err = result.expect_err("expected deserialization error");
 
@@ -1012,7 +1018,7 @@ mod tests {
         // field in the serde path, so every string segment is redacted (structure
         // kept).
         const SENTINEL: &str = "SUPER_SECRET_MAP_KEY";
-        let json = format!(r#"{{"items": {{"{SENTINEL}": {{"port": "nope"}}}}}}"#);
+        let json = json!({"items": {(SENTINEL): {"port": "nope"}}}).to_string();
         let de = &mut serde_json::Deserializer::from_str(&json);
         let result: Result<Outer, _> = serde_path_to_error::deserialize(de);
         let serde_err = result.expect_err("expected deserialization error");
@@ -1048,10 +1054,10 @@ mod tests {
             value: u32,
         }
 
-        // A completely invalid JSON causes a root-level error. serde_path_to_error
+        // A valid JSON string instead of an object causes a root-level error. serde_path_to_error
         // returns "." as the path sentinel in this case.
-        let json = r#""not-an-object""#;
-        let de = &mut serde_json::Deserializer::from_str(json);
+        let json = json!("not-an-object").to_string();
+        let de = &mut serde_json::Deserializer::from_str(&json);
         let result: Result<Root, _> = serde_path_to_error::deserialize(de);
         let serde_err = result.expect_err("expected deserialization error");
 

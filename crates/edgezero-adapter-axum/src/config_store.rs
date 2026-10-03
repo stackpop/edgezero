@@ -412,7 +412,8 @@ mod tests {
         let path = temp.path().join("local-config-app_config.json");
         fs::write(
             &path,
-            r#"{"greeting":"hello from file","feature.new_checkout":"false"}"#,
+            serde_json::json!({"greeting": "hello from file", "feature.new_checkout": "false"})
+                .to_string(),
         )
         .expect("write json");
 
@@ -445,7 +446,7 @@ mod tests {
     fn axum_config_store_from_path_rejects_non_string_values() {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("local-config-numeric.json");
-        fs::write(&path, r#"{"greeting":42}"#).expect("write");
+        fs::write(&path, serde_json::json!({"greeting": 42_u32}).to_string()).expect("write");
 
         match AxumConfigStore::from_path(&path) {
             Err(ConfigStoreError::Unavailable { .. }) => {}

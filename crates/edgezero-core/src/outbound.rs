@@ -2792,7 +2792,7 @@ mod tests {
 
     #[test]
     fn outbound_response_json_error_classification() {
-        let response = response_with_body(Body::from(r#"{"ok":true}"#));
+        let response = response_with_body(Body::from(serde_json::json!({"ok": true}).to_string()));
         let value: serde_json::Value = response.json().expect("json");
         assert_eq!(value["ok"], true);
 
@@ -2808,9 +2808,11 @@ mod tests {
             }
         ));
 
-        let streamed = response_with_body(Body::stream(stream::iter([Bytes::from_static(b"{}")])))
-            .json::<serde_json::Value>()
-            .expect_err("stream requires bounded helper");
+        let streamed = response_with_body(Body::stream(stream::iter([Bytes::from(
+            serde_json::json!({}).to_string(),
+        )])))
+        .json::<serde_json::Value>()
+        .expect_err("stream requires bounded helper");
         assert!(matches!(
             streamed,
             EdgeError::BadGateway {
@@ -2819,7 +2821,9 @@ mod tests {
             }
         ));
 
-        let streamed = response_with_body(Body::stream(stream::iter([Bytes::from_static(b"{}")])));
+        let streamed = response_with_body(Body::stream(stream::iter([Bytes::from(
+            serde_json::json!({}).to_string(),
+        )])));
         let value: serde_json::Value = block_on(streamed.json_bounded(2)).expect("bounded json");
         assert_eq!(value, serde_json::json!({}));
     }

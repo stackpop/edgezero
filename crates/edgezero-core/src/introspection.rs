@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn manifest_returns_injected_json() {
         let router = RouterService::builder()
-            .with_manifest_json("{\"app\":{\"name\":\"t\"}}")
+            .with_manifest_json(serde_json::json!({"app": {"name": "t"}}).to_string())
             .get("/m", manifest)
             .build();
         let req = request_builder()
@@ -309,15 +309,27 @@ mod tests {
     #[test]
     fn config_sha_mismatch_maps_500() {
         // Valid JSON envelope shape but wrong sha → verify() fails.
-        let bad = r#"{"data":{"a":1},"generated_at":"t","sha256":"deadbeef","version":1}"#;
-        let resp = run_config(StubStore(Ok(Some(bad.to_owned()))));
+        let bad = serde_json::json!({
+            "data": {"a": 1_u32},
+            "generated_at": "t",
+            "sha256": "deadbeef",
+            "version": 1_u32,
+        })
+        .to_string();
+        let resp = run_config(StubStore(Ok(Some(bad))));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
     fn config_unknown_version_maps_500() {
-        let bad = r#"{"data":{},"generated_at":"t","sha256":"x","version":99}"#;
-        let resp = run_config(StubStore(Ok(Some(bad.to_owned()))));
+        let bad = serde_json::json!({
+            "data": {},
+            "generated_at": "t",
+            "sha256": "x",
+            "version": 99_u32,
+        })
+        .to_string();
+        let resp = run_config(StubStore(Ok(Some(bad))));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

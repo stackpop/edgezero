@@ -421,7 +421,7 @@ mod tests {
         // would not exercise the corruption path at all.
         let store = FastlyConfigStore::from_entries([(
             "app_config".to_owned(),
-            r#"{"edgezero_kind":"fastly_config_chunks"}"#.to_owned(),
+            serde_json::json!({"edgezero_kind": "fastly_config_chunks"}).to_string(),
         )]);
         let err = block_on(store.get("app_config"))
             .expect_err("corrupt root must map to a ConfigStoreError");
@@ -447,7 +447,7 @@ mod tests {
         use futures::executor::block_on;
         let store = FastlyConfigStore::from_entries([(
             "app_config".to_owned(),
-            r#"{"edgezero_kind":"fastly_config_chunks","version":2,"chunks":[]}"#.to_owned(),
+            serde_json::json!({"edgezero_kind": "fastly_config_chunks", "version": 2_u64, "chunks": []}).to_string(),
         )]);
         let err = block_on(store.get("app_config")).expect_err("a future format must error");
         assert!(

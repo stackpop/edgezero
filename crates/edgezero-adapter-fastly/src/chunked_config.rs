@@ -1829,8 +1829,11 @@ mod tests {
             ("empty", String::new()),
             ("whitespace", "   ".to_owned()),
             ("not json", "not-json-at-all".to_owned()),
-            ("unrelated json", r#"{"some":"value"}"#.to_owned()),
-            ("json scalar", "42".to_owned()),
+            (
+                "unrelated json",
+                serde_json::json!({"some": "value"}).to_string(),
+            ),
+            ("json scalar", serde_json::json!(42_u32).to_string()),
             ("valid-JSON partial pointer", reserialise(&partial)),
         ];
         for (label, raw) in cases {
@@ -1912,9 +1915,15 @@ mod tests {
         let root = "app_config";
         // `version` is typed `u8`; a string there makes serde quote it:
         // `invalid type: string "s3cr3t-do-not-log", expected u8`.
-        let malformed = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":"{SENTINEL}","chunks":[],"data_sha256":"","envelope_len":0,"envelope_sha256":""}}"#
-        );
+        let malformed = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": SENTINEL,
+            "chunks": [],
+            "data_sha256": "",
+            "envelope_len": 0_u32,
+            "envelope_sha256": "",
+        })
+        .to_string();
         let Err(gc_err) = gc_classify_root(root, &malformed) else {
             panic!("a malformed pointer must fail closed on the gc path");
         };
@@ -2021,7 +2030,10 @@ mod tests {
 
         for (label, value) in [
             ("plain text", "just some plain text"),
-            ("unrelated json", r#"{"some":"value"}"#),
+            (
+                "unrelated json",
+                &serde_json::json!({"some": "value"}).to_string(),
+            ),
             ("someone's real config", make_envelope_json(200).as_str()),
         ] {
             assert!(
@@ -2045,10 +2057,15 @@ mod tests {
     fn pointer_key_does_not_leak_into_diagnostics() {
         const SENTINEL: &str = "prod-db-password=hunter2";
         let root = "app_config";
-        let malformed = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{SENTINEL}","len":10,"sha256":"x"}}],"data_sha256":"","envelope_len":10,"envelope_sha256":"{}"}}"#,
-            "a".repeat(64)
-        );
+        let malformed = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": 1_u32,
+            "chunks": [{"key": SENTINEL, "len": 10_u32, "sha256": "x"}],
+            "data_sha256": "",
+            "envelope_len": 10_u32,
+            "envelope_sha256": "a".repeat(64),
+        })
+        .to_string();
         let err = prior_chunk_keys(root, &malformed).expect_err("must warn");
         assert!(
             !err.contains(SENTINEL),
@@ -2065,18 +2082,32 @@ mod tests {
         let root = "app_config";
         let sha = "a".repeat(64);
         let huge = usize::MAX;
-        let overflowing = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.0","len":{huge},"sha256":"x"}},{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.1","len":{huge},"sha256":"y"}}],"data_sha256":"","envelope_len":{huge},"envelope_sha256":"{sha}"}}"#
-        );
+        let overflowing = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": 1_u32,
+            "chunks": [
+                {"key": format!("{root}{CHUNK_KEY_INFIX}{sha}.0"), "len": huge, "sha256": "x"},
+                {"key": format!("{root}{CHUNK_KEY_INFIX}{sha}.1"), "len": huge, "sha256": "y"},
+            ],
+            "data_sha256": "",
+            "envelope_len": huge,
+            "envelope_sha256": sha,
+        })
+        .to_string();
         assert!(
             prior_chunk_keys(root, &overflowing).is_err(),
             "chunk lengths that overflow when summed must be rejected"
         );
 
         // A single absurd chunk: no overflow, but far beyond what we emit.
-        let oversized = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.0","len":{huge},"sha256":"x"}}],"data_sha256":"","envelope_len":{huge},"envelope_sha256":"{sha}"}}"#
-        );
+        let oversized = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": 1_u32,
+            "chunks": [{"key": format!("{root}{CHUNK_KEY_INFIX}{sha}.0"), "len": huge, "sha256": "x"}],
+            "data_sha256": "",
+            "envelope_len": huge,
+            "envelope_sha256": sha,
+        }).to_string();
         assert!(
             prior_chunk_keys(root, &oversized).is_err(),
             "a chunk larger than the writer's payload target must be rejected"
@@ -2103,7 +2134,9 @@ mod tests {
         );
         // Direct envelopes, unrelated JSON and non-JSON are not pointers either.
         assert!(!value_is_pointer_kind(&make_envelope_json(200)));
-        assert!(!value_is_pointer_kind(r#"{"some":"value"}"#));
+        assert!(!value_is_pointer_kind(
+            &serde_json::json!({"some": "value"}).to_string()
+        ));
         assert!(!value_is_pointer_kind("not json at all"));
     }
 
@@ -2117,7 +2150,7 @@ mod tests {
         // (raw, is_pointer, is_inert_foreign, announces_our_kind, is_unknown_kind)
         let cases: &[(&str, bool, bool, bool, bool)] = &[
             (
-                r#"{"edgezero_kind":"fastly_config_chunks"}"#,
+                &serde_json::json!({"edgezero_kind": "fastly_config_chunks"}).to_string(),
                 true,
                 false,
                 true,
@@ -2125,24 +2158,42 @@ mod tests {
             ),
             // Unknown STRING kind: claims our namespace, not inert, not our pointer.
             (
-                r#"{"edgezero_kind":"fastly_config_chunks_v2"}"#,
+                &serde_json::json!({"edgezero_kind": "fastly_config_chunks_v2"}).to_string(),
                 false,
                 false,
                 true,
                 true,
             ),
             // NON-STRING kind: still claims the namespace -- must NOT be inert.
-            (r#"{"edgezero_kind":7}"#, false, false, true, true),
-            (r#"{"edgezero_kind":null}"#, false, false, true, true),
             (
-                r#"{"edgezero_kind":{"nested":true}}"#,
+                &serde_json::json!({"edgezero_kind": 7_u64}).to_string(),
+                false,
+                false,
+                true,
+                true,
+            ),
+            (
+                &serde_json::json!({"edgezero_kind": null}).to_string(),
+                false,
+                false,
+                true,
+                true,
+            ),
+            (
+                &serde_json::json!({"edgezero_kind": {"nested": true}}).to_string(),
                 false,
                 false,
                 true,
                 true,
             ),
             // Genuinely foreign: no discriminator.
-            (r#"{"unrelated":"json"}"#, false, true, false, false),
+            (
+                &serde_json::json!({"unrelated": "json"}).to_string(),
+                false,
+                true,
+                false,
+                false,
+            ),
             ("value_a", false, true, false, false),
             ("", false, true, false, false),
             // Object-shaped but unparseable (a possible truncated pointer): none.
@@ -2190,38 +2241,48 @@ mod tests {
         // SCHEMA-CHANGING v2: a future shape that DROPS the v1 fields must still be
         // future -- detection keys on `version` alone, not the four v1 fields.
         assert!(
-            value_is_future_format(r#"{"version":2,"payload":{"k":"v"}}"#),
+            value_is_future_format(
+                &serde_json::json!({"version": 2_u64, "payload": {"k": "v"}}).to_string()
+            ),
             "schema-changing v2 (no v1 fields)"
         );
 
         // A `version` PRESENT but not EXACTLY the JSON integer 1 is future,
         // whatever its JSON type -- `as_u64()` alone would let these slip through.
         for raw in [
-            r#"{"version":"2"}"#,  // string
-            r#"{"version":-1}"#,   // negative integer
-            r#"{"version":2.5}"#,  // float
-            r#"{"version":1.0}"#,  // float, not the integer 1
-            r#"{"version":null}"#, // present but null
+            json!({"version": "2"}).to_string(),
+            json!({"version": -1_i32}).to_string(),
+            json!({"version": 2.5_f64}).to_string(),
+            json!({"version": 1.0_f64}).to_string(), // float, not the integer 1
+            json!({"version": null}).to_string(),
         ] {
             assert!(
-                value_is_future_format(raw),
+                value_is_future_format(&raw),
                 "a non-integer-1 version must be future: {raw}"
             );
         }
         // The exact JSON integer 1 (and an absent version) is NOT future.
-        assert!(!value_is_future_format(r#"{"version":1,"greeting":"hi"}"#));
-        assert!(!value_is_future_format(r#"{"greeting":"hi"}"#));
+        assert!(!value_is_future_format(
+            &json!({"version": 1_u32, "greeting": "hi"}).to_string()
+        ));
+        assert!(!value_is_future_format(
+            &serde_json::json!({"greeting": "hi"}).to_string()
+        ));
 
         // A v2 POINTER (our kind, bumped pointer version) -> future.
         assert!(
             value_is_future_format(
-                r#"{"edgezero_kind":"fastly_config_chunks","version":2,"chunks":[]}"#
+                &serde_json::json!({"edgezero_kind": "fastly_config_chunks", "version": 2_u64, "chunks": []}).to_string()
             ),
             "v2 pointer"
         );
         // Unknown/non-string kind -> future.
-        assert!(value_is_future_format(r#"{"edgezero_kind":"future"}"#));
-        assert!(value_is_future_format(r#"{"edgezero_kind":9}"#));
+        assert!(value_is_future_format(
+            &serde_json::json!({"edgezero_kind": "future"}).to_string()
+        ));
+        assert!(value_is_future_format(
+            &serde_json::json!({"edgezero_kind": 9_u64}).to_string()
+        ));
 
         // A valid v1 envelope is NOT future.
         assert!(!value_is_future_format(&v1), "v1 envelope");
@@ -2232,10 +2293,12 @@ mod tests {
         assert!(!value_is_future_format(&bad_sha.to_string()), "v1 bad sha");
         // A malformed v1 pointer MISSING its version is NOT future (repairable).
         assert!(!value_is_future_format(
-            r#"{"edgezero_kind":"fastly_config_chunks","chunks":[]}"#
+            &serde_json::json!({"edgezero_kind": "fastly_config_chunks", "chunks": []}).to_string()
         ));
         // A plain foreign value is not future.
-        assert!(!value_is_future_format(r#"{"unrelated":"json"}"#));
+        assert!(!value_is_future_format(
+            &serde_json::json!({"unrelated": "json"}).to_string()
+        ));
         assert!(!value_is_future_format("not json"));
     }
 
@@ -2280,9 +2343,17 @@ mod tests {
         // A metadata-consistent-looking pointer whose per-chunk length is far
         // over the writer's payload target (and whose envelope is too small to
         // have been chunked at all).
-        let bogus = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.0","len":99999,"sha256":"x"}},{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.1","len":1,"sha256":"y"}}],"data_sha256":"","envelope_len":100000,"envelope_sha256":"{sha}"}}"#
-        );
+        let bogus = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": 1_u32,
+            "chunks": [
+                {"key": format!("{root}{CHUNK_KEY_INFIX}{sha}.0"), "len": 99_999_u32, "sha256": "x"},
+                {"key": format!("{root}{CHUNK_KEY_INFIX}{sha}.1"), "len": 1_u32, "sha256": "y"},
+            ],
+            "data_sha256": "",
+            "envelope_len": 100_000_u32,
+            "envelope_sha256": sha,
+        }).to_string();
         // No fetch should even be attempted: fail on metadata alone.
         let mut fetched = false;
         let err = resolve_fastly_config_value(root, bogus, |_key| {
@@ -2316,24 +2387,27 @@ mod tests {
     /// fetch fan-out.
     #[test]
     fn pointer_with_many_tiny_chunks_is_rejected() {
-        use std::fmt::Write as _;
         let root = "app_config";
         let sha = "a".repeat(64);
         // 100 chunks of 100 bytes each = 10_000 bytes (> entry limit, dense).
-        let mut chunks = String::new();
-        for idx in 0..100_u32 {
-            if idx > 0 {
-                chunks.push(',');
-            }
-            write!(
-                chunks,
-                r#"{{"key":"{root}{CHUNK_KEY_INFIX}{sha}.{idx}","len":100,"sha256":"x"}}"#
-            )
-            .expect("write to String");
-        }
-        let bogus = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{chunks}],"data_sha256":"","envelope_len":10000,"envelope_sha256":"{sha}"}}"#
-        );
+        let chunks: Vec<_> = (0..100_u32)
+            .map(|idx| {
+                serde_json::json!({
+                    "key": format!("{root}{CHUNK_KEY_INFIX}{sha}.{idx}"),
+                    "len": 100_u32,
+                    "sha256": "x",
+                })
+            })
+            .collect();
+        let bogus = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": 1_u32,
+            "chunks": chunks,
+            "data_sha256": "",
+            "envelope_len": 10_000_u32,
+            "envelope_sha256": sha,
+        })
+        .to_string();
         let mut fetched = false;
         let err = resolve_fastly_config_value(root, bogus, |_key| {
             fetched = true;
@@ -2728,7 +2802,7 @@ mod tests {
     #[test]
     fn empty_root_key_is_rejected() {
         assert!(
-            prepare_fastly_config_entries("", "{}").is_err(),
+            prepare_fastly_config_entries("", &serde_json::json!({}).to_string()).is_err(),
             "an empty key must be rejected on the direct path"
         );
         let big = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
@@ -2756,7 +2830,8 @@ mod tests {
         // A root over the limit is rejected even for a DIRECT (unchunked) value.
         let over_limit_root = "r".repeat(FASTLY_CONFIG_KEY_LIMIT.saturating_add(1));
         assert!(
-            prepare_fastly_config_entries(&over_limit_root, "{}").is_err(),
+            prepare_fastly_config_entries(&over_limit_root, &serde_json::json!({}).to_string())
+                .is_err(),
             "a root key over the limit must be rejected on the direct path too"
         );
 
@@ -2772,7 +2847,7 @@ mod tests {
             multibyte_root.len() > FASTLY_CONFIG_KEY_LIMIT,
             "fixture must be multi-byte"
         );
-        prepare_fastly_config_entries(&multibyte_root, "{}")
+        prepare_fastly_config_entries(&multibyte_root, &serde_json::json!({}).to_string())
             .expect("a key at the CHARACTER limit must be accepted regardless of byte length");
     }
 
@@ -2950,9 +3025,9 @@ mod tests {
         // it is our reserved field, so an unrecognised value in it is an error,
         // never an ordinary entry.
         for raw in [
-            r#"{"edgezero_kind":"fastly_config_chunks_v2"}"#,
-            r#"{"edgezero_kind":null}"#,
-            r#"{"edgezero_kind":7}"#,
+            &serde_json::json!({"edgezero_kind": "fastly_config_chunks_v2"}).to_string(),
+            &serde_json::json!({"edgezero_kind": null}).to_string(),
+            &serde_json::json!({"edgezero_kind": 7_u64}).to_string(),
         ] {
             let err = resolve_fastly_config_value("k", raw.to_owned(), |_chunk_key| {
                 Err("fetch must not be called".to_owned())
@@ -3200,7 +3275,7 @@ mod tests {
         // A value that ANNOUNCES our pointer kind but is missing every other
         // required field. It claims to be ours, so it must error rather than
         // pass through as an ordinary value.
-        let malformed = format!(r#"{{"edgezero_kind":"{POINTER_KIND}"}}"#);
+        let malformed = serde_json::json!({"edgezero_kind": POINTER_KIND}).to_string();
         let err = resolve_fastly_config_value("my_key", malformed, |_| Ok(None))
             .expect_err("malformed pointer must error");
         assert!(
@@ -3278,14 +3353,18 @@ mod tests {
     #[test]
     fn prior_chunk_keys_returns_empty_for_unrelated_json() {
         assert_eq!(
-            prior_chunk_keys("app_config", r#"{"hello":"world"}"#).unwrap(),
+            prior_chunk_keys(
+                "app_config",
+                &serde_json::json!({"hello": "world"}).to_string()
+            )
+            .unwrap(),
             Vec::<String>::new()
         );
     }
 
     #[test]
     fn prior_chunk_keys_returns_empty_for_wrong_kind() {
-        let raw = r#"{"edgezero_kind":"other","version":1,"chunks":[],"data_sha256":"","envelope_len":0,"envelope_sha256":""}"#;
+        let raw = &serde_json::json!({"edgezero_kind": "other", "version": 1_u64, "chunks": [], "data_sha256": "", "envelope_len": 0_u64, "envelope_sha256": ""}).to_string();
         assert_eq!(
             prior_chunk_keys("app_config", raw).unwrap(),
             Vec::<String>::new()
@@ -3402,7 +3481,8 @@ mod tests {
     // be silently dropped by a failed struct deserialize.
     #[test]
     fn prior_chunk_keys_warns_on_pointer_kind_with_missing_fields() {
-        let raw = r#"{"edgezero_kind":"fastly_config_chunks","version":2}"#;
+        let raw = &serde_json::json!({"edgezero_kind": "fastly_config_chunks", "version": 2_u64})
+            .to_string();
         let err = prior_chunk_keys("app_config", raw)
             .expect_err("pointer-kind but malformed must warn, not Ok([])");
         assert!(!err.is_empty(), "{err}");
