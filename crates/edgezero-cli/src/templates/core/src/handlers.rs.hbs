@@ -119,11 +119,11 @@ fn proxy_not_available_response() -> Result<Response, EdgeError> {
 // owns the lookup.
 //
 // #[action]
-// pub async fn upstream() -> Result<Response, EdgeError> {
+// pub async fn upstream() -> Result<Text<&'static str>, EdgeError> {
 //     // Uncomment when AppConfig has `#[secret] api_token`.
 //     // let AppConfig(cfg) = ...; // via extractor injection
 //     // make_upstream_call(&cfg.api_token).await?;
-//     Ok(text("upstream sample"))
+//     Ok(Text::new("upstream sample"))
 // }
 //
 // // Uncomment together with the `upstream` handler above:

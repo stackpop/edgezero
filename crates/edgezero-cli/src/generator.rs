@@ -805,6 +805,7 @@ fn initialize_git_repo(out_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::path_mutation_guard;
     use edgezero_core::app_config::app_name_prefix;
     use edgezero_core::test_env::PathPrepend as PathOverride;
     use std::path::Path;
@@ -1019,6 +1020,16 @@ mod tests {
         assert!(project_dir.join(".gitignore").exists());
         assert!(project_dir.join(".tool-versions").exists());
         assert!(project_dir.join("README.md").exists());
+        let readme = fs::read_to_string(project_dir.join("README.md")).expect("read README");
+        assert!(
+            readme.contains("Fastly uses the logical key")
+                && readme.contains("`app_config` for production, staging, and local Viceroy"),
+            "generated README must document the one Fastly logical config key"
+        );
+        assert!(
+            !readme.contains("app_config_staging"),
+            "generated README must not advertise the removed staging key"
+        );
         assert!(project_dir.join("crates/demo-app-core/src/lib.rs").exists());
         assert!(
             project_dir.join("crates/demo-app-cli/Cargo.toml").exists(),
@@ -1301,6 +1312,7 @@ mod tests {
 
     #[test]
     fn generate_new_scaffolds_workspace_layout() {
+        let _path_lock = path_mutation_guard().lock().expect("path guard");
         let temp = TempDir::new().expect("temp dir");
         let bin_dir = temp.path().join("bin");
         write_git_stub(&bin_dir);

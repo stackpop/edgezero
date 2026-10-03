@@ -8,11 +8,12 @@
 //! each `edgezero-adapter-*` crate's `Adapter::provision` impl, not
 //! here.
 
-use std::path::Path;
+use std::{env, path::Path};
 
 use crate::args::ProvisionArgs;
 use crate::config::{
-    enforce_single_store_capability, reject_merged_id_collisions, strict_handler_paths,
+    effective_manifest_environment, enforce_single_store_capability, reject_merged_id_collisions,
+    strict_handler_paths,
 };
 use crate::ensure_adapter_defined;
 use edgezero_adapter::registry::{self as adapter_registry, ProvisionStores, ResolvedStoreId};
@@ -93,7 +94,14 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
     // fastly.toml); the logical id stays available for status-line
     // wording so operators see what they declared even when the
     // env override redirected the create.
-    let env_config = EnvConfig::from_env();
+    let env_config = effective_manifest_environment(manifest, &args.adapter, env::vars());
+
+    // Resolve and validate every declared selector before dispatching to an
+    // adapter. Provision can create remote resources, so an explicitly invalid
+    // value must not silently fall back to the logical id after mutation starts.
+    let config_ids = resolve_kind(manifest.stores.config.as_ref(), &env_config, "config")?;
+    let kv_ids = resolve_kind(manifest.stores.kv.as_ref(), &env_config, "kv")?;
+    let secret_ids = resolve_kind(manifest.stores.secrets.as_ref(), &env_config, "secrets")?;
 
     // Same env-resolved merged-id collision check `config validate`
     // runs. Without it, `provision --adapter spin --dry-run` would
@@ -105,9 +113,6 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
     // collisions across merged kinds.
     reject_merged_id_collisions(&args.adapter, adapter, manifest, &env_config)?;
 
-    let config_ids = resolve_kind(manifest.stores.config.as_ref(), &env_config, "config");
-    let kv_ids = resolve_kind(manifest.stores.kv.as_ref(), &env_config, "kv");
-    let secret_ids = resolve_kind(manifest.stores.secrets.as_ref(), &env_config, "secrets");
     let stores = ProvisionStores {
         config: &config_ids,
         kv: &kv_ids,
@@ -138,13 +143,20 @@ fn resolve_kind(
     declaration: Option<&StoreDeclaration>,
     env_config: &EnvConfig,
     kind: &str,
-) -> Vec<ResolvedStoreId> {
-    declaration.map_or_else(Vec::new, |decl| {
-        decl.ids
-            .iter()
-            .map(|id| ResolvedStoreId::new(id.clone(), env_config.store_name(kind, id)))
-            .collect()
-    })
+) -> Result<Vec<ResolvedStoreId>, String> {
+    declaration.map_or_else(
+        || Ok(Vec::new()),
+        |decl| {
+            decl.ids
+                .iter()
+                .map(|id| {
+                    env_config
+                        .store_name_checked(kind, id)
+                        .map(|platform| ResolvedStoreId::new(id.clone(), platform))
+                })
+                .collect()
+        },
+    )
 }
 
 #[cfg(test)]
@@ -154,6 +166,40 @@ mod tests {
     use crate::test_support::{EnvOverride, PROVISION_MANIFEST, manifest_guard};
     use std::fs;
     use tempfile::TempDir;
+
+    const SPIN_MANIFEST: &str = "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n";
+
+    fn spin_provision_manifest(environment_default: Option<&str>) -> String {
+        let environment = environment_default.map_or_else(String::new, |value| {
+            format!(
+                r#"
+[[environment.variables]]
+name = "CONFIG_STORE"
+env = "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"
+value = "{value}"
+adapters = ["spin"]
+"#
+            )
+        });
+        format!(
+            r#"
+[app]
+name = "demo-app"
+{environment}
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+"#
+        )
+    }
 
     #[test]
     fn run_provision_axum_prints_local_only_notes_for_each_store() {
@@ -459,6 +505,101 @@ ids = ["default"]
                 && err.contains("[stores.kv].sessions")
                 && err.contains("[stores.config].app_config"),
             "error names the resolved platform label + both logical ids: {err}"
+        );
+    }
+
+    #[test]
+    fn run_provision_applies_manifest_store_name_default() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            spin_provision_manifest(Some("manifest_config")),
+        )
+        .expect("write manifest");
+        let spin_path = temp.path().join("spin.toml");
+        fs::write(&spin_path, SPIN_MANIFEST).expect("write spin manifest");
+
+        run_provision(&ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: false,
+            manifest: manifest_path,
+        })
+        .expect("manifest store default must provision");
+
+        let spin = fs::read_to_string(spin_path).expect("read spin manifest");
+        assert!(
+            spin.contains("\"manifest_config\""),
+            "provision must write the adapter-scoped manifest default: {spin}"
+        );
+        assert!(
+            !spin.contains("\"app_config\""),
+            "logical fallback must not replace a declared manifest default: {spin}"
+        );
+    }
+
+    #[test]
+    fn run_provision_parent_selector_overrides_manifest_default() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _selector = EnvOverride::set(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME",
+            "parent_config",
+        );
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            spin_provision_manifest(Some("manifest_config")),
+        )
+        .expect("write manifest");
+        let spin_path = temp.path().join("spin.toml");
+        fs::write(&spin_path, SPIN_MANIFEST).expect("write spin manifest");
+
+        run_provision(&ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: false,
+            manifest: manifest_path,
+        })
+        .expect("parent selector must provision");
+
+        let spin = fs::read_to_string(spin_path).expect("read spin manifest");
+        assert!(
+            spin.contains("\"parent_config\""),
+            "parent selector must override the manifest default: {spin}"
+        );
+        assert!(
+            !spin.contains("\"manifest_config\""),
+            "stale default: {spin}"
+        );
+    }
+
+    #[test]
+    fn run_provision_rejects_empty_store_selector_before_adapter_write() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _selector = EnvOverride::set("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, spin_provision_manifest(None)).expect("write manifest");
+        let spin_path = temp.path().join("spin.toml");
+        fs::write(&spin_path, SPIN_MANIFEST).expect("write spin manifest");
+        let before = fs::read_to_string(&spin_path).expect("read before");
+
+        let error = run_provision(&ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: false,
+            manifest: manifest_path,
+        })
+        .expect_err("an explicitly empty selector must fail before provision");
+
+        assert!(
+            error.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME"),
+            "error must identify the invalid selector without its value: {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(spin_path).expect("read after"),
+            before,
+            "invalid selector must not mutate the adapter manifest"
         );
     }
 

@@ -1,4 +1,6 @@
-use edgezero_adapter::registry::{self as adapter_registry, AdapterAction};
+use edgezero_adapter::registry::{
+    self as adapter_registry, AdapterAction, AdapterDeployContext, DeployOwnership,
+};
 use edgezero_core::manifest::{Manifest, ManifestLoader, ResolvedEnvironment};
 
 use std::env;
@@ -130,16 +132,23 @@ pub fn execute(
         );
     }
 
-    let adapter = adapter_registry::get_adapter(adapter_name).ok_or_else(|| {
+    let adapter = require_adapter(adapter_name, manifest_loader.is_some())?;
+
+    adapter.execute(AdapterAction::from(action), adapter_args)
+}
+
+fn require_adapter(
+    adapter_name: &str,
+    has_manifest: bool,
+) -> Result<&'static dyn adapter_registry::Adapter, String> {
+    adapter_registry::get_adapter(adapter_name).ok_or_else(|| {
         let available = adapter_registry::registered_adapters();
         if available.is_empty() {
-            if manifest_loader.is_none() {
-                format!(
-                    "adapter `{adapter_name}` is not registered in this build. Provide an `edgezero.toml` (or set `EDGEZERO_MANIFEST`) so the CLI can load adapters, or rebuild `edgezero-cli` with the `{adapter_name}` adapter feature enabled."
-                )
+            if has_manifest {
+                format!("adapter `{adapter_name}` is not registered (no adapters available)")
             } else {
                 format!(
-                    "adapter `{adapter_name}` is not registered (no adapters available)"
+                    "adapter `{adapter_name}` is not registered in this build. Provide an `edgezero.toml` (or set `EDGEZERO_MANIFEST`) so the CLI can load adapters, or rebuild `edgezero-cli` with the `{adapter_name}` adapter feature enabled."
                 )
             }
         } else {
@@ -149,61 +158,82 @@ pub fn execute(
                 available.join(", ")
             )
         }
-    })?;
-
-    adapter.execute(AdapterAction::from(action), adapter_args)
+    })
 }
 
-/// Same dispatch as [`execute`], but when the action resolves to a
-/// manifest-declared shell command the child's output is echoed AND
-/// captured (see [`run_shell_tee`]) and returned as `Some(text)`.
-///
-/// Returns `Ok(None)` when the action was served by the registered
-/// adapter's built-in `execute` instead — that path writes straight to
-/// the inherited stdio, so there is nothing for us to capture and the
-/// caller must fall back to another source of truth (for Fastly deploy:
-/// the Fastly API).
-pub fn execute_capture(
+/// Select deployment ownership through the registered adapter's preflight.
+/// Manifest-owned and fallback deployments retain the legacy finalizer, while
+/// adapter-managed deployments own the complete lifecycle in `deploy`.
+pub fn deploy(
     adapter_name: &str,
-    action: Action,
+    context: &AdapterDeployContext,
+    adapter_manifest_path_error: Option<&str>,
     manifest_loader: Option<&ManifestLoader>,
     adapter_args: &[String],
-) -> Result<Option<String>, String> {
-    if let Some(loader) = manifest_loader
-        && let Some(command) = manifest_command(loader.manifest(), adapter_name, action)
+) -> Result<(), String> {
+    let registered_adapter = adapter_registry::get_adapter(adapter_name);
+    let ownership = registered_adapter
+        .map_or(Ok(DeployOwnership::ManifestCommand), |registered| {
+            registered.preflight_deploy(context, adapter_args)
+        })?;
+
+    if ownership != DeployOwnership::AdapterManaged && context.application_release_root.is_some() {
+        return Err(format!(
+            "adapter `{adapter_name}` does not support immutable application releases; omit --application-release"
+        ));
+    }
+
+    if ownership == DeployOwnership::AdapterManaged {
+        if let Some(err) = adapter_manifest_path_error {
+            return Err(err.to_owned());
+        }
+        let Some(managed_adapter) = registered_adapter else {
+            return Err(format!(
+                "adapter `{adapter_name}` selected managed deployment without being registered"
+            ));
+        };
+        return managed_adapter.deploy(context, adapter_args);
+    }
+
+    if !context.staging
+        && let Some(loader) = manifest_loader
+        && let Some(command) = manifest_command(loader.manifest(), adapter_name, Action::Deploy)
     {
+        if registered_adapter.is_some()
+            && !context.stores.is_empty()
+            && let Some(err) = adapter_manifest_path_error
+        {
+            return Err(err.to_owned());
+        }
         let root = loader.manifest().root().unwrap_or_else(|| Path::new("."));
         let env = loader.manifest().environment_for(adapter_name);
         let adapter_bind = adapter_bind_from_manifest(loader.manifest(), adapter_name);
-        return run_shell_tee(
+        let mut command_args = Vec::new();
+        if let Some(service_id) = context.service_id.as_deref() {
+            command_args.extend(["--service-id".to_owned(), service_id.to_owned()]);
+        }
+        command_args.extend_from_slice(adapter_args);
+        let output = run_shell_tee(
             command,
             root,
             adapter_name,
-            action,
+            Action::Deploy,
             Some(env),
             adapter_bind,
-            adapter_args,
-        )
-        .map(Some);
+            &command_args,
+        )?;
+        if let Some(finalizer) = registered_adapter {
+            finalizer.finalize_deploy(context, Some(&output))?;
+        }
+        return Ok(());
     }
-    execute(adapter_name, action, manifest_loader, adapter_args)?;
-    Ok(None)
-}
 
-/// Whether `action` for `adapter_name` resolves to a manifest-declared
-/// shell command (rather than the registered adapter's built-in logic).
-///
-/// Callers use this to decide whether an EdgeZero-internal directive
-/// (e.g. `--manifest-path`, understood only by the built-in adapter) is
-/// safe to thread into `adapter_args`: a manifest shell command receives
-/// those args verbatim and would choke on a flag its own CLI lacks.
-pub fn has_manifest_command(
-    manifest_loader: Option<&ManifestLoader>,
-    adapter_name: &str,
-    action: Action,
-) -> bool {
-    manifest_loader
-        .is_some_and(|loader| manifest_command(loader.manifest(), adapter_name, action).is_some())
+    if let Some(err) = adapter_manifest_path_error {
+        return Err(err.to_owned());
+    }
+    let fallback_adapter = require_adapter(adapter_name, manifest_loader.is_some())?;
+    fallback_adapter.deploy(context, adapter_args)?;
+    fallback_adapter.finalize_deploy(context, None)
 }
 
 fn manifest_command<'manifest>(
@@ -443,11 +473,27 @@ fn shell_join(args: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedEnvironment, apply_environment};
+    use super::{AdapterDeployContext, ResolvedEnvironment, apply_environment, deploy};
     use crate::test_support::manifest_guard;
     use edgezero_core::manifest::ResolvedEnvironmentBinding;
     use edgezero_core::test_env::EnvOverride;
+    use std::path::PathBuf;
     use std::process::Command;
+
+    #[test]
+    fn deploy_rejects_application_release_for_non_managed_adapter() {
+        let context = AdapterDeployContext {
+            application_release_root: Some(PathBuf::from("/verified/release")),
+            ..AdapterDeployContext::default()
+        };
+
+        let error = deploy("unregistered", &context, None, None, &[])
+            .expect_err("a manifest-owned adapter must not ignore the release contract");
+        assert_eq!(
+            error,
+            "adapter `unregistered` does not support immutable application releases; omit --application-release"
+        );
+    }
 
     #[test]
     fn apply_environment_sets_defaults_and_checks_secrets() {

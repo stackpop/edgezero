@@ -16,13 +16,14 @@
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::path::Path;
     use std::process::{Command, ExitStatus};
 
     /// Targets installed for the toolchain that builds `project`. A wasm
     /// check is skipped when its target is absent (e.g. a local run where
     /// the project sits outside a checkout that pins the wasm targets); CI
-    /// installs both wasm targets, so the full set always runs there.
+    /// installs every required wasm target, so the full set always runs there.
     fn installed_targets(project: &Path) -> String {
         Command::new("rustup")
             .args(["target", "list", "--installed"])
@@ -137,6 +138,10 @@ mod tests {
             ("spin", "wasm32-wasip2"),
         ] {
             if !targets.contains(target) {
+                assert!(
+                    env::var_os("CI").is_none(),
+                    "generated {adapter} wasm check requires installed target {target} in CI",
+                );
                 eprintln!("skipping {adapter} wasm check: target {target} not installed");
                 continue;
             }

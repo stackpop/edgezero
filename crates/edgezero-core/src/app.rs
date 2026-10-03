@@ -1,3 +1,4 @@
+use crate::manifest::ResolvedLoggingConfig;
 use crate::router::RouterService;
 
 /// Canonical adapter name for the Axum adapter.
@@ -120,6 +121,17 @@ pub trait Hooks {
     #[inline]
     fn configure(_app: &mut App) {}
 
+    /// Logging settings for one adapter, baked from the application manifest.
+    ///
+    /// Macro-generated applications override this with the matching
+    /// `[adapters.<name>.logging]` or `[logging.<name>]` configuration. A
+    /// handwritten implementation receives the portable defaults.
+    #[must_use]
+    #[inline]
+    fn logging_for(_adapter: &str) -> ResolvedLoggingConfig {
+        ResolvedLoggingConfig::default()
+    }
+
     /// Display name for the application. Defaults to `"EdgeZero App"`.
     #[must_use]
     #[inline]
@@ -157,6 +169,7 @@ mod tests {
     use crate::context::RequestContext;
     use crate::error::EdgeError;
     use crate::http::{Method, StatusCode, request_builder};
+    use crate::manifest::LogLevel;
     use futures::executor::block_on;
     use tower_service::Service as _;
 
@@ -251,6 +264,14 @@ mod tests {
     #[test]
     fn default_hooks_do_not_own_logging() {
         assert!(!DefaultHooks::owns_logging());
+    }
+
+    #[test]
+    fn default_hooks_use_default_logging_for_every_adapter() {
+        let logging = DefaultHooks::logging_for("fastly");
+        assert_eq!(logging.level, LogLevel::Info);
+        assert!(logging.endpoint.is_none());
+        assert!(logging.echo_stdout.is_none());
     }
 
     #[test]
