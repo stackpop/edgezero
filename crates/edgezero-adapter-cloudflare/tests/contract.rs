@@ -342,17 +342,81 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    async fn service_with_config_missing_binding_skips_injection() {
-        // The test env is an empty JS object; any env.var() call returns None.
-        // `CloudflareService::with_config(name)` should log a warning and
-        // dispatch without injecting a config-store handle, so the handler
-        // sees `ctx.config_store_default()` return `None`.
+    async fn service_with_config_missing_binding_preserves_typed_failure() {
+        #[edgezero_core::action]
+        async fn read_declared_config(ctx: RequestContext) -> Result<Response, EdgeError> {
+            let binding = ctx
+                .config_store_default_binding()
+                .expect("declared binding must remain registered");
+            let error = binding
+                .handle
+                .get(&binding.default_key)
+                .await
+                .expect_err("failed opening must not become a missing value");
+            assert!(matches!(&error, ConfigStoreError::Unavailable { .. }));
+
+            let clock = ctx.monotonic_clock();
+            let bounded_error = binding
+                .handle
+                .get_bounded(
+                    &binding.default_key,
+                    &clock,
+                    Deadline::at_instant(
+                        clock
+                            .now()
+                            .checked_add(Duration::from_secs(1))
+                            .expect("read deadline"),
+                    ),
+                    1024,
+                    1024,
+                )
+                .await
+                .expect_err("bounded reads must preserve the opening failure");
+            assert!(matches!(
+                bounded_error,
+                ConfigStoreError::Unavailable { .. }
+            ));
+
+            Err(EdgeError::from(error))
+        }
+
+        // The empty environment cannot open this declared binding. It must
+        // stay registered with a typed error rather than look unconfigured.
+        let mut app = App::new(
+            RouterService::builder()
+                .get("/config-value", read_declared_config)
+                .build(),
+        );
+        // Browser fixtures lack Workers' FixedLengthStream. A bodyless
+        // error renderer isolates binding failures from that host-only API.
+        app.set_error_response_renderer(|error| {
+            response_builder()
+                .status(error.status())
+                .body(Body::empty())
+                .expect("error response")
+        });
+        let req = cf_request(CfMethod::Get, "/config-value", None);
+        let (env, ctx) = test_env_ctx();
+
+        let response = CloudflareService::new(&app)
+            .with_config("nonexistent_binding")
+            .dispatch(req, env, ctx)
+            .await
+            .expect("cf response");
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn service_without_config_keeps_registry_absent() {
         let app = build_test_app();
         let req = cf_request(CfMethod::Get, "/has-config", None);
         let (env, ctx) = test_env_ctx();
 
         let mut response = CloudflareService::new(&app)
-            .with_config("nonexistent_binding")
             .dispatch(req, env, ctx)
             .await
             .expect("cf response");

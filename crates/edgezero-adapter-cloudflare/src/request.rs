@@ -203,9 +203,11 @@ impl<'app> CloudflareService<'app> {
     }
 
     /// Open the KV namespace bound as `binding` (per `wrangler.toml`)
-    /// as a Cloudflare config store and inject its handle. If the
-    /// binding is absent the dispatcher logs once and proceeds
-    /// without it.
+    /// as a Cloudflare config store and inject its handle. If opening
+    /// fails, the dispatcher logs once and retains a failing handle
+    /// whose reads return
+    /// [`ConfigStoreError::Unavailable`](edgezero_core::config_store::ConfigStoreError::Unavailable).
+    /// Only an unconfigured service has no config-store handle.
     #[must_use]
     #[inline]
     pub fn with_config<S: Into<String>>(mut self, binding: S) -> Self {
