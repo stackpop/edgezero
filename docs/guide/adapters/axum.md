@@ -216,21 +216,144 @@ flow — the bundled `edgezero config push` errors), which writes the same
 `.edgezero/local-config-<id>.json` files the runtime reads — no shell-out, no
 server to authenticate against.
 
-## Container Deployment
+## Container packaging
 
-Build and deploy as a standard container:
+`edgezero new` generates a workspace-root `Dockerfile` and `.dockerignore` when
+Axum is registered in the CLI build. The recipe builds only the native Axum
+application binary with `--release --locked`, using a GNU/Linux Rust builder and
+compatible Debian-slim runtime. The base images have reviewed digest pins;
+package installation still needs network access and is not a byte-reproducible
+build claim.
+
+### Prepare the application
+
+Generated EdgeZero dependencies may point into the developer's local checkout.
+Those paths are not portable Docker inputs. Before building, edit the root
+`[workspace.dependencies]` entries to use the same approved release tag or
+commit for every EdgeZero crate. For example:
+
+```toml
+# Replace the placeholder with a reviewed release compatible with this app.
+edgezero-core = { git = "https://github.com/stackpop/edgezero.git", tag = "<approved-release>", default-features = false }
+edgezero-adapter-axum = { git = "https://github.com/stackpop/edgezero.git", tag = "<approved-release>", default-features = false }
+edgezero-cli = { git = "https://github.com/stackpop/edgezero.git", tag = "<approved-release>" }
+```
+
+Apply that ref to the other generated EdgeZero adapter entries too. Preserve
+member feature settings, including Axum's `axum` feature and the operator CLI's
+default features. Keep relative paths between the application's own crates.
+There is no new dependency-selection flag; this is ordinary manifest preparation.
+
+```sh
+cargo generate-lockfile
+cargo metadata --locked --format-version 1
+# Review dependency sources, then commit the app manifests and Cargo.lock.
+```
+
+Do not copy EdgeZero's workspace lockfile. Scaffolding stays offline; these
+explicit preparation commands may fetch dependencies. Docker requires a present,
+current application lockfile and never repairs dependencies during the build.
+
+The builder compiler must match the exact Rust pin in the generated
+`.tool-versions`. An optional `rust-toolchain.toml` must have a matching quoted
+`channel = "X.Y.Z"` under `[toolchain]`. The small container check supports that
+conventional format, not arbitrary TOML/channel syntax; legacy `rust-toolchain`
+files are rejected. Update the declarations, Docker Rust version and reviewed
+builder digest together when upgrading. The image uses the installed compiler
+without downloading toolchain-file targets/components. It selects the native
+host target explicitly rather than inheriting a consumer's WASM build target.
+
+### Build and run
+
+Run from the application workspace root, which must retain all workspace member
+manifests, `edgezero.toml` and required build-time sources/assets:
+
+```sh
+docker build -t my-app:local .
+docker run --rm --read-only --cap-drop=ALL \
+  --security-opt=no-new-privileges:true \
+  -p 127.0.0.1:8787:8787 my-app:local
+# From another terminal:
+curl --fail http://127.0.0.1:8787/
+```
+
+The runtime contains the binary, system CA trust and required native libraries,
+not the source workspace, Rust, Node or the operator CLI. It runs as UID/GID
+10001:10001 with exec startup and binds `0.0.0.0:8787` inside the container. The
+publication above is localhost-only. EXPOSE does not publish ports, and the
+read-only/capability settings are Docker run options, not Dockerfile guarantees.
+To change the internal port, set `EDGEZERO__ADAPTER__PORT` and adjust the published
+port mapping. Local development still defaults to localhost.
+
+The default generated app declares no stores and needs no writable mount. Apps
+using current embedded stores must provide `/app/.edgezero`, owned/readable as
+needed by UID 10001. Provision permissions outside startup; do not run a root
+chown wrapper or use world-writable state. Config-only mounts can be read-only.
+Embedded redb needs one writer; a shared volume does not establish multi-replica
+safety. Runtime configuration, secrets, signing keys and mutable state remain
+external inputs. The image does not generate them.
+
+Review `.dockerignore` before building. It excludes common credentials, local
+state, Git and host build output, but cannot identify custom secret filenames.
+Keep required manifests and assets. Private build credentials need an explicit
+app-owned BuildKit secret/SSH setup, never COPY, ARG or ENV.
+
+### Optional application asset builds
+
+Node is not required for the generic template. Applications that embed JS during
+Rust compilation can add a separate pinned asset stage before the Rust builder.
+Trusted Server is one such consumer. Its app-owned extension can start with:
 
 ```dockerfile
-FROM rust:1.75 as builder
-WORKDIR /app
-COPY . .
-RUN cargo build -p my-app-adapter-axum --release
+FROM node:24.12.0-bookworm-slim AS assets
+WORKDIR /assets/lib
+COPY crates/trusted-server-js/lib/ ./
+RUN npm ci && npm run build
 
-FROM debian:bookworm-slim
-COPY --from=builder /app/target/release/my-app-adapter-axum /usr/local/bin/
-EXPOSE 8787
-CMD ["my-app-adapter-axum"]
+# In the existing Rust builder, before Cargo compilation:
+# COPY --from=assets /assets/dist /build/crates/trusted-server-js/dist
+# ENV TSJS_SKIP_BUILD=1
 ```
+
+Choose Node from the consumer's declared pin, retain its npm lockfile, and build
+fresh bundles rather than reuse host dist output. Trusted Server's build.rs
+embeds those bundles; after the explicit asset build, `TSJS_SKIP_BUILD=1` avoids
+an implicit npm retry. Select its native package `trusted-server-adapter-axum`
+and binary `trusted-server-axum`, not its Fastly default member or operator CLI.
+Check bundle completeness and embedded bytes. This customization is guidance,
+not a claim that Trusted Server's bind/config/health behavior or image has been
+validated. Node stays out of the final runtime.
+
+### Packaging verification and limits
+
+From an EdgeZero checkout, the opt-in smoke accepts a **disposable generated
+workspace** after the preparation above:
+
+```sh
+./scripts/test_generated_axum_container.sh /path/to/container-probe
+```
+
+It requires Docker, Python 3.11+, curl, OpenSSL, readelf and preparation network access.
+It tests actual context exclusions, final filesystem/native libraries, UID,
+read-only root, dropped capabilities, explicit mount permissions, published-port
+HTTP and the real proxy's controlled TLS trust and hostname rejection. It uses
+private test CA material, not production secrets or public upstreams, and cleans
+up its containers/network/image. Failure diagnostics are retained in a temporary
+directory, with private test keys removed.
+
+For unmerged framework changes, a separate disposable fixture can explicitly
+stage EdgeZero sources and point test-only dependencies within the context.
+Include all needed workspace manifests and the CLI's optional app-demo source
+path. Resolve that fixture's own lockfile. This local-source evidence is not a
+substitute for a standalone consumer with portable Git references.
+
+These are packaging checks, not production certification. The current runtime
+still needs accepted PR #275 integration and the lifecycle/config work tracked
+by #392/#396 for readiness, required-config failure, durable restart and bounded
+SIGTERM draining. A response from `/` is not application readiness, and exec
+startup alone does not implement signal handling. #399 owns native amd64/arm64
+CI and publishing guidance; #400 owns Docker/Kubernetes/cloud operations.
+Application owners publish their own images. No public EdgeZero image is needed.
 
 ## Configuration
 
