@@ -40,10 +40,10 @@ The root `Dockerfile` builds only `{{proj_axum}}`. Prepare the workspace first:
    filenames. Keep required workspace manifests and build-time assets.
 
 ```sh
-docker build -t {{name}}:local .
+docker build -t app:local .
 docker run --rm --read-only --cap-drop=ALL \
   --security-opt=no-new-privileges:true \
-  -p 127.0.0.1:8787:8787 {{name}}:local
+  -p 127.0.0.1:8787:8787 app:local
 ```
 
 The image runs as UID/GID 10001 and binds `0.0.0.0:8787` inside the container.

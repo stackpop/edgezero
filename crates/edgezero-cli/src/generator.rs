@@ -1037,6 +1037,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn container_readme_uses_valid_image_name_for_digit_leading_app() {
+        let mut hbs = Handlebars::new();
+        register_templates(&mut hbs);
+        let name = sanitize_crate_name("123app");
+        let readme = hbs
+            .render(
+                "root_README_md",
+                &serde_json::json!({
+                    "has_axum": true,
+                    "name": name,
+                    "proj_axum": format!("{name}-adapter-axum"),
+                }),
+            )
+            .expect("render README");
+        assert!(readme.contains("docker build -t app:local ."));
+        assert!(readme.contains("-p 127.0.0.1:8787:8787 app:local"));
+        assert!(readme.contains("`_123app-adapter-axum`"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn container_toolchain_check_validates_declared_and_installed_versions() {
