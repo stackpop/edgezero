@@ -1,0 +1,29 @@
+# Host build output and dependencies. Keep workspace manifests and source assets.
+**/target
+/bin
+/pkg
+**/node_modules
+
+# Operator inputs and local runtime state do not belong in a build context.
+{{name}}.toml
+**/.env
+**/.env.*
+**/.dev.vars
+**/.dev.vars.*
+**/.cargo/credentials
+**/.cargo/credentials.toml
+**/.edgezero
+**/.wrangler
+**/.spin
+**/.*.edgezero-lock
+**/.*.edgezero-*.tmp
+
+# Repository/editor metadata.
+**/.git
+**/.vscode
+**/.idea
+**/.specstory
+**/.DS_Store
+
+# Add application-specific config, signing-key and state filenames here.
+# Do not exclude Cargo.lock, edgezero.toml, workspace crates, or required build assets.
