@@ -105,8 +105,10 @@ is no `--local` flag because Axum's push IS always local.
 ### Cloudflare
 
 The push shells out to `wrangler kv bulk put --namespace-id=<id> --remote`
-with one entry: `(<key>, <envelope_json>)`. With `--local`, the same
-command runs against `.wrangler/state` instead.
+with one entry: `(<key>, <envelope_json>)`. With `--local`, the push runs
+`wrangler kv bulk put <file> --binding <BINDING> --local` against
+`.wrangler/state`, selecting the namespace by binding name rather than by
+namespace id.
 
 The bundled `edgezero` binary calls `wrangler` from your shell; your
 project's `wrangler.toml` selects the namespace.
@@ -187,16 +189,16 @@ non-zero on a non-TTY (per spec §8.3's four-branch UX).
 
    ```sh
    # Cloudflare (per spec §10.2)
-   wrangler secret put demo_api_token --binding APP_SECRETS
+   wrangler secret put demo_api_token
 
    # Fastly
-   fastly secret-store-entry create --store-id=<id> --name=demo_api_token --value=<value>
+   printf '%s' '<value>' | fastly secret-store-entry create --store-id=<id> --name=demo_api_token --stdin
 
-   # Spin local
-   echo demo_api_token=<value> >> .env
+   # Spin local (spin.toml must declare the `demo_api_token` variable)
+   echo SPIN_VARIABLE_DEMO_API_TOKEN=<value> >> .env
 
    # Axum local
-   EDGEZERO_SECRET_demo_api_token=<value> cargo run -p <app-cli> -- serve --adapter axum
+   demo_api_token=<value> cargo run -p <app-cli> -- serve --adapter axum
    ```
 
 3. Push the typed config:
@@ -219,7 +221,7 @@ production. To swap which blob the runtime reads:
 ```sh
 # Push BOTH variants. Each lands at its own key.
 <app-cli> config push --adapter <name> --key app_config
-<app-cli> config push --adapter <name> --key app_config_staging
+<app-cli> config push --adapter <name> --key app_config_canary
 ```
 
 The override variable is `EDGEZERO__STORES__CONFIG__<ID>__KEY` --
@@ -228,12 +230,12 @@ packs `default_key` into the `ConfigStoreBinding` at adapter init.
 **Where you set the override depends on the platform's variable
 mechanism.**
 
-| Adapter        | Where to set `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY`                                                                                                                     |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Axum**       | Process env: `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging <app-cli> serve --adapter axum`                                                                   |
-| **Cloudflare** | `.dev.vars` (local) or `wrangler.toml` `[vars]` (deployed) -- wrangler surfaces it to `env.var(...)` in the worker                                                           |
-| **Spin**       | `[application.variables]` in `spin.toml` (defaulted) plus `SPIN_VARIABLE_EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging spin up` for a per-invocation override |
-| **Fastly**     | Do not set a custom key. Production, staging, and local Viceroy all use the logical key `app_config`; select a different physical store with `__NAME`.                       |
+| Adapter        | Where to set `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY`                                                                                                                    |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Axum**       | Process env: `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_canary <app-cli> serve --adapter axum`                                                                   |
+| **Cloudflare** | `.dev.vars` (local) or `wrangler.toml` `[vars]` (deployed) -- wrangler surfaces it to `env.var(...)` in the worker                                                          |
+| **Spin**       | `[application.variables]` in `spin.toml` (defaulted) plus `SPIN_VARIABLE_EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_canary spin up` for a per-invocation override |
+| **Fastly**     | Do not set a custom key. Production, staging, and local Viceroy all use the logical key `app_config`; select a different physical store with `__NAME`.                      |
 
 #### Fastly specifically
 
@@ -302,12 +304,12 @@ entries (`feature.new_checkout`, `service.timeout_ms`, etc.) that
 nothing reads. The blob model leaves them inert — they're not
 referenced — but they consume store quota.
 
-| Adapter    | Cleanup command                                                                                                                                                                                                                              |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Axum       | `rm .edgezero/local-config-*.json` (the blob push writes a fresh file)                                                                                                                                                                       |
-| Cloudflare | `wrangler kv bulk delete <tempfile.json> --namespace-id=<id> --remote` with the orphan keys listed                                                                                                                                           |
-| Fastly     | `fastly config-store-entry delete --store-id=<id> --key=<orphan-key>` per key                                                                                                                                                                |
-| Spin local | `sqlite3 .spin/sqlite_key_value.db "DELETE FROM spin_key_value WHERE store='<id>' AND key NOT IN ('app_config', 'app_config_staging', ...)"` -- preserve every key your runtime might select via `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` |
+| Adapter    | Cleanup command                                                                                                                                                                                                                             |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Axum       | `rm .edgezero/local-config-*.json` (the blob push writes a fresh file)                                                                                                                                                                      |
+| Cloudflare | `wrangler kv bulk delete <tempfile.json> --namespace-id=<id> --remote` with the orphan keys listed                                                                                                                                          |
+| Fastly     | `fastly config-store-entry delete --store-id=<id> --key=<orphan-key>` per key                                                                                                                                                               |
+| Spin local | `sqlite3 .spin/sqlite_key_value.db "DELETE FROM spin_key_value WHERE store='<id>' AND key NOT IN ('app_config', 'app_config_canary', ...)"` -- preserve every key your runtime might select via `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` |
 
 Listing the orphans before deletion:
 
@@ -414,5 +416,6 @@ after push B reconstructs envelope B, not A.
 - Implementation plan: [`docs/superpowers/plans/2026-06-17-blob-app-config.md`](https://github.com/stackpop/edgezero)
 - Extractor source: `crates/edgezero-core/src/extractor.rs`
 - CLI push entry point: `crates/edgezero-cli/src/config.rs::run_config_push_typed`
-- CLI diff entry point: `crates/edgezero-cli/src/diff.rs::run_config_diff_typed`
+- CLI diff entry point: `crates/edgezero-cli/src/config.rs::run_config_diff_typed`
+  (`diff.rs` holds the change collection and the format renderers)
 - Fastly chunk-pointer helper: `crates/edgezero-adapter-fastly/src/chunked_config.rs`

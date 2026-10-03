@@ -245,8 +245,9 @@ impl<'app> FastlyService<'app> {
     /// Handlers reading `ctx.secret_store_default()?.require_str(key)`
     /// open a Fastly Secret Store literally named `"default"`. Use
     /// the manifest-aware `run_app` if your account uses a
-    /// different store name -- it routes through the env-overlay
-    /// resolution path instead.
+    /// different store name -- it opens each `[stores.secrets]` id
+    /// baked into the app as a resource-link alias, and a managed
+    /// deploy links the selected physical store under that alias.
     #[must_use]
     #[inline]
     pub fn with_secrets(mut self) -> Self {
@@ -324,8 +325,8 @@ where
 /// dispatch_with_registries(&app, req, stores, |_req, _extensions| {})
 /// ```
 ///
-/// [`FastlyService`]'s bare-handle path binds `default_key: "default"` and
-/// ignores those selectors.
+/// [`FastlyService`]'s bare-handle path binds `default_key: "default"` instead
+/// of the logical ID.
 ///
 /// KV failures escalate via `resolve_kv_handle`'s `kv_required=true` path;
 /// missing config / secret stores degrade silently with a one-time warning.

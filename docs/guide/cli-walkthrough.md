@@ -242,8 +242,7 @@ api_token = { required = true, secret = true }  # the #[secret] field
 api_token = "{{ api_token }}"
 ```
 
-Then set the value at run time via `SPIN_VARIABLE_API_TOKEN=<value>` or
-`spin up --env API_TOKEN=<value>`.
+Then set the value at run time via `SPIN_VARIABLE_API_TOKEN=<value>`.
 
 ## 6. Env-var overlay
 

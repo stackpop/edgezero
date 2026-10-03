@@ -25,7 +25,7 @@ crates/my-app-adapter-fastly/
 The Fastly manifest configures your service:
 
 ```toml
-manifest_version = 2
+manifest_version = 3
 name = "my-app"
 language = "rust"
 authors = ["you@example.com"]
@@ -35,6 +35,20 @@ authors = ["you@example.com"]
     [local_server.backends."origin"]
     url = "https://your-origin.example.com"
 ```
+
+`edgezero provision --adapter fastly` creates each declared store and writes a
+`[setup.kv_stores]`, `[setup.secret_stores]` or `[setup.config_stores]` entry
+into `fastly.toml`, keyed by the store's logical ID. It writes that entry only
+when the physical store name equals the logical ID. A different physical name
+needs a selected service (`service_id` in `fastly.toml` or `FASTLY_SERVICE_ID`),
+and provision leaves `fastly.toml` unchanged for that store. Whenever a service
+is selected, provision prints the `fastly service resource-link create` command
+that links each new store under its logical ID, because an existing service does
+not re-run `[setup]`. Provision leaves the Viceroy-only `[local_server.*]` tables
+alone. The config-store stanzas there are written by your generated app CLI,
+`<app-cli> config push --adapter fastly --local` (the bundled `edgezero` binary
+has no typed app config and exits 2), and KV / secret local-server seeding is
+hand-edited.
 
 ### Entrypoint
 
@@ -101,6 +115,10 @@ edgezero_adapter_fastly::request::dispatch_with_registries(
 )
 ```
 
+A hand-written `Hooks` impl inherits the default `stores()`, which is empty, so
+`dispatch_with_registries` opens no stores. Such an impl must override
+`stores()` or pass explicit `StoresMetadata`.
+
 `EDGEZERO__STORES__<KIND>__<ID>__NAME` is now a deployment input. EdgeZero
 resolves it before provider mutation and binds that physical resource to the
 version under the stable logical `<ID>` alias. The runtime opens the alias
@@ -145,7 +163,8 @@ need, then read them in a handler via a custom extractor or
 
 ### Owning your own logging
 
-By default `run_app` initializes the Fastly logger. If your app already installs
+By default `run_app` initializes the Fastly logger when the baked
+`[adapters.fastly.logging]` table sets an `endpoint`. If your app already installs
 a `log` backend, opt out with the platform-neutral `Hooks::owns_logging()` flag —
 via the `app!` macro:
 
@@ -164,8 +183,8 @@ Build for Fastly's Wasm target:
 # Using the CLI
 edgezero build --adapter fastly
 
-# Or directly with cargo
-cargo build -p my-app-adapter-fastly --target wasm32-wasip1 --release
+# Or directly
+fastly compute build -C crates/my-app-adapter-fastly
 ```
 
 The compiled Wasm binary is placed in `target/wasm32-wasip1/release/`.
@@ -179,7 +198,7 @@ Run locally with Viceroy (Fastly's local simulator):
 edgezero serve --adapter fastly
 
 # Or directly
-fastly compute serve --skip-build
+fastly compute serve -C crates/my-app-adapter-fastly
 ```
 
 This starts a local server at `http://127.0.0.1:7676`.
@@ -208,7 +227,7 @@ EdgeZero's Fastly proxy client uses **dynamic backends** derived from the target
 You do not need to predeclare backends in `fastly.toml` for EdgeZero proxying.
 
 ```rust
-use edgezero_adapter_fastly::FastlyProxyClient;
+use edgezero_adapter_fastly::proxy::FastlyProxyClient;
 use edgezero_core::proxy::ProxyService;
 
 let client = FastlyProxyClient;
@@ -238,7 +257,7 @@ fn main() {
 ```
 
 ::: tip Logging status
-Fastly logging is wired when you call `init_logger` (or `run_app`); otherwise no logger is installed.
+Fastly logging is wired when you call `init_logger`, or when `run_app` finds an `endpoint` in the baked `[adapters.fastly.logging]` table and `owns_logging()` is `false`; otherwise no logger is installed.
 :::
 
 ## Store selection and deployment
@@ -347,7 +366,9 @@ async fn handler(ctx: RequestContext) -> Result<Response, EdgeError> {
 
 ## Streaming
 
-Fastly supports native streaming via `stream_to_client`. The adapter automatically converts `Body::stream` to Fastly's streaming APIs.
+A `Body::Stream` response is drained into a `fastly::Body` before the adapter
+returns, so the full payload is materialised in memory rather than streamed to
+the client chunk by chunk.
 
 See the [Streaming guide](/guide/streaming) for examples and patterns.
 

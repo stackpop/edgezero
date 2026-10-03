@@ -345,6 +345,12 @@ x86-64 and provide Bash, `jq`, Mike Farah `yq` v4, `tar`, `curl`, `git`, `base64
 `realpath`, and either `sha256sum` or `shasum`. The application CLI archive must
 contain a Linux x86-64 executable.
 
+A self-hosted runner that runs the producer actions must also be **Actions
+Runner 2.327.1 or newer**. The producer actions upload with
+`actions/upload-artifact@v7`, and the `setup-rust-build-cache` helper uses
+`actions/cache@v5`; both run on Node 24 and require runner 2.327.1+. Hosted
+runners already meet this.
+
 ## Security and concurrency
 
 - Pin the release archive by digest and pin action references to a released tag or

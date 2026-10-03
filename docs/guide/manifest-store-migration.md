@@ -163,15 +163,15 @@ last one returns a `BoundSecretStore` whose `get_bytes(key)` is
 single-arg — the platform store name is bound by the
 dispatcher, not passed at the call site).
 
-Adapter setup code still has `with_*_handle` /
-`dispatch_with_*_handle` convenience constructors that take a
-single bare handle. Internally each dispatcher synthesises a
-one-id `KvRegistry` / `ConfigRegistry` / `SecretRegistry`
+Adapter setup code still has `with_*_handle` convenience
+constructors that take a single bare handle. Internally each
+dispatcher synthesises a one-id `KvRegistry` / `ConfigRegistry` / `SecretRegistry`
 under the conventional `"default"` id from that handle before
 the request reaches the router — so the registry-aware
 accessors and the `Kv` / `Config` / `Secrets` extractors
 resolve uniformly regardless of which constructor wired the
-store.
+store. Fastly additionally exposes a public
+`request::dispatch_with_registries` for custom entry points.
 
 ## What about local config-store seeding?
 
@@ -203,7 +203,7 @@ binding = "app_config"
 id      = "abc123…"
 ```
 
-Populate the namespace via `wrangler kv:key put`. The binding name
+Populate the namespace via `wrangler kv key put`. The binding name
 becomes the platform name resolved by
 `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME` (with the default being
 the literal id `app_config`).
