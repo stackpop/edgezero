@@ -277,3 +277,18 @@ While Axum provides a convenient development environment, always test on actual 
 - Deploy to [Fastly Compute](/guide/adapters/fastly) for production
 - Deploy to [Cloudflare Workers](/guide/adapters/cloudflare) as an alternative
 - Explore [Configuration](/guide/configuration) for manifest options
+
+## Ingress provenance
+
+Conversion captures runtime URI parts and retains the original HeaderMap and
+extensions. JSON buffering and non-JSON streaming are unchanged. The standard
+plain HTTP listener supplies a private transport marker. Origin is available
+only with that marker and one valid Host consistent with any URI authority and
+scheme; forwarded headers do not supply a scheme. Generic conversion without
+the marker leaves origin unavailable.
+
+Raw TCP tests retain extension methods, tested path spelling, same-name
+duplicates and FF values. Hyper folds identical Content-Length values and
+rejects conflicting lengths before the hook. The established server path
+therefore records a Content-Length-specific multiplicity limitation. Global
+wire order remains unavailable. See [the capability matrix](./overview#inbound-request-fidelity).

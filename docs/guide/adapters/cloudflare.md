@@ -314,3 +314,20 @@ Configure the Cloudflare adapter in `edgezero.toml`. See [Configuration](/guide/
 
 - Learn about [Fastly Compute](/guide/adapters/fastly) as an alternative
 - Explore the [Axum adapter](/guide/adapters/axum) for local development
+
+## Runtime request fidelity
+
+Inbound conversion reads `req.inner().method()` rather than the closed Workers
+method enum. Valid runtime extension tokens retain their spelling.
+`Headers.entries()` values follow workerd's UTF-8 string convention and are copied through `HeaderValue::from_bytes(value.as_bytes())`. Invalid runtime HeaderValues produce bounded conversion errors. Conversion never comma-splits combined fields. Browser ByteString construction is not evidence of Worker wire-byte preservation.
+
+Ingress captures `req.inner().url()` before additional parsing. It records a
+runtime URL and validated runtime origin. Fetch can already have normalized dot
+segments and combined repeated fields; those changes cannot be reversed by
+EdgeZero. Header fidelity remains conservative.
+
+Browser converter tests cover custom methods, high bytes, metadata and service
+hook dispatch. Locked local workerd transport tests additionally distinguish
+pre-Worker rejections: its HTTP parser returns 501 for extension methods.
+Real Worker tests assert valid UTF-8 values C3 A9 and C4 80 survive conversion. Local wire FF becomes U+FFFD in Web Headers before Rust, so its runtime UTF-8 copy EF BF BD cannot prove original bytes. Common octet and multiplicity fidelity is `Unknown`: the observed transformations do not prove every particular field changed. Local absolute-form and duplicate Content-Length requests return 500 without a hook verdict. These transport/runtime limits remain separate from runtime-to-core conversion correctness.
+See [the capability matrix](./overview#inbound-request-fidelity).

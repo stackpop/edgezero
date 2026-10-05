@@ -25,8 +25,12 @@ mod tests {
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
-    use edgezero_core::http::{Method, Response, StatusCode, response_builder};
-    use edgezero_core::router::RouterService;
+    use edgezero_core::http::{Method, Request, Response, StatusCode, response_builder};
+    use edgezero_core::request::{
+        CapturedTarget, MAX_TARGET_BYTES, OriginSource, Preservation, RequestIngress,
+        TargetUnavailable,
+    };
+    use edgezero_core::router::{PreDispatchHook, RouterService};
     use futures::stream;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
     use worker::js_sys::Object;
@@ -36,6 +40,10 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    struct IngressHook {
+        continue_routing: bool,
+    }
+
     struct FixedConfigStore(&'static str);
 
     #[async_trait::async_trait(?Send)]
@@ -43,6 +51,179 @@ mod tests {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(Some(self.0.to_owned()))
         }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PreDispatchHook for IngressHook {
+        async fn handle(&self, request: &mut Request) -> Result<Option<Response>, EdgeError> {
+            assert!(request.extensions().get::<RequestIngress>().is_some());
+            assert_eq!(request.method().as_str(), "EXAMPLE-METHOD");
+            if self.continue_routing {
+                *request.method_mut() = Method::GET;
+                *request.uri_mut() = "https://example.com/uri"
+                    .parse()
+                    .expect("should parse fixed URI");
+                Ok(None)
+            } else {
+                Ok(Some(
+                    response_builder()
+                        .status(418)
+                        .header("allow", "POST")
+                        .body(Body::empty())
+                        .map_err(EdgeError::internal)?,
+                ))
+            }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn ingress_preserves_runtime_extension_methods_and_header_strings() {
+        for token in [
+            "EXAMPLE-METHOD",
+            "example-method",
+            "GET",
+            "POST",
+            "PUT",
+            "DELETE",
+        ] {
+            let init = web_sys::RequestInit::new();
+            init.set_method(token);
+            let headers = web_sys::Headers::new().expect("should create headers");
+            headers
+                .append("x-octets", "\u{ff}\u{80}\u{c3}\u{a9}")
+                .expect("should append ByteString header");
+            init.set_headers_headers(&headers);
+            let raw =
+                web_sys::Request::new_with_str_and_init("https://example.com/reserved", &init)
+                    .expect("should create raw Web Request");
+            let expected_method = raw.method();
+            let (env, ctx) = test_env_ctx();
+            let converted = into_core_request(CfRequest::from(raw), env, ctx)
+                .await
+                .expect("should convert raw request");
+            assert_eq!(converted.method().as_str(), expected_method);
+            assert_eq!(
+                converted.headers()["x-octets"].as_bytes(),
+                "\u{ff}\u{80}\u{c3}\u{a9}".as_bytes()
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn ingress_metadata_tracks_runtime_url_origin_and_coalescing() {
+        let oversized = format!("https://example.com/{}", "a".repeat(MAX_TARGET_BYTES));
+        for url in [
+            "https://example.com/reserved/../ordinary?q=a%2Fb",
+            "https://example.com/reserved/%2e%2e/ordinary",
+            "https://example.com/reserved//%2F",
+            oversized.as_str(),
+        ] {
+            let raw = web_sys::Request::new_with_str(url).expect("should construct Web Request");
+            raw.headers()
+                .append("x-repeat", "first")
+                .expect("should append header");
+            raw.headers()
+                .append("x-repeat", "second")
+                .expect("should append header");
+            raw.headers()
+                .set("origin", "https://spoof.example.com")
+                .expect("should set spoofed origin");
+            raw.headers()
+                .set("forwarded", "proto=http;host=spoof.example.com")
+                .expect("should set spoofed forwarding header");
+            let exposed = raw.url();
+            let (env, ctx) = test_env_ctx();
+            let converted = into_core_request(CfRequest::from(raw), env, ctx)
+                .await
+                .expect("should convert Web Request");
+            let ingress = converted
+                .extensions()
+                .get::<RequestIngress>()
+                .expect("should insert metadata");
+            match ingress.target() {
+                CapturedTarget::Complete(target) => {
+                    assert_eq!(target.value(), exposed);
+                    assert_eq!(target.fidelity(), Preservation::Transformed);
+                }
+                CapturedTarget::Unavailable(reason) => {
+                    assert_eq!(*reason, TargetUnavailable::TooLarge);
+                }
+            }
+            assert_eq!(
+                matches!(ingress.target(), CapturedTarget::Complete(_)),
+                exposed.len() <= MAX_TARGET_BYTES
+            );
+            let origin = ingress.origin().expect("should expose runtime origin");
+            assert_eq!(origin.scheme(), "https");
+            assert_eq!(origin.authority(), "example.com");
+            assert_eq!(origin.source(), OriginSource::RuntimeUri);
+            assert_eq!(converted.headers().get_all("x-repeat").iter().count(), 1);
+            assert_eq!(converted.headers()["x-repeat"], "first, second");
+            assert_eq!(
+                ingress
+                    .header_fidelity(&"x-repeat".parse().expect("should parse name"))
+                    .field_multiplicity(),
+                Preservation::Unknown
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn ingress_non_http_runtime_url_has_no_origin() {
+        let raw = web_sys::Request::new_with_str("ftp://example.com/reserved")
+            .expect("should construct runtime URL");
+        let (env, ctx) = test_env_ctx();
+        let request = into_core_request(CfRequest::from(raw), env, ctx)
+            .await
+            .expect("should convert exposed URI");
+        assert!(
+            request
+                .extensions()
+                .get::<RequestIngress>()
+                .expect("should insert metadata")
+                .origin()
+                .is_none()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn ingress_hook_intercepts_and_continues_through_service() {
+        for continue_routing in [false, true] {
+            let app = App::new(
+                RouterService::builder()
+                    .pre_dispatch_hook(Arc::new(IngressHook { continue_routing }))
+                    .get("/uri", capture_uri_for_ingress)
+                    .build(),
+            );
+            let init = web_sys::RequestInit::new();
+            init.set_method("EXAMPLE-METHOD");
+            let raw = web_sys::Request::new_with_str_and_init("https://example.com/missing", &init)
+                .expect("should create extension request");
+            let (env, ctx) = test_env_ctx();
+            let response = CloudflareService::new(&app)
+                .dispatch(CfRequest::from(raw), env, ctx)
+                .await
+                .expect("should dispatch hook");
+            assert_eq!(
+                response.status_code(),
+                if continue_routing { 200 } else { 418 }
+            );
+            if !continue_routing {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("allow")
+                        .expect("should read header")
+                        .as_deref(),
+                    Some("POST")
+                );
+            }
+        }
+    }
+
+    #[edgezero_core::action]
+    async fn capture_uri_for_ingress() -> &'static str {
+        "continued"
     }
 
     fn build_test_app() -> App {

@@ -176,6 +176,7 @@ where
     A: Hooks,
     F: FnOnce(&fastly::Request, &mut Extensions),
 {
+    let ingress = request::capture_request_ingress(&req);
     let stores = A::stores();
     let env = runtime_env_config(stores);
     let logging = FastlyLogging::from(&env);
@@ -184,7 +185,7 @@ where
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
     let app = A::build_app();
-    request::dispatch_with_registries(&app, req, stores, &env, extend)
+    request::dispatch_with_registries_and_ingress(&app, req, stores, &env, ingress, extend)
 }
 
 /// Build an [`EnvConfig`] from the optional `edgezero_runtime_env`

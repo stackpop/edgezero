@@ -1,0 +1,10 @@
+spin_manifest_version = 2
+[application]
+name = "request-fidelity"
+version = "0.1.0"
+[[trigger.http]]
+route = "/..."
+component = "request-fidelity"
+[component.request-fidelity]
+source = "target/spin/wasm32-wasip2/release/request_fidelity.wasm"
+allowed_outbound_hosts = []

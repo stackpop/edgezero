@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use async_trait::async_trait;
 use matchit::Router as PathRouter;
 use tower_service::Service;
 
@@ -13,6 +14,25 @@ use crate::introspection::{ManifestJson, RouteTable};
 use crate::middleware::{BoxMiddleware, Middleware, Next};
 use crate::params::PathParams;
 use crate::response::IntoResponse as _;
+
+/// Shared optional interception performed before router lookup and state injection.
+pub type BoxPreDispatchHook = Arc<dyn PreDispatchHook>;
+
+/// Inspect or terminate a request before method/path lookup and route middleware.
+///
+/// The hook receives adapter extensions but no router-injected state or
+/// introspection. It may capture application state in its own implementation.
+/// Futures deliberately do not require `Send` so WASM runtimes remain supported.
+#[async_trait(?Send)]
+pub trait PreDispatchHook: Send + Sync + 'static {
+    /// Return a terminal response, or continue with the mutated request.
+    ///
+    /// # Errors
+    ///
+    /// Errors prevent dispatch. [`Service::call`] propagates them, while
+    /// [`RouterService::oneshot`] uses the existing error-response rendering.
+    async fn handle(&self, request: &mut Request) -> Result<Option<Response>, EdgeError>;
+}
 
 struct RouteEntry {
     handler: BoxHandler,
@@ -71,6 +91,7 @@ enum RouteMatch<'route> {
 pub struct RouterBuilder {
     manifest_json: Option<Arc<str>>,
     middlewares: Vec<BoxMiddleware>,
+    pre_dispatch_hook: Option<BoxPreDispatchHook>,
     route_info: Vec<RouteInfo>,
     routes: HashMap<Method, PathRouter<RouteEntry>>,
     /// App state registered via [`RouterBuilder::with_state`], keyed by type.
@@ -119,6 +140,7 @@ impl RouterBuilder {
             route_index,
             self.manifest_json,
             self.state_extensions,
+            self.pre_dispatch_hook,
         )
     }
 
@@ -172,6 +194,18 @@ impl RouterBuilder {
         self.route(path, Method::POST, handler)
     }
 
+    /// Install one hook before route lookup, state injection and middleware.
+    ///
+    /// Repeated registration replaces the previous hook. Router clones share
+    /// the same instance. None of the normal route lifecycle runs after a
+    /// terminal response; outer adapter/application finalizers may still run.
+    #[must_use]
+    #[inline]
+    pub fn pre_dispatch_hook(mut self, hook: BoxPreDispatchHook) -> Self {
+        self.pre_dispatch_hook = Some(hook);
+        self
+    }
+
     #[must_use]
     #[inline]
     pub fn put<H>(self, path: &str, handler: H) -> Self
@@ -221,6 +255,7 @@ impl RouterBuilder {
 struct RouterInner {
     manifest_json: Option<Arc<str>>,
     middlewares: Vec<BoxMiddleware>,
+    pre_dispatch_hook: Option<BoxPreDispatchHook>,
     route_index: Arc<[RouteInfo]>,
     routes: HashMap<Method, PathRouter<RouteEntry>>,
     state_extensions: Extensions,
@@ -228,6 +263,11 @@ struct RouterInner {
 
 impl RouterInner {
     async fn dispatch(&self, mut request: Request) -> Result<Response, EdgeError> {
+        if let Some(hook) = &self.pre_dispatch_hook
+            && let Some(response) = hook.handle(&mut request).await?
+        {
+            return Ok(response);
+        }
         let method = request.method().clone();
         let path = request.uri().path().to_owned();
 
@@ -330,11 +370,13 @@ impl RouterService {
         route_index: Arc<[RouteInfo]>,
         manifest_json: Option<Arc<str>>,
         state_extensions: Extensions,
+        pre_dispatch_hook: Option<BoxPreDispatchHook>,
     ) -> Self {
         Self {
             inner: Arc::new(RouterInner {
                 manifest_json,
                 middlewares,
+                pre_dispatch_hook,
                 route_index,
                 routes,
                 state_extensions,
@@ -945,5 +987,309 @@ mod tests {
 
         let response = block_on(service.oneshot(request)).expect("response");
         assert_eq!(response.body().as_bytes().expect("buffered"), b"7-hi");
+    }
+}
+
+#[cfg(test)]
+mod pre_dispatch_tests {
+    use std::io::Error as IoError;
+    use std::mem::take;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::executor::block_on;
+    use futures::future::ready;
+    use futures::stream;
+    use tower_service::Service as _;
+
+    use crate::action;
+    use crate::body::Body;
+    use crate::context::RequestContext;
+    use crate::error::EdgeError;
+    use crate::http::{Method, Request, Response, StatusCode, request_builder, response_builder};
+    use crate::introspection::{ManifestJson, RouteTable};
+    use crate::middleware::{Middleware, Next};
+    use crate::router::{PreDispatchHook, RouterService};
+
+    struct CountedState {
+        clones: Arc<AtomicUsize>,
+    }
+
+    impl Clone for CountedState {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, Ordering::SeqCst);
+            Self {
+                clones: Arc::clone(&self.clones),
+            }
+        }
+
+        fn clone_from(&mut self, source: &Self) {
+            *self = source.clone();
+        }
+    }
+
+    struct CountingMiddleware {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait(?Send)]
+    impl Middleware for CountingMiddleware {
+        async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            next.run(ctx).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct HookMarker;
+
+    struct InspectHook;
+
+    #[async_trait(?Send)]
+    impl PreDispatchHook for InspectHook {
+        async fn handle(&self, request: &mut Request) -> Result<Option<Response>, EdgeError> {
+            let local = Rc::new(7_u32);
+            let body = take(request.body_mut());
+            body.into_bytes_bounded(0).await?;
+            ready(()).await;
+            assert_eq!(*local, 7_u32, "should support a non-Send hook future");
+            Ok(Some(
+                response_builder()
+                    .status(204)
+                    .body(Body::empty())
+                    .map_err(EdgeError::internal)?,
+            ))
+        }
+    }
+
+    struct RewriteHook;
+
+    #[async_trait(?Send)]
+    impl PreDispatchHook for RewriteHook {
+        async fn handle(&self, request: &mut Request) -> Result<Option<Response>, EdgeError> {
+            assert!(request.extensions().get::<CountedState>().is_none());
+            *request.method_mut() = Method::POST;
+            *request.uri_mut() = "/after".parse().expect("should parse fixed URI");
+            request.headers_mut().insert(
+                "x-hook",
+                "present".parse().expect("should parse fixed header"),
+            );
+            request.extensions_mut().insert(HookMarker);
+            *request.body_mut() = Body::text("changed");
+            Ok(None)
+        }
+    }
+
+    struct TerminalHook {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl PreDispatchHook for TerminalHook {
+        async fn handle(&self, request: &mut Request) -> Result<Option<Response>, EdgeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert!(request.extensions().get::<CountedState>().is_none());
+            assert!(request.extensions().get::<ManifestJson>().is_none());
+            assert!(request.extensions().get::<RouteTable>().is_none());
+            if self.fail {
+                return Err(EdgeError::bad_request("hook rejected request"));
+            }
+            Ok(Some(
+                response_builder()
+                    .status(418)
+                    .header("allow", "POST")
+                    .header("www-authenticate", "Basic")
+                    .body(Body::text("local"))
+                    .map_err(EdgeError::internal)?,
+            ))
+        }
+    }
+
+    #[action]
+    async fn after_handler(context: RequestContext) -> Result<Response, EdgeError> {
+        assert!(context.request().extensions().get::<HookMarker>().is_some());
+        assert!(
+            context
+                .request()
+                .extensions()
+                .get::<CountedState>()
+                .is_some()
+        );
+        assert_eq!(context.request().headers()["x-hook"], "present");
+        assert_eq!(
+            context.request().body().as_bytes(),
+            Some(b"changed".as_slice())
+        );
+        response_builder()
+            .body(Body::text("continued"))
+            .map_err(EdgeError::internal)
+    }
+
+    #[action(manifest, routes)]
+    async fn unreachable_handler() -> &'static str {
+        panic!("should short-circuit before handler");
+    }
+
+    fn input(method: Method, path: &str, body: Body) -> Request {
+        request_builder()
+            .method(method)
+            .uri(path)
+            .body(body)
+            .expect("should build hook input")
+    }
+
+    #[test]
+    fn pre_dispatch_continuation_uses_mutated_request() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .with_state(CountedState {
+                clones: Arc::clone(&clones),
+            })
+            .pre_dispatch_hook(Arc::new(RewriteHook))
+            .post("/after", after_handler)
+            .build();
+        let response = block_on(router.oneshot(input(Method::GET, "/before", Body::empty())))
+            .expect("should dispatch rewritten request");
+        assert_eq!(response.body().as_bytes(), Some(b"continued".as_slice()));
+        assert_eq!(clones.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pre_dispatch_errors_stop_routing_in_both_service_apis() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .with_state(CountedState {
+                clones: Arc::clone(&clones),
+            })
+            .pre_dispatch_hook(Arc::new(TerminalHook {
+                calls: Arc::clone(&calls),
+                fail: true,
+            }))
+            .post("/after", after_handler)
+            .build();
+        let error = block_on(
+            router
+                .clone()
+                .call(input(Method::POST, "/after", Body::empty())),
+        )
+        .expect_err("should propagate hook error from Service");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        let response = block_on(router.oneshot(input(Method::POST, "/after", Body::empty())))
+            .expect("should render hook error from oneshot");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(clones.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn pre_dispatch_hook_is_shared_across_router_clones() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .pre_dispatch_hook(Arc::new(TerminalHook {
+                calls: Arc::clone(&calls),
+                fail: false,
+            }))
+            .build();
+        for service in [router.clone(), router] {
+            let response = block_on(service.oneshot(input(Method::GET, "/missing", Body::empty())))
+                .expect("should reuse shared hook");
+            assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn pre_dispatch_inspects_empty_stream_without_send_bound() {
+        let router = RouterService::builder()
+            .pre_dispatch_hook(Arc::new(InspectHook))
+            .build();
+        let chunks = stream::iter([Ok::<Bytes, IoError>(Bytes::new()), Ok(Bytes::new())]);
+        let response =
+            block_on(router.oneshot(input(Method::POST, "/unknown", Body::from_stream(chunks))))
+                .expect("should inspect clean streamed EOF");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn pre_dispatch_registration_replaces_previous_hook() {
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .pre_dispatch_hook(Arc::new(TerminalHook {
+                calls: Arc::clone(&first),
+                fail: true,
+            }))
+            .pre_dispatch_hook(Arc::new(TerminalHook {
+                calls: Arc::clone(&second),
+                fail: false,
+            }))
+            .build();
+        let response = block_on(router.oneshot(input(Method::GET, "/unknown", Body::empty())))
+            .expect("should run replacement hook only");
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(first.load(Ordering::SeqCst), 0);
+        assert_eq!(second.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pre_dispatch_rejects_nonempty_or_failed_streams() {
+        let router = RouterService::builder()
+            .pre_dispatch_hook(Arc::new(InspectHook))
+            .build();
+        let chunks = stream::iter([Ok::<Bytes, IoError>(Bytes::from_static(b"x"))]);
+        let response =
+            block_on(router.oneshot(input(Method::POST, "/unknown", Body::from_stream(chunks))))
+                .expect("should render nonempty body rejection");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let failure = stream::iter([Err::<Bytes, IoError>(IoError::other("fixture failure"))]);
+        let failure_response =
+            block_on(router.oneshot(input(Method::POST, "/unknown", Body::from_stream(failure))))
+                .expect("should render stream failure");
+        assert_eq!(failure_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn pre_dispatch_terminal_response_precedes_method_path_and_lifecycle() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let clones = Arc::new(AtomicUsize::new(0));
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .with_state(CountedState {
+                clones: Arc::clone(&clones),
+            })
+            .with_manifest_json("{}")
+            .middleware(CountingMiddleware {
+                calls: Arc::clone(&middleware_calls),
+            })
+            .pre_dispatch_hook(Arc::new(TerminalHook {
+                calls: Arc::clone(&calls),
+                fail: false,
+            }))
+            .post("/after", unreachable_handler)
+            .build();
+        for (method, path) in [
+            (Method::POST, "/after"),
+            (Method::GET, "/after"),
+            (
+                Method::from_bytes(b"EXAMPLE-METHOD").expect("should parse extension method"),
+                "/after",
+            ),
+            (Method::GET, "/missing"),
+        ] {
+            let response = block_on(router.oneshot(input(method, path, Body::empty())))
+                .expect("should intercept before method/path lookup");
+            assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+            assert_eq!(response.headers()["allow"], "POST");
+            assert_eq!(response.headers()["www-authenticate"], "Basic");
+            assert_eq!(response.body().as_bytes(), Some(b"local".as_slice()));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(clones.load(Ordering::SeqCst), 0);
+        assert_eq!(middleware_calls.load(Ordering::SeqCst), 0);
     }
 }
