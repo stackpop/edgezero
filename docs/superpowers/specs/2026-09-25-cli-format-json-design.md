@@ -149,7 +149,7 @@ whether it succeeds or fails:
 | `schema_version` | integer | `1` for this spec. See §6.5. |
 | `command` | string | The command path as the user types it: `"active-version"`, `"auth status"`, `"build"`, `"config gc"`, `"config validate"`, `"deploy"`, `"healthcheck"`, `"provision"`, `"rollback"`. |
 | `ok` | boolean | `true` exactly when the process will exit 0. |
-| `result` | object or `null` | Never `null` when `ok` is `true`. When `ok` is `false` it holds the **partial result** if the command produced one (an unhealthy healthcheck, a partially failed gc, an unauthenticated `auth status`, `active-version --require-active` with nothing active), and is `null` otherwise. |
+| `result` | object or `null` | Never `null` when `ok` is `true`. When `ok` is `false` it holds the **partial result** if the command produced one (an unhealthy healthcheck, a partially failed gc, an unauthenticated `auth status`, a deploy that went live without a resolvable version), and is `null` otherwise. |
 | `error` | object or `null` | `null` exactly when `ok` is `true`. Otherwise `{ "message": string }`. |
 
 **Field conventions**, applied to the envelope and every result:
@@ -205,6 +205,11 @@ Exit codes do not change.
 | Command failure | 1 (bundled binary) / 2 (template-generated CLIs) | envelope, `ok: false` |
 | Usage error (reported by clap) | 2 | empty. clap parses before the format is known, and its message goes to stderr as today |
 | Bundled stub (`config push` / `config diff`) | 2 | empty |
+| `--help` / `--version` (clap) | 0 | clap's text, not an envelope |
+
+In a generated CLI, exit code 2 covers a command failure, a usage error and an
+unsupported `config diff`. Only the envelope tells them apart: an empty stdout
+means no envelope was produced.
 
 Consumers should branch on `ok`, not on the specific non-zero code, because
 failure codes differ between binaries.
@@ -418,8 +423,6 @@ Every command's `result` includes `adapter` (string), except
 ```
 
 - `version` is `null` when no version is active.
-- With `--require-active` and no active version: `ok: false`, and `result` is
-  present with `version: null`.
 
 ### `auth status`
 
@@ -455,7 +458,11 @@ adapter cannot know the path.
 - For a production Fastly deploy with a service id, `version` is the active
   version after the deploy, found the same way as today (captured `version=`
   output, then falling back to the API).
-- Otherwise `version` is `null`. `service_id` is `null` when none was given.
+- Otherwise `version` is `null`.
+- `service_id` is the id the adapter resolved (a Fastly staged deploy falls
+  back to `FASTLY_SERVICE_ID`), else `--service-id` as passed, else `null`.
+- A production deploy that went live but whose version could not be resolved
+  gives `ok: false` with `result` present and `version: null`.
 
 ### `healthcheck`
 
@@ -469,7 +476,8 @@ adapter cannot know the path.
 
 - `attempts` is the number of probes actually made.
 - `version_verified` is `true` when the check that the version is active ran
-  both before and after the probe (production with an API token).
+  both before and after the probe (a healthy production probe with an API
+  token). An unhealthy probe skips the after-probe check, so it is `false`.
 - Unhealthy means `ok: false` with `result` present, `healthy: false`, and
   `error.message` set to today's failure message.
 - A failure before the probe (invalid arguments, version not active, staging
@@ -499,7 +507,10 @@ adapter cannot know the path.
 ```
 
 - `action` is one of `created`, `already_present`, `would_create`, `updated`,
-  `would_update`, `not_applicable` or `note`.
+  `would_update`, `not_applicable` or `note`. A dry run's `would_create` pairs
+  with a real run's `created` or `already_present`, and `would_update` with
+  `updated`. The Fastly and Spin dry runs report the plan without checking the
+  current state.
 - `store` is `null` for adapter-level notes. `store.logical` is `null` for
   stores EdgeZero owns rather than the manifest, such as Fastly's
   `edgezero_runtime_env`.
@@ -522,7 +533,8 @@ adapter cannot know the path.
 ```
 
 - `older_than_secs` is `null` when `--older-than` was not given.
-- `deleted` is `null` on a dry run.
+- `deleted` is `null` on a dry run, and `0` for a real run with nothing to
+  reclaim.
 - If any delete failed: `ok: false`, `result` present, and `error.message` set
   to today's diagnostic, including the recovery commands.
 - The dry-run advisory text goes to stderr and is not part of `result`.
@@ -535,7 +547,7 @@ adapter cannot know the path.
 
 - `mode` is `raw` in the bundled binary and `typed` in template-generated
   CLIs.
-- `app_config` is `null` in `raw` mode.
+- `app_config` is the app-config file both modes read and require.
 - A validation failure gives `ok: false` and `result: null`, with the first
   failing check in `error.message`. Validation stops at the first failure
   today.
@@ -642,9 +654,32 @@ contract in §5, §6 or §8.
   a second rendering path that could drift.
 - **Only data lines moved to the CLI** (§7.2). Prose lines, such as the
   staged-rollback message, stay in the adapter.
-- **`AuthStatus` carries a `failure` message**, so an unauthenticated status
-  keeps its exact error text.
+- **`AuthState::Unauthenticated` carries its reason**, so an unauthenticated
+  status keeps its exact error text.
 - **The enums mapped to the wire are exhaustive**, not `#[non_exhaustive]`
   (§7.2).
 - **Wire types live in a single `output.rs`**, not an `output::wire` submodule.
 
+Revision 3 records the changes from the review of the implementation PR
+(#388). They fix results that contradicted §8 before schema version 1 shipped.
+
+- **`healthcheck.version_verified`** is `true` only when both active-version
+  checks ran. It was `true` on an unhealthy probe with a token.
+- **`config gc` `deleted`** is `0`, not `null`, for a real run with nothing to
+  reclaim.
+- **`build`** rejects a `--format` that follows a passthrough argument instead
+  of forwarding it to the build command.
+- **`config validate.app_config`** is always set, in both modes.
+- **`deploy`** reports the adapter-resolved `service_id`, and keeps its result
+  when the deploy went live but the version could not be resolved.
+- **Spin `provision`** reports `created` for an added label, pairing with the
+  dry run's `would_create`.
+- **Outcome types hold each fact once**: `HealthcheckOutcome::healthy()` is
+  derived from `failure`, `AuthState::Unauthenticated` carries its reason, and
+  a failed gc is one `GcFailure`.
+- **`std::io::stdout` is a disallowed method**, with an `#[expect]` at each of
+  the three deliberate writers. The generated project's `clippy.toml` carries
+  the same guard.
+- `active-version` has no `--require-active` flag (only the CLI's internal
+  deploy fallback passes it), so §6.1 and §8 no longer promise a partial result
+  for it.
