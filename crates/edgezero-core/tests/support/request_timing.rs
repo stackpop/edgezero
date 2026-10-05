@@ -1,4 +1,7 @@
-//! Runtime-neutral timing scenario shared by the adapter WASM contract suites.
+//! Shared attachment scenario and separate local-runtime clock check.
+//!
+//! The advancement check is only for Viceroy, Wasmtime and browser harnesses.
+//! Deployed Cloudflare CPU-only work may legitimately leave timers unchanged.
 
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
@@ -25,8 +28,8 @@ async fn timed(ctx: RequestContext) -> Result<Response, EdgeError> {
         .snapshot(|view| {
             assert!(view.phases[0].is_some());
             assert!(view.elapsed >= view.data.unwrap());
-            assert_eq!(view.headers_ready_total, None);
-            assert_eq!(view.request_elapsed, None);
+            assert_eq!(view.headers_ready, None);
+            assert_eq!(view.request_complete, None);
         })
         .unwrap();
     response_with_body(StatusCode::OK, Body::empty())
@@ -34,7 +37,7 @@ async fn timed(ctx: RequestContext) -> Result<Response, EdgeError> {
 
 pub(crate) fn clock_handle_and_attachment_work_on_runtime() {
     let handle = Handle::new();
-    let before = handle.elapsed().unwrap();
+    let before = handle.elapsed();
     let mut request = request_builder().uri("/timed").body(Body::empty()).unwrap();
     request.extensions_mut().insert(handle.clone());
     let router = RouterService::builder()
@@ -50,14 +53,14 @@ pub(crate) fn clock_handle_and_attachment_work_on_runtime() {
             assert!(view.phases[0].is_some());
             assert!(view.data.unwrap() >= before);
             assert!(view.elapsed >= view.data.unwrap());
-            assert_eq!(view.headers_ready_total, None);
-            assert_eq!(view.request_elapsed, None);
+            assert_eq!(view.headers_ready, None);
+            assert_eq!(view.request_complete, None);
         })
         .unwrap();
     handle.mark_headers_ready().unwrap();
     assert!(
         handle
-            .snapshot(|view| view.headers_ready_total.unwrap() >= before)
+            .snapshot(|view| view.headers_ready.unwrap() >= before)
             .unwrap()
     );
 
@@ -68,4 +71,21 @@ pub(crate) fn clock_handle_and_attachment_work_on_runtime() {
         block_on(router.oneshot(uninstrumented)).unwrap().status(),
         StatusCode::OK
     );
+}
+
+/// Tests known advancing local clocks, bounded by an independent wall clock
+/// supplied by the harness and an iteration cap if that clock also stops.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn clock_advances_on_local_runtime(mut timed_out: impl FnMut() -> bool) {
+    let handle = RequestTimings::<0>::new();
+    let before = handle.elapsed();
+    for _ in 0_u32..100_000_000_u32 {
+        if handle.elapsed() > before {
+            return;
+        }
+        if timed_out() {
+            break;
+        }
+    }
+    panic!("local runtime clock never advanced");
 }

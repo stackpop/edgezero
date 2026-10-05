@@ -46,7 +46,8 @@ middleware = ["edgezero_core::middleware::RequestLogger"]
 
 ### Middleware
 
-Manifest-driven middleware are applied in order before routes:
+Routes are matched first. Middleware then run in registration order for a matched route;
+unmatched 404/405 requests bypass the middleware chain.
 
 ```toml
 [app]
@@ -59,7 +60,7 @@ middleware = [
 Each item must be:
 
 - A publicly accessible path
-- Either a unit struct or zero-argument constructor
+- A value such as a unit struct or named const, not a constructor call
 - Implementing `edgezero_core::middleware::Middleware`
 
 ## HTTP Triggers

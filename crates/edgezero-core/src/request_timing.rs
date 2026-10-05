@@ -1,12 +1,18 @@
 //! Bounded, best-effort per-request timing with application-owned data.
 //!
-//! All clones share one origin and mutex. Contention drops an entire operation;
-//! it never blocks or substitutes zero for unavailable facts. Callbacks run under
+//! All clones share one immutable origin and one state mutex. Elapsed reads are
+//! lock-free; contended state operations never block or substitute zero for
+//! unavailable facts. Callbacks run under
 //! the lock and must be short, synchronous and non-reentrant. Panics propagate,
 //! without rollback: callbacks must leave their data valid even on unwind.
 //! Poisoned locks recover best-effort, not with validation of application state.
 //! Collection does not render headers or implicitly mark request completion.
+//!
+//! On deployed Cloudflare Workers, timers advance only after I/O, so CPU-only
+//! phases may record zero. Local Wrangler/workerd and browser tests do not
+//! reproduce this restriction. See the [Workers timer documentation](https://developers.cloudflare.com/workers/runtime-apis/performance/).
 
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
@@ -14,6 +20,7 @@ use web_time::Instant;
 
 /// Why a timing operation could not be performed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum TimingError {
     /// The slot is outside the collector's fixed array; nothing was changed.
     #[error("timing slot is out of bounds")]
@@ -23,13 +30,17 @@ pub enum TimingError {
     Unavailable,
 }
 
+struct Shared<const N: usize, D> {
+    state: Mutex<Inner<N, D>>,
+    t0: Instant,
+}
+
 struct Inner<const N: usize, D> {
     data: D,
-    headers_ready_total: Option<Duration>,
+    headers_ready: Option<Duration>,
     phases: [Option<Duration>; N],
-    request_elapsed: Option<Duration>,
-    resp_bytes: Option<u64>,
-    t0: Instant,
+    request_complete: Option<Duration>,
+    response_bytes: Option<u64>,
 }
 
 /// Consistent generic fields and borrowed application data, projected under lock.
@@ -42,19 +53,20 @@ struct Inner<const N: usize, D> {
 /// let timings = RequestTimings::<1, String>::new();
 /// let escaped = timings.snapshot(|view| view.data).unwrap();
 /// ```
-pub struct TimingSnapshot<'data, const N: usize, D> {
+#[non_exhaustive]
+pub struct TimingSnapshot<'data, const N: usize, D = ()> {
     /// Application facts protected by the same lock as the generic fields.
     pub data: &'data D,
     /// Elapsed from the shared origin when this snapshot was taken.
     pub elapsed: Duration,
-    /// First successful explicit headers-ready mark.
-    pub headers_ready_total: Option<Duration>,
+    /// Elapsed at the first successful explicit headers-ready mark.
+    pub headers_ready: Option<Duration>,
     /// Accumulated durations; absent differs from a recorded zero.
     pub phases: [Option<Duration>; N],
-    /// First successful explicit request-completion mark.
-    pub request_elapsed: Option<Duration>,
+    /// Elapsed at the first successful explicit request-completion mark.
+    pub request_complete: Option<Duration>,
     /// Last successfully recorded response byte count.
-    pub resp_bytes: Option<u64>,
+    pub response_bytes: Option<u64>,
 }
 
 /// A cheap shared handle; neither cloning nor projection requires `D: Clone`.
@@ -62,7 +74,14 @@ pub struct TimingSnapshot<'data, const N: usize, D> {
 /// Create one per request at the chosen measurement boundary, not as router state.
 /// Installed extension handles require `D: Send + 'static`, not `D: Sync`.
 /// T0 is collector creation, not platform ingress or browser navigation start.
-pub struct RequestTimings<const N: usize, D = ()>(Arc<Mutex<Inner<N, D>>>);
+pub struct RequestTimings<const N: usize, D = ()>(Arc<Shared<N, D>>);
+
+impl<const N: usize, D> fmt::Debug for RequestTimings<N, D> {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestTimings").finish_non_exhaustive()
+    }
+}
 
 impl<const N: usize, D> Clone for RequestTimings<N, D> {
     #[inline]
@@ -93,12 +112,12 @@ impl<const N: usize, D: Default> RequestTimings<N, D> {
 }
 
 impl<const N: usize, D> RequestTimings<N, D> {
-    /// Returns elapsed time from the immutable shared origin.
-    /// # Errors
-    /// Returns [`TimingError::Unavailable`] on contention.
+    /// Returns elapsed time from the immutable shared origin without locking.
+    /// This remains available during state contention and inside callbacks.
+    #[must_use]
     #[inline]
-    pub fn elapsed(&self) -> Result<Duration, TimingError> {
-        Ok(self.try_inner()?.t0.elapsed())
+    pub fn elapsed(&self) -> Duration {
+        self.0.t0.elapsed()
     }
 
     /// Marks headers ready, first successful write wins (later calls succeed unchanged).
@@ -107,8 +126,8 @@ impl<const N: usize, D> RequestTimings<N, D> {
     #[inline]
     pub fn mark_headers_ready(&self) -> Result<(), TimingError> {
         let mut inner = self.try_inner()?;
-        if inner.headers_ready_total.is_none() {
-            inner.headers_ready_total = Some(inner.t0.elapsed());
+        if inner.headers_ready.is_none() {
+            inner.headers_ready = Some(self.elapsed());
         }
         Ok(())
     }
@@ -118,15 +137,17 @@ impl<const N: usize, D> RequestTimings<N, D> {
     /// # Errors
     /// Returns [`TimingError::Unavailable`] on contention.
     #[inline]
-    pub fn mark_request_elapsed(&self) -> Result<(), TimingError> {
+    pub fn mark_request_complete(&self) -> Result<(), TimingError> {
         let mut inner = self.try_inner()?;
-        if inner.request_elapsed.is_none() {
-            inner.request_elapsed = Some(inner.t0.elapsed());
+        if inner.request_complete.is_none() {
+            inner.request_complete = Some(self.elapsed());
         }
         Ok(())
     }
 
     /// Saturating-adds a duration to a slot, preserving recorded zero.
+    /// Overlapping spans on one slot sum and can exceed wall-clock time.
+    /// To measure concurrent latency, use one span around the join.
     /// # Errors
     /// Returns [`TimingError::InvalidSlot`] before any mutation for invalid slots,
     /// or [`TimingError::Unavailable`] on contention.
@@ -156,7 +177,7 @@ impl<const N: usize, D> RequestTimings<N, D> {
         // Bounds were checked before acquiring the lock or invoking user code.
         let phase = inner.phases.get_mut(slot).ok_or(TimingError::InvalidSlot)?;
         *phase = Some(phase.unwrap_or(Duration::ZERO).saturating_add(duration));
-        let elapsed = inner.t0.elapsed();
+        let elapsed = self.elapsed();
         Ok(update(&mut inner.data, elapsed))
     }
 
@@ -164,8 +185,8 @@ impl<const N: usize, D> RequestTimings<N, D> {
     /// # Errors
     /// Returns [`TimingError::Unavailable`] on contention.
     #[inline]
-    pub fn set_resp_bytes(&self, bytes: u64) -> Result<(), TimingError> {
-        self.try_inner()?.resp_bytes = Some(bytes);
+    pub fn set_response_bytes(&self, bytes: u64) -> Result<(), TimingError> {
+        self.try_inner()?.response_bytes = Some(bytes);
         Ok(())
     }
 
@@ -182,10 +203,10 @@ impl<const N: usize, D> RequestTimings<N, D> {
         let inner = self.try_inner()?;
         Ok(project(TimingSnapshot {
             phases: inner.phases,
-            elapsed: inner.t0.elapsed(),
-            headers_ready_total: inner.headers_ready_total,
-            request_elapsed: inner.request_elapsed,
-            resp_bytes: inner.resp_bytes,
+            elapsed: self.elapsed(),
+            headers_ready: inner.headers_ready,
+            request_complete: inner.request_complete,
+            response_bytes: inner.response_bytes,
             data: &inner.data,
         }))
     }
@@ -205,7 +226,7 @@ impl<const N: usize, D> RequestTimings<N, D> {
     }
 
     fn try_inner(&self) -> Result<MutexGuard<'_, Inner<N, D>>, TimingError> {
-        match self.0.try_lock() {
+        match self.0.state.try_lock() {
             Ok(guard) => Ok(guard),
             Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
             Err(TryLockError::WouldBlock) => Err(TimingError::Unavailable),
@@ -222,7 +243,7 @@ impl<const N: usize, D> RequestTimings<N, D> {
         update: F,
     ) -> Result<R, TimingError> {
         let mut inner = self.try_inner()?;
-        let elapsed = inner.t0.elapsed();
+        let elapsed = self.elapsed();
         Ok(update(&mut inner.data, elapsed))
     }
 
@@ -238,19 +259,22 @@ impl<const N: usize, D> RequestTimings<N, D> {
     #[must_use]
     #[inline]
     pub fn with_data(data: D) -> Self {
-        Self(Arc::new(Mutex::new(Inner {
-            t0: Instant::now(),
-            phases: [None; N],
-            headers_ready_total: None,
-            request_elapsed: None,
-            resp_bytes: None,
-            data,
-        })))
+        let t0 = Instant::now();
+        Self(Arc::new(Shared {
+            state: Mutex::new(Inner {
+                phases: [None; N],
+                headers_ready: None,
+                request_complete: None,
+                response_bytes: None,
+                data,
+            }),
+            t0,
+        }))
     }
 }
 
 /// Records elapsed phase work on drop, discarding a contended sample.
-#[must_use = "dropping a span records its elapsed duration"]
+#[must_use = "a span records when dropped; bind it to a named variable (not `_`) to time the enclosing scope"]
 pub struct PhaseSpan<const N: usize, D = ()> {
     slot: usize,
     started: Instant,
@@ -271,18 +295,25 @@ mod tests {
     use super::*;
 
     fn aged<const N: usize, D>(data: D) -> RequestTimings<N, D> {
-        let timings = RequestTimings::with_data(data);
-        timings.0.lock().unwrap().t0 = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
-        timings
+        let t0 = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+        RequestTimings(Arc::new(Shared {
+            state: Mutex::new(Inner {
+                phases: [None; N],
+                headers_ready: None,
+                request_complete: None,
+                response_bytes: None,
+                data,
+            }),
+            t0,
+        }))
     }
 
     #[test]
     fn clone_shares_aged_origin_and_facts_but_requests_are_independent() {
         let timings = aged::<2, _>(());
         let clone = timings.clone();
-        let origin = timings.0.lock().unwrap().t0;
-        assert_eq!(origin, clone.0.lock().unwrap().t0);
-        assert!(clone.elapsed().unwrap() >= Duration::from_secs(10));
+        assert!(Arc::ptr_eq(&timings.0, &clone.0));
+        assert!(clone.elapsed() >= Duration::from_secs(10));
         clone.record(0, Duration::from_millis(3)).unwrap();
         assert_eq!(
             timings.snapshot(|view| view.phases).unwrap(),
@@ -311,14 +342,13 @@ mod tests {
                 .extensions()
                 .get::<RequestTimings<1>>()
                 .unwrap();
-            assert!(handle.elapsed().unwrap() >= Duration::from_secs(10));
+            assert!(handle.elapsed() >= Duration::from_secs(10));
             handle.record(0, Duration::from_millis(3)).unwrap();
             handle.mark_headers_ready().unwrap();
             response_with_body(StatusCode::OK, Body::empty())
         }
 
         let timings = aged::<1, _>(());
-        let origin = timings.0.lock().unwrap().t0;
         timings.record(0, Duration::from_millis(8)).unwrap();
         let mut request = request_builder().uri("/timed").body(Body::empty()).unwrap();
         request.extensions_mut().insert(timings.clone());
@@ -331,12 +361,11 @@ mod tests {
             block_on(router.oneshot(request)).unwrap().status(),
             StatusCode::OK
         );
-        assert_eq!(timings.0.lock().unwrap().t0, origin);
         timings
             .snapshot(|view| {
                 assert_eq!(view.phases, [Some(Duration::from_millis(11))]);
-                assert!(view.headers_ready_total.unwrap() >= Duration::from_secs(10));
-                assert_eq!(view.request_elapsed, None);
+                assert!(view.headers_ready.unwrap() >= Duration::from_secs(10));
+                assert_eq!(view.request_complete, None);
             })
             .unwrap();
     }
@@ -347,6 +376,8 @@ mod tests {
         let timings = RequestTimings::<0, _>::with_data(Data(7));
         let clone = timings.clone();
         assert_eq!(clone.snapshot(|view| view.data.0).unwrap(), 7);
+        let _guard = timings.0.state.lock().unwrap();
+        assert_eq!(format!("{clone:?}"), "RequestTimings { .. }");
     }
 
     #[test]
@@ -354,7 +385,9 @@ mod tests {
         let timings = RequestTimings::<2>::new();
         timings.record(0, Duration::ZERO).unwrap();
         assert_eq!(
-            timings.snapshot(|view| view.phases).unwrap(),
+            timings
+                .snapshot(|view: TimingSnapshot<'_, 2>| view.phases)
+                .unwrap(),
             [Some(Duration::ZERO), None]
         );
         timings.record(0, Duration::from_millis(2)).unwrap();
@@ -392,29 +425,32 @@ mod tests {
         let timings = aged::<1, _>(());
         timings
             .snapshot(|view| {
-                assert_eq!(view.headers_ready_total, None);
-                assert_eq!(view.request_elapsed, None);
-                assert_eq!(view.resp_bytes, None);
+                assert_eq!(view.headers_ready, None);
+                assert_eq!(view.request_complete, None);
+                assert_eq!(view.response_bytes, None);
             })
             .unwrap();
         timings.mark_headers_ready().unwrap();
-        timings.mark_request_elapsed().unwrap();
+        timings.mark_request_complete().unwrap();
         let first = timings
-            .snapshot(|view| (view.headers_ready_total, view.request_elapsed))
+            .snapshot(|view| (view.headers_ready, view.request_complete))
             .unwrap();
         assert!(first.0.unwrap() >= Duration::from_secs(10));
         assert!(first.1.unwrap() >= first.0.unwrap());
         timings.mark_headers_ready().unwrap();
-        timings.mark_request_elapsed().unwrap();
+        timings.mark_request_complete().unwrap();
         assert_eq!(
             timings
-                .snapshot(|view| (view.headers_ready_total, view.request_elapsed))
+                .snapshot(|view| (view.headers_ready, view.request_complete))
                 .unwrap(),
             first
         );
-        timings.set_resp_bytes(42).unwrap();
-        timings.set_resp_bytes(0).unwrap();
-        assert_eq!(timings.snapshot(|view| view.resp_bytes).unwrap(), Some(0));
+        timings.set_response_bytes(42).unwrap();
+        timings.set_response_bytes(0).unwrap();
+        assert_eq!(
+            timings.snapshot(|view| view.response_bytes).unwrap(),
+            Some(0)
+        );
     }
 
     #[test]
@@ -434,11 +470,18 @@ mod tests {
                 assert_eq!(view.data.0, Some("before headers"));
                 assert!(view.data.1.unwrap() >= Duration::from_secs(10));
                 assert!(view.elapsed >= view.data.1.unwrap());
-                assert_eq!(timings.elapsed(), Err(TimingError::Unavailable));
+                assert!(timings.elapsed() >= view.elapsed);
+                assert_eq!(
+                    timings.record(0, Duration::MAX),
+                    Err(TimingError::Unavailable)
+                );
             })
             .unwrap();
         timings
-            .update_data(|data, _| data.0 = Some("streaming"))
+            .update_data(|data, elapsed| {
+                assert!(timings.elapsed() >= elapsed);
+                data.0 = Some("streaming");
+            })
             .unwrap();
         assert_eq!(
             timings.snapshot(|view| view.data.0).unwrap(),
@@ -457,7 +500,8 @@ mod tests {
     #[test]
     fn contention_drops_whole_operations_without_invoking_callbacks() {
         let timings = RequestTimings::<1, u32>::new();
-        let guard = timings.0.lock().unwrap();
+        let elapsed = timings.elapsed();
+        let guard = timings.0.state.lock().unwrap();
         assert_eq!(
             timings.record_with(0, Duration::MAX, |_, _| panic!("contended update")),
             Err(TimingError::Unavailable)
@@ -470,13 +514,13 @@ mod tests {
             timings.snapshot(|_| panic!("contended snapshot")),
             Err(TimingError::Unavailable)
         );
-        assert_eq!(timings.elapsed(), Err(TimingError::Unavailable));
+        assert!(timings.elapsed() >= elapsed);
         assert_eq!(timings.mark_headers_ready(), Err(TimingError::Unavailable));
         assert_eq!(
-            timings.mark_request_elapsed(),
+            timings.mark_request_complete(),
             Err(TimingError::Unavailable)
         );
-        assert_eq!(timings.set_resp_bytes(8), Err(TimingError::Unavailable));
+        assert_eq!(timings.set_response_bytes(8), Err(TimingError::Unavailable));
         assert_eq!(
             timings.record_with(1, Duration::MAX, |_, _| panic!("invalid update")),
             Err(TimingError::InvalidSlot)
@@ -487,18 +531,42 @@ mod tests {
             .snapshot(|view| {
                 assert_eq!(view.phases, [None]);
                 assert_eq!(*view.data, 0);
-                assert_eq!(view.headers_ready_total, None);
-                assert_eq!(view.request_elapsed, None);
-                assert_eq!(view.resp_bytes, None);
+                assert_eq!(view.headers_ready, None);
+                assert_eq!(view.request_complete, None);
+                assert_eq!(view.response_bytes, None);
             })
             .unwrap();
         timings.mark_headers_ready().unwrap();
         assert!(
             timings
-                .snapshot(|view| view.headers_ready_total)
+                .snapshot(|view| view.headers_ready)
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn elapsed_is_available_while_another_thread_updates_data() {
+        use std::{sync::Barrier, thread};
+
+        let timings = aged::<1, _>(0_u32);
+        let entered = Barrier::new(2);
+        let finished = Barrier::new(2);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                timings
+                    .update_data(|_, _| {
+                        entered.wait();
+                        finished.wait();
+                    })
+                    .unwrap();
+            });
+            entered.wait();
+            let elapsed = timings.elapsed();
+            finished.wait();
+            assert!(elapsed >= Duration::from_secs(10));
+        });
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -515,7 +583,7 @@ mod tests {
                 .unwrap();
         });
         assert!(outcome.is_err());
-        assert!(timings.0.is_poisoned());
+        assert!(timings.0.state.is_poisoned());
         assert_eq!(
             timings.snapshot(|view| (view.phases, *view.data)).unwrap(),
             ([Some(Duration::from_millis(4))], 7)
@@ -529,10 +597,10 @@ mod tests {
             timings.snapshot(|view| (view.phases, *view.data)).unwrap(),
             ([Some(Duration::from_millis(6))], 8)
         );
-        timings.mark_request_elapsed().unwrap();
+        timings.mark_request_complete().unwrap();
         assert!(
             timings
-                .snapshot(|view| view.request_elapsed)
+                .snapshot(|view| view.request_complete)
                 .unwrap()
                 .is_some()
         );
@@ -547,25 +615,19 @@ mod tests {
         drop(span);
         let before = timings.snapshot(|view| view.phases[0]).unwrap().unwrap();
         assert!(before >= Duration::from_secs(2));
-        let pending_work = async {
-            let _span = timings.span(0).unwrap();
-            pending::<()>().await;
-        };
-        // Poll once, then drop the pending future, as cancellation would.
-        assert!(pending_work.now_or_never().is_none());
-        timings
-            .snapshot(|view| {
-                assert!(view.phases[0].unwrap() >= before);
-                assert_eq!(view.headers_ready_total, None);
-                assert_eq!(view.request_elapsed, None);
-            })
-            .unwrap();
         let fresh = RequestTimings::<1>::new();
         let fresh_work = async {
             let _span = fresh.span(0).unwrap();
             pending::<()>().await;
         };
+        // Poll once, then drop the pending future, as cancellation would.
         assert!(fresh_work.now_or_never().is_none());
-        assert!(fresh.snapshot(|view| view.phases[0]).unwrap().is_some());
+        fresh
+            .snapshot(|view| {
+                assert!(view.phases[0].is_some());
+                assert_eq!(view.headers_ready, None);
+                assert_eq!(view.request_complete, None);
+            })
+            .unwrap();
     }
 }

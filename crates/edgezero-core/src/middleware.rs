@@ -86,19 +86,26 @@ pub struct RequestTimingMiddleware<const N: usize, D = ()> {
 impl<const N: usize, D> Default for RequestTimingMiddleware<N, D> {
     #[inline]
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize, D> RequestTimingMiddleware<N, D> {
+    /// Creates attachment middleware with no excluded paths.
+    #[must_use]
+    #[inline]
+    pub const fn new() -> Self {
         Self {
             data: PhantomData,
             excluded_paths: &[],
         }
     }
-}
 
-impl<const N: usize, D> RequestTimingMiddleware<N, D> {
     /// Excludes exact URI paths for every method, ignoring query strings.
-    /// Existing handles are preserved even on excluded paths.
+    /// Replaces any previous list. Existing handles are preserved even on excluded paths.
     #[must_use]
     #[inline]
-    pub fn with_excluded_paths(mut self, paths: &'static [&'static str]) -> Self {
+    pub const fn with_excluded_paths(mut self, paths: &'static [&'static str]) -> Self {
         self.excluded_paths = paths;
         self
     }
@@ -279,6 +286,22 @@ mod request_timing_tests {
     }
 
     #[test]
+    fn request_timing_const_exclusions_replace_previous_list() {
+        const TIMING: RequestTimingMiddleware<1> = RequestTimingMiddleware::new()
+            .with_excluded_paths(&["/health"])
+            .with_excluded_paths(&["/ready"]);
+        let router = RouterService::builder()
+            .middleware(TIMING)
+            .get("/health", presence)
+            .get("/ready", presence)
+            .build();
+        for (uri, expected) in [("/health", "yes"), ("/ready", "no")] {
+            let response = block_on(router.oneshot(request(Method::GET, uri))).unwrap();
+            assert_eq!(response.body().as_bytes().unwrap(), expected.as_bytes());
+        }
+    }
+
+    #[test]
     fn request_timing_duplicate_installation_preserves_state_and_requests_are_fresh() {
         let handles = Arc::new(Mutex::new(Vec::<Timings>::new()));
         let router = RouterService::builder()
@@ -294,7 +317,9 @@ mod request_timing_tests {
         timings.record(0, Duration::from_millis(8)).unwrap();
         let mut preinstalled = request(Method::GET, "/timed");
         preinstalled.extensions_mut().insert(timings.clone());
-        block_on(router.oneshot(preinstalled)).unwrap();
+        let response = block_on(router.oneshot(preinstalled)).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key("server-timing"));
         assert_eq!(
             timings.snapshot(|view| view.phases).unwrap(),
             [Some(Duration::from_millis(11))]
@@ -316,7 +341,7 @@ mod request_timing_tests {
         for handle in saved.iter() {
             assert_eq!(
                 handle
-                    .snapshot(|view| (view.headers_ready_total, view.request_elapsed))
+                    .snapshot(|view| (view.headers_ready, view.request_complete))
                     .unwrap(),
                 (None, None)
             );
@@ -339,7 +364,7 @@ mod request_timing_tests {
         assert_eq!(response.body().as_bytes().unwrap(), b"stopped");
         assert_eq!(
             handles.lock().unwrap()[0]
-                .snapshot(|view| (view.phases, view.request_elapsed))
+                .snapshot(|view| (view.phases, view.request_complete))
                 .unwrap(),
             ([None], None)
         );
@@ -357,13 +382,12 @@ mod request_timing_tests {
         assert_eq!(error.message(), "unchanged timing error");
         let rendered = block_on(router.oneshot(request(Method::GET, "/error"))).unwrap();
         assert_eq!(rendered.status(), StatusCode::BAD_REQUEST);
-        assert!(!rendered.headers().contains_key("server-timing"));
         let saved = handles.lock().unwrap();
         assert_eq!(saved.len(), 3);
         for handle in saved.iter() {
             assert_eq!(
                 handle
-                    .snapshot(|view| (view.headers_ready_total, view.request_elapsed))
+                    .snapshot(|view| (view.headers_ready, view.request_complete))
                     .unwrap(),
                 (None, None)
             );

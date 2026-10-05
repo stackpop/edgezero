@@ -1,13 +1,16 @@
 # Shared request timing collector and middleware
 
 Date: 2026-09-28
-Status: Design and API checkpoint approved on 2026-09-28. EdgeZero implemented, locally verified and independently reviewed; draft-PR publication authorized. TS migration and joint validation pending.
+Status: EdgeZero review API revision implemented and locally verified. Renewed Trusted Server integration and joint validation remain required before release.
 Scope: `edgezero-core` and coordinated Trusted Server adoption, shipped together.
 Plan: [Implementation plan](../plans/2026-09-28-request-timing.md).
 
-Implementation of both repositories and later draft-PR publication are authorized.
-Independent EdgeZero reviews cleared; a focused commit, normal push and draft PR targeting main are authorized. TS remains unchanged during this publication stage.
-Merge, release/tag, and final delivery still require separate approval.
+The initial candidate is [EdgeZero #389](https://github.com/stackpop/edgezero/pull/389)
+at `9c03cc59300363ae5339fc970dded08ede563e98`, adopted by
+[Trusted Server #1121](https://github.com/IABTechLab/trusted-server/pull/1121)
+at `2791ceb46908e6af04ccaae0c10b29d35336a9f4`. The linked PRs record completed
+migration and joint validation for those exact revisions, not later API changes.
+Merge, release/tag, final dependency pins and tag-backed validation remain pending.
 
 ## Why this change
 
@@ -30,9 +33,10 @@ was fast-forwarded to fetched `origin/main` at
 integration points in core middleware, router, context, and Cargo dependencies
 unchanged. The middleware guide changed and must be edited against this new base.
 
-The Trusted Server reference is `f951955f537b89392dcb863fca7a01a5f6fa4846`; it pins
-six EdgeZero workspace dependencies to `v0.0.7`. This remains the unchanged TS baseline. EdgeZero tasks 1–3 are implemented and
-locally verified against the base above; see the plan for evidence and remaining gates.
+The initial Trusted Server baseline was `f951955f537b89392dcb863fca7a01a5f6fa4846`,
+with six EdgeZero dependencies pinned to `v0.0.7`. The migration at `2791ceb`
+replaced those with the exact `9c03cc59` candidate. See the plan for historical
+evidence and the remaining review-update and release gates.
 
 ## Approved decisions
 
@@ -63,7 +67,7 @@ locally verified against the base above; see the plan for evidence and remaining
   policy into EdgeZero.
 - Moving the other duplicated Trusted Server middlewares in this change.
 - Automatically instrumenting every adapter, route, or streamed body.
-- Changing router dispatch, error rendering, macros, manifests, or extractors.
+- Changing router dispatch, error rendering, macro expansion, manifest schema, or extractors.
 - Adding tracing export, dynamic metric registration, retries, or a public clock
   injection framework.
 - Changing the browser's SSAT classification or comparing browser and server clocks.
@@ -74,7 +78,7 @@ locally verified against the base above; see the plan for evidence and remaining
 | --- | --- |
 | Portable monotonic origin and cloneable request handle | EdgeZero |
 | Bounded phase durations, saturating accumulation, drop-time spans | EdgeZero |
-| Headers-ready and request-elapsed marks, response byte count | EdgeZero |
+| Headers-ready and request-complete marks, response byte count | EdgeZero |
 | Nonblocking collection and consistent snapshot mechanics | EdgeZero |
 | Insert-if-absent middleware and configurable exclusion mechanism | EdgeZero |
 | Eight-phase enum and mapping to generic storage | Trusted Server |
@@ -99,7 +103,13 @@ different amounts of prologue work. The migration preserves those boundaries.
 
 Every clone, phase span, generic lifecycle mark, and application milestone must
 refer to that same origin. Wrapping an existing handle must not allocate another
-clock or an independent copy of its mutable state.
+clock or an independent copy of its mutable state. The immutable origin lives
+outside the state mutex, so `elapsed()` is available during contention.
+
+On [deployed Cloudflare Workers](https://developers.cloudflare.com/workers/runtime-apis/performance/),
+timers advance only after I/O and CPU-only phases may record zero. Local
+Wrangler/workerd and Chromium tests do not reproduce that restriction. A shared
+origin does not imply uniform CPU-time resolution across providers.
 
 ```mermaid
 flowchart TD
@@ -142,10 +152,13 @@ Non-GET Fastly health requests continue through normal timing setup. Normalizing
 that policy across adapters would be a separate behavior change.
 
 Keep the exclusion API small. A static path list is sufficient for the current
-Cloudflare/Spin consumers; a general predicate is an alternative only if a
-concrete need emerges. Fastly keeps its existing method-aware entry-point check.
+Cloudflare/Spin consumers. `new()` and `with_excluded_paths` are const, so a
+manifest can name an exported middleware const. Each exclusion call replaces the
+previous list. Owned paths or predicates remain deferred until a concrete need emerges. Fastly keeps its existing method-aware entry-point check.
 Neither collector nor application payload belongs in `RouterBuilder::with_state`:
 that state is shared across requests and can overwrite same-type extensions.
+Use optional typed extension lookup, not `State<RequestTimings<...>>`: excluded
+or absent handles otherwise fail extraction with a 500.
 
 Register the middleware before consumers that need timing. Trusted Server's
 client-IP sanitization must remain first; extraction must not change that order.
@@ -160,11 +173,11 @@ consumed or sent.
 Consequently:
 
 - Axum retains its outer terminal timing service and error-response coverage.
-  For non-excluded requests, the proposed migration must retrieve the configured
+  For non-excluded requests, the migrated service retrieves the configured
   concrete handle if present, creating and inserting one only when absent. Both
-  the handler and terminal renderer use that handle. This deliberately strengthens
-  the current wrapper, which unconditionally replaces a preinstalled collector;
-  it is not a claim about current behavior. The health bypass remains unchanged.
+  the handler and terminal renderer use that handle. The regression at `2791ceb`
+  protects the fix to the baseline wrapper's unconditional replacement. The
+  health bypass remains unchanged.
 - Fastly retains its early collector creation, app-build span, header emission,
   streaming duration, and successfully written-byte accounting.
 - Cloudflare and Spin adopt the shared attachment middleware without gaining
@@ -177,13 +190,11 @@ guarantee destructor execution.
 
 ## Collector shape
 
-The ownership and state arrangement below are approved. Exact Rust signatures and
-the payload failure contract need the API checkpoint in the implementation plan.
-
-Use a cloneable handle backed by one `Arc` and one mutex. The shared state holds
-an immutable origin, generic lifecycle fields, a bounded phase array, and an
-application-defined payload. A candidate name is
-`RequestTimings<const N: usize, D = ()>`.
+`RequestTimings<const N: usize, D = ()>` is a cloneable handle backed by one
+`Arc<Shared<N, D>>`. `Shared` holds the immutable origin beside a mutex protecting
+generic lifecycle fields, a bounded phase array and application-owned payload.
+Only elapsed reads bypass that mutex; compound updates and projections still
+use one lock.
 
 The payload lets Trusted Server keep auction definitions in its own crate while
 sharing synchronization with the generic fields. For example, recording auction
@@ -195,7 +206,7 @@ Generic operations should cover:
 
 - Construction, elapsed time from T0, and cheap handle cloning.
 - Saturating phase accumulation and a span that records elapsed time on drop.
-- First-successful-write headers-ready and request-elapsed marks.
+- First-successful-write `headers_ready` and `request_complete` elapsed marks.
 - Last-write response byte count.
 - A consistent read of generic fields and application payload.
 - A short synchronous update of a phase and application facts under the same lock.
@@ -225,28 +236,31 @@ Selected: fixed indexed slots inside EdgeZero, with typed phase enums at
 application call sites. `N` is chosen at compile time, not from a request. Invalid
 indices must be rejected without panicking or mutating state, and the caller must
 be able to distinguish them from a successful write. Do not silently alias them
-to another phase. The exact result type remains an API review decision.
+to another phase. `TimingError::InvalidSlot` reports that rejection.
 
 ### Synchronization and failure behavior
 
-Preserve nonblocking `try_lock` behavior. A contended update drops the whole
-sample; a contended read reports unavailable. Trusted Server maps unavailable
-reads to its existing all-None snapshot or omitted header. Do not retry, block,
-or substitute zero for missing facts.
+Preserve nonblocking `try_lock` behavior for mutable state. A contended update
+drops the whole sample; a contended snapshot reports unavailable. `elapsed()`
+reads the immutable origin without locking and cannot fail from contention.
+Trusted Server maps unavailable projections to its existing all-None snapshot or
+omitted header. Do not retry, block, or substitute zero for missing facts.
+
+Phase durations are sums, not the union of overlapping intervals. Concurrent
+spans on one slot can total more than wall-clock time; use one span around a join
+to measure concurrent latency.
 
 Any application update callback must be synchronous, short, and non-reentrant.
 It cannot retain a guard across an await or call a lock-taking collector method
-from inside itself. One lock makes successful compound updates and snapshots
+from inside itself. Lock-free `elapsed()` is safe inside callbacks. One lock makes
+successful compound updates and snapshots
 consistent; it does not provide rollback if a callback panics partway through.
 
-The existing TS collector recovers poisoned locks because its state is simple
-counters and optional facts. Arbitrary application payloads do not necessarily
-have that property. Before accepting a public payload-update API, explicitly
-choose its panic/poison contract. A candidate is documented best-effort recovery
-with callbacks required to leave valid state even on unwind. An alternative is a
-narrower mutation interface. Do not promise unconditional infallibility for
-arbitrary user code, and do not change TS poison recovery without a deliberate
-compatibility decision.
+The baseline TS collector recovered poisoned locks because its state was simple
+counters and optional facts. The generic API preserves best-effort recovery,
+with callbacks required to leave valid data even on unwind. Panics propagate and
+may leave partially changed facts; recovery provides neither rollback nor payload
+validation. This is not unconditional infallibility for arbitrary user code.
 
 ## Trusted Server compatibility requirements
 
@@ -298,8 +312,7 @@ flowchart TD
    and shared middleware in `src/middleware.rs`. Colocate tests. Add usage docs in
    `docs/guide/middleware.md`. Router changes are not expected.
 3. Prepare Trusted Server adoption against the candidate EdgeZero revision using
-   temporary exact git-revision pins after the reviewed EdgeZero draft PR is
-   pushed. Pin all six TS dependencies to that same commit and verify one core
+   temporary exact git-revision pins to a pushed candidate. Pin all six TS dependencies to that same commit and verify one core
    package identity, without developer-specific paths. Replace collector mechanics
    and the Cloudflare/Spin middleware copies; preserve the TS domain facade and
    Fastly/Axum boundaries.
@@ -330,7 +343,8 @@ no public clock trait is required just for testing. Cover:
 - Absent versus recorded-zero phases, accumulation, saturation and invalid slots.
 - First-write marks, last-write byte counts, and explicit lifecycle completion.
 - Compound phase/payload updates and consistent snapshots.
-- Contention dropping a whole operation and poison behavior under the chosen contract.
+- Contention dropping whole state operations, lock-free elapsed reads across
+  threads and inside callbacks, and poison behavior under the chosen contract.
 - Span drop and cancellation without fabricated request completion.
 
 ### Middleware and consumer contracts
@@ -343,7 +357,7 @@ Test GET and non-GET `/health`, with and without query strings, against each
 adapter's preserved method policy. For Axum, attach a pre-aged collector in an
 upstream service and prove that its origin and recorded phases survive both
 handler access and private-response header rendering. This regression should
-fail against the current unconditional replacement before that wrapper changes.
+fail against the baseline unconditional replacement and pass after the wrapper fix.
 
 Before replacing TS mechanics, establish its existing output fixtures. Retain
 private-header append/enable/cache tests, Axum terminal error coverage, Fastly
@@ -358,6 +372,7 @@ EdgeZero:
 
 ```sh
 cargo test -p edgezero-core
+cargo test -p edgezero-core --doc
 cargo test --workspace --all-targets
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -369,7 +384,11 @@ Also run the repository's adapter WASM CI matrix, including Fastly
 `wasm32-wasip1` and Cloudflare `wasm32-unknown-unknown`, plus existing generated-app
 and demo checks relevant to a public core API change. Compile checks do not prove
 runtime clock behavior; distinguish native execution, WASM compilation, and any
-platform clock smoke tests in the implementation report.
+platform clock smoke tests in the implementation report. Run the shared attachment
+scenario natively as well as in all three adapter harnesses. Separate advancement
+tests use native sleep or bounded polling in Viceroy, Wasmtime and Chromium, with
+an independent wall-clock deadline and an iteration cap. They do not establish
+deployed Cloudflare CPU-time behavior.
 
 Trusted Server uses its target-matched `cargo test-fastly`, `cargo test-axum`,
 `cargo test-cloudflare`, `cargo test-spin`, and `./scripts/test-cli.sh` commands.
@@ -382,18 +401,21 @@ For the internal spec/plan, inspect links, Markdown structure, and the final dif
 `docs/superpowers/**` is excluded from both the published site and the normal docs
 Prettier check, so a passing site check would not validate this document.
 
-## Approved API checkpoint
+## Approved API contract
 
-The supervisor approved these exact contracts before production edits:
-
-- `RequestTimings<const N: usize, D = ()>` holds one `Arc<Mutex<Inner<N,D>>>`.
+- `RequestTimings<const N: usize, D = ()>` holds one `Arc<Shared<N,D>>`, with
+  immutable `t0` outside the mutex protecting `Inner<N,D>`.
   `with_data(D)` needs neither `Default` nor `Clone`; `new`/`Default` need
   `D: Default`. Manual handle cloning never needs `D: Clone`. Extension and
   middleware payloads need `D: Send + 'static`, not `D: Sync`.
-- `TimingError::{InvalidSlot, Unavailable}` distinguishes invalid slots from
-  contention. `record`, lifecycle marks and `set_resp_bytes` return
-  `Result<(), TimingError>`; `elapsed` returns `Result<Duration, TimingError>`.
+- Non-exhaustive `TimingError::{InvalidSlot, Unavailable}` distinguishes invalid
+  slots from contention. `record`, lifecycle marks and `set_response_bytes` return
+  `Result<(), TimingError>`; lock-free `elapsed()` returns `Duration`.
   Repeated first-write marks return `Ok(())` without replacing the value.
+- Snapshot lifecycle fields are `headers_ready`, `request_complete` and
+  `response_bytes`. Marks use `mark_headers_ready()` and `mark_request_complete()`.
+  They record elapsed durations at explicit application boundaries, not automatic
+  proof of streamed-body completion.
 - `update_data(FnOnce(&mut D, Duration) -> R)` and
   `record_with(slot, duration, FnOnce(&mut D, Duration) -> R)` return
   `Result<R, TimingError>`. Duration is elapsed from the immutable origin.
@@ -402,6 +424,7 @@ The supervisor approved these exact contracts before production edits:
 - `snapshot(FnOnce(TimingSnapshot<'_, N, D>) -> R)` projects copied generic
   fields/current elapsed and borrowed `&D` under that same lock. Neither the
   borrowed payload nor the guard can escape; payload cloning is not required.
+  `TimingSnapshot<'data, N, D = ()>` is non-exhaustive to permit later fields.
 - Contention invokes no callback and changes no state. Callbacks are synchronous,
   short and non-reentrant. Panics propagate, may leave phase/payload partially
   changed, and poison the mutex. Poison recovery is best-effort, **not rollback**
@@ -409,31 +432,60 @@ The supervisor approved these exact contracts before production edits:
 - `span(slot)` returns `Result<PhaseSpan<N,D>, TimingError>` after bounds
   validation. Drop attempts a best-effort record, discarding contention; it never
   marks request completion.
-- `RequestTimingMiddleware<N,D>` defaults to no exclusions and offers
-  `with_excluded_paths(&'static [&'static str])`. The TS facade reads exactly
-  `RequestTimings<8, TsPayload>` from extensions rather than installing itself.
+- `RequestTimingMiddleware<N,D>` defaults to no exclusions and offers const
+  `new()` and `with_excluded_paths(&'static [&'static str])`, enabling named-const
+  manifest registration. The setter replaces the previous list. The TS facade
+  reads exactly `RequestTimings<8, TsPayload>` from extensions rather than
+  installing itself.
+- `RequestTimings` implements `Debug` without a payload bound or lock acquisition,
+  and omits application data. Phase guards must be bound to named variables to
+  measure the enclosing scope.
 
-## Implementation checkpoints
+## Deferred follow-ups
 
-The five design decisions above are settled. These details remain to be pinned
-before the corresponding implementation step, not reopened as scope choices:
+These review suggestions remain outside this release's scope:
 
-1. Specify update/read result types, invalid-slot handling, callback panic and
-   poison behavior, and reentrancy restrictions. Recovering a poisoned mutex must
-   not be described as rollback or validation of arbitrary payload state.
-2. Compile a typed-phase, concrete-extension, domain-facade example against the
-   first API slice. Prove shared T0 and atomic phase/payload snapshots before
-   migrating adapters.
-3. Record exact EdgeZero and TS revisions for joint validation. Choose a release
-   tag only through the normal approved publication process.
+- [Contention diagnostics](https://github.com/stackpop/edgezero/pull/389#discussion_r4162404464):
+  explicit operations already report `Unavailable`. A future counter needs
+  read/write and consistency rules; a request-wide count cannot attribute a
+  missing phase or prove that no auction occurred.
+- [Runtime-config exclusions](https://github.com/stackpop/edgezero/pull/389#discussion_r4162404477):
+  current consumers use static paths. Any owned-path API should preserve const
+  configuration where practical and specify allocation and validation behavior.
+- [Response propagation or an outer service](https://github.com/stackpop/edgezero/pull/389#discussion_r4162404480):
+  current outer layers preinstall and retain a clone. Successful-response
+  extensions alone would not cover unmatched routes, rendered errors or every
+  adapter conversion. A wrapper must preserve application measurement boundaries.
+- [Explicit span finish/discard](https://github.com/stackpop/edgezero/pull/389#discussion_r4162634076):
+  manual `Instant` plus `record_with` handles conditional and compound recording
+  today. Do not use `mem::forget` to discard a span; it leaks the shared handle.
+  Future finish/cancel methods must avoid duplicate Drop recording and release
+  the handle, with compound finishing considered separately.
+- [Optional timing extractor](https://github.com/stackpop/edgezero/pull/389#discussion_r4162634050):
+  use optional typed extension lookup today. A future extractor must preserve
+  missing-handle behavior without creating router-wide collector state.
 
-If the API checkpoint requires a different state model or broadens the agreed
-scope, return for a decision rather than implementing a silent redesign.
+## Remaining release checkpoints
+
+1. Update the six dependency-facing TS facade accesses for the renamed EdgeZero
+   fields/methods while preserving TS facade and wire names. Refresh all six
+   temporary dependency pins to one pushed candidate and verify one core identity.
+2. Revalidate both repositories against that exact candidate. Earlier joint
+   evidence at `9c03cc59`/`2791ceb` does not cover this API revision.
+3. Approve the EdgeZero merge/tag through its normal release process, then replace
+   temporary TS pins with that tag and perform final tag-backed validation.
+
+Publication, merge, releases, GitHub replies and thread resolution require their
+own authorization; this record does not grant it.
 
 ## Source references
 
-EdgeZero files are relative to this repository at the revision named above:
+EdgeZero implementation and runtime tests:
 
+- `crates/edgezero-core/src/request_timing.rs`: shared collector and lifecycle API.
+- `crates/edgezero-core/tests/request_timing_consumer.rs`: public facade and native scenario.
+- `crates/edgezero-core/tests/support/request_timing.rs`: shared adapter fixture.
+- `crates/edgezero-macros/tests/app_macro.rs`: named-const manifest registration.
 - `crates/edgezero-core/src/middleware.rs`: `Middleware`, `Next`, `RequestLogger`.
 - `crates/edgezero-core/src/router.rs`: route matching, state injection, and
   error-to-response conversion.
@@ -441,7 +493,7 @@ EdgeZero files are relative to this repository at the revision named above:
 - `crates/edgezero-core/Cargo.toml`: existing `web-time` dependency.
 - `.github/workflows/test.yml` and `.github/workflows/format.yml`: target matrices.
 
-Trusted Server sources at the reviewed revision:
+Trusted Server initial-baseline sources, before the migration at `2791ceb`:
 
 - [Collector and application rendering](https://github.com/IABTechLab/trusted-server/blob/f951955f537b89392dcb863fca7a01a5f6fa4846/crates/trusted-server-core/src/request_timing.rs).
 - [Axum terminal timing service](https://github.com/IABTechLab/trusted-server/blob/f951955f537b89392dcb863fca7a01a5f6fa4846/crates/trusted-server-adapter-axum/src/timing.rs).

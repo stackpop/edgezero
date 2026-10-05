@@ -1,0 +1,13 @@
+[app]
+name = "request-timing-fixture"
+middleware = ["crate::timing::TIMING"]
+
+[[triggers.http]]
+path = "/timed"
+methods = ["GET"]
+handler = "crate::timing::presence"
+
+[[triggers.http]]
+path = "/health"
+methods = ["GET"]
+handler = "crate::timing::presence"

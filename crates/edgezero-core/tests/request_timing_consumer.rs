@@ -1,5 +1,10 @@
 //! Public API fixture: application types stay outside the generic collector.
 #[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "support/request_timing.rs"]
+mod request_timing_tests;
+
+#[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::time::Duration;
@@ -60,14 +65,30 @@ mod tests {
         timings
             .record(Phase::Fetch, Duration::from_millis(7))
             .expect("record");
-        assert!(ctx.request().extensions().get::<AppTimings>().is_none());
         response_with_body(StatusCode::OK, Body::empty())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn request_timing_shared_scenario_runs_natively() {
+        super::request_timing_tests::clock_handle_and_attachment_work_on_runtime();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn request_timing_clock_advances_on_native() {
+        use std::thread;
+
+        let handle = Handle::new();
+        let before = handle.elapsed();
+        thread::sleep(Duration::from_millis(20));
+        assert!(handle.elapsed() > before);
     }
 
     #[test]
     fn request_timing_public_facade_shares_extension_state_and_origin() {
         let handle = Handle::new();
-        let before = handle.elapsed().expect("elapsed");
+        let before = handle.elapsed();
         let mut request = request_builder()
             .uri("/timed")
             .body(Body::empty())
@@ -85,8 +106,8 @@ mod tests {
                 assert_eq!(view.data.attempts.get(), 1);
                 assert!(view.data.started.expect("application mark") >= before);
                 assert!(view.elapsed >= view.data.started.expect("application mark"));
-                assert_eq!(view.headers_ready_total, None);
-                assert_eq!(view.request_elapsed, None);
+                assert_eq!(view.headers_ready, None);
+                assert_eq!(view.request_complete, None);
             })
             .expect("snapshot");
         let fresh = request_builder()
