@@ -659,6 +659,14 @@ happens on command-line usage errors (clap reports them before `--format` is
 read), on the bundled binary's `config push` / `config diff` stubs, and on a
 crash. Treat it as a failure.
 
+`--help` and `--version` are handled by clap before `--format` is read: they
+print clap's text to stdout and exit `0`, with no envelope.
+
+The routing relies on the EdgeZero logger (`edgezero_cli::init_cli_logger()`).
+A downstream CLI that installs a different logger, such as `simple_logger`,
+which writes every level to stdout, will put log lines on stdout and break the
+one-document rule.
+
 ### The envelope
 
 ```json
@@ -689,7 +697,9 @@ order is not part of the contract.
 
 **Exit codes** are the same in both formats: `0` on success, and non-zero on
 failure (`1` for the bundled `edgezero` binary, `2` for a CLI generated from the
-template). Branch on `ok` rather than on the specific non-zero code.
+template). Branch on `ok` rather than on the specific non-zero code. In a
+generated CLI, `2` also means a usage error or an unsupported `config diff`;
+only the envelope tells them apart, and an empty stdout means there is none.
 
 ### Compatibility
 
@@ -706,60 +716,128 @@ Consumers should ignore unknown keys, handle unknown enum values, and check
 
 ### Results
 
-**`active-version`:** `{ adapter, service_id, version }`. `version` is `null`
-when the service has no active version yet.
+Each table lists every key of a command's `result`. **Nullable** says whether
+the key can be `null` under schema version `1`; a key marked "no" never is.
+Every result except `config validate`'s also has a non-null `adapter` string.
 
-**`auth status`:** `{ adapter, state }`, where `state` is `authenticated`,
-`unauthenticated`, or `not_applicable` (axum). `unauthenticated` gives
-`ok: false` with the result present. A missing native CLI gives `result: null`.
+**`active-version`**
 
-**`build`:** `{ adapter, artifact }`. `artifact` is the built file's path, or
-`null` when a manifest `commands.build` override ran or the adapter does not
-track it (axum).
+| Key          | Type    | Nullable | Meaning                                             |
+| ------------ | ------- | -------- | --------------------------------------------------- |
+| `service_id` | string  | no       | The service queried.                                |
+| `version`    | integer | yes      | The active version; `null` when none is active yet. |
 
-**`deploy`:** `{ adapter, service_id, staging, version }`. `version` is the
-staged version for `--staging`, the activated version for a Fastly production
-deploy with a service id, and `null` otherwise.
+**`auth status`**
 
-**`healthcheck`:** `{ adapter, service_id, domain, path, version, staging,
-staging_ip, healthy, status_code, attempts, version_verified }`. `attempts` is
-the number of probes actually made. `version_verified` is `true` when the
-version was confirmed active before and after the probe (a production probe with
-`FASTLY_API_TOKEN` set). An unhealthy probe gives `ok: false` with the result
-present.
+| Key     | Type   | Nullable | Meaning                                                         |
+| ------- | ------ | -------- | --------------------------------------------------------------- |
+| `state` | string | no       | `authenticated`, `unauthenticated`, or `not_applicable` (axum). |
 
-**`rollback`:** `{ adapter, service_id, staging, version, rolled_back_to }`.
-`version` is the version rolled back from, or the staged version that was
-deactivated. `rolled_back_to` is `null` for `--staging`.
+`unauthenticated` gives `ok: false` with the result present. A missing native
+CLI gives `result: null`.
 
-**`provision`:** `{ adapter, dry_run, entries }`. Each entry is
-`{ action, store, message }`:
+**`build`**
 
-- `action` is one of `created`, `already_present`, `would_create`, `updated`,
-  `would_update`, `not_applicable`, or `note`.
-- `store` is `{ kind, logical, platform }` (`kind` is `config`, `kv`, or
-  `secrets`), or `null` for an adapter-level note. `logical` is `null` for a
-  store EdgeZero owns itself, such as Fastly's `edgezero_runtime_env`.
-- `message` is the line `text` mode prints. It may span several lines and is
-  meant for people, not parsing.
+| Key        | Type   | Nullable | Meaning                                                                                                              |
+| ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------- |
+| `artifact` | string | yes      | The built file's path; `null` when a manifest `commands.build` override ran or the adapter does not track it (axum). |
 
-**`config gc`:** `{ adapter, store, dry_run, older_than_secs, summary,
-kept_roots, planned_deletions, deleted, failed, stranded, uncertain, warnings }`.
+`--format` must come before the first passthrough argument. A `--format` after
+one is rejected rather than forwarded to the build command.
 
-- `store` is `{ logical, platform, id }`.
-- `summary` holds the counts `entries`, `roots`, `referenced_chunks`,
-  `orphans_planned`, `generations_planned`, `orphans_too_recent`, and
-  `unprovable`.
-- `planned_deletions` is a list of `{ key, age_secs }`.
-- `older_than_secs` is `null` without `--older-than`, and `deleted` is `null` on
-  a dry run.
-- If any delete failed, the command gives `ok: false` with the result present,
-  and `error.message` carries the recovery commands.
+**`deploy`**
 
-**`config validate`:** `{ mode, manifest, app_config, app_name, strict }`.
-`mode` is `raw` for the bundled binary (where `app_config` is `null`) and
-`typed` for a generated CLI. A validation failure gives `ok: false` and
-`result: null`, with the first failing check in `error.message`.
+| Key          | Type    | Nullable | Meaning                                                                                                                                       |
+| ------------ | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `service_id` | string  | yes      | The service the adapter resolved (a Fastly `--staging` deploy falls back to `FASTLY_SERVICE_ID`), else `--service-id` as passed, else `null`. |
+| `staging`    | boolean | no       | Whether `--staging` was passed.                                                                                                               |
+| `version`    | integer | yes      | The staged version for `--staging`, the activated version for a Fastly production deploy with `--service-id`, and `null` otherwise.           |
+
+A Fastly production deploy that went live but whose version could not be
+resolved gives `ok: false` with the result present and `version: null`. Check
+`result`, not only `ok`, before assuming nothing was deployed.
+
+**`healthcheck`**
+
+| Key                | Type    | Nullable | Meaning                                                                                                                                             |
+| ------------------ | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `service_id`       | string  | no       | The service probed.                                                                                                                                 |
+| `domain`           | string  | no       | The probed domain.                                                                                                                                  |
+| `path`             | string  | no       | The probed path.                                                                                                                                    |
+| `version`          | integer | no       | The version under test.                                                                                                                             |
+| `staging`          | boolean | no       | Whether the staging IP was probed.                                                                                                                  |
+| `staging_ip`       | string  | yes      | The resolved staging IP; `null` for a production probe.                                                                                             |
+| `healthy`          | boolean | no       | Whether the probe passed.                                                                                                                           |
+| `status_code`      | integer | yes      | The last HTTP status; `null` when no probe got a response.                                                                                          |
+| `attempts`         | integer | no       | The number of probes actually made.                                                                                                                 |
+| `version_verified` | boolean | no       | `true` when the version was confirmed active before and after the probe: a healthy production probe with `FASTLY_API_TOKEN` set. Otherwise `false`. |
+
+An unhealthy probe gives `ok: false` with the result present.
+
+**`rollback`**
+
+| Key              | Type    | Nullable | Meaning                                                          |
+| ---------------- | ------- | -------- | ---------------------------------------------------------------- |
+| `service_id`     | string  | no       | The service rolled back.                                         |
+| `staging`        | boolean | no       | Whether a staged version was deactivated.                        |
+| `version`        | integer | no       | The version rolled back from, or the staged version deactivated. |
+| `rolled_back_to` | integer | yes      | The re-activated version; `null` for `--staging`.                |
+
+**`provision`**
+
+| Key       | Type    | Nullable | Meaning                         |
+| --------- | ------- | -------- | ------------------------------- |
+| `dry_run` | boolean | no       | Whether `--dry-run` was passed. |
+| `entries` | array   | no       | One entry per step, in order.   |
+
+Each entry:
+
+| Key              | Type   | Nullable | Meaning                                                                                               |
+| ---------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------- |
+| `action`         | string | no       | `created`, `already_present`, `would_create`, `updated`, `would_update`, `not_applicable`, or `note`. |
+| `store`          | object | yes      | `{ kind, logical, platform }`; `null` for an adapter-level note.                                      |
+| `store.kind`     | string | no       | `config`, `kv`, or `secrets`.                                                                         |
+| `store.logical`  | string | yes      | The manifest id; `null` for a store EdgeZero owns itself, such as Fastly's `edgezero_runtime_env`.    |
+| `store.platform` | string | no       | The platform name the runtime resolves.                                                               |
+| `message`        | string | no       | The line `text` mode prints. It may span several lines and is meant for people, not parsing.          |
+
+A dry run's `would_create` pairs with a real run's `created` or
+`already_present`, and `would_update` with `updated`. The Fastly and Spin dry
+runs report the plan without checking the current state, so a store that
+already exists still shows `would_create`. Fastly's real run also omits the
+`edgezero_runtime_env` entry when `fastly.toml` already declares it.
+
+**`config gc`**
+
+| Key                 | Type    | Nullable | Meaning                                                                                                                               |
+| ------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `store`             | object  | no       | `{ logical, platform, id }`. `id`, the platform's store id, is nullable.                                                              |
+| `dry_run`           | boolean | no       | `true` unless `--yes` was passed.                                                                                                     |
+| `older_than_secs`   | integer | yes      | The `--older-than` window; `null` without `--older-than`.                                                                             |
+| `summary`           | object  | no       | The counts `entries`, `roots`, `referenced_chunks`, `orphans_planned`, `generations_planned`, `orphans_too_recent`, and `unprovable`. |
+| `kept_roots`        | array   | no       | The retained root keys.                                                                                                               |
+| `planned_deletions` | array   | no       | `{ key, age_secs }` for each planned delete.                                                                                          |
+| `deleted`           | integer | yes      | Entries deleted; `null` on a dry run, and `0` for a real run with nothing to reclaim.                                                 |
+| `failed`            | array   | no       | Keys whose delete failed.                                                                                                             |
+| `stranded`          | array   | no       | Keys left in a generation that lost a sibling to a confirmed delete. Remove these by hand.                                            |
+| `uncertain`         | array   | no       | Keys whose delete outcome is unknown; a re-run may reclaim them.                                                                      |
+| `warnings`          | array   | no       | Warnings about the store's contents.                                                                                                  |
+
+If any delete failed, the command gives `ok: false` with the result present,
+and `error.message` carries the recovery commands.
+
+**`config validate`**
+
+| Key          | Type    | Nullable | Meaning                                                    |
+| ------------ | ------- | -------- | ---------------------------------------------------------- |
+| `mode`       | string  | no       | `raw` for the bundled binary, `typed` for a generated CLI. |
+| `manifest`   | string  | no       | The validated manifest.                                    |
+| `app_config` | string  | no       | The app-config file both modes read and require.           |
+| `app_name`   | string  | no       | The app name from the manifest.                            |
+| `strict`     | boolean | no       | Whether `--strict` was passed.                             |
+
+A validation failure gives `ok: false` and `result: null`, with the first
+failing check in `error.message`.
 
 ### Schema changelog
 

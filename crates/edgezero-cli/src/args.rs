@@ -229,6 +229,7 @@ pub enum AuthSub {
     },
     /// Show the current session (`wrangler whoami` / `fastly profile
     /// list` / `spin cloud info`).
+    #[non_exhaustive]
     Status {
         #[arg(long)]
         adapter: String,

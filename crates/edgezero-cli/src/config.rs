@@ -24,7 +24,9 @@ use crate::args::{
 };
 use crate::diff::{collect_changes, render_json, render_structured};
 use crate::ensure_adapter_defined;
-use crate::output::{self, CommandName, Failure, GcResult, Outcome, OutputScope, ValidateResult};
+use crate::output::{
+    self, CommandName, Failure, GcResult, Outcome, OutputScope, ValidateMode, ValidateResult,
+};
 use edgezero_adapter::registry::{
     self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
 };
@@ -232,9 +234,10 @@ fn validate_raw(args: &ConfigValidateArgs) -> Outcome<ValidateResult> {
     );
     Ok(ValidateResult::new(
         &args.manifest,
-        None,
+        &ctx.app_config_path,
         &ctx.app_name,
         args.strict,
+        ValidateMode::Raw,
     ))
 }
 
@@ -288,9 +291,10 @@ where
     );
     Ok(ValidateResult::new(
         &args.manifest,
-        Some(&ctx.app_config_path),
+        &ctx.app_config_path,
         &ctx.app_name,
         args.strict,
+        ValidateMode::Typed,
     ))
 }
 
@@ -464,8 +468,8 @@ fn config_gc(args: &ConfigGcArgs) -> Outcome<GcResult> {
     // A run whose deletes failed reports through its error (the full report
     // plus recovery commands), exactly as before; its lines are not logged
     // separately.
-    if let Some(diagnostic) = report.failure_diagnostic {
-        return Err(Failure::with_result(diagnostic, result));
+    if let Some(failure) = report.failure {
+        return Err(Failure::with_result(failure.diagnostic, result));
     }
     for line in &report.text_lines {
         log::info!("[edgezero] {line}");
@@ -1367,6 +1371,10 @@ pub(crate) fn print_unified_diff_inline(
     local_sha: &str,
 ) {
     use std::io::stdout;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "`config push` has no `--format`; its inline diff is text-only output"
+    )]
     let mut stdout = stdout().lock();
     // Silently ignore write errors — stdout may be a closed pipe (e.g.
     // `edgezero config push | head`). The operator already saw the diff

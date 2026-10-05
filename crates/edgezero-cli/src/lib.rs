@@ -72,7 +72,7 @@ use output::{
 #[cfg(feature = "cli")]
 use std::env;
 #[cfg(feature = "cli")]
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind, Write as _};
 #[cfg(feature = "cli")]
 use std::path::PathBuf;
 #[cfg(feature = "cli")]
@@ -115,24 +115,16 @@ impl log::Log for CliLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        // `writeln!` rather than `eprintln!`: a closed stderr must not panic
+        // the command before `--format json` writes its envelope.
         match record.level() {
+            // warn/error always go to stderr; `--format json` sends info there
+            // too, keeping stdout for the JSON envelope.
             log::Level::Error | log::Level::Warn => {
-                #[expect(
-                    clippy::print_stderr,
-                    reason = "CLI UX output goes to stderr for warn/error"
-                )]
-                {
-                    eprintln!("{}", record.args());
-                }
+                let _ignored = writeln!(io::stderr(), "{}", record.args());
             }
             log::Level::Info if INFO_TO_STDERR.load(Ordering::SeqCst) => {
-                #[expect(
-                    clippy::print_stderr,
-                    reason = "`--format json` keeps stdout for the JSON envelope"
-                )]
-                {
-                    eprintln!("{}", record.args());
-                }
+                let _ignored = writeln!(io::stderr(), "{}", record.args());
             }
             log::Level::Info => {
                 #[expect(clippy::print_stdout, reason = "CLI UX output goes to stdout for info")]
@@ -178,6 +170,20 @@ pub fn run_build(args: &BuildArgs) -> Result<(), String> {
 
 #[cfg(feature = "cli")]
 fn build(args: &BuildArgs) -> Outcome<BuildResult> {
+    // `trailing_var_arg` captures everything after the first passthrough token,
+    // so a late `--format json` would be forwarded to the build command and the
+    // run would silently print text. Fail closed instead.
+    if let Some(flag) = args
+        .adapter_args
+        .iter()
+        .find(|arg| *arg == "--format" || arg.starts_with("--format="))
+    {
+        return Err(format!(
+            "`{flag}` after a passthrough argument is forwarded to the build command, not read \
+             as EdgeZero's `--format`. Put `--format` before the first passthrough argument."
+        )
+        .into());
+    }
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
     if let Some(loader) = &manifest {
@@ -213,10 +219,11 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
 
 #[cfg(feature = "cli")]
 fn deploy(args: &DeployArgs) -> Outcome<DeployResult> {
-    let result = |version: Option<u64>| {
+    // `service_id`: the id the adapter resolved, else `--service-id` as passed.
+    let result = |service_id: Option<String>, version: Option<u64>| {
         DeployResult::new(
             &args.adapter,
-            args.service_id.clone(),
+            service_id.or_else(|| args.service_id.clone()),
             args.staging,
             version,
         )
@@ -308,11 +315,11 @@ fn deploy(args: &DeployArgs) -> Outcome<DeployResult> {
             manifest.as_ref(),
             &passthrough,
         )?;
-        let version = deployed_version(&outcome);
+        let (service_id, version) = deployed(outcome);
         if let Some(staged) = version {
             log::info!("version={staged}");
         }
-        return Ok(result(version));
+        return Ok(result(service_id, version));
     }
 
     // Production deploy also emits the activated version
@@ -330,11 +337,16 @@ fn deploy(args: &DeployArgs) -> Outcome<DeployResult> {
     //   2. Only when the output yields nothing: the Fastly API lookup
     //      (`EmitVersion`), which needs a live API + a real token.
     //   3. If BOTH fail: a clear `Err`. We never silently emit an empty
-    //      version — that was the original bug.
+    //      version — that was the original bug. The deploy DID go live, so
+    //      the failure still carries a result (with a `null` version).
     if args.service_id.is_some() && args.adapter.eq_ignore_ascii_case("fastly") {
-        let version = fastly_production_deploy(&args.adapter, manifest.as_ref(), &passthrough)?;
-        log::info!("version={version}");
-        return Ok(result(Some(version)));
+        return match fastly_production_deploy(&args.adapter, manifest.as_ref(), &passthrough)? {
+            Ok(version) => {
+                log::info!("version={version}");
+                Ok(result(None, Some(version)))
+            }
+            Err(unresolved) => Err(Failure::with_result(unresolved, result(None, None))),
+        };
     }
 
     let outcome = adapter::execute(
@@ -343,21 +355,25 @@ fn deploy(args: &DeployArgs) -> Outcome<DeployResult> {
         manifest.as_ref(),
         &passthrough,
     )?;
-    Ok(result(deployed_version(&outcome)))
+    let (service_id, version) = deployed(outcome);
+    Ok(result(service_id, version))
 }
 
 /// Run a production Fastly deploy for a known service and resolve the version
 /// it activated (see `deploy` for the resolution precedence).
+///
+/// The outer `Err` means the deploy itself failed. The inner `Err` means the
+/// deploy went live but the activated version could not be resolved.
 #[cfg(feature = "cli")]
 fn fastly_production_deploy(
     adapter_name: &str,
     manifest: Option<&ManifestLoader>,
     passthrough: &[String],
-) -> Result<u64, String> {
+) -> Result<Result<u64, String>, String> {
     let captured =
         adapter::execute_capture(adapter_name, adapter::Action::Deploy, manifest, passthrough)?;
     if let Some(version) = captured.as_deref().and_then(parse_deploy_version) {
-        return Ok(version);
+        return Ok(Ok(version));
     }
     // Fallback: resolve the version the deploy just activated via the Fastly
     // API. `--require-active` makes EmitVersion FAIL (not emit an empty
@@ -373,24 +389,29 @@ fn fastly_production_deploy(
              failed: {err}"
         )
     };
-    let outcome = adapter::execute(
-        adapter_name,
-        adapter::Action::EmitVersion,
-        manifest,
-        &emit_args,
-    )
-    .map_err(|err| unresolved(&err))?;
     // `--require-active` makes EmitVersion fail rather than report none.
-    active_version(&outcome).ok_or_else(|| unresolved("no active version was reported"))
+    Ok(
+        match adapter::execute(
+            adapter_name,
+            adapter::Action::EmitVersion,
+            manifest,
+            &emit_args,
+        ) {
+            Ok(outcome) => {
+                active_version(&outcome).ok_or_else(|| unresolved("no active version was reported"))
+            }
+            Err(err) => Err(unresolved(&err)),
+        },
+    )
 }
 
-/// The version a deploy outcome reports, if any.
+/// The service id and version a deploy outcome reports, if any.
 #[cfg(feature = "cli")]
-const fn deployed_version(outcome: &ActionOutcome) -> Option<u64> {
+fn deployed(outcome: ActionOutcome) -> (Option<String>, Option<u64>) {
     if let ActionOutcome::Deploy(deployed) = outcome {
-        deployed.version
+        (deployed.service_id, deployed.version)
     } else {
-        None
+        (None, None)
     }
 }
 
@@ -600,7 +621,7 @@ fn healthcheck(args: &HealthcheckArgs) -> Outcome<HealthcheckResult> {
     if let Some(code) = outcome.status_code {
         log::info!("status-code={code}");
     }
-    log::info!("healthy={}", outcome.healthy);
+    log::info!("healthy={}", outcome.healthy());
     let result = HealthcheckResult::new(&args.adapter, &outcome);
     match outcome.failure {
         Some(failure) => Err(Failure::with_result(failure, result)),

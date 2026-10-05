@@ -73,9 +73,6 @@ pub struct ActiveVersionOutcome {
 /// Result of [`AdapterAction::AuthStatus`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthStatusOutcome {
-    /// Why the session is not authenticated (`Some` exactly when `state` is
-    /// [`AuthState::Unauthenticated`]).
-    pub failure: Option<String>,
     pub state: AuthState,
 }
 
@@ -84,12 +81,15 @@ pub struct AuthStatusOutcome {
 /// Deliberately exhaustive (like [`ProvisionAction`] and [`StoreKind`]): the
 /// CLI maps each variant onto its versioned JSON schema, so a new variant must
 /// fail to compile there until the schema covers it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthState {
     Authenticated,
     /// The adapter has no remote auth surface (axum).
     NotApplicable,
-    Unauthenticated,
+    Unauthenticated {
+        /// Why the session is not authenticated.
+        reason: String,
+    },
 }
 
 /// Result of [`AdapterAction::Build`].
@@ -102,6 +102,8 @@ pub struct BuildOutcome {
 /// Result of [`AdapterAction::Deploy`] / [`AdapterAction::DeployStaging`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeployOutcome {
+    /// The service the deploy targeted, when the adapter resolved one.
+    pub service_id: Option<String>,
     /// The staged (or activated) platform version, when known.
     pub version: Option<u64>,
 }
@@ -112,9 +114,8 @@ pub struct HealthcheckOutcome {
     /// Probes actually made.
     pub attempts: u32,
     pub domain: String,
-    /// Why the probe is unhealthy (`Some` exactly when `healthy` is false).
+    /// `None` when healthy; why the probe is unhealthy otherwise.
     pub failure: Option<String>,
-    pub healthy: bool,
     pub path: String,
     pub service_id: String,
     pub staging: bool,
@@ -124,6 +125,15 @@ pub struct HealthcheckOutcome {
     pub version: u64,
     /// Whether `version` was verified ACTIVE before and after the probe.
     pub version_verified: bool,
+}
+
+impl HealthcheckOutcome {
+    /// Whether the probe came back healthy.
+    #[inline]
+    #[must_use]
+    pub const fn healthy(&self) -> bool {
+        self.failure.is_none()
+    }
 }
 
 /// Result of [`AdapterAction::Rollback`].
@@ -304,18 +314,16 @@ pub enum StoreKind {
 
 /// What [`Adapter::gc_config_entries`] found and did.
 ///
-/// A run whose deletes partly failed is still `Ok`: `failed` is non-empty and
-/// `failure_diagnostic` carries the operator-facing recovery text, which the
-/// CLI turns into a non-zero exit.
+/// A run whose deletes partly failed is still `Ok`: `failure` describes what
+/// failed, and the CLI turns it into a non-zero exit.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GcReport {
     /// Entries deleted; `None` on a dry run.
     pub deleted: Option<usize>,
     /// Entries in the store.
     pub entries: usize,
-    pub failed: Vec<String>,
-    /// `Some` exactly when `failed` is non-empty.
-    pub failure_diagnostic: Option<String>,
+    /// `None` unless a delete failed.
+    pub failure: Option<GcFailure>,
     pub generations_planned: usize,
     pub kept_roots: Vec<String>,
     /// Orphan chunks planned for deletion, with their ages.
@@ -326,13 +334,24 @@ pub struct GcReport {
     pub roots: usize,
     /// The platform's id for the swept store, when resolved.
     pub store_id: Option<String>,
-    pub stranded: Vec<String>,
     /// The human-readable report, rendered only by the text output.
     pub text_lines: Vec<String>,
-    pub uncertain: Vec<String>,
     /// Chunk-shaped entries left untouched because they could not be proved.
     pub unprovable: usize,
     pub warnings: Vec<String>,
+}
+
+/// The deletes a `config gc` run could not complete.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GcFailure {
+    /// The operator-facing report and recovery text.
+    pub diagnostic: String,
+    /// Keys whose delete failed (never empty).
+    pub failed: Vec<String>,
+    /// Keys left in a generation that lost a sibling to a confirmed delete.
+    pub stranded: Vec<String>,
+    /// Keys whose generation's only failure has an unknown outcome.
+    pub uncertain: Vec<String>,
 }
 
 /// One orphan chunk `config gc` would delete.

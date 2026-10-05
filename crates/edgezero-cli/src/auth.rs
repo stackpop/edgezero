@@ -48,13 +48,10 @@ fn auth_status(adapter_name: &str) -> Outcome<AuthStatusResult> {
     let ActionOutcome::AuthStatus(status) = outcome else {
         return Err(format!("adapter `{adapter_name}` returned no auth status result").into());
     };
-    let result = AuthStatusResult::new(adapter_name, status.state);
-    match (status.state, status.failure) {
-        (AuthState::Unauthenticated, failure) => Err(Failure::with_result(
-            failure.unwrap_or_else(|| format!("adapter `{adapter_name}` is not authenticated")),
-            result,
-        )),
-        (AuthState::Authenticated | AuthState::NotApplicable, _) => Ok(result),
+    let result = AuthStatusResult::new(adapter_name, &status.state);
+    match status.state {
+        AuthState::Unauthenticated { reason } => Err(Failure::with_result(reason, result)),
+        AuthState::Authenticated | AuthState::NotApplicable => Ok(result),
     }
 }
 

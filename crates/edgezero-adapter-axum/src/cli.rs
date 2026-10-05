@@ -146,7 +146,6 @@ impl Adapter for AxumCliAdapter {
                 );
                 Ok(if action == AdapterAction::AuthStatus {
                     ActionOutcome::AuthStatus(AuthStatusOutcome {
-                        failure: None,
                         state: AuthState::NotApplicable,
                     })
                 } else {

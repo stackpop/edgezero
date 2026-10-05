@@ -72,12 +72,13 @@ pub(crate) struct OutputScope {
 
 impl OutputScope {
     pub(crate) fn enter(format: OutputFormat) -> Self {
-        let previous = (format == OutputFormat::Json).then(|| {
-            (
+        let previous = match format {
+            OutputFormat::Text => None,
+            OutputFormat::Json => Some((
                 process::set_child_stdout_to_stderr(true),
                 crate::set_info_to_stderr(true),
-            )
-        });
+            )),
+        };
         Self { previous }
     }
 }
@@ -164,13 +165,13 @@ pub(crate) struct AuthStatusResult {
 }
 
 impl AuthStatusResult {
-    pub(crate) fn new(adapter: &str, state: AuthState) -> Self {
+    pub(crate) fn new(adapter: &str, state: &AuthState) -> Self {
         Self {
             adapter: adapter.to_owned(),
             state: match state {
                 AuthState::Authenticated => WireAuthState::Authenticated,
                 AuthState::NotApplicable => WireAuthState::NotApplicable,
-                AuthState::Unauthenticated => WireAuthState::Unauthenticated,
+                AuthState::Unauthenticated { .. } => WireAuthState::Unauthenticated,
             },
         }
     }
@@ -247,7 +248,7 @@ impl HealthcheckResult {
             adapter: adapter.to_owned(),
             attempts: outcome.attempts,
             domain: outcome.domain.clone(),
-            healthy: outcome.healthy,
+            healthy: outcome.healthy(),
             path: outcome.path.clone(),
             service_id: outcome.service_id.clone(),
             staging: outcome.staging,
@@ -394,11 +395,12 @@ impl GcResult {
         older_than_secs: Option<u64>,
         report: &GcReport,
     ) -> Self {
+        let failure = report.failure.clone().unwrap_or_default();
         Self {
             adapter: adapter.to_owned(),
             deleted: report.deleted,
             dry_run,
-            failed: report.failed.clone(),
+            failed: failure.failed,
             kept_roots: report.kept_roots.clone(),
             older_than_secs,
             planned_deletions: report
@@ -414,7 +416,7 @@ impl GcResult {
                 logical: store.logical.clone(),
                 platform: store.platform.clone(),
             },
-            stranded: report.stranded.clone(),
+            stranded: failure.stranded,
             summary: GcSummaryResult {
                 entries: report.entries,
                 generations_planned: report.generations_planned,
@@ -424,7 +426,7 @@ impl GcResult {
                 roots: report.roots,
                 unprovable: report.unprovable,
             },
-            uncertain: report.uncertain.clone(),
+            uncertain: failure.uncertain,
             warnings: report.warnings.clone(),
         }
     }
@@ -457,7 +459,7 @@ struct GcSummaryResult {
 /// `config validate` result. Present only when validation passed.
 #[derive(Debug, Serialize)]
 pub(crate) struct ValidateResult {
-    app_config: Option<String>,
+    app_config: String,
     app_name: String,
     manifest: String,
     mode: ValidateMode,
@@ -465,30 +467,27 @@ pub(crate) struct ValidateResult {
 }
 
 impl ValidateResult {
-    /// `app_config` is `None` for the raw (untyped) flow.
     pub(crate) fn new(
         manifest: &Path,
-        app_config: Option<&Path>,
+        app_config: &Path,
         app_name: &str,
         strict: bool,
+        mode: ValidateMode,
     ) -> Self {
         Self {
-            app_config: app_config.map(path_string),
+            app_config: path_string(app_config),
             app_name: app_name.to_owned(),
             manifest: path_string(manifest),
-            mode: if app_config.is_some() {
-                ValidateMode::Typed
-            } else {
-                ValidateMode::Raw
-            },
+            mode,
             strict,
         }
     }
 }
 
+/// Which `config validate` flow ran.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum ValidateMode {
+pub(crate) enum ValidateMode {
     Raw,
     Typed,
 }
@@ -532,12 +531,19 @@ pub(crate) fn finish<R: Serialize>(
     format: OutputFormat,
     outcome: Outcome<R>,
 ) -> Result<(), String> {
-    if format == OutputFormat::Json {
-        let document = render_envelope(command, &outcome)?;
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{document}")
-            .and_then(|()| stdout.flush())
-            .map_err(|err| format!("failed to write the JSON result to stdout: {err}"))?;
+    match format {
+        OutputFormat::Text => {}
+        OutputFormat::Json => {
+            let document = render_envelope(command, &outcome)?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the JSON envelope is the one thing `--format json` writes to stdout"
+            )]
+            let mut stdout = io::stdout().lock();
+            writeln!(stdout, "{document}")
+                .and_then(|()| stdout.flush())
+                .map_err(|err| format!("failed to write the JSON result to stdout: {err}"))?;
+        }
     }
     outcome.map(|_| ()).map_err(|failure| failure.message)
 }
@@ -554,7 +560,7 @@ fn path_string(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::test_support::manifest_guard;
-    use edgezero_adapter::registry::{GcCandidate, ProvisionEntry};
+    use edgezero_adapter::registry::{GcCandidate, GcFailure, ProvisionEntry};
     use serde_json::{Value, json};
 
     fn envelope_of<R: Serialize>(command: CommandName, outcome: &Outcome<R>) -> Value {
@@ -614,7 +620,6 @@ mod tests {
             attempts: 3,
             domain: "app.example.com".to_owned(),
             failure: Some("healthcheck failed".to_owned()),
-            healthy: false,
             path: "/".to_owned(),
             service_id: "SVC1".to_owned(),
             staging: true,
@@ -674,7 +679,7 @@ mod tests {
 
     #[test]
     fn auth_build_deploy_rollback_results_serialize_every_key() {
-        let auth = serde_json::to_value(AuthStatusResult::new("axum", AuthState::NotApplicable))
+        let auth = serde_json::to_value(AuthStatusResult::new("axum", &AuthState::NotApplicable))
             .expect("serialize");
         assert_eq!(auth, json!({"adapter": "axum", "state": "not_applicable"}));
 
@@ -772,23 +777,59 @@ mod tests {
     }
 
     #[test]
-    fn validate_result_reports_mode_from_the_app_config() {
+    fn gc_failure_fills_the_partial_result() {
+        let report = GcReport {
+            deleted: Some(1),
+            failure: Some(GcFailure {
+                diagnostic: "config gc: 1 of 3 deletes FAILED".to_owned(),
+                failed: vec!["c.2".to_owned()],
+                stranded: vec!["c.3".to_owned()],
+                uncertain: vec!["d.1".to_owned()],
+            }),
+            store_id: Some("7Ab".to_owned()),
+            ..GcReport::default()
+        };
+        let store = ResolvedStoreId::from_logical("app_config");
+        let result = GcResult::new("fastly", &store, false, Some(3_600), &report);
+        let failed: Outcome<GcResult> = Err(Failure::with_result(
+            report.failure.expect("failure").diagnostic,
+            result,
+        ));
+        let envelope = envelope_of(CommandName::ConfigGc, &failed);
+        assert_envelope_invariants(&envelope);
+        assert_eq!(envelope["ok"], json!(false));
+        assert_eq!(
+            envelope["error"],
+            json!({"message": "config gc: 1 of 3 deletes FAILED"})
+        );
+        let gc = &envelope["result"];
+        assert_eq!(gc["deleted"], json!(1));
+        assert_eq!(gc["failed"], json!(["c.2"]));
+        assert_eq!(gc["stranded"], json!(["c.3"]));
+        assert_eq!(gc["uncertain"], json!(["d.1"]));
+        assert_eq!(gc["older_than_secs"], json!(3_600));
+    }
+
+    #[test]
+    fn validate_result_reports_the_app_config_in_both_modes() {
         let raw = serde_json::to_value(ValidateResult::new(
             Path::new("edgezero.toml"),
-            None,
+            Path::new("demo.toml"),
             "demo",
             true,
+            ValidateMode::Raw,
         ))
         .expect("serialize");
         assert_eq!(
             raw,
-            json!({"app_config": null, "app_name": "demo", "manifest": "edgezero.toml", "mode": "raw", "strict": true})
+            json!({"app_config": "demo.toml", "app_name": "demo", "manifest": "edgezero.toml", "mode": "raw", "strict": true})
         );
         let typed = serde_json::to_value(ValidateResult::new(
             Path::new("edgezero.toml"),
-            Some(Path::new("demo.toml")),
+            Path::new("demo.toml"),
             "demo",
             false,
+            ValidateMode::Typed,
         ))
         .expect("serialize");
         assert_eq!(typed["mode"], json!("typed"));

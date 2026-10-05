@@ -246,7 +246,7 @@ impl Adapter for SpinCliAdapter {
                 }
                 let added = ensure_kv_label_in_component(&spin_path, &component_id, label)?;
                 if added {
-                    entries.push(ProvisionEntry::for_store(ProvisionAction::Updated, store_kind, store, format!(
+                    entries.push(ProvisionEntry::for_store(ProvisionAction::Created, store_kind, store, format!(
                         "added {kind} label `{label}` (logical id `{logical}`) to [component.{component_id}].key_value_stores in {}",
                         spin_path.display()
                     )));
@@ -1738,10 +1738,12 @@ mod tests {
             kv: &kv_ids,
             secrets: &[],
         };
-        let out = SpinCliAdapter
+        let report = SpinCliAdapter
             .provision(dir.path(), Some("spin.toml"), None, &stores, false)
-            .expect("real run succeeds")
-            .into_messages();
+            .expect("real run succeeds");
+        // Pairs with the dry run's `WouldCreate`.
+        assert_eq!(report.entries[0].action, ProvisionAction::Created);
+        let out = report.into_messages();
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("added KV label `sessions`"), "got: {out:?}");
         let after = fs::read_to_string(dir.path().join("spin.toml")).expect("read back");

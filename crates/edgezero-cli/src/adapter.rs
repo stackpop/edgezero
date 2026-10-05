@@ -341,12 +341,9 @@ fn run_shell(
         .then(|| format!("{action} command `{command}` exited with status {status}"));
     match (action, exit_failure) {
         (Action::AuthStatus, failure) => Ok(ActionOutcome::AuthStatus(AuthStatusOutcome {
-            state: if failure.is_some() {
-                AuthState::Unauthenticated
-            } else {
-                AuthState::Authenticated
-            },
-            failure,
+            state: failure.map_or(AuthState::Authenticated, |reason| {
+                AuthState::Unauthenticated { reason }
+            }),
         })),
         (_, Some(message)) => Err(message),
         (_, None) => Ok(ActionOutcome::Empty),
@@ -428,7 +425,12 @@ fn run_shell_tee(
     let captured_stdout = if process::child_stdout_to_stderr() {
         tee_stream(child_stdout, io::stderr())
     } else {
-        tee_stream(child_stdout, io::stdout())
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "text mode echoes the child's stdout to stdout, exactly as before `--format`"
+        )]
+        let stdout = io::stdout();
+        tee_stream(child_stdout, stdout)
     };
     let captured_stderr = stderr_worker.join().unwrap_or_default();
 

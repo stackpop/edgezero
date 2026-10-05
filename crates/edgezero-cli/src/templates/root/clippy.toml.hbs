@@ -8,3 +8,13 @@ allow-expect-in-tests = true
 allow-indexing-slicing-in-tests = true
 allow-panic-in-tests = true
 allow-unwrap-in-tests = true
+
+# The built-in commands' `--format json` reserves stdout for one JSON envelope.
+# Mirror the EdgeZero workspace guard so your own subcommands keep stdout clean
+# too: route output through the logger (`edgezero_cli::init_cli_logger`), and
+# `#[expect]` any deliberate stdout write or child spawn with a reason.
+disallowed-methods = [
+    { path = "std::process::Command::status", reason = "the child inherits stdout; pipe or redirect it, or `#[expect]` with a reason" },
+    { path = "std::process::Command::spawn", reason = "the child inherits stdout by default; pipe or redirect it, or `#[expect]` with a reason" },
+    { path = "std::io::stdout", reason = "`--format json` reserves stdout for the JSON envelope; write through the logger, or `#[expect]` with a reason" },
+]

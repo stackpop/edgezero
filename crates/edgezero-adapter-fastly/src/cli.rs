@@ -30,9 +30,9 @@ use edgezero_adapter::cli_support::{
 use edgezero_adapter::process;
 use edgezero_adapter::registry::{
     ActionOutcome, ActiveVersionOutcome, Adapter, AdapterAction, AdapterPushContext, BuildOutcome,
-    DeployOutcome, GcCandidate, GcReport, HealthcheckOutcome, ProvisionAction, ProvisionEntry,
-    ProvisionReport, ProvisionStoreRef, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
-    RollbackOutcome, StoreKind, register_adapter,
+    DeployOutcome, GcCandidate, GcFailure, GcReport, HealthcheckOutcome, ProvisionAction,
+    ProvisionEntry, ProvisionReport, ProvisionStoreRef, ProvisionStores, ReadConfigEntry,
+    ResolvedStoreId, RollbackOutcome, StoreKind, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
@@ -419,13 +419,19 @@ impl Adapter for FastlyCliAdapter {
             }
             // The CLI resolves the activated version (deploy output, then the
             // Fastly API), so the built-in deploy reports none.
-            AdapterAction::Deploy => {
-                deploy(args).map(|()| ActionOutcome::Deploy(DeployOutcome { version: None }))
-            }
+            AdapterAction::Deploy => deploy(args).map(|()| {
+                ActionOutcome::Deploy(DeployOutcome {
+                    service_id: None,
+                    version: None,
+                })
+            }),
             AdapterAction::Serve => serve(args).map(|()| ActionOutcome::Empty),
             // Fastly staging lifecycle.
             AdapterAction::DeployStaging => deploy_staging(args).map(|version| {
                 ActionOutcome::Deploy(DeployOutcome {
+                    // `deploy_staging` already resolved this (flag, then
+                    // `FASTLY_SERVICE_ID`), so it cannot fail here.
+                    service_id: resolve_service_id(args).ok(),
                     version: Some(version),
                 })
             }),
@@ -2492,12 +2498,13 @@ fn append_kept_roots_report(out: &mut Vec<String>, kept_roots: &[String], live_c
 }
 
 /// The typed `config gc` report for `plan`, before any delete runs.
-fn gc_report_for(plan: &GcPlan, entries: usize, store_id: &str) -> GcReport {
+fn gc_report_for(plan: &GcPlan, entries: usize, store_id: &str, dry_run: bool) -> GcReport {
     GcReport {
-        deleted: None,
+        // A real run that finds nothing to reclaim deleted zero entries; only a
+        // dry run reports `None`.
+        deleted: (!dry_run).then_some(0),
         entries,
-        failed: Vec::new(),
-        failure_diagnostic: None,
+        failure: None,
         generations_planned: plan.doomed.len(),
         kept_roots: plan.kept_roots.clone(),
         planned: plan
@@ -2513,9 +2520,7 @@ fn gc_report_for(plan: &GcPlan, entries: usize, store_id: &str) -> GcReport {
         retained_recent: plan.retained_recent,
         roots: plan.roots,
         store_id: Some(store_id.to_owned()),
-        stranded: Vec::new(),
         text_lines: Vec::new(),
-        uncertain: Vec::new(),
         unprovable: plan.unprovable,
         warnings: plan.warnings.clone(),
     }
@@ -2554,7 +2559,7 @@ fn gc_fastly_config_store(
         .ok_or_else(|| no_matching_store_error(store_name))?;
     let items = list_config_store_entries(&resolved_id)?;
     let plan = plan_gc_reclamation(&items, unix_now_secs(), older_than_secs)?;
-    let mut report = gc_report_for(&plan, items.len(), &resolved_id);
+    let mut report = gc_report_for(&plan, items.len(), &resolved_id, dry_run);
     let GcPlan {
         doomed,
         kept_roots,
@@ -2626,7 +2631,7 @@ fn gc_fastly_config_store(
         return Ok(report);
     }
     // Partial/total failure is still a REPORT (what was and was not deleted);
-    // the CLI turns `failure_diagnostic` into a non-zero exit.
+    // the CLI turns `failure` into a non-zero exit.
     let diagnostic = gc_failure_diagnostic(
         &out,
         doomed_count,
@@ -2635,11 +2640,13 @@ fn gc_fastly_config_store(
         &stranded,
         &resolved_id,
     )?;
-    report.failed = failed;
-    report.failure_diagnostic = Some(diagnostic);
-    report.stranded = stranded;
+    report.failure = Some(GcFailure {
+        diagnostic,
+        failed,
+        stranded,
+        uncertain,
+    });
     report.text_lines = out;
-    report.uncertain = uncertain;
     Ok(report)
 }
 
@@ -3955,42 +3962,40 @@ fn provision_runtime_env_store(
         // Already declared; nothing to do.
         return Ok(None);
     }
-    {
-        create_fastly_store_in(runtime_env_kind, runtime_env_name, manifest_dir)?;
-        append_fastly_setup(fastly_path, runtime_env_kind, runtime_env_name).map_err(
-            |err| {
-                format!(
-                    "fastly {runtime_env_kind}-store `{runtime_env_name}` was created remotely, but writeback to {path} failed: {err}\n  Recover via `fastly {runtime_env_kind}-store delete --name={runtime_env_name}` then re-run `edgezero provision --adapter fastly`.",
-                    path = fastly_path.display()
-                )
-            },
-        )?;
-        // Same already-deployed-service caveat as the declared-store
-        // path: if `service_id` is set in fastly.toml, the
-        // `[setup.config_stores.edgezero_runtime_env]` table won't
-        // be re-applied by the next `fastly compute deploy`, so the
-        // runtime can't open the store. Emit the resource-link
-        // remediation alongside the populate-keys hint.
-        let post_create_note = resource_link_note(fastly_path, runtime_env_kind, runtime_env_name)?;
-        // NB: this store is what the ACTIVE (production) service reads. The
-        // example must never point it at a staging key — following that would
-        // make production serve staged config. Staged versions get their own
-        // selector via `edgezero_runtime_env_staging`, wired automatically by
-        // a staged deploy; nothing here should be edited to stage config.
-        let production_selector_key = runtime_env_key_for(
-            runtime_env_service_id.unwrap_or("<SERVICE_ID>"),
-            "app_config",
-        );
-        let mut line = format!(
-            "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store, read by the ACTIVE version); appended setup tables to {}\n  Provision writes service-scoped non-default store-name mappings below. Config stores still select their logical id as the default key.\n  To point PRODUCTION at a different config key, and only then:\n    fastly config-store-entry update --store-id=<STORE-ID> --key={production_selector_key} --value=<production-key> --upsert\n  Do NOT set a `_staging` key here: staged config is isolated by a per-service `{RUNTIME_ENV_STAGING_STORE_PREFIX}_<service-id>` store, which a staged deploy creates and links automatically.",
-            fastly_path.display()
-        );
-        if let Some(note) = post_create_note {
-            line.push('\n');
-            line.push_str(&note);
-        }
-        Ok(Some(runtime_env_entry(ProvisionAction::Created, line)))
+    create_fastly_store_in(runtime_env_kind, runtime_env_name, manifest_dir)?;
+    append_fastly_setup(fastly_path, runtime_env_kind, runtime_env_name).map_err(
+        |err| {
+            format!(
+                "fastly {runtime_env_kind}-store `{runtime_env_name}` was created remotely, but writeback to {path} failed: {err}\n  Recover via `fastly {runtime_env_kind}-store delete --name={runtime_env_name}` then re-run `edgezero provision --adapter fastly`.",
+                path = fastly_path.display()
+            )
+        },
+    )?;
+    // Same already-deployed-service caveat as the declared-store
+    // path: if `service_id` is set in fastly.toml, the
+    // `[setup.config_stores.edgezero_runtime_env]` table won't
+    // be re-applied by the next `fastly compute deploy`, so the
+    // runtime can't open the store. Emit the resource-link
+    // remediation alongside the populate-keys hint.
+    let post_create_note = resource_link_note(fastly_path, runtime_env_kind, runtime_env_name)?;
+    // NB: this store is what the ACTIVE (production) service reads. The
+    // example must never point it at a staging key — following that would
+    // make production serve staged config. Staged versions get their own
+    // selector via `edgezero_runtime_env_staging`, wired automatically by
+    // a staged deploy; nothing here should be edited to stage config.
+    let production_selector_key = runtime_env_key_for(
+        runtime_env_service_id.unwrap_or("<SERVICE_ID>"),
+        "app_config",
+    );
+    let mut line = format!(
+        "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store, read by the ACTIVE version); appended setup tables to {}\n  Provision writes service-scoped non-default store-name mappings below. Config stores still select their logical id as the default key.\n  To point PRODUCTION at a different config key, and only then:\n    fastly config-store-entry update --store-id=<STORE-ID> --key={production_selector_key} --value=<production-key> --upsert\n  Do NOT set a `_staging` key here: staged config is isolated by a per-service `{RUNTIME_ENV_STAGING_STORE_PREFIX}_<service-id>` store, which a staged deploy creates and links automatically.",
+        fastly_path.display()
+    );
+    if let Some(note) = post_create_note {
+        line.push('\n');
+        line.push_str(&note);
     }
+    Ok(Some(runtime_env_entry(ProvisionAction::Created, line)))
 }
 
 /// A provision entry about `EdgeZero`'s own runtime-override config store
@@ -5511,8 +5516,9 @@ fn version_active_verdict(
 
 /// `healthcheck --adapter fastly ...`: probe the domain
 /// (production) or the version's staging IP (`--staging`), retrying up
-/// to `--retry` times. Emits `status-code` / `healthy` and returns
-/// `Err` (non-zero exit) when unhealthy after retries.
+/// to `--retry` times. An unhealthy probe is still `Ok`, with `failure`
+/// set; the CLI emits `status-code` / `healthy` and turns that into a
+/// non-zero exit.
 ///
 /// `--domain`, `--service-id` and `--version` are REQUIRED and validated
 /// on BOTH the production and the staging path. GitHub Actions' `required:
@@ -5609,14 +5615,16 @@ fn healthcheck(args: &[String]) -> Result<HealthcheckOutcome, String> {
     );
     // The CLI emits `status-code=<N>` / `healthy=<bool>` from this outcome, and
     // turns an unhealthy one into a non-zero exit.
-    let (healthy, status_code, failure) = match outcome {
+    // `version_verified` means BOTH checks ran, so it is true only on the
+    // healthy arm, the one that runs the "after probing" check.
+    let (version_verified, status_code, failure) = match outcome {
         Ok(code) => {
             // Confirm `version` is STILL active, so a deploy that activated a newer
             // version during the probe+retries is not reported as a healthy `version`.
             if let Some(token) = production_token.as_deref() {
                 verify_version_active(&service_id, version, token, "after probing")?;
             }
-            (true, Some(code), None)
+            (production_token.is_some(), Some(code), None)
         }
         Err((last_code, msg)) => (
             false,
@@ -5631,14 +5639,13 @@ fn healthcheck(args: &[String]) -> Result<HealthcheckOutcome, String> {
         attempts,
         domain: domain.to_owned(),
         failure,
-        healthy,
         path: path.to_owned(),
         service_id,
         staging: is_staging,
         staging_ip,
         status_code,
         version,
-        version_verified: production_token.is_some(),
+        version_verified,
     })
 }
 
@@ -8381,7 +8388,6 @@ exit 1
                 attempts: 1,
                 domain: "app.example.com".to_owned(),
                 failure: None,
-                healthy: true,
                 path: "/".to_owned(),
                 service_id: "SVC1".to_owned(),
                 staging: false,
@@ -8397,7 +8403,7 @@ exit 1
         let _path = PathPrepend::new(unhealthy_curl.path());
         let unhealthy =
             healthcheck(&args("2")).expect("an unhealthy probe is an outcome, not an error");
-        assert!(!unhealthy.healthy);
+        assert!(!unhealthy.healthy());
         assert_eq!(unhealthy.attempts, 2);
         assert_eq!(unhealthy.status_code, Some(503));
         let failure = unhealthy
@@ -8407,6 +8413,72 @@ exit 1
             failure.contains("failed after 2 attempt(s)"),
             "keeps the pre-existing message: {failure}"
         );
+    }
+
+    /// `version_verified` claims the version was ACTIVE before AND after the
+    /// probe, so it is true only when both API checks actually ran: an
+    /// unhealthy probe skips the "after" check and must report `false`.
+    #[cfg(unix)]
+    #[test]
+    fn healthcheck_version_verified_only_when_both_checks_ran() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let _token = EnvOverride::set(FASTLY_API_TOKEN_ENV, "test-token");
+        let args: Vec<String> = [
+            "--domain",
+            "app.example.com",
+            "--service-id",
+            "SVC1",
+            "--version",
+            "7",
+            "--retry",
+            "1",
+            "--retry-delay",
+            "0",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        // A fake `curl` serving the versions API (`--config -`, version 7
+        // active) and answering health probes with `code`; each API call is
+        // logged so the test can count the checks.
+        let fake_curl_with_api = |code: u16| {
+            let dir = tempdir().expect("tempdir");
+            let log = dir.path().join("api.log");
+            let script = format!(
+                "#!/bin/sh
+                 case \" $* \" in *\" --config \"*) cat >/dev/null; echo get >> '{log}'; \
+                 printf '%s\\n200' '[{{\"number\":7,\"active\":true}}]'; exit 0;; esac
+                 echo {code}
+",
+                log = log.display()
+            );
+            let script_path = dir.path().join("curl");
+            fs::write(&script_path, script).expect("write script");
+            let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_path, perms).expect("chmod +x");
+            (dir, log)
+        };
+        let api_calls = |log: &Path| fs::read_to_string(log).unwrap_or_default().lines().count();
+
+        let (unhealthy_curl, unhealthy_log) = fake_curl_with_api(503);
+        let unhealthy_path = PathPrepend::new(unhealthy_curl.path());
+        let unhealthy = healthcheck(&args).expect("an unhealthy probe is an outcome");
+        assert!(!unhealthy.healthy());
+        assert!(
+            !unhealthy.version_verified,
+            "the after-probe check never ran on an unhealthy probe"
+        );
+        assert_eq!(api_calls(&unhealthy_log), 1, "only the before-probe check");
+        drop(unhealthy_path);
+
+        let (healthy_curl, healthy_log) = fake_curl_with_api(200);
+        let _path = PathPrepend::new(healthy_curl.path());
+        let healthy = healthcheck(&args).expect("probe runs");
+        assert!(healthy.healthy());
+        assert!(healthy.version_verified, "both checks ran and passed");
+        assert_eq!(api_calls(&healthy_log), 2, "before and after the probe");
     }
 
     #[cfg(unix)]
@@ -10089,9 +10161,8 @@ echo 'unexpected' >&2; exit 1
     // ---------- config gc (operator-invoked reclamation) ----------
 
     #[cfg(unix)]
-    fn run_gc(dir: &Path, older_than_secs: u64, dry_run: bool) -> Result<Vec<String>, String> {
-        // Mirror the CLI: a report carrying a failure diagnostic is an error.
-        let report = FastlyCliAdapter.gc_config_entries(
+    fn gc_report(dir: &Path, older_than_secs: u64, dry_run: bool) -> Result<GcReport, String> {
+        FastlyCliAdapter.gc_config_entries(
             dir,
             None,
             None,
@@ -10099,9 +10170,15 @@ echo 'unexpected' >&2; exit 1
             &AdapterPushContext::new(),
             older_than_secs,
             dry_run,
-        )?;
-        match report.failure_diagnostic {
-            Some(diagnostic) => Err(diagnostic),
+        )
+    }
+
+    #[cfg(unix)]
+    fn run_gc(dir: &Path, older_than_secs: u64, dry_run: bool) -> Result<Vec<String>, String> {
+        // Mirror the CLI: a report carrying a failure is an error.
+        let report = gc_report(dir, older_than_secs, dry_run)?;
+        match report.failure {
+            Some(failure) => Err(failure.diagnostic),
             None => Ok(report.text_lines),
         }
     }
@@ -10304,6 +10381,73 @@ echo 'unexpected' >&2; exit 1
             !oplog_has(&oplog, &format!("delete {squatter_key}")),
             "a one-chunk 'generation' is never something this writer emitted, so it must not be \
              reclaimed even though it hashes to its own key: `{squatter_key}`; log:\n{log}"
+        );
+    }
+
+    /// `deleted` is `None` only on a dry run: a real run that finds nothing to
+    /// reclaim deleted zero entries, and says so.
+    #[cfg(unix)]
+    #[test]
+    fn gc_report_deleted_is_zero_for_a_real_run_with_nothing_to_reclaim() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let real = gc_report(dir.path(), 86_400, false).expect("gc runs");
+        assert_eq!(real.deleted, Some(0));
+        assert_eq!(real.failure, None);
+        assert!(real.planned.is_empty());
+
+        let preview = gc_report(dir.path(), 86_400, true).expect("gc runs");
+        assert_eq!(preview.deleted, None, "a dry run deletes nothing at all");
+    }
+
+    /// A failed delete is still a report: `failure` names the failed key, and
+    /// the keys whose outcome is unknown, alongside the recovery text.
+    #[cfg(unix)]
+    #[test]
+    fn gc_report_carries_a_failed_delete() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[],
+            &listing,
+            Some(&dead_chunks[0]),
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+
+        let report = gc_report(dir.path(), 86_400, false).expect("a failed delete is a report");
+        assert_eq!(report.deleted, Some(0));
+        assert_eq!(report.planned.len(), dead_chunks.len());
+        let failure = report.failure.expect("the failed delete is reported");
+        assert_eq!(failure.failed, vec![dead_chunks[0].clone()]);
+        assert!(
+            failure.stranded.is_empty(),
+            "nothing was deleted before the failure"
+        );
+        assert!(
+            !failure.uncertain.is_empty(),
+            "the failed first delete has an unknown outcome"
+        );
+        assert!(
+            failure.diagnostic.contains("unknown outcome"),
+            "{}",
+            failure.diagnostic
         );
     }
 

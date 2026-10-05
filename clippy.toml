@@ -11,8 +11,10 @@ allow-unwrap-in-tests = true
 # `--format json` reserves stdout for the JSON envelope, so every child that
 # inherits stdout must go through `edgezero_adapter::process::status`, which
 # applies the stdout-to-stderr policy. Captured spawns (`.output()`, or
-# `.spawn()` with piped stdout) carry a documented `#[expect]`.
+# `.spawn()` with piped stdout) carry a documented `#[expect]`, as does every
+# direct `std::io::stdout()` writer (`print_stdout` covers only the macros).
 disallowed-methods = [
     { path = "std::process::Command::status", reason = "use `edgezero_adapter::process::status` so the `--format json` stdout policy applies" },
     { path = "std::process::Command::spawn", reason = "inherits stdout by default; pipe stdout and `#[expect]` with a reason, or use `edgezero_adapter::process::status`" },
+    { path = "std::io::stdout", reason = "`--format json` reserves stdout for the JSON envelope; write through the logger, or `#[expect]` with a reason" },
 ]
