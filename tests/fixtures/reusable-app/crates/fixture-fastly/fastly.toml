@@ -1,0 +1,18 @@
+manifest_version = 3
+name = "reusable-app-fixture"
+description = "Local lifecycle verification"
+language = "rust"
+[local_server]
+[local_server.backends]
+
+[local_server.config_stores.fixture_config]
+format = "inline-toml"
+[local_server.config_stores.fixture_config.contents]
+marker = "local-fixture"
+[[local_server.kv_stores.fixture_kv]]
+key = "__init__"
+data = ""
+
+[[local_server.secret_stores.fixture_secrets]]
+key = "fixture_marker"
+data = "fixture-only-value"

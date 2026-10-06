@@ -274,6 +274,10 @@ non-zero with a one-line diagnostic on error.
 
 ### edgezero config validate
 
+`config validate` checks every adapter declared in the manifest and compiled
+into this CLI. With `--strict`, it checks that adapter set's capability limits.
+Spin secret-reference validation reports fields and rules without printing values.
+
 Validate `edgezero.toml` together with the typed `<name>.toml` app
 config (see [Application config](/guide/configuration#application-config)).
 
@@ -324,7 +328,13 @@ flags and exits `2` with a pointer to the typed CLI — it cannot push (see
 
 **Arguments:**
 
-- `--adapter <name>` — target adapter (`axum`, `cloudflare`, `fastly`, `spin`).
+- `--adapter <name>` — target adapter (`axum`, `cloudflare`, `fastly`, `spin`),
+  matched case-insensitively. Adapter-specific checks run only for `<name>`:
+  app-config key syntax, adapter-manifest validation, merged store-id
+  collisions, `#[secret]` reference rules, and the `--strict` capability checks
+  (push always runs in strict mode). Shared schema, secret-presence and strict handler-path checks still apply. A
+  passing push does not prove portability; run `config validate --strict` in CI
+  for that.
 - `--manifest <path>` — manifest path (default: `edgezero.toml`).
 - `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
 - `--store <id>` — logical config-store id to push to. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
@@ -397,7 +407,12 @@ stub that absorbs its flags and exits `2` with a pointer to the typed CLI.
 
 **Arguments:**
 
-- `--adapter <name>` — target adapter (`axum`, `cloudflare`, `fastly`, `spin`).
+- `--adapter <name>` — target adapter (`axum`, `cloudflare`, `fastly`, `spin`),
+  matched case-insensitively. Adapter-specific checks run only for `<name>`:
+  app-config key syntax, adapter-manifest validation, merged store-id
+  collisions, and `#[secret]` reference rules. Shared schema and secret-presence
+  checks still apply. `diff` runs no `--strict` capability checks; a clean diff
+  does not prove portability. Run `config validate --strict` in CI for that.
 - `--manifest <path>` — manifest path (default: `edgezero.toml`).
 - `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
 - `--store <id>` — logical config-store id to diff against. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
