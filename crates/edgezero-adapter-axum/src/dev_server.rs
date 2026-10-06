@@ -4,7 +4,6 @@ use std::future;
 use std::iter;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
-use std::str::FromStr as _;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -19,12 +18,12 @@ use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::key_value_store::KvHandle;
+use edgezero_core::logging::{BOOT_LOG_LEVEL, BOOT_LOG_TARGET, resolve_logging_level};
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
-use log::LevelFilter;
 use simple_logger::SimpleLogger;
 use std::collections::BTreeMap;
 
@@ -395,30 +394,50 @@ fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
     App::build::<A>(crate::AXUM_PLATFORM).context("application configuration failed")
 }
 
+fn app_logger(env: &EnvConfig) -> SimpleLogger {
+    SimpleLogger::new()
+        .with_level(resolve_logging_level(env))
+        .with_module_level(BOOT_LOG_TARGET, BOOT_LOG_LEVEL)
+}
+
 /// Runs an application with the Axum development server.
 ///
 /// # Errors
-/// Returns an error if application configuration, runtime setup, store initialization, listener
+/// Returns an error if logger setup, application configuration, runtime setup, store initialization, listener
 /// binding, or connection serving fails.
 #[inline]
 pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
-    let app = build_app_for_dispatch::<A>()?;
+    run_app_with_preflight::<A, _>(|| Ok(()))
+}
+
+/// Run a startup check after logger initialization and before application configuration.
+///
+/// Useful for capability validation in embedded runners. Applications that own logging
+/// must install their backend and filters before calling this function.
+///
+/// # Errors
+/// Returns an error if logger setup, `preflight`, application configuration, runtime setup,
+/// store initialization, listener binding, or connection serving fails.
+#[inline]
+pub fn run_app_with_preflight<A, F>(preflight: F) -> anyhow::Result<()>
+where
+    A: Hooks,
+    F: FnOnce() -> anyhow::Result<()>,
+{
     let env = EnvConfig::from_env();
+    if !A::owns_logging() {
+        app_logger(&env)
+            .init()
+            .context("failed to initialize application logger")?;
+    }
+    preflight()?;
+    let app = build_app_for_dispatch::<A>()?;
     let stores = A::stores();
     let kv_init_requirement = kv_init_requirement(stores);
 
-    let level = env
-        .logging_level()
-        .and_then(|raw| LevelFilter::from_str(raw).ok())
-        .unwrap_or(LevelFilter::Info);
-
-    if !A::owns_logging() {
-        let _logger_init = SimpleLogger::new().with_level(level).init();
-    }
-
     let resolution = resolve_addr(&env);
     for warning in &resolution.warnings {
-        log::warn!("{warning}");
+        log::warn!(target: BOOT_LOG_TARGET, "{warning}");
     }
     let addr = resolution.addr;
     log::info!("[edgezero] starting axum server on http://{addr}");
@@ -474,6 +493,7 @@ fn build_kv_registry(
             Err(err) => match init {
                 KvInitRequirement::Optional => {
                     log::warn!(
+                        target: BOOT_LOG_TARGET,
                         "KV store '{}' (id `{}`) could not be initialized at {}: {}",
                         store_name,
                         id,
@@ -498,6 +518,7 @@ fn build_kv_registry(
     let default_id = meta.default.to_owned();
     if !by_id.contains_key(&default_id) {
         log::warn!(
+            target: BOOT_LOG_TARGET,
             "KV registry default id `{default_id}` failed to initialize; dropping the KV registry — \
              handlers will see no KV store"
         );
@@ -523,6 +544,7 @@ fn build_config_registry(
             Ok(store) => store,
             Err(err) => {
                 log::warn!(
+                    target: BOOT_LOG_TARGET,
                     "config store for id `{}` could not be loaded from {}: {}; \
                      dropping this id from the registry",
                     id,
@@ -543,6 +565,7 @@ fn build_config_registry(
     let default_id = meta.default.to_owned();
     if !by_id.contains_key(&default_id) {
         log::warn!(
+            target: BOOT_LOG_TARGET,
             "config registry default id `{default_id}` failed to load; dropping the config registry — \
              handlers will see no config store"
         );
@@ -590,10 +613,17 @@ pub(crate) fn resolve_addr(env: &EnvConfig) -> addr::BindAddrResolution {
 mod tests {
     use super::*;
     use edgezero_core::error::EdgeError;
+    use log::LevelFilter;
+    use std::env;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FailingConfiguration;
+
+    struct LoggingConfiguration;
+
+    struct OwnedLoggingConfiguration;
 
     struct PlatformAwareConfiguration;
 
@@ -604,6 +634,42 @@ mod tests {
     impl Hooks for FailingConfiguration {
         fn configure(_app: &mut App) -> Result<(), EdgeError> {
             Err(EdgeError::service_unavailable("configuration unavailable"))
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test hook probes startup logging"
+    )]
+    impl Hooks for LoggingConfiguration {
+        fn configure(_app: &mut App) -> Result<(), EdgeError> {
+            log::warn!(target: edgezero_core::BOOT_LOG_TARGET, "boot-warning-probe");
+            log::info!(target: edgezero_core::BOOT_LOG_TARGET, "boot-info-probe");
+            log::warn!("runtime-warning-probe");
+            log::debug!("runtime-debug-probe");
+            Err(EdgeError::service_unavailable("stop before listening"))
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test hook probes application logger ownership"
+    )]
+    impl Hooks for OwnedLoggingConfiguration {
+        fn configure(app: &mut App) -> Result<(), EdgeError> {
+            LoggingConfiguration::configure(app)
+        }
+
+        fn owns_logging() -> bool {
+            true
         }
 
         fn routes() -> RouterService {
@@ -627,6 +693,112 @@ mod tests {
         fn routes() -> RouterService {
             RouterService::builder().build()
         }
+    }
+
+    fn logging_probe(scenario: &str, level: &str) -> String {
+        let output = Command::new(env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "dev_server::tests::startup_logging_child",
+                "--nocapture",
+            ])
+            .env("EDGEZERO_TEST_LOGGING_SCENARIO", scenario)
+            .env("EDGEZERO__LOGGING__LEVEL", level)
+            .output()
+            .expect("isolated logging probe");
+        let stdout = String::from_utf8(output.stdout).expect("probe stdout");
+        let stderr = String::from_utf8(output.stderr).expect("probe stderr");
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("1 passed"),
+            "child probe must execute: {stdout}"
+        );
+        format!("{stdout}\n{stderr}")
+    }
+
+    #[test]
+    fn startup_logging_child() {
+        let Ok(scenario) = env::var("EDGEZERO_TEST_LOGGING_SCENARIO") else {
+            return;
+        };
+        let result = match scenario.as_str() {
+            "installed" => {
+                SimpleLogger::new()
+                    .with_level(LevelFilter::Trace)
+                    .init()
+                    .expect("existing logger");
+                let result = run_app_with_preflight::<LoggingConfiguration, _>(|| {
+                    log::warn!(target: BOOT_LOG_TARGET, "unexpected-preflight-probe");
+                    Ok(())
+                });
+                assert_eq!(
+                    result
+                        .expect_err("logger conflict must stop startup")
+                        .to_string(),
+                    "failed to initialize application logger"
+                );
+                return;
+            }
+            "owned" => {
+                SimpleLogger::new()
+                    .with_level(LevelFilter::Trace)
+                    .init()
+                    .expect("owned logger");
+                log::set_max_level(LevelFilter::Debug);
+                let result = run_app::<OwnedLoggingConfiguration>();
+                assert_eq!(log::max_level(), LevelFilter::Debug);
+                result
+            }
+            "preflight" => run_app_with_preflight::<LoggingConfiguration, _>(|| {
+                log::warn!(target: edgezero_core::BOOT_LOG_TARGET, "preflight-warning-probe");
+                anyhow::bail!("preflight stopped startup");
+            }),
+            _ => run_app::<LoggingConfiguration>(),
+        };
+        assert!(result.is_err(), "probe must stop before listener setup");
+    }
+
+    #[test]
+    fn logging_is_ready_before_configure_with_separate_boot_filter() {
+        for level in ["off", "error", "trace"] {
+            let output = logging_probe("managed", level);
+            assert!(output.contains("boot-warning-probe"), "{output}");
+            assert!(!output.contains("boot-info-probe"), "{output}");
+            assert_eq!(
+                output.contains("runtime-warning-probe"),
+                level == "trace",
+                "{output}"
+            );
+            assert_eq!(
+                output.contains("runtime-debug-probe"),
+                level == "trace",
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_logging_preserves_backend_and_facade_filter() {
+        let output = logging_probe("owned", "off");
+        assert!(output.contains("runtime-debug-probe"), "{output}");
+        assert!(
+            output.contains("boot-info-probe"),
+            "application owns boot filtering: {output}"
+        );
+    }
+
+    #[test]
+    fn preflight_runs_after_logger_and_before_configuration() {
+        let output = logging_probe("preflight", "off");
+        assert!(output.contains("preflight-warning-probe"), "{output}");
+        assert!(!output.contains("boot-warning-probe"), "{output}");
+    }
+
+    #[test]
+    fn logger_conflict_prevents_preflight_and_configuration() {
+        let output = logging_probe("installed", "trace");
+        assert!(!output.contains("unexpected-preflight-probe"), "{output}");
+        assert!(!output.contains("boot-warning-probe"), "{output}");
     }
 
     #[test]

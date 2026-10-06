@@ -571,8 +571,17 @@ pub trait Hooks {
         App::default_name()
     }
 
-    /// When `true`, an adapter's `run_app` skips its own logger initialization;
-    /// the app is responsible for installing a `log` backend. Default `false`.
+    /// When `true`, an adapter's entrypoint skips its own logger initialization
+    /// and must not reconfigure the application's backend or facade maximum.
+    /// Default `false`.
+    ///
+    /// The application must install its `log` backend before the adapter
+    /// entrypoint and apply configured levels to both backend filters and the
+    /// facade maximum. [`crate::logging::resolve_logging_level`] resolves the
+    /// runtime level without mutating logging state. Startup diagnostics use
+    /// [`crate::logging::BOOT_LOG_TARGET`]; preserving those warnings requires
+    /// a separate backend target filter and a facade maximum that admits them.
+    /// Setting only `log::set_max_level` cannot restore backend-filtered records.
     #[must_use]
     #[inline]
     fn owns_logging() -> bool {

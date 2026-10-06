@@ -20,7 +20,7 @@ pub mod config_store;
 pub mod context;
 #[cfg(feature = "fastly")]
 pub mod key_value_store;
-#[cfg(feature = "fastly")]
+#[cfg(any(feature = "fastly", all(test, not(target_arch = "wasm32"))))]
 pub mod logger;
 #[cfg(any(test, feature = "test-utils", feature = "fastly"))]
 pub mod outbound;
@@ -45,6 +45,8 @@ use edgezero_core::http::{Extensions, Response};
 use edgezero_core::manifest::ResolvedLoggingConfig;
 #[cfg(feature = "fastly")]
 use fastly::compute_runtime::service_id;
+#[cfg(any(feature = "fastly", test))]
+use std::mem;
 use std::num::NonZeroU32;
 #[cfg(feature = "fastly")]
 use std::sync::Once;
@@ -73,6 +75,13 @@ pub const FASTLY_PLATFORM: edgezero_core::PlatformMetadata = edgezero_core::Plat
 #[cfg(any(feature = "fastly", all(feature = "cli", not(target_arch = "wasm32"))))]
 const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";
 
+#[cfg(any(feature = "fastly", test))]
+const RUNTIME_ENV_WARNING: &str = "Fastly Config Store `edgezero_runtime_env` could not be opened; \
+     EDGEZERO__* runtime overrides will use baked-in defaults. \
+     Run `edgezero provision --adapter fastly` to create the store, \
+     then populate per-environment override keys with \
+     `fastly config-store-entry update --upsert`.";
+
 /// Name of the Fastly Config Store the runtime opens for `EDGEZERO__*`
 /// overrides.
 ///
@@ -91,6 +100,35 @@ pub struct FastlyLogging {
     pub endpoint: Option<String>,
     pub level: log::LevelFilter,
     pub use_fastly_logger: bool,
+}
+
+/// Resolved runtime overrides and bounded diagnostics deferred until logging is ready.
+#[cfg(any(feature = "fastly", test))]
+#[derive(Debug)]
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "runtime overrides are public but one-shot diagnostic state must remain private"
+)]
+pub struct FastlyRuntimeConfig {
+    /// Canonical `EDGEZERO__*` overrides for logging and request dispatch.
+    pub env: EnvConfig,
+    runtime_env_unavailable: bool,
+}
+
+#[cfg(any(feature = "fastly", test))]
+impl FastlyRuntimeConfig {
+    /// Emit pending boot warnings at most once, after installing a logging backend.
+    /// Without a backend the warning is not observable; this does not install one.
+    #[inline]
+    pub fn emit_boot_diagnostics(&mut self) {
+        if let Some(warning) = self.take_boot_warning() {
+            log::warn!(target: edgezero_core::BOOT_LOG_TARGET, "{warning}");
+        }
+    }
+
+    fn take_boot_warning(&mut self) -> Option<&'static str> {
+        mem::take(&mut self.runtime_env_unavailable).then_some(RUNTIME_ENV_WARNING)
+    }
 }
 
 #[cfg(any(feature = "fastly", test))]
@@ -118,12 +156,7 @@ impl From<ResolvedLoggingConfig> for FastlyLogging {
 impl From<&EnvConfig> for FastlyLogging {
     #[inline]
     fn from(env: &EnvConfig) -> Self {
-        use std::str::FromStr as _;
-
-        let level = env
-            .logging_level()
-            .and_then(|raw| log::LevelFilter::from_str(raw).ok())
-            .unwrap_or(log::LevelFilter::Info);
+        let level = edgezero_core::resolve_logging_level(env);
         // Only attach Fastly's named-endpoint logger when `EDGEZERO__LOGGING__ENDPOINT`
         // is set. Production deployments set it to a real `[log_endpoints]` entry from
         // `fastly.toml`; local Viceroy runs leave it unset and avoid the
@@ -238,15 +271,16 @@ where
     Finalize: FnOnce(&mut Response) -> State,
 {
     init_fastly_abi();
-    let app = build_app_for_dispatch::<A>()?;
     let stores = A::stores();
-    let env = runtime_env_config(stores);
-    let logging = FastlyLogging::from(&env);
+    let mut config = runtime_env_config(stores);
+    let logging = FastlyLogging::from(&config.env);
     if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
-    request::send_with_registries_and_hooks(&app, stores, &env, prepare, finalize)
+    let app = build_app_for_dispatch::<A>();
+    config.emit_boot_diagnostics();
+    request::send_with_registries_and_hooks(&app?, stores, &config.env, prepare, finalize)
 }
 
 /// Build an [`EnvConfig`] from the optional `edgezero_runtime_env`
@@ -271,34 +305,26 @@ where
 /// [`Hooks`] impl inherits the empty [`StoresMetadata::default`] and must
 /// override `stores()` or pass explicit metadata here.
 ///
-/// If the store cannot be opened, the function logs a warning and returns an
-/// empty [`EnvConfig`]. Callers then use their baked-in adapter and store defaults.
+/// If the store cannot be opened, the result contains an empty [`EnvConfig`] and
+/// one deferred warning. Custom entrypoints must initialize their logger, then
+/// call [`FastlyRuntimeConfig::emit_boot_diagnostics`]. No logging occurs here.
 #[cfg(feature = "fastly")]
 #[must_use]
 #[inline]
-pub fn runtime_env_config(stores: StoresMetadata) -> EnvConfig {
+pub fn runtime_env_config(stores: StoresMetadata) -> FastlyRuntimeConfig {
     use fastly::ConfigStore;
-    use std::iter::empty;
     let Ok(dict) = ConfigStore::try_open(RUNTIME_ENV_STORE_NAME) else {
-        // The store is optional -- a clean cutover deploy with all
-        // baked-in defaults works without it. But the absence means
-        // EDGEZERO__* runtime overrides (spec 5.4 __KEY, spec 5.2
-        // __NAME) will silently fall back to baked defaults. Log
-        // once at request time so operators can spot the gap in
-        // their Fastly logs and run `edgezero provision --adapter fastly`
-        // to create the store.
-        log::warn!(
-            "Fastly Config Store `edgezero_runtime_env` not found; \
-             EDGEZERO__* runtime overrides will use baked-in defaults. \
-             Run `edgezero provision --adapter fastly` to create the store, \
-             then populate per-environment override keys with \
-             `fastly config-store-entry update --upsert`."
-        );
-        return EnvConfig::from_vars(empty::<(String, String)>());
+        return FastlyRuntimeConfig {
+            env: EnvConfig::default(),
+            runtime_env_unavailable: true,
+        };
     };
     let current_service_id = service_id();
     let vars = runtime_env_vars_for_service(stores, current_service_id, |key| dict.get(key));
-    EnvConfig::from_vars(vars)
+    FastlyRuntimeConfig {
+        env: EnvConfig::from_vars(vars),
+        runtime_env_unavailable: false,
+    }
 }
 
 #[cfg(any(
@@ -372,11 +398,11 @@ pub fn run_app_with_config<A: Hooks>(
     config_store_name: Option<&str>,
 ) -> Result<(), fastly::Error> {
     init_fastly_abi();
-    let app = build_app_for_dispatch::<A>()?;
     if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
+    let app = build_app_for_dispatch::<A>()?;
     let mut service = request::FastlyService::new(&app);
     if let Some(name) = config_store_name {
         service = service.with_config(name);
@@ -388,6 +414,53 @@ pub fn run_app_with_config<A: Hooks>(
 mod fastly_logging_tests {
     use super::*;
     use edgezero_core::manifest::LogLevel;
+
+    #[test]
+    fn runtime_env_warning_is_deferred_and_taken_once() {
+        let mut config = FastlyRuntimeConfig {
+            env: EnvConfig::default(),
+            runtime_env_unavailable: true,
+        };
+        assert!(config.env.logging_level().is_none());
+        assert_eq!(config.take_boot_warning(), Some(RUNTIME_ENV_WARNING));
+        assert!(config.take_boot_warning().is_none());
+    }
+
+    #[test]
+    fn available_empty_runtime_env_has_no_boot_warning() {
+        let mut config = FastlyRuntimeConfig {
+            env: EnvConfig::default(),
+            runtime_env_unavailable: false,
+        };
+        assert!(config.take_boot_warning().is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn public_boot_diagnostic_emission_is_once_and_empty_store_is_silent() {
+        let guard = log_fastly::reset_logger(
+            log_fastly::Logger::builder()
+                .default_endpoint("diagnostic-test")
+                .max_level(log::LevelFilter::Warn)
+                .build()
+                .expect("SDK capture"),
+        );
+        let mut config = FastlyRuntimeConfig {
+            env: EnvConfig::default(),
+            runtime_env_unavailable: true,
+        };
+        config.emit_boot_diagnostics();
+        guard.assert_contains("diagnostic-test", RUNTIME_ENV_WARNING);
+        log::warn!("diagnostic emission sentinel");
+        config.emit_boot_diagnostics();
+        guard.assert_contains("diagnostic-test", "diagnostic emission sentinel");
+        let mut available = FastlyRuntimeConfig {
+            env: EnvConfig::default(),
+            runtime_env_unavailable: false,
+        };
+        available.emit_boot_diagnostics();
+        guard.assert_contains("diagnostic-test", "diagnostic emission sentinel");
+    }
 
     #[test]
     fn fastly_logging_from_manifest_converts_defaults() {

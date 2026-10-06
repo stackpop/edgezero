@@ -43,6 +43,21 @@ that retain partial results after cancellation should also require the appropria
 
 {{{readme_adapter_dev}}}
 
+## Logging
+
+Axum and Fastly entrypoints delegate logging to the reusable adapter runners;
+do not initialize a second CLI logger before a runtime runner. Ordinary levels
+come from `EDGEZERO__LOGGING__LEVEL` (Fastly reads its runtime Config Store), with
+`Info` as the absent/invalid fallback. Managed boot warnings use `edgezero::boot`
+at `Warn`, independently of ordinary `Error` or `Off`.
+
+Cloudflare and Spin logger initializers are no-ops, not Rust facade backends.
+To own logging on any target, set `owns_logging = true` in `app!`, install your
+backend before entering the runner, and configure both backend and facade filters.
+Reuse `edgezero_core::resolve_logging_level(&EnvConfig)`, `BOOT_LOG_TARGET`, and
+`BOOT_LOG_LEVEL`; raising only `log::set_max_level` cannot restore backend-filtered
+messages. No logging implementation is duplicated in the generated entrypoints.
+
 ## Configuration
 
 Environment variables are declared in `edgezero.toml`. Set `API_BASE_URL` to the upstream origin you want `/proxy/...` to target; the handlers read it through `RequestContext::variable`, including from the declared Cloudflare Worker binding. Adapter-specific secrets are opt-in: uncomment the `#[secret]` field in `crates/{{proj_core}}/src/config.rs` and the matching `[stores.secrets]` block in `edgezero.toml`, then provide the secret value through the wired backend (Cloudflare Worker secret, Fastly Secret Store, Spin secret variable, ...).

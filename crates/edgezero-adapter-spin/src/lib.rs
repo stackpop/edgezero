@@ -121,16 +121,12 @@ pub fn build_app_for_test<A: Hooks>() -> anyhow::Result<App> {
 
 /// Initialize the logger for Spin.
 ///
-/// Currently a no-op — Spin manages its own logging internally.
-/// When a real logger is needed for one target, split this into
-/// `#[cfg(all(feature = "spin", target_arch = "wasm32"))]` /
-/// `#[cfg(not(...))]` branches following the Fastly/Cloudflare pattern.
-// TODO: wire in real Spin logger when available
+/// This is a no-op. Host stdout/stderr capture does not install a Rust `log`
+/// backend. Applications needing facade output must install their backend and
+/// filters before the adapter entrypoint and set `Hooks::owns_logging()` to `true`.
 ///
 /// # Errors
-/// Never; this is currently a no-op because Spin manages logging
-/// internally. The signature still returns [`log::SetLoggerError`] so
-/// the future "wire in a real logger" branch stays drop-in compatible.
+/// Never; no logger is installed or reconfigured.
 #[inline]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
@@ -184,14 +180,10 @@ pub async fn run_app_with_platform<A: Hooks>(
     req: SpinRequest,
     platform: edgezero_core::PlatformMetadata,
 ) -> anyhow::Result<SpinResponse> {
-    let app = build_app_for_dispatch::<A>(platform)?;
-    // Best-effort: every Spin `#[http_service]` re-enters this function, so a
-    // second `log::set_logger` call returns Err — drop the result instead of
-    // `.expect()` to avoid panicking on every subsequent request. Skipped
-    // entirely when the app owns logging.
     if !A::owns_logging() {
         drop(init_logger());
     }
+    let app = build_app_for_dispatch::<A>(platform)?;
     let env = EnvConfig::from_env();
     let stores = A::stores();
     request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)

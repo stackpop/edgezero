@@ -533,7 +533,15 @@ Logging can be configured per adapter under `[adapters.<name>.logging]` or via a
 | `level`       | All          | Log level: `trace`, `debug`, `info`, `warn`, `error`, `off` |
 | `echo_stdout` | Fastly, Axum | Mirror logs to stdout                                       |
 
-Note: Cloudflare logging is not wired to a built-in logger yet.
+Manifest logging settings and runtime `EDGEZERO__LOGGING__*` overrides are separate; consult
+the adapter guide for which source its runner consumes. Cloudflare and Spin do not install a
+Rust `log` backend. `owns_logging = true` transfers installation **and filter configuration**
+to the application, before entering the runner. The pure
+`edgezero_core::resolve_logging_level(&EnvConfig)` helper resolves runtime levels without
+implicitly applying manifest defaults or changing global state.
+
+Managed Fastly/Axum loggers retain `edgezero::boot` errors and warnings at `Warn` even when
+ordinary runtime logging is `Off`. See [Logging Initialisation](/guide/adapters/overview#logging-initialisation).
 
 ## Full Example
 

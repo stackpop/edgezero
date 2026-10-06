@@ -82,10 +82,21 @@ exclusions. Consumers upgrading platform resource or response construction APIs 
 
 ## Logging Initialisation
 
-Each adapter exports an `init_logger` helper for platform-specific logging backends. Fastly wires
-`log_fastly`, Cloudflare currently no-ops, Spin no-ops because Spin manages its own logging
-internally, and Axum uses `simple_logger` in its `run_app` helper.
-New adapters should provide a comparable helper so apps consistently opt into logging.
+Fastly wires `log_fastly`, and Axum uses `simple_logger`. Their runners initialize logging
+before application configuration. Cloudflare and Spin `init_logger` helpers are no-ops: host
+console or stdout/stderr capture does not install a Rust `log` backend.
+
+`owns_logging = true` skips adapter logger setup completely. Install your backend **before**
+entering the adapter runner, apply the configured runtime filter to that backend, and set the
+facade maximum high enough for all enabled targets. `edgezero_core::resolve_logging_level(&env)`
+resolves the supplied platform environment's runtime level (invalid or absent means `Info`);
+it neither installs a logger nor reads manifest defaults implicitly.
+
+Managed Fastly and Axum backends filter `edgezero_core::BOOT_LOG_TARGET` (`edgezero::boot`) at
+`BOOT_LOG_LEVEL` (`Warn`) independently of ordinary records. Consequently boot warnings and
+errors still appear with ordinary logging set to `Error` or `Off`. Boot `Info`/`Debug` messages
+do not appear. The target is not a physical Fastly endpoint. Application-owned loggers choose
+their own boot policy; raising `log::set_max_level` alone cannot restore backend-filtered records.
 
 ## Contract Tests
 

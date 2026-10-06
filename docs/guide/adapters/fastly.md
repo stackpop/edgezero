@@ -112,7 +112,7 @@ response-returning dispatch operation.
 
 ### Owning your own logging
 
-By default `run_app` initializes the Fastly logger. If your app already installs
+When a log endpoint is configured, `run_app` initializes the Fastly logger. If your app installs
 a `log` backend, opt out with the platform-neutral `Hooks::owns_logging()` flag —
 via the `app!` macro:
 
@@ -121,7 +121,10 @@ edgezero_core::app!("edgezero.toml", owns_logging = true);
 ```
 
 or on a hand-written `Hooks` impl (`fn owns_logging() -> bool { true }`). Every
-adapter's `run_app` honors it, so the app is responsible for logger setup.
+adapter's `run_app` honors it. The app must install its backend **before** entering the runner,
+apply the configured runtime level, and set both backend and facade filters. Use
+`edgezero_core::resolve_logging_level(&env)` for consistent level resolution; raising only
+`log::set_max_level` does not override `log_fastly`'s internal filter.
 
 ### Custom entry points
 
@@ -142,6 +145,13 @@ and overridden `__NAME` / `__KEY` selectors fall back to baked-in defaults. A fu
 entrypoint must call `runtime_env_config` and use `send_with_registries_and_hooks` for parity with
 `run_app`. A hand-written `Hooks` implementation must also override `stores()` or pass explicit
 `StoresMetadata`; the trait default declares no stores.
+
+`runtime_env_config` returns `FastlyRuntimeConfig`, not `EnvConfig`. It performs no logging:
+use `config.env` for logger and dispatch setup, then call `config.emit_boot_diagnostics()` after
+installing the backend. An unavailable runtime Config Store produces one deferred, fixed-message
+boot warning, consumed at most once. Without an installed backend it is not observable.
+`run_app` and `run_app_with_hooks` do this automatically, including when application configuration
+fails. `run_app_with_config` does not collect the runtime-env diagnostic.
 
 `FastlyLogging::from(&EnvConfig)` derives `use_fastly_logger` from
 `endpoint.is_some()`, which is what keeps a local Viceroy run off the reserved
@@ -214,14 +224,19 @@ applied on this path: stdout echo is always on, and logger use is derived from
 `ENDPOINT` alone. An `[adapters.fastly.logging]` table in `edgezero.toml` is
 consumed only by `edgezero new` when scaffolding.
 
-To initialize logging manually, call `init_logger` with explicit settings:
+Managed Fastly logging keeps the `edgezero::boot` target at `Warn` while ordinary records use
+the configured level. Both the SDK and facade allow boot warnings even at ordinary `Off`;
+raising the facade maximum alone is insufficient. `edgezero::boot` is a logical target, not a
+Fastly endpoint name. Initialize logging before application configuration.
+
+To initialize logging manually, call `init_logger` with a provisioned endpoint:
 
 ```rust
 use edgezero_adapter_fastly::init_logger;
 use log::LevelFilter;
 
 fn main() {
-    init_logger("stdout", LevelFilter::Info, true).expect("init logger");
+    init_logger("edgezero-logs", LevelFilter::Info, true).expect("init logger");
 }
 ```
 

@@ -100,7 +100,28 @@ The Axum adapter's `run_app` helper installs `simple_logger` at the level read f
 `EDGEZERO__LOGGING__LEVEL`, falling back to `info` when the variable is unset or
 unparseable. It does not read `edgezero.toml`, and `echo_stdout` has no effect on
 the runtime. To install a different logger, set `owns_logging = true` on your `app!`
-declaration so `run_app` skips its own logger, then install yours in `main`. Wiring
+declaration so `run_app` skips its own logger, then install yours in `main` **before** `run_app`.
+Logger setup now precedes application configuration, and setup failures are returned rather than
+ignored. For embedding startup validation, `run_app_with_preflight::<App, _>(check)` runs `check`
+after logging is ready and before configuration or listener binding. The bundled `edgezero demo`
+uses this for its capability gate instead of preinstalling a second CLI logger.
+
+Managed boot warnings use `edgezero::boot` at `Warn`, even when runtime logging is `Off`.
+Application-owned loggers can reuse the shared resolver and constants:
+
+```rust
+use edgezero_core::{BOOT_LOG_LEVEL, BOOT_LOG_TARGET, resolve_logging_level};
+use edgezero_core::env_config::EnvConfig;
+
+let env = EnvConfig::from_env();
+simple_logger::SimpleLogger::new()
+    .with_level(resolve_logging_level(&env))
+    .with_module_level(BOOT_LOG_TARGET, BOOT_LOG_LEVEL)
+    .init()?;
+// Then call run_app::<App>() with owns_logging = true.
+```
+
+Wiring
 `edgezero_core::app::App::build::<App>(edgezero_adapter_axum::AXUM_PLATFORM)` and `AxumDevServer` by hand remains the fallback if you also need
 to control the bind address or store setup.
 

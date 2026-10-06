@@ -54,3 +54,6 @@ walkdir = { workspace = true, optional = true }
 edgezero-core = { path = "../edgezero-core", features = ["test-utils"] }
 handlebars = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+log-fastly = { workspace = true, features = ["native-test-stubs"] }

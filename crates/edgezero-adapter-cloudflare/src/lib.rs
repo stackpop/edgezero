@@ -65,7 +65,7 @@ pub const CLOUDFLARE_PLATFORM: edgezero_core::PlatformMetadata =
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 fn build_app_for_dispatch<A: Hooks>() -> Result<App, WorkerError> {
     build_target_app::<A>().map_err(|error| {
-        log::error!("application configuration failed: {}", error.kind());
+        log::error!(target: edgezero_core::BOOT_LOG_TARGET, "application configuration failed: {}", error.kind());
         WorkerError::RustError("application configuration failed".to_owned())
     })
 }
@@ -84,10 +84,9 @@ pub fn build_app_for_test<A: Hooks>() -> Result<App, WorkerError> {
 }
 
 /// # Errors
-/// Never; this is currently a no-op on Cloudflare Workers (Workers manages
-/// its own logging). The signature still returns [`log::SetLoggerError`] so
-/// callers and the non-wasm stub stay drop-in compatible if a real logger
-/// is wired in later.
+/// Never; this is a no-op. Workers console logging does not install a Rust
+/// `log` backend. Applications needing facade output must install a backend
+/// and its filters before [`run_app`] and set `Hooks::owns_logging()` to `true`.
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 #[inline]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
@@ -168,13 +167,10 @@ pub async fn run_app<A: Hooks>(
     env: Env,
     ctx: Context,
 ) -> Result<Response, WorkerError> {
-    let app = build_app_for_dispatch::<A>()?;
-    // Best-effort: if a logger is already installed, ignore the error rather
-    // than panicking — every Worker request re-enters this function. Skipped
-    // entirely when the app owns logging.
     if !A::owns_logging() {
         drop(init_logger());
     }
+    let app = build_app_for_dispatch::<A>()?;
     let stores = A::stores();
     let env_config = env_config_from_worker(&env, stores);
     let runtime_variables = match A::manifest() {

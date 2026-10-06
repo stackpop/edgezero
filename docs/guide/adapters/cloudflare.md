@@ -153,6 +153,12 @@ EdgeZero does not install a Cloudflare logger by default. Use your preferred log
 `console_log` or your own `log` implementation), and view output in Wrangler or the Cloudflare
 dashboard.
 
+Workers console capture does not install a Rust `log` backend. Initialize your backend and
+both its filter and facade maximum **before** `run_app`, and set `owns_logging = true`.
+`edgezero_core::resolve_logging_level(&env_config)` resolves a supplied platform `EnvConfig`;
+`edgezero::boot` is available for separately filtered startup diagnostics. The no-op adapter
+initializer cannot guarantee their visibility.
+
 ::: tip Logging status
 Cloudflare logging is opt-in; install a logger (such as `console_log`) in your entrypoint if you
 need structured output.

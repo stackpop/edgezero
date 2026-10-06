@@ -275,14 +275,16 @@ surfaces before `provision` / `config push` run.
 
 ## Logging
 
-`edgezero_adapter_spin::init_logger()` is a no-op today because Spin manages its own
-logging internally; `run_app` calls it unless your app sets `owns_logging = true`. An
+`edgezero_adapter_spin::init_logger()` is a no-op; `run_app` calls it before application
+configuration unless your app sets `owns_logging = true`. An
 `[adapters.spin.logging]` table in `edgezero.toml` is not consumed by the Spin runtime.
 View output through `spin up` or your Spin host's log files.
 
 ::: tip Logging status
-Spin logging is handled by the runtime; install your own `log` implementation in the
-entrypoint if you need structured output.
+Host stdout/stderr capture does not install a Rust `log` backend. Install yours before the
+adapter entrypoint and set `owns_logging = true` if you need facade output. Resolve ordinary
+levels with `edgezero_core::resolve_logging_level(&EnvConfig)` and apply both backend and facade
+filters; the adapter does not promise boot-target visibility without that backend.
 :::
 
 ## Context Access

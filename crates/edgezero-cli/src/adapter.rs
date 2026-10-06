@@ -332,10 +332,12 @@ pub(crate) fn ensure_capabilities(
         if capabilities.required.is_empty() {
             if capabilities.optional.is_empty() {
                 log::warn!(
+                    target: edgezero_core::BOOT_LOG_TARGET,
                     "adapter '{adapter_name}' not in registry; capability check skipped (no capabilities declared)"
                 );
             } else {
                 log::warn!(
+                    target: edgezero_core::BOOT_LOG_TARGET,
                     "adapter '{adapter_name}' not in registry; cannot verify its OPTIONAL capabilities; proceeding, since optional capabilities never hard-fail"
                 );
             }
@@ -375,15 +377,18 @@ pub(crate) fn ensure_capabilities(
     for capability in capabilities.optional.iter().copied() {
         match adapter.capability(capability) {
             CapabilitySupport::BestEffort => log::warn!(
+                target: edgezero_core::BOOT_LOG_TARGET,
                 "adapter '{adapter_name}': optional capability '{}' is best-effort; see https://edgezero.dev/guide/capabilities",
                 capability.as_str()
             ),
             CapabilitySupport::BoundedCooperative | CapabilitySupport::Native => {}
             CapabilitySupport::Unsupported => log::warn!(
+                target: edgezero_core::BOOT_LOG_TARGET,
                 "adapter '{adapter_name}': optional capability '{}' unavailable",
                 capability.as_str()
             ),
             _ => log::warn!(
+                target: edgezero_core::BOOT_LOG_TARGET,
                 "adapter '{adapter_name}': optional capability '{}' reports an unrecognized support level; treating as degraded",
                 capability.as_str()
             ),

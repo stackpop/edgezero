@@ -30,6 +30,7 @@ pub mod http;
 pub mod ingress;
 pub mod introspection;
 pub mod key_value_store;
+pub mod logging;
 pub mod manifest;
 pub mod middleware;
 pub mod outbound;
@@ -73,6 +74,7 @@ pub use ingress::{
     IngressDispatchOutcome, IngressFraming, IngressGrant, IngressHead, IngressHeadAccounting,
     IngressHeadLimits, IngressHeadParts, PreparedIngress,
 };
+pub use logging::{BOOT_LOG_LEVEL, BOOT_LOG_TARGET, resolve_logging_level};
 pub use manifest::{
     AtomicHost, BakedManifest, Capability, CapabilitySupport, HostParseError, HostPat,
     ManifestCapabilities, ManifestContract, ManifestOutboundCapability, Port, Scheme,
