@@ -1,22 +1,38 @@
+#![expect(
+    clippy::pub_use,
+    reason = "validated options retain the existing dev_server API location"
+)]
+#![expect(
+    clippy::arbitrary_source_item_ordering,
+    reason = "compatibility entrypoints, normalization, native ownership and startup policy remain grouped by responsibility"
+)]
+
 use std::any::Any;
 use std::fs;
-use std::future;
+use std::future::{self, Future};
 #[cfg(test)]
 use std::iter;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
+pub use crate::run_options::AxumRunOptions;
+use crate::run_options::{failure, shutdown_grace};
 use anyhow::Context as _;
-use futures_util::FutureExt as _;
-use futures_util::StreamExt as _;
-use futures_util::stream::FuturesUnordered;
+use edgezero_core::probe::LifecyclePhase;
+use futures_util::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
+#[cfg(test)]
 use tokio::sync::oneshot::{Receiver as ShutdownReceiver, Sender as ShutdownSender, channel};
-use tokio::task::{LocalSet, spawn_blocking};
+use tokio::sync::watch;
+use tokio::task::LocalSet;
+#[cfg(test)]
+use tokio::task::spawn_blocking;
 
 use edgezero_core::addr;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
@@ -29,25 +45,63 @@ use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
+use log::LevelFilter;
 use simple_logger::SimpleLogger;
+
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
+use std::process;
+use tokio::task::yield_now;
+use tokio::time::{Instant as NativeInstant, sleep_until};
 
 use crate::config_store::AxumConfigStore;
 use crate::config_store_limits::ConfigStoreLimits;
-use crate::connection::{ConnectionExit, serve_http1};
+use crate::connection::{ConnectionExit, serve_http1_with_shutdown};
 use crate::ingress_config::AxumIngressConfig;
 use crate::key_value_store::PersistentKvStore;
+use crate::outbound::AxumOutboundClient;
 use crate::response::EgressConnection;
 use crate::secret_store::EnvSecretStore;
 use crate::service::AxumServiceState;
+
+/// Local application-owned startup work, borrowing the unshared App and prepared stores.
+pub type LocalStartupFuture<'startup> =
+    Pin<Box<dyn Future<Output = Result<(), edgezero_core::EdgeError>> + 'startup>>;
+
+/// The exact registries prepared for requests. Handles may be cloned by the application;
+/// retained KV clones must be released by their owners before reopening or backing up.
+#[derive(Default)]
+pub struct PreparedStores {
+    config: Option<ConfigRegistry>,
+    kv: Option<KvRegistry>,
+    secrets: Option<SecretRegistry>,
+}
+
+impl PreparedStores {
+    #[must_use]
+    #[inline]
+    pub fn config(&self) -> Option<&ConfigRegistry> {
+        self.config.as_ref()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn kv(&self) -> Option<&KvRegistry> {
+        self.kv.as_ref()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn secrets(&self) -> Option<&SecretRegistry> {
+        self.secrets.as_ref()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum KvInitRequirement {
     Optional,
     Required,
 }
-
-type ConnectionResult = Result<Result<ConnectionExit, hyper::Error>, Box<dyn Any + Send>>;
 
 /// Configuration used when running the dev server embedding `EdgeZero` into Axum.
 #[derive(Clone)]
@@ -105,39 +159,19 @@ impl AxumDevServer {
     /// Returns an error if the dev server fails to bind, the Tokio runtime fails to start, or the underlying request loop returns an error.
     #[inline]
     pub fn run(self) -> anyhow::Result<()> {
-        let runtime = RuntimeBuilder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("failed to build tokio runtime")?;
-
-        runtime.block_on(async move { self.run_async().await })
-    }
-
-    async fn run_async(self) -> anyhow::Result<()> {
-        let AxumDevServer {
+        let Self {
             router,
             config,
             stores,
         } = self;
-
-        // Allow binding to already-open listener if caller created one to surface errors early.
-        let std_listener = StdTcpListener::bind(config.addr)
-            .with_context(|| format!("failed to bind dev server to {}", config.addr))?;
-        std_listener
-            .set_nonblocking(true)
-            .context("failed to set listener to non-blocking")?;
-
-        let listener = TokioTcpListener::from_std(std_listener)
-            .context("failed to adopt std listener into tokio")?;
-
-        serve_with_stores(
-            App::new(router),
-            listener,
+        run_local(
+            ListenerSource::Bind(config.addr),
             config.enable_ctrl_c,
+            Duration::from_secs(10),
             config.ingress,
-            stores,
+            future::pending::<()>(),
+            async move { prepare_transport(App::new(router), stores.into()) },
         )
-        .await
     }
 
     #[cfg(test)]
@@ -228,18 +262,16 @@ fn kv_init_requirement(stores: StoresMetadata) -> KvInitRequirement {
     }
 }
 
-fn kv_store_path(store_name: &str) -> PathBuf {
-    // Every declared id gets its own slug-based filename. The
-    // pre-rewrite hard-coded `.edgezero/kv.redb` shortcut for
-    // store_name == "EDGEZERO_KV" is gone -- the runtime no longer
-    // hands out a default name; if you reach here you have a real
-    // declared id and the slug encoding handles every shape
-    // uniformly.
-    PathBuf::from(".edgezero").join(format!(
+fn kv_store_file_name(store_name: &str) -> String {
+    format!(
         "kv-{}-{:016x}.redb",
         store_name_slug(store_name),
         stable_store_name_hash(store_name)
-    ))
+    )
+}
+
+fn kv_store_path(store_name: &str) -> PathBuf {
+    PathBuf::from(".edgezero").join(kv_store_file_name(store_name))
 }
 
 fn store_name_slug(store_name: &str) -> String {
@@ -299,6 +331,39 @@ fn kv_handle_from_path(kv_path: &Path) -> anyhow::Result<KvHandle> {
     Ok(KvHandle::new(kv_store))
 }
 
+impl From<Stores> for PreparedStores {
+    #[inline]
+    fn from(stores: Stores) -> Self {
+        Self {
+            config: stores.config_registry.or_else(|| {
+                stores.config_store.map(|handle| {
+                    ConfigRegistry::single_id(
+                        "default".to_owned(),
+                        ConfigStoreBinding {
+                            handle,
+                            default_key: "default".to_owned(),
+                        },
+                    )
+                })
+            }),
+            kv: stores.kv_registry.or_else(|| {
+                stores
+                    .kv
+                    .map(|handle| KvRegistry::single_id("default".to_owned(), handle))
+            }),
+            secrets: stores.secret_registry.or_else(|| {
+                stores.secrets.map(|handle| {
+                    SecretRegistry::single_id(
+                        "default".to_owned(),
+                        BoundSecretStore::new(handle, "default".to_owned()),
+                    )
+                })
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
 async fn serve_with_stores(
     app: App,
     listener: TokioTcpListener,
@@ -336,6 +401,7 @@ async fn serve_with_stores(
     result
 }
 
+#[cfg(test)]
 fn serve_local(
     app: App,
     std_listener: StdTcpListener,
@@ -344,78 +410,280 @@ fn serve_local(
     stores: Stores,
     shutdown_receiver: ShutdownReceiver<()>,
 ) -> anyhow::Result<()> {
-    let mut service = AxumServiceState::from_app(app);
-    if let Some(registry) = stores.config_registry {
-        service = service.with_config_registry(registry);
-    }
-    if let Some(handle) = stores.config_store {
-        service = service.with_config_store_handle(handle);
-    }
-    if let Some(registry) = stores.kv_registry {
-        service = service.with_kv_registry(registry);
-    }
-    if let Some(handle) = stores.kv {
-        service = service.with_kv_handle(handle);
-    }
-    if let Some(registry) = stores.secret_registry {
-        service = service.with_secret_registry(registry);
-    }
-    if let Some(handle) = stores.secrets {
-        service = service.with_secret_handle(handle);
+    run_local(
+        ListenerSource::Prebound(std_listener),
+        enable_ctrl_c,
+        Duration::ZERO,
+        ingress,
+        async move {
+            let _closed = shutdown_receiver.await;
+        },
+        async move { prepare_transport(app, stores.into()) },
+    )
+}
+
+type PreparedApp = (App, PreparedStores, Arc<reqwest::Client>);
+type ConnectionResult = Result<Result<ConnectionExit, hyper::Error>, Box<dyn Any + Send>>;
+type Connections = FuturesUnordered<Pin<Box<dyn Future<Output = ConnectionResult>>>>;
+
+enum ListenerSource {
+    Bind(SocketAddr),
+    #[cfg(test)]
+    Prebound(StdTcpListener),
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::needless_pass_by_value,
+        reason = "test embedding consumes a prebound listener through the same source"
+    )
+)]
+fn adopt_listener(source: ListenerSource) -> anyhow::Result<TokioTcpListener> {
+    let listener = match source {
+        ListenerSource::Bind(addr) => StdTcpListener::bind(addr)
+            .map_err(|_error| failure("bind", "listener", "address unavailable"))?,
+        #[cfg(test)]
+        ListenerSource::Prebound(listener) => listener,
+    };
+    listener
+        .set_nonblocking(true)
+        .map_err(|_error| failure("bind", "listener", "nonblocking setup failed"))?;
+    TokioTcpListener::from_std(listener)
+        .map_err(|_error| failure("bind", "listener", "runtime adoption failed"))
+}
+
+fn prepare_transport(app: App, stores: PreparedStores) -> anyhow::Result<PreparedApp> {
+    let transport = AxumOutboundClient::try_transport()
+        .map_err(|_error| failure("transport", "HTTP client", "initialization failed"))?;
+    Ok((app, stores, transport))
+}
+
+struct Signals {
+    #[cfg(unix)]
+    interrupt: signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: signal::unix::Signal,
+}
+
+#[expect(
+    clippy::arbitrary_source_item_ordering,
+    reason = "registration precedes observation in this lifecycle owner"
+)]
+impl Signals {
+    fn register(enabled: bool) -> anyhow::Result<Option<Self>> {
+        if !enabled {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        {
+            let interrupt = signal::unix::signal(signal::unix::SignalKind::interrupt())
+                .map_err(|_error| failure("signals", "SIGINT", "registration failed"))?;
+            let terminate = signal::unix::signal(signal::unix::SignalKind::terminate())
+                .map_err(|_error| failure("signals", "SIGTERM", "registration failed"))?;
+            Ok(Some(Self {
+                interrupt,
+                terminate,
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Some(Self {}))
+        }
     }
 
+    #[expect(
+        clippy::integer_division_remainder_used,
+        reason = "tokio select branch arithmetic"
+    )]
+    async fn next(&mut self) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            let received = tokio::select! {
+                received = self.interrupt.recv() => received,
+                received = self.terminate.recv() => received,
+            };
+            received.ok_or_else(|| failure("signals", "termination", "observation closed"))
+        }
+        #[cfg(not(unix))]
+        {
+            signal::ctrl_c()
+                .await
+                .map_err(|_error| failure("signals", "SIGINT", "registration failed"))
+        }
+    }
+}
+
+async fn next_signal(signals: &mut Option<Signals>) -> anyhow::Result<()> {
+    match signals {
+        Some(source) => source.next().await,
+        None => future::pending().await,
+    }
+}
+
+fn run_local<Prepare, Stop>(
+    listener: ListenerSource,
+    enable_signals: bool,
+    grace: Duration,
+    ingress: AxumIngressConfig,
+    stop: Stop,
+    prepare: Prepare,
+) -> anyhow::Result<()>
+where
+    Prepare: Future<Output = anyhow::Result<PreparedApp>>,
+    Stop: Future<Output = ()>,
+{
     let runtime = RuntimeBuilder::new_current_thread()
         .enable_all()
         .build()
-        .context("failed to build axum connection runtime")?;
+        .map_err(|_error| failure("runtime", "local runner", "creation failed"))?;
     let local = LocalSet::new();
-    #[expect(
-        clippy::integer_division_remainder_used,
-        reason = "tokio::select! expands to internal randomized branch selection arithmetic"
-    )]
-    let serve = async move {
-        let listener = TokioTcpListener::from_std(std_listener)
-            .context("failed to adopt listener on axum connection runtime")?;
-        let shutdown = async move {
-            let _closed = shutdown_receiver.await;
-        };
-        let ctrl_c = async move {
-            if enable_ctrl_c {
-                let _signal = signal::ctrl_c().await;
-            } else {
-                future::pending::<()>().await;
-            }
-        };
-        tokio::pin!(shutdown);
-        tokio::pin!(ctrl_c);
-        let mut connections = FuturesUnordered::new();
+    runtime.block_on(local.run_until(async move {
+        let mut signals = Signals::register(enable_signals)?;
+        let (phase, reader) = watch::channel(LifecyclePhase::Starting);
+        let result = run_owned(
+            listener,
+            grace,
+            ingress,
+            stop,
+            prepare,
+            &mut signals,
+            &phase,
+            reader,
+        )
+        .await;
+        phase.send_replace(LifecyclePhase::Stopped);
+        result
+    }))
+}
 
-        loop {
-            tokio::select! {
-                biased;
-                () = &mut shutdown => break,
-                () = &mut ctrl_c => break,
-                Some(result) = connections.next(), if !connections.is_empty() => {
-                    report_connection_exit(&result);
-                }
-                accepted = listener.accept() => {
-                    let (stream, remote_addr) = accepted.context("axum listener accept failed")?;
-                    // One transient accepted socket; no parser, task or waiter on refusal.
-                    if connections.len() >= ingress.max_connections() {
-                        drop(stream);
-                        continue;
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "tokio select branch arithmetic"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one lifecycle owner carries the validated ingress policy and stop sources"
+)]
+async fn run_owned<Prepare, Stop>(
+    listener_source: ListenerSource,
+    grace: Duration,
+    ingress: AxumIngressConfig,
+    stop: Stop,
+    prepare: Prepare,
+    signals: &mut Option<Signals>,
+    phase: &watch::Sender<LifecyclePhase>,
+    reader: watch::Receiver<LifecyclePhase>,
+) -> anyhow::Result<()>
+where
+    Prepare: Future<Output = anyhow::Result<PreparedApp>>,
+    Stop: Future<Output = ()>,
+{
+    tokio::pin!(stop);
+    tokio::pin!(prepare);
+    let prepared = tokio::select! {
+        biased;
+        signal = next_signal(signals) => {
+            signal?;
+            phase.send_replace(LifecyclePhase::Draining);
+            return Ok(());
+        }
+        () = &mut stop => {
+            phase.send_replace(LifecyclePhase::Draining);
+            return Ok(());
+        }
+        prepared = &mut prepare => prepared?,
+    };
+    let (app, stores, transport) = prepared;
+    let mut service = AxumServiceState::with_transport(app, transport).with_phase(reader.clone());
+    if let Some(registry) = stores.config {
+        service = service.with_config_registry(registry);
+    }
+    if let Some(registry) = stores.kv {
+        service = service.with_kv_registry(registry);
+    }
+    if let Some(registry) = stores.secrets {
+        service = service.with_secret_registry(registry);
+    }
+    // Give stop observation another poll before bind/adoption and readiness.
+    let listener = tokio::select! {
+        biased;
+        signal = next_signal(signals) => { signal?; phase.send_replace(LifecyclePhase::Draining); return Ok(()); }
+        () = &mut stop => { phase.send_replace(LifecyclePhase::Draining); return Ok(()); }
+        result = async { yield_now().await; adopt_listener(listener_source) } => result?,
+    };
+    phase.send_replace(LifecyclePhase::Ready);
+    log::info!("[edgezero] native server ready");
+    let mut tasks = Connections::new();
+    let mut outcome = Ok(());
+    loop {
+        tokio::select! {
+            biased;
+            signal = next_signal(signals) => { outcome = signal; break; }
+            () = &mut stop => break,
+            Some(result) = tasks.next(), if !tasks.is_empty() => {
+                report_connection_exit(&result);
+            }
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, remote_addr)) => {
+                        if tasks.len() >= ingress.max_connections() {
+                            drop(stream);
+                            continue;
+                        }
+                        let responses = EgressConnection::default();
+                        let connection_service = service.for_connection(remote_addr, responses.clone());
+                        let connection = serve_http1_with_shutdown(stream, connection_service, responses, Some(reader.clone()), ingress);
+                        tasks.push(Box::pin(AssertUnwindSafe(connection).catch_unwind()));
                     }
-                    let responses = EgressConnection::default();
-                    let connection_service = service.for_connection(remote_addr, responses.clone());
-                    connections.push(AssertUnwindSafe(serve_http1(stream, connection_service, responses, ingress)).catch_unwind());
+                    Err(_error) => {
+                        outcome = Err(failure("runner", "listener", "accept failed"));
+                        break;
+                    }
                 }
             }
         }
-        // Dropping the bounded owner releases sockets, parser buffers and egress attempts.
-        drop(connections);
-        Ok(())
+    }
+    phase.send_replace(LifecyclePhase::Draining);
+    drop(listener);
+    let result = drain_tasks(&mut tasks, grace, signals, outcome).await;
+    // Service/registry clones are dropped only after every owned connection settles.
+    drop(service);
+    result
+}
+
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "tokio select branch arithmetic"
+)]
+async fn drain_tasks(
+    tasks: &mut Connections,
+    grace: Duration,
+    signals: &mut Option<Signals>,
+    mut outcome: anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let Some(deadline) = NativeInstant::now().checked_add(grace) else {
+        tasks.clear();
+        return Err(failure("shutdown", "budget", "unusable deadline"));
     };
-    runtime.block_on(local.run_until(serve))
+    while !tasks.is_empty() {
+        tokio::select! {
+            biased;
+            signal = next_signal(signals) => {
+                outcome = Err(signal.err().unwrap_or_else(|| failure("shutdown", "signal", "forced stop")));
+                break;
+            }
+            () = sleep_until(deadline) => {
+                outcome = Err(failure("shutdown", "budget", "grace exhausted"));
+                break;
+            }
+            Some(result) = tasks.next() => {
+                report_connection_exit(&result);
+            }
+        }
+    }
+    tasks.clear();
+    outcome
 }
 
 fn report_connection_exit(result: &ConnectionResult) {
@@ -434,7 +702,8 @@ fn report_connection_exit(result: &ConnectionResult) {
 /// # Errors
 /// Returns an error if the dev server fails to bind or any required store handle cannot be initialised.
 fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
-    App::build::<A>(crate::AXUM_PLATFORM).context("application configuration failed")
+    App::build::<A>(crate::AXUM_PLATFORM)
+        .map_err(|_error| anyhow::anyhow!("application configuration failed"))
 }
 
 fn app_logger(env: &EnvConfig) -> SimpleLogger {
@@ -453,14 +722,10 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
     run_app_with_preflight::<A, _>(|| Ok(()))
 }
 
-/// Run a startup check after logger initialization and before application configuration.
-///
-/// Useful for capability validation in embedded runners. Applications that own logging
-/// must install their backend and filters before calling this function.
+/// Runs a startup check after logging and policy validation, before app configuration.
 ///
 /// # Errors
-/// Returns an error if logger setup, `preflight`, application configuration, runtime setup,
-/// store initialization, listener binding, or connection serving fails.
+/// Returns an error for logging, preflight, configuration, stores, or serving failure.
 #[inline]
 pub fn run_app_with_preflight<A, F>(preflight: F) -> anyhow::Result<()>
 where
@@ -478,42 +743,271 @@ where
     log::info!("[edgezero] axum HTTP/1 ingress limits: {ingress:?}");
     log::info!("[edgezero] axum config snapshot limits: {config_limits:?}");
     preflight()?;
-    let app = build_app_for_dispatch::<A>()?;
-    let stores = A::stores();
-    let kv_init_requirement = kv_init_requirement(stores);
-    let kv_registry = build_kv_registry(stores.kv, &env, kv_init_requirement)?;
-    let config_registry = build_config_registry(stores.config, &env, config_limits)?;
-    let secret_registry = build_secret_registry(stores.secrets, &env);
-
+    let grace = shutdown_grace(&env)?;
     let resolution = resolve_addr(&env);
-    for warning in &resolution.warnings {
-        log::warn!(target: BOOT_LOG_TARGET, "{warning}");
+    run_local(
+        ListenerSource::Bind(resolution.addr),
+        true,
+        grace,
+        ingress,
+        future::pending::<()>(),
+        async move {
+            let app = build_app_for_dispatch::<A>()?;
+            let metadata = A::stores();
+            for warning in &resolution.warnings {
+                log::warn!(target: BOOT_LOG_TARGET, "{warning}");
+            }
+            let stores = PreparedStores {
+                kv: build_kv_registry(metadata.kv, &env, kv_init_requirement(metadata))?,
+                config: build_config_registry(metadata.config, &env, config_limits)?,
+                secrets: build_secret_registry(metadata.secrets, &env),
+            };
+            prepare_transport(app, stores)
+        },
+    )
+}
+
+fn init_logging<A: Hooks>(level: LevelFilter) -> anyhow::Result<()> {
+    if !A::owns_logging() {
+        SimpleLogger::new()
+            .with_level(level)
+            .with_module_level(BOOT_LOG_TARGET, BOOT_LOG_LEVEL)
+            .init()
+            .map_err(|_error| failure("logging", "application", "initialization failed"))?;
     }
-    let addr = resolution.addr;
-    log::info!("[edgezero] starting axum server on http://{addr}");
+    Ok(())
+}
 
-    let runtime = RuntimeBuilder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to build tokio runtime")?;
+fn no_initialize<'startup>(
+    _app: &'startup mut App,
+    _stores: &'startup PreparedStores,
+) -> LocalStartupFuture<'startup> {
+    Box::pin(future::ready(Ok(())))
+}
 
-    runtime.block_on(async move {
-        let std_listener = StdTcpListener::bind(addr)
-            .with_context(|| format!("failed to bind dev server to {addr}"))?;
-        std_listener
-            .set_nonblocking(true)
-            .context("failed to set listener to non-blocking")?;
-        let listener = TokioTcpListener::from_std(std_listener)
-            .context("failed to adopt std listener into tokio")?;
+/// Runs strict framework startup with SIGINT and Unix SIGTERM. No callback is
+/// required. Ready does not claim application-specific schema/bootstrap checks.
+///
+/// # Errors
+/// Returns classified startup/runner errors or non-success for forced shutdown.
+#[inline]
+pub fn run_production_app<A: Hooks>() -> anyhow::Result<()> {
+    run_production_selected::<A, _, _>(
+        AxumRunOptions::from_env()?,
+        true,
+        future::pending::<()>(),
+        no_initialize,
+    )
+}
 
-        let request_stores = Stores {
-            config_registry,
-            kv_registry,
-            secret_registry,
-            ..Stores::default()
-        };
-        serve_with_stores(app, listener, true, ingress, request_stores).await
-    })
+/// Runs strict startup plus exactly one application-owned local initializer.
+/// Pass an inline `|app, stores| Box::pin(async move { ... })` or a boxed function
+/// so Rust can infer the higher-ranked borrow lifetime. Futures need not be Send.
+///
+/// # Errors
+/// Returns safe classified errors; callback/provider source chains are discarded.
+#[inline]
+pub fn run_production_app_with_initializer<A, Initialize>(
+    initialize: Initialize,
+) -> anyhow::Result<()>
+where
+    A: Hooks,
+    Initialize: for<'startup> FnOnce(
+        &'startup mut App,
+        &'startup PreparedStores,
+    ) -> LocalStartupFuture<'startup>,
+{
+    run_production_selected::<A, _, _>(
+        AxumRunOptions::from_env()?,
+        true,
+        future::pending::<()>(),
+        initialize,
+    )
+}
+
+/// Runs production with explicit options and caller-owned stop, installing no
+/// process-wide signal handlers and merging no ambient hosting/store settings.
+///
+/// # Errors
+/// Returns classified startup/runner errors or grace exhaustion.
+#[inline]
+pub fn run_app_with_options<A, Stop>(options: AxumRunOptions, stop: Stop) -> anyhow::Result<()>
+where
+    A: Hooks,
+    Stop: Future<Output = ()>,
+{
+    run_app_with_options_and_initializer::<A, _, _>(options, stop, no_initialize)
+}
+
+/// Runs production embedding with app-selected startup checks before acceptance.
+/// Retained cloned KV handles remain the caller's responsibility after return.
+///
+/// # Errors
+/// Returns classified startup/runner errors or grace exhaustion.
+#[inline]
+pub fn run_app_with_options_and_initializer<A, Initialize, Stop>(
+    options: AxumRunOptions,
+    stop: Stop,
+    initialize: Initialize,
+) -> anyhow::Result<()>
+where
+    A: Hooks,
+    Stop: Future<Output = ()>,
+    Initialize: for<'startup> FnOnce(
+        &'startup mut App,
+        &'startup PreparedStores,
+    ) -> LocalStartupFuture<'startup>,
+{
+    run_production_selected::<A, _, _>(options, false, stop, initialize)
+}
+
+fn run_production_selected<A, Initialize, Stop>(
+    options: AxumRunOptions,
+    signals: bool,
+    stop: Stop,
+    initialize: Initialize,
+) -> anyhow::Result<()>
+where
+    A: Hooks,
+    Stop: Future<Output = ()>,
+    Initialize: for<'startup> FnOnce(
+        &'startup mut App,
+        &'startup PreparedStores,
+    ) -> LocalStartupFuture<'startup>,
+{
+    run_local(
+        ListenerSource::Bind(options.addr()),
+        signals,
+        options.shutdown_grace(),
+        AxumIngressConfig::from_env(options.env_config())?,
+        stop,
+        async move {
+            let metadata = A::stores();
+            options.validate_stores(metadata)?;
+            let mut app = build_app_for_dispatch::<A>()?;
+            init_logging::<A>(options.logging_level())?;
+            let stores = build_production_stores(metadata, &options)?;
+            let transport = AxumOutboundClient::try_transport()
+                .map_err(|_error| failure("transport", "HTTP client", "initialization failed"))?;
+            initialize(&mut app, &stores).await.map_err(|error| {
+                let category = error.store_extraction_reason().map_or_else(
+                    || "application checks failed".to_owned(),
+                    |reason| format!("{reason:?}"),
+                );
+                failure("initializer", "application", &category)
+            })?;
+            Ok((app, stores, transport))
+        },
+    )
+}
+
+fn check_data_write_access(root: &Path) -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for _attempt in 0..8_u8 {
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!(
+            ".edgezero-write-check-{}-{sequence}",
+            process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                drop(file);
+                fs::remove_file(path).map_err(|_error| {
+                    failure("stores", "DATA_DIR", "write-probe cleanup failed")
+                })?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(_error) => return Err(failure("stores", "DATA_DIR", "directory is not writable")),
+        }
+    }
+    Err(failure("stores", "DATA_DIR", "write-probe unavailable"))
+}
+
+fn build_production_stores(
+    metadata: StoresMetadata,
+    options: &AxumRunOptions,
+) -> anyhow::Result<PreparedStores> {
+    let mut stores = PreparedStores::default();
+    if let Some(meta) = metadata.config {
+        let root = options
+            .config_dir()
+            .ok_or_else(|| failure("settings", "CONFIG_DIR", "required"))?;
+        let mut by_id = BTreeMap::new();
+        let limits = ConfigStoreLimits::from_env(options.env_config())?;
+        let mut resident = 0_usize;
+        for id in meta.ids {
+            let store = AxumConfigStore::load_required_at_startup(
+                &root.join(format!("local-config-{id}.json")),
+                limits,
+                resident,
+            )
+            .map_err(|error| {
+                let category = match error {
+                    ConfigStoreError::ValueTooLarge => "snapshot size limit",
+                    ConfigStoreError::Unavailable { message }
+                        if message == "config file missing" =>
+                    {
+                        "required snapshot missing"
+                    }
+                    ConfigStoreError::Unavailable { message }
+                        if message == "config snapshot requires a regular file" =>
+                    {
+                        "snapshot requires a regular file"
+                    }
+                    _ => "required snapshot unavailable or malformed",
+                };
+                failure("config", id, category)
+            })?;
+            resident = resident
+                .checked_add(store.resident_allocation_bytes())
+                .ok_or_else(|| failure("config", id, "snapshot allocation limit"))?;
+            by_id.insert(
+                (*id).to_owned(),
+                ConfigStoreBinding {
+                    handle: ConfigStoreHandle::new(Arc::new(store)),
+                    default_key: options.env_config().store_key("config", id),
+                },
+            );
+        }
+        stores.config = Some(
+            ConfigRegistry::from_parts(by_id, meta.default.to_owned()).ok_or_else(|| {
+                failure("config", meta.default, "invalid declared default binding")
+            })?,
+        );
+    }
+    if let Some(meta) = metadata.kv {
+        let root = options
+            .data_dir()
+            .ok_or_else(|| failure("settings", "DATA_DIR", "required"))?;
+        check_data_write_access(root)?;
+        let mut by_id = BTreeMap::new();
+        let mut handles: BTreeMap<String, KvHandle> = BTreeMap::new();
+        for id in meta.ids {
+            let name = options.env_config().store_name("kv", id);
+            let handle = if let Some(handle) = handles.get(&name) {
+                handle.clone()
+            } else {
+                let store = PersistentKvStore::new(root.join(kv_store_file_name(&name)))
+                    .map_err(|_error| failure("KV", id, "database unavailable or locked"))?;
+                let handle = KvHandle::new(Arc::new(store));
+                handles.insert(name, handle.clone());
+                handle
+            };
+            by_id.insert((*id).to_owned(), handle);
+        }
+        stores.kv = Some(
+            KvRegistry::from_parts(by_id, meta.default.to_owned())
+                .ok_or_else(|| failure("KV", meta.default, "invalid declared default binding"))?,
+        );
+    }
+    stores.secrets = build_secret_registry(metadata.secrets, options.env_config());
+    Ok(stores)
 }
 
 /// Build the per-request KV registry from baked store metadata.
@@ -531,33 +1025,27 @@ fn build_kv_registry(
     };
 
     let mut by_id: BTreeMap<String, KvHandle> = BTreeMap::new();
+    let mut handles: BTreeMap<String, KvHandle> = BTreeMap::new();
     for id in meta.ids {
         let store_name = env.store_name("kv", id);
+        if let Some(handle) = handles.get(&store_name) {
+            by_id.insert((*id).to_owned(), handle.clone());
+            continue;
+        }
         let kv_path = kv_store_path(&store_name);
         let handle = match kv_handle_from_path(&kv_path) {
             Ok(handle) => handle,
-            Err(err) => match init {
+            Err(_error) => match init {
                 KvInitRequirement::Optional => {
-                    log::warn!(
-                        target: BOOT_LOG_TARGET,
-                        "KV store '{}' (id `{}`) could not be initialized at {}: {}",
-                        store_name,
-                        id,
-                        kv_path.display(),
-                        err
-                    );
+                    log::warn!(target: BOOT_LOG_TARGET, "KV store id `{id}` unavailable; omitting optional binding");
                     continue;
                 }
                 KvInitRequirement::Required => {
-                    return Err(err.context(format!(
-                        "KV store '{}' (id `{}`) is explicitly configured for axum but could not be initialized at {}",
-                        store_name,
-                        id,
-                        kv_path.display()
-                    )));
+                    return Err(failure("KV", id, "declared database unavailable or locked"));
                 }
             },
         };
+        handles.insert(store_name, handle.clone());
         by_id.insert((*id).to_owned(), handle);
     }
 
@@ -916,6 +1404,45 @@ mod tests {
         let app = build_app_for_dispatch::<PlatformAwareConfiguration>().expect("configured app");
 
         assert_eq!(app.platform(), crate::AXUM_PLATFORM);
+    }
+
+    #[test]
+    fn initializer_borrows_inputs_across_await_and_captures_rc() {
+        use futures::executor::block_on;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        async fn initialize<Initialize>(
+            app: &mut App,
+            stores: &PreparedStores,
+            callback: Initialize,
+        ) -> Result<(), EdgeError>
+        where
+            Initialize: for<'startup> FnOnce(
+                &'startup mut App,
+                &'startup PreparedStores,
+            ) -> LocalStartupFuture<'startup>,
+        {
+            callback(app, stores).await
+        }
+        let calls = Rc::new(Cell::new(0_u32));
+        let recorded = Rc::clone(&calls);
+        let mut owned_app = App::new(RouterService::builder().build());
+        block_on(initialize(
+            &mut owned_app,
+            &PreparedStores::default(),
+            move |app, stores| {
+                Box::pin(async move {
+                    future::ready(()).await;
+                    assert!(stores.config().is_none());
+                    app.insert_state(Arc::<str>::from("initialized"));
+                    recorded.set(recorded.get() + 1);
+                    Ok(())
+                })
+            },
+        ))
+        .expect("initialize");
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

@@ -844,10 +844,15 @@ where
                 None,
             )
         })?;
-        let key = binding.default_key.clone();
-        extract_from_handle::<C>(ctx, &binding.handle, &key)
-            .await
-            .map(AppConfig)
+        Self::from_binding(
+            binding,
+            None,
+            ctx.extensions().get::<SecretRegistry>(),
+            ctx.config_extraction_limits(),
+            ctx.monotonic_clock(),
+        )
+        .await
+        .map(AppConfig)
     }
 }
 
@@ -855,6 +860,33 @@ impl<C> AppConfig<C>
 where
     C: DeserializeOwned + AppConfigMeta + Validate + Send + 'static,
 {
+    /// Loads one application-selected binding without a request or route dispatch.
+    ///
+    /// Uses the same limits, envelope checks, secret resolution, validation and
+    /// error categories as request extraction. `None` selects the binding's default
+    /// key. This does not cache config or infer required application schemas.
+    ///
+    /// # Errors
+    /// Returns a typed store-extraction error for backend, budget, envelope,
+    /// secret or schema failures. Native startup must classify errors before logging.
+    #[inline]
+    pub async fn from_binding(
+        binding: &ConfigStoreBinding,
+        key: Option<&str>,
+        secrets: Option<&SecretRegistry>,
+        limits: ConfigExtractionLimits,
+        clock: MonotonicClock,
+    ) -> Result<C, EdgeError> {
+        extract_from_handle::<C>(
+            &binding.handle,
+            key.unwrap_or(&binding.default_key),
+            secrets,
+            limits,
+            clock,
+        )
+        .await
+    }
+
     /// Read the typed config from a NON-default config store.
     /// `key = None` falls back to that store's `binding.default_key`.
     /// Returns the inner `C` directly per spec 6.2.1.
@@ -874,8 +906,14 @@ where
                 None,
             )
         })?;
-        let resolved_key = key.unwrap_or(&binding.default_key).to_owned();
-        extract_from_handle::<C>(ctx, &binding.handle, &resolved_key).await
+        Self::from_binding(
+            binding,
+            key,
+            ctx.extensions().get::<SecretRegistry>(),
+            ctx.config_extraction_limits(),
+            ctx.monotonic_clock(),
+        )
+        .await
     }
 
     /// Read the typed config from the default store under an
@@ -896,7 +934,14 @@ where
                 None,
             )
         })?;
-        extract_from_handle::<C>(ctx, &binding.handle, key).await
+        Self::from_binding(
+            binding,
+            Some(key),
+            ctx.extensions().get::<SecretRegistry>(),
+            ctx.config_extraction_limits(),
+            ctx.monotonic_clock(),
+        )
+        .await
     }
 }
 
@@ -1201,15 +1246,16 @@ fn future_format_reason(raw: &str) -> Option<String> {
 /// Returns [`EdgeError::StoreExtraction`] with the stable reason corresponding
 /// to store, envelope, secret, or schema failure.
 async fn extract_from_handle<C>(
-    ctx: &RequestContext,
     handle: &ConfigStoreHandle,
     key: &str,
+    secrets: Option<&SecretRegistry>,
+    limits: ConfigExtractionLimits,
+    clock: MonotonicClock,
 ) -> Result<C, EdgeError>
 where
     C: DeserializeOwned + AppConfigMeta + Validate + Send + 'static,
 {
-    let mut budget =
-        ConfigExtractionBudget::start(ctx.config_extraction_limits(), ctx.monotonic_clock())?;
+    let mut budget = ConfigExtractionBudget::start(limits, clock)?;
     let read = handle
         .get_bounded(
             key,
@@ -1274,7 +1320,7 @@ where
     let mut data = parsed?;
     drop(raw);
 
-    let resolved = secret_walk::<C>(ctx, &mut budget, &mut data).await;
+    let resolved = secret_walk::<C>(secrets, &mut budget, &mut data).await;
     budget.check_deadline()?;
     resolved?;
 
@@ -1335,7 +1381,7 @@ fn map_config_store_error(err: &ConfigStoreError) -> EdgeError {
 ///
 /// `StoreRef` fields are skipped — their value is a store id, not a key.
 async fn secret_walk<C>(
-    ctx: &RequestContext,
+    secrets: Option<&SecretRegistry>,
     budget: &mut ConfigExtractionBudget,
     data: &mut serde_json::Value,
 ) -> Result<(), EdgeError>
@@ -1349,7 +1395,7 @@ where
         if matches!(field.kind, SecretKind::StoreRef) {
             continue;
         }
-        resolve_secret_field(ctx, budget, data, &field, &field.path, String::new()).await?;
+        resolve_secret_field(secrets, budget, data, &field, &field.path, String::new()).await?;
     }
     Ok(())
 }
@@ -1358,7 +1404,7 @@ where
 /// secret leaf(s). `rendered` is the dotted path so far (with concrete `[n]`
 /// indices) for error hints.
 fn resolve_secret_field<'walk>(
-    ctx: &'walk RequestContext,
+    secrets: Option<&'walk SecretRegistry>,
     budget: &'walk mut ConfigExtractionBudget,
     node: &'walk mut serde_json::Value,
     field: &'walk SecretField,
@@ -1369,7 +1415,7 @@ fn resolve_secret_field<'walk>(
         match remaining.split_first() {
             // Leaf reached: `node` is the PARENT object; the last field is the key.
             Some((SecretPathSegment::Field(name), [])) => {
-                resolve_leaf(ctx, budget, node, field, name.as_ref(), &rendered).await
+                resolve_leaf(secrets, budget, node, field, name.as_ref(), &rendered).await
             }
             Some((SecretPathSegment::OptionalField(name), [])) => {
                 if node.as_object().is_some_and(|parent| {
@@ -1380,7 +1426,7 @@ fn resolve_secret_field<'walk>(
                 }) {
                     return Ok(());
                 }
-                resolve_leaf(ctx, budget, node, field, name.as_ref(), &rendered).await
+                resolve_leaf(secrets, budget, node, field, name.as_ref(), &rendered).await
             }
             // Required intermediates still reject stale blobs. Optional
             // intermediates are represented explicitly below rather than by the
@@ -1394,7 +1440,8 @@ fn resolve_secret_field<'walk>(
                         Some(next_rendered),
                     )),
                     Some(child) => {
-                        resolve_secret_field(ctx, budget, child, field, rest, next_rendered).await
+                        resolve_secret_field(secrets, budget, child, field, rest, next_rendered)
+                            .await
                     }
                 }
             }
@@ -1410,7 +1457,8 @@ fn resolve_secret_field<'walk>(
                 match parent.get_mut(name.as_ref()) {
                     None | Some(serde_json::Value::Null) => Ok(()),
                     Some(child) => {
-                        resolve_secret_field(ctx, budget, child, field, rest, next_rendered).await
+                        resolve_secret_field(secrets, budget, child, field, rest, next_rendered)
+                            .await
                     }
                 }
             }
@@ -1426,7 +1474,7 @@ fn resolve_secret_field<'walk>(
                 };
                 for (idx, item) in items.iter_mut().enumerate() {
                     let indexed = format!("{rendered}[{idx}]");
-                    resolve_secret_field(ctx, budget, item, field, rest, indexed).await?;
+                    resolve_secret_field(secrets, budget, item, field, rest, indexed).await?;
                 }
                 Ok(())
             }
@@ -1447,7 +1495,7 @@ fn join_field(prefix: &str, name: &str) -> String {
 /// secret field name; `store_ref_field` (for `KeyInNamedStore`) is a sibling
 /// within `parent`.
 async fn resolve_leaf(
-    ctx: &RequestContext,
+    secrets: Option<&SecretRegistry>,
     budget: &mut ConfigExtractionBudget,
     parent: &mut serde_json::Value,
     field: &SecretField,
@@ -1486,7 +1534,7 @@ async fn resolve_leaf(
 
     let (bound, resolved_store_id) = match field.kind {
         SecretKind::KeyInDefault => {
-            let bound = ctx.secret_store_default().ok_or_else(|| {
+            let bound = secrets.and_then(SecretRegistry::default).ok_or_else(|| {
                 store_extraction_error(
                     StoreExtractionReason::MissingRegistry,
                     format!(
@@ -1514,19 +1562,21 @@ async fn resolve_leaf(
                     )
                 })?
                 .to_owned();
-            let bound = ctx.secret_store(&store_id_str).ok_or_else(|| {
-                // `store_id_str` is the blob's store_ref VALUE — config data that
-                // may be sensitive — and this message reaches the HTTP body. Name
-                // the field, not the stored id.
-                store_extraction_error(
-                    StoreExtractionReason::UnknownStore,
-                    format!(
-                        "secret field `{leaf_path}` names a store_ref that is not declared in \
+            let bound = secrets
+                .and_then(|registry| registry.named(&store_id_str))
+                .ok_or_else(|| {
+                    // `store_id_str` is the blob's store_ref VALUE — config data that
+                    // may be sensitive — and this message reaches the HTTP body. Name
+                    // the field, not the stored id.
+                    store_extraction_error(
+                        StoreExtractionReason::UnknownStore,
+                        format!(
+                            "secret field `{leaf_path}` names a store_ref that is not declared in \
                          [stores.secrets] (id redacted)"
-                    ),
-                    Some(leaf_path.clone()),
-                )
-            })?;
+                        ),
+                        Some(leaf_path.clone()),
+                    )
+                })?;
             (bound, store_id_str)
         }
     };
@@ -2785,7 +2835,7 @@ mod tests {
         let mut budget =
             ConfigExtractionBudget::start(ConfigExtractionLimits::default(), ctx.monotonic_clock())
                 .expect("test budget");
-        secret_walk::<C>(ctx, &mut budget, data).await
+        secret_walk::<C>(ctx.extensions().get::<SecretRegistry>(), &mut budget, data).await
     }
 
     #[test]

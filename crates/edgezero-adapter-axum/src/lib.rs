@@ -23,6 +23,8 @@ pub mod request;
 #[cfg(feature = "axum")]
 mod response;
 #[cfg(feature = "axum")]
+mod run_options;
+#[cfg(feature = "axum")]
 pub mod secret_store;
 #[cfg(feature = "axum")]
 mod service;

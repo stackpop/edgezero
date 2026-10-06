@@ -36,6 +36,7 @@ pub mod middleware;
 pub mod outbound;
 pub mod params;
 pub mod platform;
+pub mod probe;
 pub mod responder;
 pub mod response;
 pub mod response_egress;
