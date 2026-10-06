@@ -406,3 +406,17 @@ Viceroy 6/0 and Spin Wasmtime 12/0. The rebuilt raw matrix retains all 54
 committed observations (20 Fastly, 17 Cloudflare, 17 Spin). Independent review
 approved the metadata correction without changing request conversion or claims
 about original wire bytes.
+
+## Latest independent review follow-up — 2026-10-06
+
+The earlier 47-case records above describe earlier execution checkpoints. The
+final baseline and dependency-handoff evidence contain 54 cases: Fastly 20,
+Cloudflare 17 and Spin 17. Those final counts supersede earlier probe totals.
+
+Clarify the Axum guide: common field multiplicity remains `Unknown`, including
+the Content-Length override. `InboundOrigin::parse` validates URI authorities,
+not DNS-label-only names. Commas, asterisks and semicolons are permitted
+registered-name characters under [RFC 3986 section 3.2.2](https://www.rfc-editor.org/rfc/rfc3986.html#section-3.2.2),
+and a trailing dot is valid. The proposed DNS-only rejection would narrow the
+approved contract and reject valid authorities, so no parser change is made.
+These clarifications do not change the consumer dependency API or runtime code.
