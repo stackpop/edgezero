@@ -124,15 +124,13 @@ impl Body {
     pub fn with_buffered_json_policy(self, ceiling: NonZeroUsize, ingress_is_json: bool) -> Self {
         match self {
             Self::Managed(_) => self,
-            Self::Once(_) | Self::Stream(_) => Self::Managed(ManagedBody {
-                inner: Box::new(ManagedBodyState {
-                    policy: BufferedJsonPolicy {
-                        ceiling,
-                        ingress_is_json,
-                    },
-                    transfer: BodyTransfer::Initial(self.into_content()),
+            Self::Once(_) | Self::Stream(_) => Self::from_transfer(
+                Some(BufferedJsonPolicy {
+                    ceiling,
+                    ingress_is_json,
                 }),
-            }),
+                BodyTransfer::Initial(self.into_content()),
+            ),
         }
     }
 
