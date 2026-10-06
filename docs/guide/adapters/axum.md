@@ -80,6 +80,48 @@ cargo build -p my-app-adapter-axum --release
 
 The binary is placed in `target/release/my-app-adapter-axum`.
 
+## Buffered JSON body limits
+
+Every standard Axum hosting path defaults framework-managed JSON buffering to 2 MiB,
+exactly 2,097,152 bytes. Valid JSON at the effective limit succeeds; one byte over returns
+HTTP 413. Malformed JSON within the limit remains HTTP 400.
+
+For standalone development or production, select decimal integer bytes at startup:
+
+```bash
+EDGEZERO__ADAPTER__JSON_BODY_LIMIT_BYTES=4194304 cargo run -p my-app-adapter-axum
+```
+
+The value must be positive and representable by the collector. Zero, signs, whitespace,
+suffixes, fractions, overflowing values, and non-Unicode values fail startup before application
+configuration or readiness. There is no unlimited sentinel, CLI flag, or manifest setting.
+The selected value is captured once per run.
+
+For explicit production embedding or a router-only server, use the fallible builder:
+
+```rust
+use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumRunOptions};
+
+let options = AxumRunOptions::new("127.0.0.1:8787".parse()?)?
+    .with_json_body_limit_bytes(4 * 1024 * 1024)?;
+let server = AxumDevServer::new(router).with_json_body_limit_bytes(4 * 1024 * 1024)?;
+```
+
+Explicit options and router builders do not merge ambient settings. `AxumRunOptions::from_env`
+is the deliberate environment-driven alternative. The low-level `into_core_request` converter
+attaches the finite default without reading this environment setting.
+
+Ordinary `Json` and `ValidatedJson` use the selected ceiling, including overrides above the
+portable 8 MiB fallback. Explicit JSON caps take the minimum of the caller cap and native ceiling.
+JSON helpers enforce it regardless of Content-Type; generic buffered helpers enforce it for the
+original `application/json` or `application/*+json` ingress classification. Ordinary Form retains
+its 1 MiB caller cap. Header/extension mutation and context reconstruction cannot loosen policy.
+
+Taken streams and proxy forwarding receive no new aggregate size cap. Manual body collection
+keeps its supplied cap and existing 400 overflow behavior. The ceiling bounds logical buffered
+body bytes, not parsed JSON allocations, host buffers, concurrent requests, or process memory.
+It does not promise client receipt or keep-alive reuse after rejection.
+
 ## Outbound HTTP
 
 The Axum adapter injects `AxumOutboundClient`, backed by `reqwest`. Application handlers use the

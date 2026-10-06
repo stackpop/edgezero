@@ -11,7 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
 use bytes::Bytes;
-use edgezero_core::body::{Body, BodyStream};
+use edgezero_core::body::{Body, BodyContent, BodyStream};
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderMap, Method, Response, StatusCode};
 use edgezero_core::response_egress::{
@@ -265,9 +265,9 @@ where
 }
 
 fn body_source(body: Body) -> BodyStream {
-    match body {
-        Body::Once(bytes) => stream::once(async move { Ok(bytes) }).boxed_local(),
-        Body::Stream(source) => source,
+    match body.into_content() {
+        BodyContent::Once(bytes) => stream::once(async move { Ok(bytes) }).boxed_local(),
+        BodyContent::Stream(source) => source,
     }
 }
 

@@ -93,9 +93,10 @@ where
 pub fn response_with_body(status: StatusCode, body: Body) -> Result<Response, EdgeError> {
     use crate::http::response_builder;
 
+    let plain_body = Body::from(body.into_content());
     let mut builder = response_builder().status(status);
 
-    if let Body::Once(bytes) = &body
+    if let Some(bytes) = plain_body.as_bytes()
         && !bytes.is_empty()
     {
         builder = builder
@@ -106,12 +107,28 @@ pub fn response_with_body(status: StatusCode, body: Body) -> Result<Response, Ed
             );
     }
 
-    builder.body(body).map_err(EdgeError::internal)
+    builder.body(plain_body).map_err(EdgeError::internal)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_response_is_normalized_without_copying_or_enforcing_ingress_policy() {
+        use bytes::Bytes;
+        use std::num::NonZeroUsize;
+        let bytes = Bytes::from_static(b"reply");
+        let tagged = Body::from_bytes(bytes.clone())
+            .with_buffered_json_policy(NonZeroUsize::new(1).expect("cap"), true);
+        let response = response_with_body(StatusCode::OK, tagged).expect("response");
+        assert!(matches!(response.body(), Body::Once(_)));
+        assert_eq!(
+            response.body().as_bytes().expect("bytes").as_ptr(),
+            bytes.as_ptr()
+        );
+        assert_eq!(response.headers()[CONTENT_LENGTH], "5");
+    }
 
     #[test]
     fn response_with_body_sets_length_and_type() {

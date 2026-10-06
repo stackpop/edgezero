@@ -689,6 +689,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "log",
+ "mime",
  "redb",
  "reqwest",
  "serde",

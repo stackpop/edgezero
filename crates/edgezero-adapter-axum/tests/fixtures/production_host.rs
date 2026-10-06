@@ -19,8 +19,9 @@ use edgezero_adapter_axum::dev_server::{
 };
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
-use edgezero_core::extractor::{AppConfig, State};
+use edgezero_core::extractor::{AppConfig, Json, State};
 use edgezero_core::key_value_store::KvHandle;
+use edgezero_core::params::PathParams;
 use edgezero_core::probe::{self, LifecyclePhase, LifecycleReader};
 use edgezero_core::router::RouterService;
 use edgezero_core::{Body, EdgeError, MonotonicClock, MonotonicInstant, action};
@@ -36,6 +37,7 @@ struct FixtureApp;
 )]
 impl Hooks for FixtureApp {
     fn configure(app: &mut App) -> Result<(), EdgeError> {
+        println!("HOOK_ENTERED");
         if mode() == "hook-error" {
             return Err(EdgeError::internal(anyhow::anyhow!("HOOK_SENTINEL")));
         }
@@ -52,6 +54,11 @@ impl Hooks for FixtureApp {
 
     fn routes() -> RouterService {
         RouterService::builder()
+            .post("/json", buffered_json)
+            .post("/json-explicit", explicit_json)
+            .post("/json-small", small_json)
+            .post("/generic", generic_body)
+            .post("/taken", taken_body)
             .get("/ready", probe::readiness)
             .get("/live", probe::liveness)
             .get("/state", fixture::state)
@@ -97,6 +104,53 @@ impl Hooks for FixtureApp {
             }),
         }
     }
+}
+
+#[action]
+async fn buffered_json(Json(value): Json<String>) -> Result<String, EdgeError> {
+    println!("JSON_HANDLER_ENTERED");
+    Ok(value.len().to_string())
+}
+
+#[action]
+async fn explicit_json(ctx: RequestContext) -> Result<String, EdgeError> {
+    let value: String = ctx.json_within(16 * 1024 * 1024).await?;
+    Ok(value.len().to_string())
+}
+
+#[action]
+async fn small_json(ctx: RequestContext) -> Result<String, EdgeError> {
+    let value: String = ctx.json_within(32).await?;
+    Ok(value.len().to_string())
+}
+
+#[action]
+async fn generic_body(mut ctx: RequestContext) -> Result<String, EdgeError> {
+    ctx.headers_mut().clear();
+    ctx.extensions_mut().clear();
+    let request = ctx.into_request()?;
+    let reconstructed = RequestContext::new(request, PathParams::default());
+    Ok(reconstructed
+        .body_bytes(16 * 1024 * 1024)
+        .await?
+        .len()
+        .to_string())
+}
+
+#[action]
+async fn taken_body(ctx: RequestContext) -> Result<String, EdgeError> {
+    use futures::StreamExt as _;
+    let mut source = ctx
+        .take_body()?
+        .into_stream()
+        .ok_or_else(|| EdgeError::bad_request("expected stream"))?;
+    let mut bytes = 0_usize;
+    while let Some(chunk) = source.next().await {
+        bytes = bytes
+            .checked_add(chunk?.len())
+            .ok_or_else(|| EdgeError::bad_request("fixture accounting overflow"))?;
+    }
+    Ok(bytes.to_string())
 }
 
 struct WorkGuard(&'static str);
@@ -281,6 +335,9 @@ fn main() -> anyhow::Result<()> {
     if selected.starts_with("embedding") {
         let address: SocketAddr = env::var("FIXTURE_BIND")?.parse()?;
         let mut options = AxumRunOptions::new(address)?;
+        if let Ok(raw) = env::var("FIXTURE_JSON_LIMIT") {
+            options = options.with_json_body_limit_bytes(raw.parse()?)?;
+        }
         if selected == "embedding" {
             options = options
                 .with_config_dir(env::var("FIXTURE_CONFIG_ROOT")?)?

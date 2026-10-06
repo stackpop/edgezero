@@ -50,7 +50,7 @@ pub mod store_registry;
 pub mod test_env;
 pub mod time;
 
-pub use body::{Body, BodyStream};
+pub use body::{Body, BodyContent, BodyStream};
 pub use compression::{
     BROTLI_DECODER_FIXED_CHARGE_BYTES, ContentEncoding, FLATE_DECODER_FIXED_CHARGE_BYTES,
     PassthroughReason, brotli_decoder_memory_charge, classify_content_encoding,

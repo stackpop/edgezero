@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::Url;
 
-use crate::body::{Body, BodyStream};
+use crate::body::{Body, BodyContent, BodyStream};
 use crate::compression::ContentEncoding;
 use crate::error::{BadGatewayDecodeReason, BadGatewayReason, EdgeError, ResponseLimitReason};
 use crate::http::header::{
@@ -148,6 +148,10 @@ pub enum OutboundBatchTermination {
 /// `Finished(Completed)`; completion is not inferred from the number of items observed.
 #[derive(Debug)]
 #[non_exhaustive]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the body carrier adds one word to terminal items; preserve the public unboxed batch contract"
+)]
 pub enum OutboundBatchNext {
     /// The batch reached its normal or cutoff terminal state.
     Finished(OutboundBatchTermination),
@@ -535,9 +539,9 @@ impl OutboundResponse {
     /// Returns a typed source error or `BufferedBody` response-limit error.
     #[inline]
     pub async fn into_bytes_bounded(self, max: u64) -> Result<Bytes, EdgeError> {
-        match self.body {
-            Body::Once(bytes) => validate_buffered_response_bytes(bytes, max),
-            Body::Stream(stream) => collect_response_stream(stream, max).await,
+        match self.body.into_content() {
+            BodyContent::Once(bytes) => validate_buffered_response_bytes(bytes, max),
+            BodyContent::Stream(stream) => collect_response_stream(stream, max).await,
         }
     }
 
@@ -554,13 +558,13 @@ impl OutboundResponse {
     ) -> Result<Bytes, EdgeError> {
         let clock = self.monotonic_clock.clone();
         ensure_deadline_live(deadline, &clock)?;
-        match self.body {
-            Body::Once(bytes) => {
+        match self.body.into_content() {
+            BodyContent::Once(bytes) => {
                 let outcome = validate_buffered_response_bytes(bytes, max);
                 ensure_deadline_live(deadline, &clock)?;
                 outcome
             }
-            Body::Stream(stream) => {
+            BodyContent::Stream(stream) => {
                 collect_response_stream_until_with_clock(stream, max, deadline, &clock).await
             }
         }
@@ -609,7 +613,7 @@ impl OutboundResponse {
     where
         Value: DeserializeOwned,
     {
-        let Body::Once(bytes) = &self.body else {
+        let Some(bytes) = self.body.as_bytes() else {
             return Err(EdgeError::bad_gateway_with_reason(
                 "response body not buffered; use json_bounded(max) or json_bounded_until(max, deadline)",
                 BadGatewayReason::Protocol,
@@ -667,7 +671,7 @@ impl OutboundResponse {
         monotonic_clock: MonotonicClock,
     ) -> Self {
         Self {
-            body,
+            body: body.into_content().into(),
             headers,
             monotonic_clock,
             request_method,
@@ -696,7 +700,7 @@ impl OutboundRequest {
     where
         BodyValue: Into<Body>,
     {
-        self.body = body.into();
+        self.body = body.into().into_content().into();
         self
     }
 
@@ -736,7 +740,7 @@ impl OutboundRequest {
     pub fn from_parts(parts: OutboundRequestParts) -> Result<Self, EdgeError> {
         let canonical_uri = canonicalize_typed_uri(&parts.uri)?;
         Ok(Self {
-            body: parts.body,
+            body: parts.body.into_content().into(),
             cache_policy: parts.cache_policy,
             deadline: parts.deadline,
             headers: parts.headers,
@@ -775,7 +779,7 @@ impl OutboundRequest {
     pub fn from_request(request: Request, target: Uri) -> Result<Self, EdgeError> {
         let (parts, body) = request.into_parts();
         let mut outbound = Self::new(parts.method, target)?;
-        outbound.body = body;
+        outbound.body = body.into_content().into();
         outbound.headers = parts.headers;
         normalize_request_headers(&mut outbound.headers)?;
         Ok(outbound)
@@ -1321,14 +1325,14 @@ pub fn validate_for_dispatch(request: &OutboundRequest) -> Result<(), EdgeError>
     }
 
     if matches!(request.method, Method::GET | Method::HEAD) {
-        match &request.body {
-            Body::Once(bytes) if bytes.is_empty() => {}
-            Body::Once(_) => {
+        match request.body.as_bytes() {
+            Some([]) => {}
+            Some(_) => {
                 return Err(EdgeError::bad_request(
                     "GET/HEAD request must not carry a body",
                 ));
             }
-            Body::Stream(_) => {
+            None => {
                 return Err(EdgeError::bad_request(
                     "GET/HEAD request must not carry a streamed body; emptiness cannot be determined without consuming the stream",
                 ));
@@ -1793,6 +1797,44 @@ mod tests {
                 Ok(response_with_body(Body::empty())),
             ),
         )
+    }
+
+    #[test]
+    fn managed_outbound_inputs_strip_policy_and_preserve_bytes() {
+        use std::num::NonZeroUsize;
+        let bytes = Bytes::from_static(b"\"value\"");
+        let tagged = || {
+            Body::from_bytes(bytes.clone())
+                .with_buffered_json_policy(NonZeroUsize::new(1).expect("cap"), true)
+        };
+        let request = OutboundRequest::post("https://example.com/")
+            .expect("target")
+            .body(tagged());
+        let parts = request.into_parts();
+        assert!(matches!(&parts.body, Body::Once(_)));
+        let rebuilt = OutboundRequest::from_parts(parts).expect("parts");
+        assert!(matches!(rebuilt.into_parts().body, Body::Once(_)));
+        let inbound = request_builder()
+            .method(Method::POST)
+            .body(tagged())
+            .expect("inbound");
+        let forwarded =
+            OutboundRequest::from_request(inbound, "https://example.com/".parse().expect("target"))
+                .expect("forward");
+        assert!(matches!(forwarded.into_parts().body, Body::Once(_)));
+        let response = OutboundResponse::new(
+            Method::GET,
+            StatusCode::OK,
+            HeaderMap::new(),
+            tagged(),
+            MonotonicClock::default(),
+        );
+        assert!(matches!(response.body(), Body::Once(_)));
+        assert_eq!(
+            response.body().as_bytes().expect("bytes").as_ptr(),
+            bytes.as_ptr()
+        );
+        assert_eq!(response.json::<String>().expect("JSON"), "value");
     }
 
     #[test]

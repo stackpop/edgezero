@@ -14,7 +14,7 @@ use validator::Validate;
 use crate::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
 use crate::blob_envelope::{BlobEnvelope, BlobEnvelopeError};
 use crate::config_store::{ConfigExtractionLimits, ConfigStoreError, ConfigStoreHandle};
-use crate::context::{DEFAULT_INBOUND_FORM_BYTES, DEFAULT_INBOUND_JSON_BYTES, RequestContext};
+use crate::context::{DEFAULT_INBOUND_FORM_BYTES, RequestContext};
 use crate::error::{EdgeError, StoreExtractionReason};
 use crate::http::HeaderMap;
 use crate::secret_store::SecretError;
@@ -39,7 +39,7 @@ where
 {
     #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        ctx.json_within(DEFAULT_INBOUND_JSON_BYTES).await.map(Json)
+        ctx.json_within(ctx.json_body_default()).await.map(Json)
     }
 }
 

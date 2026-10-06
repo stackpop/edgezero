@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 
 use axum::http::Response;
 use bytes::Bytes;
-use edgezero_core::body::{Body, BodyStream};
+use edgezero_core::body::{Body, BodyContent, BodyStream};
 use edgezero_core::http::{Method, Response as CoreResponse, StatusCode};
 use edgezero_core::response_egress::{
     RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt, ResponseEgressEnvelope,
@@ -268,13 +268,13 @@ impl AxumEgressBody {
             return Err(Box::new(attempt));
         }
         let (source, inferred_length) = if transmits_body {
-            match body {
-                Body::Once(bytes) if bytes.is_empty() => (ResponseSource::Done, Some(0)),
-                Body::Once(bytes) => {
+            match body.into_content() {
+                BodyContent::Once(bytes) if bytes.is_empty() => (ResponseSource::Done, Some(0)),
+                BodyContent::Once(bytes) => {
                     let length = u64::try_from(bytes.len()).ok();
                     (ResponseSource::Once(Some(bytes)), length)
                 }
-                Body::Stream(stream) => (ResponseSource::Stream(stream), None),
+                BodyContent::Stream(stream) => (ResponseSource::Stream(stream), None),
             }
         } else {
             drop(body);

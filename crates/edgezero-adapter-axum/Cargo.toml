@@ -21,6 +21,7 @@ axum = [
     "dep:http-body",
     "dep:hyper",
     "dep:hyper-util",
+    "dep:mime",
     "dep:reqwest",
     "dep:redb",
 ]
@@ -51,6 +52,7 @@ http-body = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 log = { workspace = true }
+mime = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

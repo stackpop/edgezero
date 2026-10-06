@@ -10,7 +10,7 @@
 #[path = "fastly_response_abi.rs"]
 mod fastly_abi;
 
-use edgezero_core::body::Body;
+use edgezero_core::body::{Body, BodyContent};
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderMap, Method, Response, StatusCode, Uri};
 use edgezero_core::response_egress::{
@@ -474,9 +474,9 @@ fn pump_body<Sink>(
 where
     Sink: EgressSink,
 {
-    match body {
-        Body::Once(bytes) => write_chunk(bytes.as_ref(), sink, deadline, attempt, clock),
-        Body::Stream(mut source) => loop {
+    match body.into_content() {
+        BodyContent::Once(bytes) => write_chunk(bytes.as_ref(), sink, deadline, attempt, clock),
+        BodyContent::Stream(mut source) => loop {
             ensure_deadline(deadline, clock)?;
             let next = executor::block_on(source.next());
             ensure_deadline(deadline, clock)?;

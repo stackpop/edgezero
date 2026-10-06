@@ -4,7 +4,7 @@ use bytes::Bytes;
 use core::num::NonZeroU64;
 use core::task::Poll;
 use core::time::Duration;
-use edgezero_core::body::{Body, BodyStream};
+use edgezero_core::body::{Body, BodyContent, BodyStream};
 use edgezero_core::compression::{
     ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_deflate_stream,
     decode_gzip_stream,
@@ -267,8 +267,8 @@ async fn collect_request_body(
     budget: DispatchBudget,
     clock: &MonotonicClock,
 ) -> Result<Bytes, EdgeError> {
-    match body {
-        Body::Once(bytes) => {
+    match body.into_content() {
+        BodyContent::Once(bytes) => {
             let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             if length > maximum {
                 return Err(EdgeError::bad_request(
@@ -278,7 +278,7 @@ async fn collect_request_body(
             budget_remaining(budget, clock)?;
             Ok(bytes)
         }
-        Body::Stream(mut source) => {
+        BodyContent::Stream(mut source) => {
             let mut collected = Vec::new();
             let mut total = 0_u64;
             loop {

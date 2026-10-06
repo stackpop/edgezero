@@ -7,6 +7,8 @@
     reason = "compatibility entrypoints, normalization, native ownership and startup policy remain grouped by responsibility"
 )]
 
+use std::env::vars_os;
+use std::ffi::OsString;
 use std::fs;
 use std::future;
 use std::future::Future;
@@ -19,7 +21,7 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 
 pub use crate::run_options::AxumRunOptions;
-use crate::run_options::{failure, shutdown_grace};
+use crate::run_options::{JsonBodyLimit, failure, shutdown_grace};
 use anyhow::Context as _;
 use edgezero_core::probe::LifecyclePhase;
 use std::time::Duration;
@@ -133,6 +135,7 @@ struct Stores {
 /// Blocking dev server runner used by the `EdgeZero` CLI.
 pub struct AxumDevServer {
     config: AxumDevServerConfig,
+    json_body_limit: JsonBodyLimit,
     router: RouterService,
     stores: Stores,
 }
@@ -143,6 +146,7 @@ impl AxumDevServer {
     pub fn new(router: RouterService) -> Self {
         Self {
             config: AxumDevServerConfig::default(),
+            json_body_limit: JsonBodyLimit::DEFAULT,
             router,
             stores: Stores::default(),
         }
@@ -156,13 +160,14 @@ impl AxumDevServer {
             router,
             config,
             stores,
+            json_body_limit,
         } = self;
         run_local(
             ListenerSource::Bind(config.addr),
             config.enable_ctrl_c,
             Duration::from_secs(10),
             future::pending::<()>(),
-            async move { prepare_transport(App::new(router), stores.into()) },
+            async move { prepare_transport(App::new(router), stores.into(), json_body_limit) },
         )
     }
 
@@ -172,8 +177,16 @@ impl AxumDevServer {
             router,
             config,
             stores,
+            json_body_limit,
         } = self;
-        serve_with_stores(App::new(router), listener, config.enable_ctrl_c, stores).await
+        serve_with_stores(
+            App::new(router),
+            listener,
+            config.enable_ctrl_c,
+            stores,
+            json_body_limit,
+        )
+        .await
     }
 
     #[must_use]
@@ -181,9 +194,20 @@ impl AxumDevServer {
     pub fn with_config(router: RouterService, config: AxumDevServerConfig) -> Self {
         Self {
             config,
+            json_body_limit: JsonBodyLimit::DEFAULT,
             router,
             stores: Stores::default(),
         }
+    }
+
+    /// Selects the ceiling for framework-managed JSON buffering, in bytes.
+    ///
+    /// # Errors
+    /// Rejects zero and values above the collector's representable capacity.
+    #[inline]
+    pub fn with_json_body_limit_bytes(mut self, limit: usize) -> anyhow::Result<Self> {
+        self.json_body_limit = JsonBodyLimit::new(limit)?;
+        Ok(self)
     }
 
     #[must_use]
@@ -354,6 +378,7 @@ async fn serve_with_stores(
     listener: TokioTcpListener,
     enable_ctrl_c: bool,
     stores: Stores,
+    json_body_limit: JsonBodyLimit,
 ) -> anyhow::Result<()> {
     struct ShutdownOnDrop(Option<ShutdownSender<()>>);
 
@@ -376,6 +401,7 @@ async fn serve_with_stores(
             native_listener,
             enable_ctrl_c,
             stores,
+            json_body_limit,
             shutdown_receiver,
         )
     });
@@ -390,6 +416,7 @@ fn serve_local(
     std_listener: StdTcpListener,
     enable_ctrl_c: bool,
     stores: Stores,
+    json_body_limit: JsonBodyLimit,
     shutdown_receiver: ShutdownReceiver<()>,
 ) -> anyhow::Result<()> {
     run_local(
@@ -399,11 +426,11 @@ fn serve_local(
         async move {
             let _closed = shutdown_receiver.await;
         },
-        async move { prepare_transport(app, stores.into()) },
+        async move { prepare_transport(app, stores.into(), json_body_limit) },
     )
 }
 
-type PreparedApp = (App, PreparedStores, Arc<reqwest::Client>);
+type PreparedApp = (App, PreparedStores, Arc<reqwest::Client>, JsonBodyLimit);
 
 enum ListenerSource {
     Bind(SocketAddr),
@@ -432,10 +459,14 @@ fn adopt_listener(source: ListenerSource) -> anyhow::Result<TokioTcpListener> {
         .map_err(|_error| failure("bind", "listener", "runtime adoption failed"))
 }
 
-fn prepare_transport(app: App, stores: PreparedStores) -> anyhow::Result<PreparedApp> {
+fn prepare_transport(
+    app: App,
+    stores: PreparedStores,
+    json_body_limit: JsonBodyLimit,
+) -> anyhow::Result<PreparedApp> {
     let transport = AxumOutboundClient::try_transport()
         .map_err(|_error| failure("transport", "HTTP client", "initialization failed"))?;
-    Ok((app, stores, transport))
+    Ok((app, stores, transport, json_body_limit))
 }
 
 struct Signals {
@@ -557,8 +588,9 @@ where
         }
         prepared = &mut prepare => prepared?,
     };
-    let (app, stores, transport) = prepared;
-    let mut service = AxumServiceState::with_transport(app, transport).with_phase(reader.clone());
+    let (app, stores, transport, json_body_limit) = prepared;
+    let mut service = AxumServiceState::with_transport(app, transport, json_body_limit)
+        .with_phase(reader.clone());
     if let Some(registry) = stores.config {
         service = service.with_config_registry(registry);
     }
@@ -677,7 +709,7 @@ fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
 /// binding, or connection serving fails.
 #[inline]
 pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
-    let env = EnvConfig::from_env();
+    let (env, json_body_limit) = capture_dev_environment(vars_os())?;
     let grace = shutdown_grace(&env)?;
     let resolution = resolve_addr(&env);
     run_local(
@@ -701,9 +733,38 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
                 config: build_config_registry(metadata.config, &env),
                 secrets: build_secret_registry(metadata.secrets, &env),
             };
-            prepare_transport(app, stores)
+            prepare_transport(app, stores, json_body_limit)
         },
     )
+}
+
+fn capture_dev_environment<I>(vars: I) -> anyhow::Result<(EnvConfig, JsonBodyLimit)>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut pairs = Vec::new();
+    for (os_key, os_value) in vars {
+        let Some(key) = os_key.to_str() else {
+            continue;
+        };
+        let recognized = key
+            .strip_prefix("EDGEZERO__")
+            .is_some_and(|path| path.eq_ignore_ascii_case("ADAPTER__JSON_BODY_LIMIT_BYTES"));
+        match os_value.to_str() {
+            Some(value) => pairs.push((key.to_owned(), value.to_owned())),
+            None if recognized => {
+                return Err(failure(
+                    "settings",
+                    "JSON_BODY_LIMIT_BYTES",
+                    "non-Unicode value",
+                ));
+            }
+            None => {}
+        }
+    }
+    let env = EnvConfig::from_vars(pairs);
+    let limit = JsonBodyLimit::from_config(&env)?;
+    Ok((env, limit))
 }
 
 fn init_logging<A: Hooks>(level: LevelFilter) {
@@ -829,7 +890,7 @@ where
                 );
                 failure("initializer", "application", &category)
             })?;
-            Ok((app, stores, transport))
+            Ok((app, stores, transport, options.json_body_limit()))
         },
     )
 }
@@ -1180,6 +1241,68 @@ mod tests {
     }
 
     #[test]
+    fn json_limit_development_capture_and_explicit_router_builder() {
+        let (env, selected) = capture_dev_environment([
+            (
+                OsString::from("EDGEZERO__ADAPTER__HOST"),
+                OsString::from("invalid-host"),
+            ),
+            (
+                OsString::from("EDGEZERO__ADAPTER__JSON_BODY_LIMIT_BYTES"),
+                OsString::from("64"),
+            ),
+        ])
+        .expect("permissive bind and strict JSON option");
+        assert_eq!(selected.get().get(), 64);
+        assert_eq!(resolve_addr(&env).addr.ip(), addr::DEFAULT_HOST);
+        let router = RouterService::builder().build();
+        let default = AxumDevServer::new(router.clone());
+        assert_eq!(default.json_body_limit.get().get(), 0x0020_0000);
+        let explicit = AxumDevServer::with_config(router, AxumDevServerConfig::default())
+            .with_json_body_limit_bytes(64)
+            .expect("builder");
+        let prepared = prepare_transport(
+            App::new(explicit.router),
+            explicit.stores.into(),
+            explicit.json_body_limit,
+        )
+        .expect("prepared transport");
+        assert_eq!(prepared.3.get().get(), 64);
+        assert!(
+            AxumDevServer::new(RouterService::builder().build())
+                .with_json_body_limit_bytes(0)
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn development_capture_skips_unrelated_binary_settings_but_rejects_binary_json_limit() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let binary = OsString::from_vec(vec![0xff]);
+        let (env, selected) = capture_dev_environment([
+            (binary.clone(), OsString::from("ignored")),
+            (OsString::from("UNRELATED"), binary.clone()),
+            (OsString::from("EDGEZERO__ADAPTER__HOST"), binary.clone()),
+            (
+                OsString::from("EDGEZERO__STORES__KV__DEFAULT__NAME"),
+                binary.clone(),
+            ),
+        ])
+        .expect("unrelated omissions");
+        assert_eq!(selected.get().get(), 0x0020_0000);
+        assert!(env.adapter_host().is_none());
+        assert_eq!(env.store_name("kv", "default"), "default");
+        let error = capture_dev_environment([(
+            OsString::from("EDGEZERO__ADAPTER__JSON_BODY_LIMIT_BYTES"),
+            binary,
+        )])
+        .expect_err("recognized binary setting");
+        assert!(error.to_string().contains("JSON_BODY_LIMIT_BYTES"));
+        assert_eq!(error.chain().count(), 1);
+    }
+
+    #[test]
     fn dev_server_new_uses_default_config() {
         use edgezero_core::router::RouterService;
 
@@ -1187,6 +1310,66 @@ mod tests {
         let server = AxumDevServer::new(router);
         assert_eq!(server.config.addr.port(), 8787);
         assert!(server.config.enable_ctrl_c);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn router_only_default_json_boundary_for_both_constructors() {
+        use edgezero_core::action;
+        use edgezero_core::extractor::Json;
+        use edgezero_core::http::StatusCode;
+        #[action]
+        async fn count_json(Json(value): Json<String>) -> String {
+            value.len().to_string()
+        }
+        let limit = 0x0020_0000_usize;
+        for configured in [false, true] {
+            let listener = TokioTcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener");
+            let addr = listener.local_addr().expect("address");
+            let router = RouterService::builder().post("/json", count_json).build();
+            let server = if configured {
+                AxumDevServer::with_config(
+                    router,
+                    AxumDevServerConfig {
+                        addr,
+                        enable_ctrl_c: false,
+                    },
+                )
+            } else {
+                AxumDevServer::new(router)
+            };
+            let serving = tokio::spawn(async move { server.run_with_listener(listener).await });
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("client");
+            for (bytes, status) in [
+                (limit, StatusCode::OK),
+                (limit.saturating_add(1), StatusCode::PAYLOAD_TOO_LARGE),
+            ] {
+                let body = format!(
+                    "\"{}\"",
+                    "x".repeat(bytes.checked_sub(2).expect("delimiters"))
+                );
+                let response = client
+                    .post(format!("http://{addr}/json"))
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .expect("prebound listener request");
+                assert_eq!(response.status(), status);
+                let text = response.text().await.expect("usable response");
+                if status == StatusCode::OK {
+                    assert_eq!(text, limit.checked_sub(2).expect("length").to_string());
+                } else {
+                    assert!(text.contains("payload_too_large"));
+                }
+            }
+            serving.abort();
+            assert!(serving.await.expect_err("cancel server").is_cancelled());
+        }
     }
 
     #[test]
