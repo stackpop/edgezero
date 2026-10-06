@@ -31,7 +31,7 @@ cli = [
     "dep:toml",
     "dep:walkdir",
 ]
-test-utils = []
+test-utils = ["dep:serde", "dep:validator"]
 
 [dependencies]
 edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = [
@@ -53,7 +53,9 @@ hyper-util = { workspace = true, optional = true }
 log = { workspace = true }
 redb = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 serde_json = { workspace = true }
+validator = { workspace = true, optional = true }
 simple_logger = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
@@ -61,6 +63,12 @@ toml = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tracing = { workspace = true }
 walkdir = { workspace = true, optional = true }
+
+[[bin]]
+name = "edgezero-hosting-fixture"
+path = "tests/fixtures/production_host.rs"
+required-features = ["axum", "test-utils"]
+test = false
 
 [dev-dependencies]
 async-trait = { workspace = true }

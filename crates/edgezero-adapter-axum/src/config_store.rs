@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read as _};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -106,23 +106,54 @@ impl AxumConfigStore {
     /// exists but cannot be read or parsed.
     #[inline]
     pub fn from_path(path: &Path) -> Result<Self, ConfigStoreError> {
-        let raw = match fs::read_to_string(path) {
-            Ok(raw) => raw,
-            Err(err) if err.kind() == ErrorKind::NotFound => {
+        Self::load_snapshot(path, false)
+    }
+
+    pub(crate) fn from_required_path(path: &Path) -> Result<Self, ConfigStoreError> {
+        Self::load_snapshot(path, true)
+    }
+
+    #[expect(
+        clippy::verbose_file_reads,
+        reason = "read the same opened file whose regular-file metadata was verified"
+    )]
+    fn load_snapshot(path: &Path, required: bool) -> Result<Self, ConfigStoreError> {
+        // Follow projected-mount symlinks. Reject non-regular targets before opening
+        // so a declared FIFO cannot stall startup. Roots are trusted deployment inputs.
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound && !required => {
                 return Ok(Self::empty());
             }
-            Err(err) => {
-                return Err(ConfigStoreError::unavailable(format!(
-                    "failed to read {}: {err}",
-                    path.display()
-                )));
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(ConfigStoreError::unavailable("config file missing"));
             }
+            Err(_error) => return Err(ConfigStoreError::unavailable("config file unreadable")),
         };
-        let data: HashMap<String, String> = serde_json::from_str(&raw).map_err(|err| {
-            ConfigStoreError::unavailable(format!(
-                "{} is not a flat string -> string JSON object: {err}",
-                path.display()
-            ))
+        if !metadata.is_file() {
+            return Err(ConfigStoreError::unavailable(
+                "config target is not a regular file",
+            ));
+        }
+        let mut file = fs::File::open(path)
+            .map_err(|_error| ConfigStoreError::unavailable("config file unreadable"))?;
+        if !file
+            .metadata()
+            .map_err(|_error| ConfigStoreError::unavailable("config file unreadable"))?
+            .is_file()
+        {
+            return Err(ConfigStoreError::unavailable(
+                "config target is not a regular file",
+            ));
+        }
+        let mut raw = String::new();
+        file.read_to_string(&mut raw).map_err(|_error| {
+            ConfigStoreError::unavailable("config file unreadable or invalid UTF-8")
+        })?;
+        let data: HashMap<String, String> = serde_json::from_str(&raw).map_err(|_error| {
+            ConfigStoreError::unavailable(
+                "config file malformed: expected a flat string -> string JSON object",
+            )
         })?;
         Ok(Self {
             data,

@@ -345,6 +345,7 @@ impl RouterBuilder {
     }
 }
 
+#[derive(Clone)]
 struct RouterInner {
     manifest_json: Option<Arc<str>>,
     middlewares: Vec<BoxMiddleware>,
@@ -526,6 +527,15 @@ impl RouterService {
                 Err(EdgeError::not_found(resolved.path))
             }
         }
+    }
+
+    pub(crate) fn insert_state<T>(&mut self, value: T)
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        Arc::make_mut(&mut self.inner)
+            .state_extensions
+            .insert(value);
     }
 
     fn new(

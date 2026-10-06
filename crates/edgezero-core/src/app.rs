@@ -283,6 +283,19 @@ impl App {
         self.ingress_head_limits
     }
 
+    /// Registers typed handler state during startup, before ingress admission or serving.
+    ///
+    /// Same-type insertion replaces previous state for this App only. Shared routers
+    /// fork on write, preserving routes and peer Apps. Previously resolved or admitted
+    /// dispatch tokens are invalid for this App after insertion. This is not live reload.
+    #[inline]
+    pub fn insert_state<T>(&mut self, value: T)
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.router.insert_state(value);
+    }
+
     /// Consume the app and return the contained router service.
     #[must_use]
     #[inline]
@@ -2432,6 +2445,60 @@ mod tests {
             .expect("request");
         let response = block_on(app.dispatch_admitted(prepared, request));
         assert_eq!(complete_envelope(response).status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn startup_state_forks_router_and_invalidates_old_admission() {
+        use crate::extractor::State;
+
+        #[crate::action]
+        async fn state(State(value): State<Arc<str>>) -> Result<String, EdgeError> {
+            Ok(value.to_string())
+        }
+
+        let router = RouterService::builder()
+            .get("/state/{id}", state)
+            .with_state(Arc::<str>::from("builder"))
+            .build();
+        let peer = App::new(router.clone());
+        let mut app = App::new(router);
+        let head = || {
+            IngressHeadParts::new(
+                Method::GET,
+                "/state/42".parse().expect("URI"),
+                Version::HTTP_11,
+                HeaderMap::new(),
+            )
+        };
+        let IngressBeginOutcome::Admitted(old) = app
+            .begin_ingress(head(), MonotonicInstant::now())
+            .expect("admission")
+        else {
+            panic!("expected admission")
+        };
+        let request = || {
+            request_builder()
+                .uri("/state/42")
+                .body(Body::empty())
+                .expect("request")
+        };
+        app.insert_state(Arc::<str>::from("first"));
+        app.insert_state(Arc::<str>::from("startup"));
+        assert_eq!(app.router().routes(), peer.router().routes());
+        let rejected = complete_envelope(block_on(app.dispatch_admitted(old, request())));
+        assert_eq!(rejected.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        for _ in 0..2_u8 {
+            let IngressBeginOutcome::Admitted(new) = app
+                .begin_ingress(head(), MonotonicInstant::now())
+                .expect("admission")
+            else {
+                panic!("expected admission")
+            };
+            let response = complete_envelope(block_on(app.dispatch_admitted(new, request())));
+            assert_eq!(response.body().as_bytes().expect("body"), b"startup");
+        }
+        let response = block_on(peer.router().oneshot(request())).expect("peer response");
+        assert_eq!(response.body().as_bytes().expect("body"), b"builder");
     }
 
     #[test]

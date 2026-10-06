@@ -700,6 +700,7 @@ dependencies = [
  "toml",
  "tower",
  "tracing",
+ "validator",
  "walkdir",
 ]
 
