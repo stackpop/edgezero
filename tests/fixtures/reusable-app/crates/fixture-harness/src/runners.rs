@@ -721,7 +721,6 @@ fn provider_build(
             &root().join("target/wasm32-wasip2/release/fixture_spin.wasm"),
             run,
         )?;
-        fs::copy(package.join("spin.toml"), run.join("spin.toml"))?;
         (staged.clone(), staged)
     } else {
         let Some(builder) = executable("WORKER_BUILD_BIN", "worker-build") else {

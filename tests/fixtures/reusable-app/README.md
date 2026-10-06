@@ -194,7 +194,8 @@ are different observation points. A standard request-start sample occurs after
 initialization, while the custom callback sample occurs before it.
 
 Each run saves its lockfile, configuration, compiler/runtime identity, and binary
-fingerprints. Fingerprints identify artifacts; they are not security checksums.
+fingerprints. Built artifacts are copied into `<run>/artifacts/` right after the
+build; runtimes serve and fingerprint those copies. Fingerprints identify artifacts; they are not security checksums.
 A larger, still bounded observation run can use:
 
 ```sh

@@ -332,7 +332,7 @@ flags and exits `2` with a pointer to the typed CLI — it cannot push (see
   matched case-insensitively. Adapter-specific checks run only for `<name>`:
   app-config key syntax, adapter-manifest validation, merged store-id
   collisions, `#[secret]` reference rules, and the `--strict` capability checks
-  push always runs. Shared schema, secret-presence and strict handler-path checks still apply. A
+  (push always runs in strict mode). Shared schema, secret-presence and strict handler-path checks still apply. A
   passing push does not prove portability; run `config validate --strict` in CI
   for that.
 - `--manifest <path>` — manifest path (default: `edgezero.toml`).
