@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::error::Error as StdError;
 use std::fmt;
+use std::mem;
 use std::pin::Pin;
 use std::ptr;
 use std::rc::{Rc, Weak};
@@ -10,18 +11,23 @@ use std::task::{Context, Poll};
 use axum::http::Response;
 use bytes::Bytes;
 use edgezero_core::body::{Body, BodyStream};
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Method, Response as CoreResponse, StatusCode};
 use edgezero_core::response_egress::{
     RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET, ResponseEgressAttempt, ResponseEgressEnvelope,
     ResponseEgressFallbackDisposition, ResponseEgressOutcome,
 };
 use edgezero_core::response_egress_framing::{
-    PreparedResponseEgress, prepare_response_egress, response_egress_source_error_category,
+    PreparedResponseEgress, ResponseEgressBodyLengthError, prepare_response_egress,
+    response_egress_source_error_category,
 };
 use edgezero_core::time::{Deadline, MonotonicClock};
+use futures_util::StreamExt as _;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use tokio::sync::Notify;
+use tokio::task::yield_now;
 use tokio::time::Instant as TokioInstant;
+use tokio::time::timeout;
 
 const INTERNAL_FALLBACK_BODY: &[u8] = b"internal server error";
 const TIMEOUT_FALLBACK_BODY: &[u8] = b"response write deadline exceeded";
@@ -207,6 +213,7 @@ pub(crate) struct AxumEgressBody {
     active: Option<ActiveEgress>,
     remaining_hint: Option<u64>,
     source: ResponseSource,
+    staged_final: Option<Bytes>,
 }
 
 #[expect(
@@ -243,6 +250,7 @@ impl AxumEgressBody {
             } else {
                 ResponseSource::Once(Some(bytes))
             },
+            staged_final: None,
         }
     }
 
@@ -290,21 +298,20 @@ impl AxumEgressBody {
             }),
             remaining_hint: declared_length.or(inferred_length),
             source,
+            staged_final: None,
         })
     }
 
     fn account(&mut self, length: usize) -> Result<(), AxumBodyError> {
-        let Some(active) = self.active.as_mut() else {
-            return Ok(());
-        };
         let Ok(accepted_length) = u64::try_from(length) else {
             self.fail(ResponseEgressOutcome::TransportError);
             return Err(AxumBodyError(ResponseEgressOutcome::TransportError));
         };
-        if !active
-            .attempt
-            .account_bytes(accepted_length, active.clock.now())
-        {
+        if self.active.as_mut().is_some_and(|active| {
+            !active
+                .attempt
+                .account_bytes(accepted_length, active.clock.now())
+        }) {
             self.fail(ResponseEgressOutcome::TransportError);
             return Err(AxumBodyError(ResponseEgressOutcome::TransportError));
         }
@@ -315,6 +322,9 @@ impl AxumEgressBody {
     }
 
     fn fail(&mut self, outcome: ResponseEgressOutcome) {
+        self.source = ResponseSource::Done;
+        self.staged_final = None;
+        self.remaining_hint = Some(0);
         let Some(mut active) = self.active.take() else {
             return;
         };
@@ -334,6 +344,55 @@ impl AxumEgressBody {
             }
         }
         active.state.unregister();
+    }
+
+    fn poll_chunk(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, EdgeError>>> {
+        if self.staged_final.is_some() {
+            return self.poll_final_eof(cx);
+        }
+        let next = match &mut self.source {
+            ResponseSource::Done => Poll::Ready(None),
+            ResponseSource::Once(bytes) => {
+                let final_bytes = bytes.take();
+                self.source = ResponseSource::Done;
+                Poll::Ready(final_bytes.map(Ok))
+            }
+            ResponseSource::Stream(stream) => stream.as_mut().poll_next(cx),
+        };
+        if matches!(self.source, ResponseSource::Stream(_))
+            && let Some(remaining) = self.remaining_hint
+            && let Poll::Ready(Some(Ok(bytes))) = &next
+            && u64::try_from(bytes.len()) == Ok(remaining)
+        {
+            self.staged_final = Some(bytes.clone());
+            return self.poll_final_eof(cx);
+        }
+        next
+    }
+
+    // Hyper stops polling once Content-Length is satisfied, so validate EOF before handing it
+    // the final frame. At most that one source-controlled frame is retained during lookahead.
+    fn poll_final_eof(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, EdgeError>>> {
+        let ResponseSource::Stream(stream) = &mut self.source else {
+            return Poll::Ready(Some(Err(EdgeError::internal(anyhow::anyhow!(
+                "response EOF lookahead lost its source"
+            )))));
+        };
+        match stream.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                self.source = ResponseSource::Done;
+                Poll::Ready(self.staged_final.take().map(Ok))
+            }
+            Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(Some(Ok(_bytes))) => Poll::Ready(Some(Err(EdgeError::internal(
+                ResponseEgressBodyLengthError::Exceeded,
+            )))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+        }
     }
 
     fn finish(&mut self) {
@@ -393,7 +452,10 @@ impl HttpBody for AxumEgressBody {
     type Error = AxumBodyError;
 
     fn is_end_stream(&self) -> bool {
-        matches!(self.source, ResponseSource::Done) || self.active.is_none()
+        matches!(
+            self.source,
+            ResponseSource::Done | ResponseSource::Once(None)
+        ) && self.staged_final.is_none()
     }
 
     fn poll_frame(
@@ -415,14 +477,7 @@ impl HttpBody for AxumEgressBody {
             ))));
         }
 
-        let next = match &mut this.source {
-            ResponseSource::Done | ResponseSource::Once(None) => {
-                this.finish();
-                return Poll::Ready(None);
-            }
-            ResponseSource::Once(bytes) => Poll::Ready(bytes.take().map(Ok)),
-            ResponseSource::Stream(stream) => stream.as_mut().poll_next(cx),
-        };
+        let next = this.poll_chunk(cx);
         if !matches!(next, Poll::Pending) {
             if let Some(outcome) = this.requested_failure() {
                 this.fail(outcome);
@@ -471,7 +526,7 @@ impl HttpBody for AxumEgressBody {
 }
 
 /// Converts one owned core envelope into the private body used by `EdgeZero`'s Hyper server.
-pub(crate) fn prepare_egress_response(
+pub(crate) async fn prepare_egress_response(
     egress: ResponseEgressEnvelope,
     connection: &EgressConnection,
 ) -> Response<AxumEgressBody> {
@@ -487,8 +542,21 @@ pub(crate) fn prepare_egress_response(
                     connection,
                 );
             }
-            match start_prepared(
+            let validated = match validate_empty_stream(
                 prepared,
+                &request_method,
+                policy.write_deadline,
+                &clock,
+            )
+            .await
+            {
+                Ok(validated) => validated,
+                Err(cause) => {
+                    return prepare_fallback(&request_method, cause, attempt, &clock, connection);
+                }
+            };
+            match start_prepared(
+                validated,
                 policy.write_deadline,
                 attempt,
                 clock.clone(),
@@ -496,13 +564,20 @@ pub(crate) fn prepare_egress_response(
                 connection,
             ) {
                 Ok(response) => response,
-                Err(returned_attempt) => prepare_fallback(
-                    &request_method,
-                    ResponseEgressOutcome::ConversionError,
-                    *returned_attempt,
-                    &clock,
-                    connection,
-                ),
+                Err(returned_attempt) => {
+                    let cause = if policy.write_deadline.is_expired_at(clock.now()) {
+                        ResponseEgressOutcome::DeadlineExceeded
+                    } else {
+                        ResponseEgressOutcome::ConversionError
+                    };
+                    prepare_fallback(
+                        &request_method,
+                        cause,
+                        *returned_attempt,
+                        &clock,
+                        connection,
+                    )
+                }
             }
         }
         Err(failure) => {
@@ -510,6 +585,51 @@ pub(crate) fn prepare_egress_response(
             prepare_fallback(&request_method, cause, attempt, &clock, connection)
         }
     }
+}
+
+async fn validate_empty_stream(
+    prepared: PreparedResponseEgress,
+    request_method: &Method,
+    deadline: Deadline,
+    clock: &MonotonicClock,
+) -> Result<PreparedResponseEgress, ResponseEgressOutcome> {
+    if !prepared.transmits_body() || prepared.declared_length() != Some(0) {
+        return Ok(prepared);
+    }
+    let mut response = prepared.into_response();
+    if let Body::Stream(mut source) = mem::take(response.body_mut()) {
+        let remaining = deadline
+            .remaining_at(clock.now())
+            .ok_or(ResponseEgressOutcome::DeadlineExceeded)?;
+        let validation = async {
+            loop {
+                if deadline.is_expired_at(clock.now()) {
+                    return Err(ResponseEgressOutcome::DeadlineExceeded);
+                }
+                let next = source.next().await;
+                if deadline.is_expired_at(clock.now()) {
+                    return Err(ResponseEgressOutcome::DeadlineExceeded);
+                }
+                match next {
+                    None => return Ok(()),
+                    Some(Ok(bytes)) if bytes.is_empty() => yield_now().await,
+                    Some(Ok(_bytes)) => return Err(ResponseEgressOutcome::ConversionError),
+                    Some(Err(error)) => {
+                        log::warn!(
+                            "response-egress Axum zero-length source failed before commit: {}",
+                            response_egress_source_error_category(&error)
+                        );
+                        return Err(ResponseEgressOutcome::ConversionError);
+                    }
+                }
+            }
+        };
+        timeout(remaining, validation)
+            .await
+            .map_err(|_elapsed| ResponseEgressOutcome::DeadlineExceeded)??;
+    }
+    prepare_response_egress(request_method, response)
+        .map_err(|_error| ResponseEgressOutcome::ConversionError)
 }
 
 fn start_prepared(
@@ -547,18 +667,18 @@ fn prepare_fallback(
 ) -> Response<AxumEgressBody> {
     if !attempt.begin_fallback(cause) {
         attempt.terminate(ResponseEgressOutcome::ConversionError, clock.now());
-        return detached_fallback(ResponseEgressOutcome::ConversionError);
+        return detached_fallback(request_method, ResponseEgressOutcome::ConversionError);
     }
     let started_at = clock.now();
     let Some(fallback_deadline) = started_at.checked_add(RESPONSE_EGRESS_FALLBACK_SAFETY_BUDGET)
     else {
         attempt.finish_fallback(ResponseEgressFallbackDisposition::Aborted, clock.now());
-        return detached_fallback(cause);
+        return detached_fallback(request_method, cause);
     };
     let fallback = fallback_response(cause);
     let Ok(prepared) = prepare_response_egress(request_method, fallback) else {
         attempt.finish_fallback(ResponseEgressFallbackDisposition::Aborted, clock.now());
-        return detached_fallback(cause);
+        return detached_fallback(request_method, cause);
     };
     match start_prepared(
         prepared,
@@ -572,7 +692,7 @@ fn prepare_fallback(
         Err(mut returned_attempt) => {
             returned_attempt
                 .finish_fallback(ResponseEgressFallbackDisposition::Aborted, clock.now());
-            detached_fallback(cause)
+            detached_fallback(request_method, cause)
         }
     }
 }
@@ -584,9 +704,17 @@ fn fallback_response(cause: ResponseEgressOutcome) -> CoreResponse {
     response
 }
 
-fn detached_fallback(cause: ResponseEgressOutcome) -> Response<AxumEgressBody> {
+fn detached_fallback(
+    request_method: &Method,
+    cause: ResponseEgressOutcome,
+) -> Response<AxumEgressBody> {
     let (status, body) = fallback_parts(cause);
-    let mut response = Response::new(AxumEgressBody::detached(Bytes::from_static(body)));
+    let payload = if *request_method == Method::HEAD {
+        Bytes::new()
+    } else {
+        Bytes::from_static(body)
+    };
+    let mut response = Response::new(AxumEgressBody::detached(payload));
     *response.status_mut() = status;
     response
 }
@@ -609,19 +737,24 @@ mod tests {
 
     use bytes::Bytes;
     use edgezero_core::body::Body;
-    use edgezero_core::http::{HeaderMap, Method, StatusCode, Version};
+    use edgezero_core::http::{HeaderMap, Method, StatusCode, Version, response_builder};
     use edgezero_core::response_egress::{
         ResponseEgressAttempt, ResponseEgressCompletion, ResponseEgressHead,
         ResponseEgressObserver, ResponseEgressObserverHandle, ResponseEgressOutcome,
         ResponseEgressReport,
     };
+    use edgezero_core::response_egress_framing::prepare_response_egress;
     use edgezero_core::router::RouteMetadata;
     use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
+    use futures_util::FutureExt as _;
     use futures_util::future::poll_fn as poll_future;
     use futures_util::stream::{pending, poll_fn as poll_stream};
     use http_body::Body as _;
 
-    use super::{AxumEgressBody, EgressConnection};
+    use super::{
+        AxumEgressBody, EgressConnection, EgressKind, INTERNAL_FALLBACK_BODY,
+        TIMEOUT_FALLBACK_BODY, prepare_fallback, start_prepared,
+    };
 
     #[derive(Clone, Default)]
     struct RecordingObserver(Arc<Mutex<Vec<ResponseEgressReport>>>);
@@ -821,6 +954,166 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].bytes_written, 0);
         assert_eq!(reports[0].outcome, ResponseEgressOutcome::DeadlineExceeded);
+        assert!(connection.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_fallback_registration_preserves_get_payload_and_head_suppression() {
+        for (method, cause, payload) in [
+            (
+                Method::GET,
+                ResponseEgressOutcome::DeadlineExceeded,
+                TIMEOUT_FALLBACK_BODY,
+            ),
+            (
+                Method::HEAD,
+                ResponseEgressOutcome::DeadlineExceeded,
+                TIMEOUT_FALLBACK_BODY,
+            ),
+            (
+                Method::GET,
+                ResponseEgressOutcome::ConversionError,
+                INTERNAL_FALLBACK_BODY,
+            ),
+            (
+                Method::HEAD,
+                ResponseEgressOutcome::ConversionError,
+                INTERNAL_FALLBACK_BODY,
+            ),
+        ] {
+            let observer = RecordingObserver::default();
+            let started_at = MonotonicInstant::now();
+            let clock_polls = Arc::new(AtomicUsize::new(0));
+            let clock = MonotonicClock::new(move || {
+                let tick =
+                    u64::try_from(clock_polls.fetch_add(1, Ordering::SeqCst)).expect("clock tick");
+                started_at
+                    .checked_add(Duration::from_secs(tick * 2))
+                    .expect("clock sample")
+            });
+            let connection = EgressConnection::default();
+            let response = prepare_fallback(
+                &method,
+                cause,
+                attempt(&observer, started_at),
+                &clock,
+                &connection,
+            );
+            let status = if cause == ResponseEgressOutcome::DeadlineExceeded {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            assert_eq!(response.status(), status);
+            let mut body = Box::pin(response.into_body());
+            if method == Method::HEAD {
+                assert!(body.is_end_stream());
+                assert!(
+                    poll_future(|context| body.as_mut().poll_frame(context))
+                        .await
+                        .is_none()
+                );
+            } else {
+                assert!(!body.is_end_stream(), "detached payload is not exhausted");
+                let frame = poll_future(|context| body.as_mut().poll_frame(context))
+                    .await
+                    .expect("fallback frame")
+                    .expect("fallback result");
+                assert_eq!(frame.into_data().expect("payload"), payload);
+                assert!(
+                    body.is_end_stream(),
+                    "final detached frame exhausts the source"
+                );
+                assert!(
+                    poll_future(|context| body.as_mut().poll_frame(context))
+                        .await
+                        .is_none()
+                );
+            }
+            assert!(connection.is_empty());
+            let reports = observer.0.lock().expect("reports lock");
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].outcome, cause);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn declared_stream_is_incremental_and_releases_staged_data_on_failure() {
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let observer = RecordingObserver::default();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let source_polls = Arc::clone(&polls);
+        let drop_probe = DropProbe(Arc::clone(&drops));
+        let source = poll_stream(move |_context| {
+            let _keep_source_alive = &drop_probe;
+            match source_polls.fetch_add(1, Ordering::SeqCst) {
+                0 => Poll::Ready(Some(Ok(Bytes::from_static(b"ab")))),
+                1 => Poll::Ready(Some(Ok(Bytes::from_static(b"c")))),
+                _ => Poll::Pending,
+            }
+        });
+        let response = response_builder()
+            .header("content-length", "3")
+            .body(Body::from_stream(source))
+            .expect("response");
+        let prepared = prepare_response_egress(&Method::GET, response).expect("prepared response");
+        let started_at = MonotonicInstant::now();
+        let clock = MonotonicClock::new(move || started_at);
+        let connection = EgressConnection::default();
+        let Ok(registered_response) = start_prepared(
+            prepared,
+            clock.deadline_after(Duration::from_secs(1)),
+            attempt(&observer, started_at),
+            clock,
+            EgressKind::Application,
+            &connection,
+        ) else {
+            panic!("registered response");
+        };
+        let mut body = Box::pin(registered_response.into_body());
+
+        let first = poll_future(|context| body.as_mut().poll_frame(context))
+            .await
+            .expect("first frame")
+            .expect("valid frame");
+        assert_eq!(first.into_data().expect("data"), "ab");
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "no eager whole-body read");
+        assert!(
+            poll_future(|context| body.as_mut().poll_frame(context))
+                .now_or_never()
+                .is_none()
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        connection.signal_transport_error();
+        let error = poll_future(|context| body.as_mut().poll_frame(context))
+            .await
+            .expect("failure frame")
+            .expect_err("transport signal wins");
+        assert_eq!(error.0, ResponseEgressOutcome::TransportError);
+        assert!(body.is_end_stream());
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "failed source drops before body drop"
+        );
+        assert!(
+            poll_future(|context| body.as_mut().poll_frame(context))
+                .await
+                .is_none()
+        );
+        drop(body);
+        let reports = observer.0.lock().expect("reports lock");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].bytes_written, 2);
+        assert_eq!(reports[0].outcome, ResponseEgressOutcome::TransportError);
         assert!(connection.is_empty());
     }
 }

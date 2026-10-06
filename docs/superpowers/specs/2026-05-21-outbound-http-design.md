@@ -179,7 +179,7 @@ pub struct OutboundBatchFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum OutboundBatchTermination {
-    /// Every input slot produced exactly one terminal result.
+    /// Every input slot produced exactly one terminal result and the driver reached clean EOF.
     Completed,
     /// The observation cutoff won while one or more slots remained unresolved.
     Cutoff,
@@ -189,6 +189,7 @@ pub enum OutboundBatchTermination {
 ///
 /// After the final `Item`, callers poll once more to receive `Finished(Completed)`;
 /// completion is not inferred from the number of items observed.
+/// The final poll waits for driver EOF and still validates trailing events or finalization failures.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum OutboundBatchNext {
@@ -407,6 +408,13 @@ timeout-like unresolved slots. Dropping the batch is equivalent to `cancel()` wi
 unresolved-index report discarded. Cancellation stops observation and triggers
 strongest-available teardown, but does not claim that already-issued network side effects were
 undone.
+
+Core reports normal completion only at driver EOF after every index has resolved. Trailing
+`Failed`, duplicate or out-of-range index events remain failures even after the last slot item;
+ordered collection retains every result already observed. A driver cutoff with no unresolved
+slots is an invariant failure. Zero-slot drivers follow the same validation protocol;
+`OutboundBatch::cutoff(0)` supplies an empty driver and completes normally. Custom drivers must
+finish after their final item rather than leave finalization pending indefinitely.
 
 #### 3.1.2 App-facing handle
 
@@ -1698,7 +1706,7 @@ samples the same injected clock used for request budgets. Equality is expired. W
 wins, the driver stops yielding new terminal results, tears down or abandons unresolved work, and
 emits an explicit cutoff event. A response that was provider-ready but not observable before a
 blocking provider primitive returned remains unresolved; capability rows make that limitation
-explicit. Core infers normal completion only after every input index emits exactly once. A
+explicit. Core reports normal completion only at driver EOF after every input index emits exactly once. A
 premature driver EOF and duplicate or out-of-range indices are invariant failures returned as
 `EdgeError::Internal`; they never become `Cutoff`. An adapter that detects its own invariant
 failure emits `OutboundBatchDriverEvent::Failed` carrying that exact `EdgeError` rather than ending

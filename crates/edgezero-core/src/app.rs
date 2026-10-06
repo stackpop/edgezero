@@ -141,11 +141,12 @@ impl App {
 
     /// Construct an application from hooks after installing target metadata.
     ///
-    /// This is the sole adapter-facing assembly path. Application hooks cannot
-    /// replace construction or observe an app before its platform is installed.
+    /// This is the sole adapter-facing assembly path. Application hooks observe the installed
+    /// platform; successful configuration must preserve its complete metadata.
     ///
     /// # Errors
-    /// Returns the typed configuration error without exposing a partially configured app.
+    /// Returns the typed configuration error, or an internal error when configuration replaces
+    /// the selected platform metadata, without exposing a partially configured app.
     #[inline]
     pub fn build<A>(platform: PlatformMetadata) -> Result<Self, EdgeError>
     where
@@ -153,6 +154,11 @@ impl App {
     {
         let mut app = Self::with_name_and_platform(A::routes(), A::name(), platform);
         A::configure(&mut app)?;
+        if app.platform() != platform {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "application configuration changed adapter-selected platform metadata"
+            )));
+        }
         Ok(app)
     }
 
@@ -539,6 +545,8 @@ pub struct StoresMetadata {
 pub trait Hooks {
     /// Allow implementations to mutate the freshly constructed application before use.
     /// The default implementation performs no changes.
+    /// Successful configuration must preserve the adapter-selected [`PlatformMetadata`].
+    /// [`App::build`] rejects changed metadata rather than silently restoring it.
     ///
     /// # Errors
     /// Returns a typed startup-policy error when configuration cannot be completed.
@@ -671,6 +679,12 @@ mod tests {
 
     struct MemoryAwareHooks;
 
+    struct ReplacingHooks;
+
+    struct ReplacingFailingHooks;
+
+    struct MemoryPreservingReplacingHooks;
+
     struct TestHooks;
 
     struct CountingMiddleware(Arc<AtomicUsize>);
@@ -747,6 +761,59 @@ mod tests {
                     "platform metadata unavailable during configuration",
                 ))
             }
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test stub exercises replacement of adapter-selected metadata"
+    )]
+    impl Hooks for ReplacingHooks {
+        fn configure(app: &mut App) -> Result<(), EdgeError> {
+            *app = App::new(Self::routes());
+            Ok(())
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test stub exercises error precedence after replacing the application"
+    )]
+    impl Hooks for ReplacingFailingHooks {
+        fn configure(app: &mut App) -> Result<(), EdgeError> {
+            *app = App::new(Self::routes());
+            Err(EdgeError::service_unavailable(
+                "replacement configuration failed",
+            ))
+        }
+
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test stub changes a platform fact other than the memory ceiling"
+    )]
+    impl Hooks for MemoryPreservingReplacingHooks {
+        fn configure(app: &mut App) -> Result<(), EdgeError> {
+            let platform = app.platform();
+            let changed = PlatformMetadata::new(
+                platform.memory_ceiling(),
+                PlatformFact::unknown(PlatformUnknownReason::OperatorConfigured),
+                platform.host_ingress_memory_accounting(),
+            );
+            *app = App::build::<DefaultHooks>(changed)?;
+            Ok(())
         }
 
         fn routes() -> RouterService {
@@ -959,6 +1026,60 @@ mod tests {
             app.platform().host_ingress_memory_accounting(),
             PlatformFact::known(host_accounting, source)
         );
+    }
+
+    #[test]
+    fn build_app_rejects_replaced_platform_metadata() {
+        let platform = PlatformMetadata::new(
+            PlatformFact::known(
+                MemoryCeiling::new(128_000_000, MemoryCeilingScope::PerInstance, None),
+                PlatformResourceSource::PlatformLimit {
+                    provider: "test-platform",
+                },
+            ),
+            PlatformFact::unknown(PlatformUnknownReason::ProviderUnpublished),
+            PlatformFact::unknown(PlatformUnknownReason::ProviderUnpublished),
+        );
+        let Err(error) = App::build::<ReplacingHooks>(platform) else {
+            panic!("replaced platform metadata must stop application assembly");
+        };
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error.to_string(),
+            "internal error: application configuration changed adapter-selected platform metadata"
+        );
+    }
+
+    #[test]
+    fn build_app_preserves_hook_failure_after_platform_replacement() {
+        let platform = PlatformMetadata::new(
+            PlatformFact::unknown(PlatformUnknownReason::OperatorConfigured),
+            PlatformFact::unknown(PlatformUnknownReason::OperatorConfigured),
+            PlatformFact::unknown(PlatformUnknownReason::OperatorConfigured),
+        );
+        let Err(error) = App::build::<ReplacingFailingHooks>(platform) else {
+            panic!("configuration failure must stop application assembly");
+        };
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.message(), "replacement configuration failed");
+    }
+
+    #[test]
+    fn build_app_compares_platform_facts_beyond_the_memory_ceiling() {
+        let platform = PlatformMetadata::new(
+            PlatformFact::known(
+                MemoryCeiling::new(128_000_000, MemoryCeilingScope::PerInstance, None),
+                PlatformResourceSource::PlatformLimit {
+                    provider: "test-platform",
+                },
+            ),
+            PlatformFact::unknown(PlatformUnknownReason::ProviderUnpublished),
+            PlatformFact::unknown(PlatformUnknownReason::ProviderUnpublished),
+        );
+        let Err(error) = App::build::<MemoryPreservingReplacingHooks>(platform) else {
+            panic!("changing only population metadata must stop assembly");
+        };
+        assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

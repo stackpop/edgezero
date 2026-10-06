@@ -136,7 +136,7 @@ pub struct OutboundBatchFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum OutboundBatchTermination {
-    /// Every input slot produced exactly one terminal result.
+    /// Every input slot produced exactly one terminal result and the driver reached clean EOF.
     Completed,
     /// The method-level observation cutoff won while one or more slots remained unresolved.
     Cutoff,
@@ -146,6 +146,7 @@ pub enum OutboundBatchTermination {
 ///
 /// After the final [`Self::Item`], callers must poll once more to receive
 /// `Finished(Completed)`; completion is not inferred from the number of items observed.
+/// That poll waits for driver EOF and still validates trailing events or finalization failures.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum OutboundBatchNext {
@@ -161,6 +162,8 @@ pub enum OutboundBatchNext {
 /// method-level observation cutoff wins, or [`Self::Failed`] when the adapter cannot continue
 /// without violating an invariant. Stream EOF is valid only after every input index has emitted;
 /// premature EOF is a core invariant failure.
+/// Resolving the last slot does not end validation: trailing failures, duplicate/out-of-range
+/// indices, and a cutoff with no unresolved slots are errors, including on zero-slot drivers.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum OutboundBatchDriverEvent {
@@ -234,10 +237,14 @@ impl OutboundBatch {
     ///
     /// Adapters use this when the method-level observation cutoff is expired at batch entry. Every
     /// input index remains unresolved.
+    /// With zero slots, the driver is empty and normal completion is returned instead.
     #[must_use]
     #[inline]
     pub fn cutoff(slot_count: usize) -> Self {
-        Self::from_driver(slot_count, iter([OutboundBatchDriverEvent::Cutoff]))
+        Self::from_driver(
+            slot_count,
+            iter((slot_count != 0).then_some(OutboundBatchDriverEvent::Cutoff)),
+        )
     }
 
     /// Builds a batch from an adapter-owned driver stream.
@@ -246,6 +253,8 @@ impl OutboundBatch {
     /// must emit each terminal index exactly once unless it first emits [`OutboundBatchDriverEvent::Cutoff`]
     /// or [`OutboundBatchDriverEvent::Failed`]. Ending the stream with unresolved indices is an
     /// invariant failure.
+    /// Core waits for clean EOF even after the last item or when `slot_count` is zero; adapter
+    /// finalization must not remain pending forever after all slots resolve.
     #[must_use]
     #[inline]
     pub fn from_driver<StreamValue>(slot_count: usize, stream: StreamValue) -> Self
@@ -255,7 +264,7 @@ impl OutboundBatch {
         Self {
             poisoned: false,
             stream: stream.boxed_local(),
-            termination: (slot_count == 0).then_some(OutboundBatchTermination::Completed),
+            termination: None,
             unresolved: vec![true; slot_count],
         }
     }
@@ -293,12 +302,15 @@ impl OutboundBatch {
                     ));
                 }
                 *unresolved = false;
-                if !self.unresolved.iter().any(|is_unresolved| *is_unresolved) {
-                    self.termination = Some(OutboundBatchTermination::Completed);
-                }
                 Ok(OutboundBatchNext::Item(item))
             }
             Some(OutboundBatchDriverEvent::Cutoff) => {
+                if !self.unresolved.iter().any(|is_unresolved| *is_unresolved) {
+                    self.poisoned = true;
+                    return Err(batch_driver_error(
+                        "outbound batch driver emitted cutoff after every slot resolved",
+                    ));
+                }
                 self.termination = Some(OutboundBatchTermination::Cutoff);
                 Ok(OutboundBatchNext::Finished(
                     OutboundBatchTermination::Cutoff,
@@ -309,6 +321,12 @@ impl OutboundBatch {
                 Err(error)
             }
             None => {
+                if !self.unresolved.iter().any(|is_unresolved| *is_unresolved) {
+                    self.termination = Some(OutboundBatchTermination::Completed);
+                    return Ok(OutboundBatchNext::Finished(
+                        OutboundBatchTermination::Completed,
+                    ));
+                }
                 self.poisoned = true;
                 Err(batch_driver_error(
                     "outbound batch driver ended before every slot resolved",
@@ -1690,6 +1708,7 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
+    use futures::FutureExt as _;
     use futures::executor::block_on;
     use futures::pin_mut;
     use futures::task::noop_waker_ref;
@@ -2354,6 +2373,134 @@ mod tests {
         assert!(matches!(failure.slots.first(), Some(None)));
         assert!(matches!(failure.slots.get(1), Some(Some(_))));
         assert!(matches!(failure.slots.get(2), Some(None)));
+    }
+
+    #[test]
+    fn batch_collection_validates_events_after_the_final_slot() {
+        for (event, diagnostic) in [
+            (
+                OutboundBatchDriverEvent::Failed(EdgeError::internal(anyhow::anyhow!(
+                    "driver finalization failed"
+                ))),
+                "internal error: driver finalization failed",
+            ),
+            (
+                OutboundBatchDriverEvent::Item(batch_item(0)),
+                "internal error: outbound batch driver emitted a duplicate slot index",
+            ),
+            (
+                OutboundBatchDriverEvent::Item(batch_item(1)),
+                "internal error: outbound batch driver emitted an out-of-range slot index",
+            ),
+            (
+                OutboundBatchDriverEvent::Cutoff,
+                "internal error: outbound batch driver emitted cutoff after every slot resolved",
+            ),
+        ] {
+            let batch = OutboundBatch::from_driver(
+                1,
+                stream::iter([OutboundBatchDriverEvent::Item(batch_item(0)), event]),
+            );
+
+            let failure = block_on(batch.collect()).expect_err("trailing event must be checked");
+            assert_eq!(failure.error.to_string(), diagnostic);
+            assert_eq!(failure.slots.len(), 1);
+            assert!(matches!(failure.slots.first(), Some(Some(_))));
+        }
+    }
+
+    #[test]
+    fn batch_zero_slot_driver_is_validated_before_completion() {
+        let completed = block_on(OutboundBatch::from_driver(0, stream::empty()).collect())
+            .expect("empty driver completes");
+        assert_eq!(completed.termination, OutboundBatchTermination::Completed);
+        let completed = block_on(OutboundBatch::cutoff(0).collect()).expect("no work to cut off");
+        assert_eq!(completed.termination, OutboundBatchTermination::Completed);
+
+        for (event, diagnostic) in [
+            (
+                OutboundBatchDriverEvent::Failed(EdgeError::internal(anyhow::anyhow!(
+                    "empty driver failed"
+                ))),
+                "internal error: empty driver failed",
+            ),
+            (
+                OutboundBatchDriverEvent::Item(batch_item(0)),
+                "internal error: outbound batch driver emitted an out-of-range slot index",
+            ),
+            (
+                OutboundBatchDriverEvent::Cutoff,
+                "internal error: outbound batch driver emitted cutoff after every slot resolved",
+            ),
+        ] {
+            let failure = block_on(OutboundBatch::from_driver(0, stream::iter([event])).collect())
+                .expect_err("zero slots do not hide malformed driver events");
+            assert_eq!(failure.error.to_string(), diagnostic);
+            assert!(failure.slots.is_empty());
+        }
+    }
+
+    #[test]
+    fn batch_finalization_remains_pending_and_cancellation_safe_until_eof() {
+        let polls = Rc::new(Cell::new(0_usize));
+        let source_polls = Rc::clone(&polls);
+        let source = stream::poll_fn(move |_context| {
+            let index = source_polls.get();
+            source_polls.set(index + 1);
+            match index {
+                0 => Poll::Ready(Some(OutboundBatchDriverEvent::Item(batch_item(0)))),
+                1 => Poll::Pending,
+                _ => Poll::Ready(None),
+            }
+        });
+        let mut batch = OutboundBatch::from_driver(1, source);
+        assert!(matches!(
+            block_on(batch.next()).expect("terminal item"),
+            OutboundBatchNext::Item(_)
+        ));
+        assert!(batch.next().now_or_never().is_none());
+        assert!(matches!(
+            block_on(batch.next()).expect("validated EOF"),
+            OutboundBatchNext::Finished(OutboundBatchTermination::Completed)
+        ));
+        assert_eq!(polls.get(), 3);
+        assert!(matches!(
+            block_on(batch.next()).expect("cached termination"),
+            OutboundBatchNext::Finished(OutboundBatchTermination::Completed)
+        ));
+        assert_eq!(polls.get(), 3);
+        assert!(batch.cancel().is_empty());
+    }
+
+    #[test]
+    fn batch_cancel_releases_pending_finalization_after_every_slot_resolves() {
+        struct DropProbe(Rc<Cell<usize>>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = Rc::new(Cell::new(0));
+        let drop_probe = DropProbe(Rc::clone(&drops));
+        let mut emitted = false;
+        let source = stream::poll_fn(move |_context| {
+            let _keep_driver_alive = &drop_probe;
+            if emitted {
+                Poll::Pending
+            } else {
+                emitted = true;
+                Poll::Ready(Some(OutboundBatchDriverEvent::Item(batch_item(0))))
+            }
+        });
+        let mut batch = OutboundBatch::from_driver(1, source);
+        assert!(matches!(
+            block_on(batch.next()).expect("slot"),
+            OutboundBatchNext::Item(_)
+        ));
+        assert!(batch.next().now_or_never().is_none());
+        assert_eq!(drops.get(), 0);
+        assert!(batch.cancel().is_empty());
+        assert_eq!(drops.get(), 1);
     }
 
     #[test]

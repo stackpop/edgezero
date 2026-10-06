@@ -113,19 +113,24 @@ fn error_chain_has_deadline(error: &hyper::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::Poll;
     use std::time::Duration;
 
+    use bytes::Bytes;
+    use edgezero_core::app::App;
     use edgezero_core::body::Body;
-    use edgezero_core::http::{HeaderMap, Method, StatusCode, Version};
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::http::{HeaderMap, Method, StatusCode, Version, response_builder};
     use edgezero_core::response_egress::{
         ResponseEgressAttempt, ResponseEgressCompletion, ResponseEgressHead,
         ResponseEgressObserver, ResponseEgressObserverHandle, ResponseEgressOutcome,
-        ResponseEgressReport,
+        ResponseEgressPolicy, ResponseEgressReport,
     };
-    use edgezero_core::router::RouteMetadata;
+    use edgezero_core::router::{RouteMetadata, RouterService};
     use edgezero_core::time::{Deadline, MonotonicClock, MonotonicInstant};
-    use futures_util::stream::{pending, repeat_with};
+    use futures_util::stream::{pending, poll_fn, repeat_with};
     use hyper::Request;
     use hyper::Response;
     use hyper::body::Incoming;
@@ -137,14 +142,288 @@ mod tests {
 
     use super::{ConnectionExit, serve_http1};
     use crate::response::{AxumEgressBody, EgressConnection};
+    use crate::service::AxumServiceState;
+
+    #[derive(Clone, Copy)]
+    enum DeclaredTail {
+        Clean,
+        Empty,
+        EmptyForever,
+        Error,
+        Excess,
+        Pending,
+    }
 
     #[derive(Clone, Default)]
     struct RecordingObserver(Arc<Mutex<Vec<ResponseEgressReport>>>);
+
+    struct SourceDropProbe(Arc<AtomicUsize>);
 
     impl ResponseEgressObserver for RecordingObserver {
         fn complete(&self, report: &ResponseEgressReport) {
             self.0.lock().expect("reports lock").push(report.clone());
         }
+    }
+
+    impl Drop for SourceDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn declared_stream_app(
+        length: &'static str,
+        tail: DeclaredTail,
+        observer: &RecordingObserver,
+        polls: &Arc<AtomicUsize>,
+        drops: &Arc<AtomicUsize>,
+    ) -> App {
+        let source_polls = Arc::clone(polls);
+        let source_drops = Arc::clone(drops);
+        let router = RouterService::builder()
+            .get("/", move |_ctx| {
+                let observed_polls = Arc::clone(&source_polls);
+                let drop_probe = SourceDropProbe(Arc::clone(&source_drops));
+                async move {
+                    let stream = poll_fn(move |_context| {
+                        let _keep_source_alive = &drop_probe;
+                        let index = observed_polls.fetch_add(1, Ordering::SeqCst);
+                        if index == 0 && length != "0" {
+                            return Poll::Ready(Some(Ok(Bytes::from_static(b"abc"))));
+                        }
+                        match tail {
+                            DeclaredTail::Empty if index <= 1 => {
+                                Poll::Ready(Some(Ok(Bytes::new())))
+                            }
+                            DeclaredTail::Clean | DeclaredTail::Empty => Poll::Ready(None),
+                            DeclaredTail::EmptyForever => Poll::Ready(Some(Ok(Bytes::new()))),
+                            DeclaredTail::Error => Poll::Ready(Some(Err(EdgeError::internal(
+                                anyhow::anyhow!("late source error"),
+                            )))),
+                            DeclaredTail::Excess => {
+                                Poll::Ready(Some(Ok(Bytes::from_static(b"extra"))))
+                            }
+                            DeclaredTail::Pending => Poll::Pending,
+                        }
+                    });
+                    let response = response_builder()
+                        .header("content-length", length)
+                        .body(Body::from_stream(stream))
+                        .expect("declared response");
+                    Ok::<_, EdgeError>(response)
+                }
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_response_egress_observer(observer.clone());
+        let budget = if matches!(tail, DeclaredTail::Pending | DeclaredTail::EmptyForever) {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(5)
+        };
+        app.set_response_egress_policy(move |_, started_at| ResponseEgressPolicy {
+            write_deadline: Deadline::at_instant(started_at.checked_add(budget).expect("deadline")),
+        });
+        app
+    }
+
+    async fn exchange_with_app(app: App) -> (String, Result<ConnectionExit, hyper::Error>) {
+        LocalSet::new()
+            .run_until(async {
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind listener");
+                let address = listener.local_addr().expect("listener address");
+                let state = AxumServiceState::from_app(app);
+                let server = spawn_local(async move {
+                    let (socket, peer) = listener.accept().await.expect("accept client");
+                    let responses = EgressConnection::default();
+                    let service = state.for_connection(peer, responses.clone());
+                    serve_http1(socket, service, responses).await
+                });
+                let mut client = TcpStream::connect(address).await.expect("connect client");
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("write request");
+                let mut wire = Vec::new();
+                timeout(Duration::from_secs(2), client.read_to_end(&mut wire))
+                    .await
+                    .expect("bounded response lifetime")
+                    .expect("read response");
+                let exit = server.await.expect("server task");
+                (String::from_utf8(wire).expect("ASCII response"), exit)
+            })
+            .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hyper_declared_stream_checks_clean_eof_including_zero() {
+        for (length, tail, expected_body, expected_polls) in [
+            ("3", DeclaredTail::Clean, "abc", 2),
+            ("0", DeclaredTail::Clean, "", 1),
+            ("3", DeclaredTail::Empty, "abc", 3),
+            ("0", DeclaredTail::Empty, "", 3),
+        ] {
+            let observer = RecordingObserver::default();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let app = declared_stream_app(length, tail, &observer, &polls, &drops);
+
+            let (wire, exit) = exchange_with_app(app).await;
+            assert_eq!(exit.expect("clean connection"), ConnectionExit::Completed);
+            let (head, body) = wire.split_once("\r\n\r\n").expect("response head");
+            assert!(head.starts_with("HTTP/1.1 200"));
+            assert_eq!(body, expected_body);
+            assert_eq!(polls.load(Ordering::SeqCst), expected_polls);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            let reports = observer.0.lock().expect("reports lock");
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].outcome, ResponseEgressOutcome::HostHandoff);
+            assert_eq!(
+                reports[0].bytes_written,
+                u64::try_from(expected_body.len()).expect("body length")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hyper_declared_stream_rejects_excess_and_error_tails() {
+        for tail in [DeclaredTail::Excess, DeclaredTail::Error] {
+            let observer = RecordingObserver::default();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let app = declared_stream_app("3", tail, &observer, &polls, &drops);
+
+            let (wire, exit) = exchange_with_app(app).await;
+            assert!(exit.is_err(), "bad tail must close the connection");
+            assert!(!wire.ends_with("abc"), "unvalidated final frame was sent");
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            let reports = observer.0.lock().expect("reports lock");
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].outcome, ResponseEgressOutcome::SourceError);
+            assert_eq!(reports[0].bytes_written, 0);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hyper_declared_stream_pending_eof_is_deadline_bounded() {
+        let observer = RecordingObserver::default();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let app = declared_stream_app("3", DeclaredTail::Pending, &observer, &polls, &drops);
+
+        let (wire, exit) = exchange_with_app(app).await;
+        assert_eq!(
+            exit.expect("deadline closes connection"),
+            ConnectionExit::DeadlineExceeded
+        );
+        assert!(!wire.ends_with("abc"));
+        assert!(polls.load(Ordering::SeqCst) >= 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let reports = observer.0.lock().expect("reports lock");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, ResponseEgressOutcome::DeadlineExceeded);
+        assert_eq!(reports[0].bytes_written, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hyper_zero_declared_stream_validation_is_bounded_before_handoff() {
+        for tail in [
+            DeclaredTail::Excess,
+            DeclaredTail::Error,
+            DeclaredTail::Pending,
+        ] {
+            let observer = RecordingObserver::default();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let app = declared_stream_app("0", tail, &observer, &polls, &drops);
+
+            let (wire, exit) = exchange_with_app(app).await;
+            assert_eq!(exit.expect("bounded fallback"), ConnectionExit::Completed);
+            let expected = if matches!(tail, DeclaredTail::Pending) {
+                ("HTTP/1.1 504", ResponseEgressOutcome::DeadlineExceeded)
+            } else {
+                ("HTTP/1.1 500", ResponseEgressOutcome::ConversionError)
+            };
+            assert!(wire.starts_with(expected.0));
+            assert!(polls.load(Ordering::SeqCst) > 0);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            let reports = observer.0.lock().expect("reports lock");
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].outcome, expected.1);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hyper_eof_lookahead_yields_to_host_deadlines_with_a_frozen_clock() {
+        for length in ["3", "0"] {
+            let observer = RecordingObserver::default();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut app = declared_stream_app(
+                length,
+                DeclaredTail::EmptyForever,
+                &observer,
+                &polls,
+                &drops,
+            );
+            let frozen_at = MonotonicInstant::now();
+            app.set_monotonic_clock(MonotonicClock::new(move || frozen_at));
+
+            let (wire, exit) = exchange_with_app(app).await;
+            if length == "3" {
+                assert_eq!(
+                    exit.expect("host deadline closes connection"),
+                    ConnectionExit::DeadlineExceeded
+                );
+                assert!(!wire.ends_with("abc"));
+            } else {
+                assert_eq!(exit.expect("bounded fallback"), ConnectionExit::Completed);
+                assert!(wire.starts_with("HTTP/1.1 504"));
+            }
+            assert!(polls.load(Ordering::SeqCst) > 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            let reports = observer.0.lock().expect("reports lock");
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].outcome, ResponseEgressOutcome::DeadlineExceeded);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hyper_zero_length_registration_expiry_uses_timeout_fallback() {
+        let observer = RecordingObserver::default();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut app = declared_stream_app("0", DeclaredTail::Clean, &observer, &polls, &drops);
+        let started_at = MonotonicInstant::now();
+        let deadline = started_at
+            .checked_add(Duration::from_secs(5))
+            .expect("deadline");
+        let observed_polls = Arc::clone(&polls);
+        let after_eof_samples = AtomicUsize::new(0);
+        app.set_monotonic_clock(MonotonicClock::new(move || {
+            if observed_polls.load(Ordering::SeqCst) == 0
+                || after_eof_samples.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                started_at
+            } else {
+                deadline
+            }
+        }));
+
+        let (wire, exit) = exchange_with_app(app).await;
+        assert_eq!(exit.expect("bounded fallback"), ConnectionExit::Completed);
+        assert!(
+            wire.starts_with("HTTP/1.1 504"),
+            "expiry at registration must remain a timeout"
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let reports = observer.0.lock().expect("reports lock");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, ResponseEgressOutcome::DeadlineExceeded);
     }
 
     fn attempt(

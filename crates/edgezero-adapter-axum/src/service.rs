@@ -227,7 +227,8 @@ impl AxumServiceState {
                 request_method.clone(),
                 request_start,
                 connection,
-            );
+            )
+            .await;
         }
         let head_parts = IngressHeadParts::from_parts(
             &parts,
@@ -237,7 +238,7 @@ impl AxumServiceState {
         let prepared = match app.begin_ingress(head_parts, request_start) {
             Ok(IngressBeginOutcome::Admitted(prepared)) => prepared,
             Ok(IngressBeginOutcome::Refused(response)) => {
-                return Ok(prepare_egress_response(response, connection));
+                return Ok(prepare_egress_response(response, connection).await);
             }
             Ok(IngressBeginOutcome::Aborted) => return Err(AxumIngressAbort),
             Ok(_) => {
@@ -247,7 +248,8 @@ impl AxumServiceState {
                     request_method,
                     request_start,
                     connection,
-                );
+                )
+                .await;
             }
             Err(error) => {
                 return prepare_detached_ingress_error(
@@ -256,7 +258,8 @@ impl AxumServiceState {
                     request_method.clone(),
                     request_start,
                     connection,
-                );
+                )
+                .await;
             }
         };
         let read_deadline = prepared.read_deadline();
@@ -268,7 +271,7 @@ impl AxumServiceState {
                     "failed to initialize outbound HTTP transport"
                 )),
             );
-            return Ok(prepare_egress_response(egress, connection));
+            return Ok(prepare_egress_response(egress, connection).await);
         };
         let mut core_request = match into_core_request_parts(
             parts,
@@ -284,7 +287,7 @@ impl AxumServiceState {
                         "failed to convert inbound request: {error}"
                     )),
                 );
-                return Ok(prepare_egress_response(egress, connection));
+                return Ok(prepare_egress_response(egress, connection).await);
             }
         };
 
@@ -299,7 +302,7 @@ impl AxumServiceState {
         }
 
         let egress = app.dispatch_admitted(prepared, core_request).await;
-        Ok(prepare_egress_response(egress, connection))
+        Ok(prepare_egress_response(egress, connection).await)
     }
 }
 
@@ -349,7 +352,7 @@ impl TowerService<Request<AxumBody>> for AxumServiceState {
     }
 }
 
-fn prepare_detached_ingress_error(
+async fn prepare_detached_ingress_error(
     app: &App,
     error: EdgeError,
     request_method: Method,
@@ -358,7 +361,7 @@ fn prepare_detached_ingress_error(
 ) -> Result<Response<AxumEgressBody>, AxumIngressAbort> {
     match app.detached_ingress_error_egress(error, request_method, request_start) {
         IngressDispatchOutcome::Response(envelope) => {
-            Ok(prepare_egress_response(*envelope, connection))
+            Ok(prepare_egress_response(*envelope, connection).await)
         }
         IngressDispatchOutcome::Aborted | _ => Err(AxumIngressAbort),
     }

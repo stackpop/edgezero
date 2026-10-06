@@ -94,6 +94,12 @@ The connection supervisor enforces the absolute response-write deadline, but fra
 not proof of socket or client receipt; response-egress capabilities therefore remain BestEffort.
 See [Capabilities](/guide/capabilities).
 
+For streamed responses with `Content-Length`, Axum retains only the final chunk until source EOF
+validates, because Hyper stops polling once the declared length is satisfied. A bad tail is not
+sent, and a pending tail remains subject to the write deadline. A declared zero-length stream is
+validated before handoff. Suppressed HEAD/status bodies are dropped without polling. Clean source
+EOF remains `HostHandoff`, not proof of socket flush or client receipt.
+
 ## Logging
 
 The Axum adapter's `run_app` helper installs `simple_logger` at the level read from

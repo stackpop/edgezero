@@ -1219,6 +1219,7 @@ for (const requiredFragment of [
   'Result<OutboundBatchResults, OutboundBatchFailure>',
   'premature driver EOF',
   'duplicate or out-of-range',
+  'Core reports normal completion only at driver EOF',
 ]) {
   if (!outboundSpecSource.includes(requiredFragment)) {
     fail(
@@ -1506,6 +1507,9 @@ for (const requiredFragment of [
   'not attached to a `Response` and never enters `http::Extensions`',
   'ResponseEgressHead::application_deadline()',
   'queue-through-egress',
+  'application configuration changed adapter-selected platform metadata',
+  'validates source EOF before handing that frame to Hyper',
+  'A transmitted zero-length stream is validated asynchronously before Hyper receives the response',
 ]) {
   if (!responseEgressSpecSource.includes(requiredFragment)) {
     fail(

@@ -143,8 +143,9 @@ defines the normative accounting, cancellation, error, and promotion requirement
 Application assembly is fallible. `Hooks::configure(&mut App) -> Result<(), EdgeError>` runs after
 the runtime adapter installs `PlatformMetadata` and before EdgeZero request conversion, body
 polling, or dispatch. The hard-cut, core-owned `App::build::<A>(platform)` constructor requires
-every caller to choose target metadata explicitly, cannot be replaced by application hooks, and
-propagates the configuration result. Axum also completes assembly before binding its listener.
+every caller to choose target metadata explicitly and propagates the configuration result. After
+successful configuration, core rejects changed platform facts, provenance, or unknown reasons
+rather than silently restoring them. Axum also completes assembly before binding its listener.
 
 ## Response Egress Matrix
 
@@ -324,6 +325,8 @@ guarantees all slots are present. Only `Cutoff` permits `None` in a successful r
 adapter failure, premature EOF, duplicate indices, and out-of-range indices return
 `OutboundBatchFailure`: its precise batch-level error remains separate from cutoff, and its
 index-aligned slots preserve sibling outcomes observed before the failure.
+Normal completion requires clean driver EOF after the last item, not merely the expected item
+count. Trailing driver failures and malformed events remain visible, including on empty batches.
 `elapsed` starts at the single method-entry monotonic snapshot and ends when that slot becomes
 terminal, including preflight validation, adapter setup, provider queueing, upload, headers,
 buffered body drain, and any delayed guest observation. It is not pure transport RTT.

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Response EOF and batch finalization
+
+Axum validates exact-length stream EOF before handing Hyper the final frame, and validates
+zero-length streams before response handoff, under the original write deadline. Detached fallback
+payloads remain sendable without a live completion attempt; HEAD suppression is preserved.
+
+Outbound batches now require clean driver EOF before reporting `Completed`, including empty
+drivers. Trailing failures or malformed events remain visible with previously collected slots.
+Application configuration that changes adapter-selected platform metadata now fails assembly.
+
 ### Logging ownership and boot diagnostics
 
 `owns_logging = true` now explicitly owns backend installation, backend filters, and the facade

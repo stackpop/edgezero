@@ -50,7 +50,7 @@ pub enum OutboundBatchNext {
 
 Change `OutboundBatch::next` to return `Result<OutboundBatchNext, EdgeError>`, `collect` to return `Result<OutboundBatchResults, OutboundBatchFailure>`, and `HttpClient::send_all_until` to return `Result<OutboundBatchResults, OutboundBatchFailure>`. Add `termination` to `OutboundBatchResults`.
 
-Use the public adapter driver event with `Item`, `Cutoff`, and `Failed` variants. Mark completion only after every index resolves. Return a fixed category-safe internal error for core-detected premature EOF, duplicate indices, out-of-range indices, or impossible terminal transitions; preserve adapter-supplied failures exactly. Ordered collection retains every slot observed before either class of failure. The event and constructors were promoted from doc-hidden adapter support by the round-6 hardening pass.
+Use the public adapter driver event with `Item`, `Cutoff`, and `Failed` variants. Mark completion only at driver EOF after every index resolves. Return a fixed category-safe internal error for core-detected premature EOF, duplicate indices, out-of-range indices, or impossible terminal transitions; preserve adapter-supplied failures exactly. Ordered collection retains every slot observed before either class of failure. The event and constructors were promoted from doc-hidden adapter support by the round-6 hardening pass.
 
 - [x] **Step 4: Run core tests and verify GREEN**
 
@@ -200,3 +200,20 @@ Run: `git diff --check`, search for removed API shapes, and confirm only intende
 Commit message: `fix(outbound): type batch termination`
 
 Update the PR description and wait for hosted checks to complete.
+
+### Review Follow-Up: Driver Finalization
+
+- [x] Add failing tests for trailing failure, duplicate/out-of-range indices, pending finalization,
+  zero-slot drivers, and cutoff after every slot resolves. Preserve collected slots on failure.
+- [x] Remove completion inference from item count. Accept driver EOF only after every slot
+  resolves; reject malformed intervening events and retain poisoned-repoll behavior.
+- [x] Run `cargo test -p edgezero-core outbound::tests::batch_` and all adapter batch contracts.
+- [x] Align the specification, public driver docs, and implementation evidence before delivery.
+
+**Evidence (2026-10-06):** The trailing-event, zero-slot, and pending-finalization regressions
+failed against item-count completion before the fix. Core now validates clean EOF, retains
+completed slots on driver failure, and releases a pending finalization driver on cancellation.
+The full workspace suite passes, including 720 core unit tests. Explicit nonzero native
+contract runs pass for Axum (13), Cloudflare (3), Fastly (1), and Spin (2); strict WASM clippy
+passes for all three provider targets. Specs/guides and the documentation checker reflect the
+EOF requirement. This follow-up does not claim new deployed-host evidence.

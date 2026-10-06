@@ -136,6 +136,11 @@ process default clock and is intended only for code that also uses the default c
 observation cutoff stops batch observation regardless of any remaining per-request budget or later
 per-request deadline. Passing an earlier observation cutoff intentionally leaves unresolved slots.
 
+After the last item, continue calling `next()` to await clean driver EOF and receive
+`Finished(Completed)`. Item count alone is not completion: a trailing driver failure, duplicate
+index, or out-of-range index still fails collection while retaining the previously collected
+slots. Custom drivers must finish after their last item; zero-slot drivers are validated too.
+
 `client.send_all_until(requests, observation_cutoff).await` collects the same driver into an
 index-aligned `Vec<Option<OutboundSlotResult>>` plus `results.termination`. `Completed` guarantees
 every slot is present. Only `Cutoff` permits `None` in a successful result, meaning that slot was

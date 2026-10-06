@@ -431,3 +431,33 @@ cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
   clock/deadline races, accepted-prefix accounting, cancellation ownership, provider diagnostics,
   cfg/feature combinations, unsafe boundaries, dependency reachability, retired APIs, demos, and
   generated projects.
+
+## Review Follow-Up: Axum EOF And Assembly Invariants
+
+- [x] Add Hyper/socket regressions for exact and zero declared-length streams, excess tails,
+  late source errors, and deadline-bounded EOF validation. Check exactly-once reports and source
+  release, not only received bytes.
+- [x] Stage only the final declared-length chunk until source EOF validates; validate zero-length
+  streams before Hyper handoff and retain the application clock and response completion owner.
+- [x] Add a deterministic expired-fallback-registration regression for GET and HEAD. Determine
+  EOF from source exhaustion, exhaust failed bodies, and preserve selected finite fallback bytes.
+- [x] Add a replacement-hook regression with nondefault platform facts; reject changed metadata
+  after successful configuration while propagating hook errors unchanged.
+- [x] Run scoped Axum/core tests, workspace gates, provider WASM checks, demo tests, and docs
+  contracts; update the spec/guide evidence without promoting BestEffort guarantees.
+
+**Decision and evidence (2026-10-06):** Investigation/proposal agents Pasteur and Plato recommended
+core-owned driver EOF validation and a complete platform-metadata comparison. Axum reviewer
+Noether identified a registration-time deadline race; its deterministic regression failed before
+the fix and now selects 504 rather than 500. Core reviewer Beauvoir requested population-only
+metadata and cancellation-during-finalization coverage; both are included. Build-validator
+Lagrange checked combined native features, strict clippy on all three WASM targets, and the demo.
+The chosen fix retains the private Axum pump and adds only final-frame lookahead, rather than
+the optional shared-driver/pump refactors.
+
+Local evidence: workspace tests and strict clippy pass; core has 720 passing unit tests; Axum's
+standard-service socket regressions cover clean/empty EOF, excess/error/pending tails, a frozen
+application clock, and zero-length registration expiry. Demo tests (54), demo logging tests (2),
+formatting, docs lint/build, and docs/dependency contracts pass. These are local proofs, not
+deployed-provider certification, and no capability was promoted. Delivery and review-thread
+replies are recorded in PR 275's commit and discussion history.

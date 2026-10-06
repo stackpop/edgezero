@@ -395,14 +395,20 @@ or attach provider capability declarations to individual reports.
 ### 3.4 Fallible application assembly
 
 Application configuration is startup policy and must not require `expect` or panic to reject
-invalid limits. Construction is core-owned so hooks cannot discard target metadata or bypass
-configuration:
+invalid limits. Construction is core-owned and installs target metadata before configuration.
+After successful configuration, core rejects any changed platform facts, provenance, or unknown
+reasons rather than silently restoring them. A hook failure propagates unchanged:
 
 ```rust
 impl App {
     pub fn build<A: Hooks>(platform: PlatformMetadata) -> Result<Self, EdgeError> {
         let mut app = Self::with_name_and_platform(A::routes(), A::name(), platform);
         A::configure(&mut app)?;
+        if app.platform() != platform {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "application configuration changed adapter-selected platform metadata"
+            )));
+        }
         Ok(app)
     }
 }
@@ -557,6 +563,25 @@ EOF to the connection supervisor. Completion is eligible only after a subsequent
 framing/flush boundary has accepted all response bytes into the OS socket. It never means peer
 receipt. A raw-socket test must prove that the selected boundary occurs once per response;
 until then the adapter reports `HostHandoff` and completion remains `BestEffort`.
+
+Hyper stops polling when its declared-length encoder reaches zero, even without an exact size
+hint. For a transmitted stream with `Content-Length`, Axum stages only the final declared-length
+chunk and validates source EOF before handing that frame to Hyper. Empty tail chunks yield
+cooperatively; excess bytes or a late source error abort without sending the staged frame. The
+source is marked exhausted on clean EOF so subsequent body drop settles `HostHandoff` unless a
+connection failure has already won. Lookahead remains under the original absolute write deadline
+and injected application clock, with the connection supervisor's host timer covering pending
+reads. It does not collect the preceding body.
+
+A transmitted zero-length stream is validated asynchronously before Hyper receives the response,
+since Hyper may never poll such a body. The original attempt retains its completion during this
+bounded validation. Source failure selects the finite conversion fallback; deadline expiry
+selects the timeout fallback. HEAD/status suppression still drops the source without polling.
+
+The detached finite fallback used after fallback registration fails determines EOF from its
+payload source, not from absence of an active attempt. GET retains the selected error bytes; HEAD
+sends no payload. Consuming the final frame exhausts the source, and terminal failure explicitly
+drops both the source and any staged frame before returning an error.
 
 HTTP/1 post-commit timeout or source failure closes the connection to preserve framing. This
 may cancel pipelined responses on that connection. The supervisor never mutates a core attempt;
@@ -735,7 +760,7 @@ Every adapter gets deterministic lifecycle tests before provider integration:
 | Completion   | Empty, buffered, streamed EOF, source failure, transport failure, timeout, disconnect, conversion failure, never-polled body, and guard drop each notify once. Competing terminal events still produce one report. The exact decision-owned completion survives normal dispatch, handler/routing errors, canonical 404/405, bounded fallback outcomes, refusal, policy/framing failure, adapter fallback, and guard drop; it runs before the global observer. Joined completions receive the same borrowed report at most once in left-to-right order and release both resources if abandoned. Child panics remain independently isolated only on unwind-capable targets; panic-abort may terminate before the right callback. A dropped pre-begin envelope releases its resource without fabricating a report. Normalized pre-admission validation invokes the detached-egress decision factory exactly once: `Send { completion, deadline }` supplies exactly one completion and one mandatory deadline, with an empty completion by default, while `Abort` constructs no response or attempt and invokes no completion, observer, handler, middleware, or body poll. Raw parser failures remain outside the lifecycle contract. Explicit ingress abort likewise starts no attempt and invokes no callback. Compile-time tests prove the completion is non-clone and cannot be stored in response extensions. |
 | Accounting   | Exact payload totals, zero-byte response, checked overflow, short/partial writes, cancellation prefixes, and no headers/framing in the count.                                                                      |
 | Commit       | Pre-commit failure may synthesize a bounded fallback; post-commit failure aborts without rewriting status or appending a body.                                                                                     |
-| Backpressure | Holding one platform write prevents the next source poll and bounds EdgeZero staging to one chunk.                                                                                                                 |
+| Backpressure | Holding one platform write prevents the next source poll and bounds EdgeZero staging to one chunk. Axum's final declared-length frame has the explicit bounded EOF-lookahead exception above. |
 | Teardown     | Source drop and native abort/reset/error/close occur on every supported failure path. A terminal stream error releases its source/native state before yielding `Err`, without a repoll or wrapper drop. A losing future cannot mutate terminal state. |
 | Headers      | Repeated fields, including `Set-Cookie`, survive the new low-level conversion paths.                                                                                                                               |
 | Framing      | `HEAD`, body-forbidden statuses, content-length exact/short/long bodies, removed transfer encoding, unsupported upgrades, and early EOF behave identically across adapters.                                        |
