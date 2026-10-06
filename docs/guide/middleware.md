@@ -24,7 +24,7 @@ impl Middleware for RequestLogger {
     ) -> Result<Response, EdgeError> {
         let method = ctx.request().method().clone();
         let path = ctx.request().uri().path().to_string();
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
 
         let response = next.run(ctx).await?;
 
@@ -42,6 +42,8 @@ impl Middleware for RequestLogger {
 }
 ```
 
+Add `web-time = "1"` to your crate's dependencies for this portable clock.
+
 ## Registering Middleware
 
 ### Via Manifest
@@ -58,7 +60,8 @@ middleware = [
 ]
 ```
 
-Middleware are applied in order before routes are matched.
+Routes are matched first. Middleware then run in registration order for a matched route;
+unmatched 404/405 requests bypass the middleware chain.
 
 ### Programmatically
 
@@ -164,30 +167,126 @@ impl Middleware for CorsMiddleware {
 
 ### Request Timing
 
+`RequestTimingMiddleware<N, D>` attaches a fresh `RequestTimings<N, D>` only when
+that exact type is absent. All clones share one immutable clock origin and one
+state mutex, including the application-owned payload. Register it before timing
+consumers. The default excludes no paths; static exclusions compare exact URI paths
+for every method, including `/health?check=1`, without removing preinstalled handles.
+Calling `with_excluded_paths` replaces any previous list.
+
+On [deployed Cloudflare Workers](https://developers.cloudflare.com/workers/runtime-apis/performance/),
+timers advance only after I/O, so CPU-only phases may record zero. Local
+Wrangler/workerd and browser tests do not reproduce that restriction.
+
+Applications own their phase enum and map it to bounded slots through a facade:
+
 ```rust
-pub struct TimingMiddleware;
+use std::time::Duration;
+use edgezero_core::context::RequestContext;
+use edgezero_core::middleware::RequestTimingMiddleware;
+use edgezero_core::request_timing::{RequestTimings, TimingError};
+use edgezero_core::router::RouterService;
 
-#[async_trait(?Send)]
-impl Middleware for TimingMiddleware {
-    async fn handle(
-        &self,
-        ctx: RequestContext,
-        next: Next<'_>,
-    ) -> Result<Response, EdgeError> {
-        let start = std::time::Instant::now();
+#[derive(Default)]
+pub struct AppData {
+    attempts: u32,
+    started: Option<Duration>,
+}
 
-        let mut response = next.run(ctx).await?;
+type Handle = RequestTimings<1, AppData>;
+type TimingMiddleware = RequestTimingMiddleware<1, AppData>;
 
-        let duration = start.elapsed();
-        response.headers_mut().insert(
-            "x-response-time",
-            format!("{}ms", duration.as_millis()).parse().unwrap(),
-        );
+enum Phase {
+    Fetch,
+}
 
-        Ok(response)
+impl Phase {
+    fn slot(self) -> usize {
+        match self {
+            Self::Fetch => 0,
+        }
     }
 }
+
+struct AppTimings(Handle);
+
+impl AppTimings {
+    fn from_context(ctx: &RequestContext) -> Option<Self> {
+        ctx.request().extensions().get::<Handle>().cloned().map(Self)
+    }
+
+    fn record(&self, phase: Phase, duration: Duration) -> Result<(), TimingError> {
+        self.0.record_with(phase.slot(), duration, |data, elapsed| {
+            data.attempts = data.attempts.saturating_add(1);
+            data.started.get_or_insert(elapsed);
+        })
+    }
+}
+
+let router = RouterService::builder()
+    .middleware(TimingMiddleware::new().with_excluded_paths(&["/health"]))
+    .build();
 ```
+
+Register application routes on that builder. Keep the handle and middleware
+aliases paired: a different `N` or `D` produces a different extension type and
+lookup returns `None`. The facade reads `Handle` from extensions; it is not a
+second installed extension or clock. Do not use `RouterBuilder::with_state` for
+collectors: router state is shared across requests and overwrites same-type
+request extensions. Avoid `State<Handle>` too: a missing handle fails the request
+with a 500 and its generic error suggests `with_state`. Use optional extension
+lookup for best-effort timing instead. Middleware payloads need only
+`Default + Send + 'static`; manual `with_data(data)` construction needs no `Default`.
+
+For manifest registration, export a named const from your core crate's timing module:
+
+```rust
+pub const TIMING: TimingMiddleware =
+    TimingMiddleware::new().with_excluded_paths(&["/health"]);
+```
+
+```toml
+[app]
+middleware = ["my_app_core::timing::TIMING"]
+```
+
+The const holds configuration, not a collector. Each eligible request still gets
+fresh data. The manifest names values; it cannot call constructors itself.
+
+- `record(slot, duration)` saturating-adds; absent and recorded zero stay distinct.
+  Overlapping spans on one slot sum and may exceed wall-clock time. Use one span
+  around a join to measure concurrent latency.
+  `let _span = timings.span(slot).ok();` records work on drop, including cancelled
+  work, but not completion. Bind the span to a named variable; `let _ = ...` drops
+  it immediately. Destructor execution is not guaranteed in panic-abort environments.
+- `record_with` updates phase and payload together; `update_data` updates payload
+  alone using elapsed time from the same origin. `snapshot(|view| ...)` projects
+  generic fields and borrowed payload under that same lock, without cloning it.
+  Borrowed payload cannot escape the projection.
+- `elapsed()` reads the immutable origin without locking and remains available
+  during contention and inside callbacks. `TimingError` and `TimingSnapshot` are
+  non-exhaustive; downstream matches need a fallback and snapshot destructuring
+  needs `..`.
+- Invalid slots return `TimingError::InvalidSlot` before mutation or callbacks.
+  Contention returns `TimingError::Unavailable`, dropping the whole operation
+  without invoking its callback. There is no blocking or retry. Span drop discards
+  an unavailable sample. Missing facts must not be interpreted as zero.
+- Callbacks must be short, synchronous and non-reentrant: never call a lock-taking
+  collector operation inside one. Panics propagate and may leave partial state;
+  poisoned locks recover best-effort, **without rollback or payload validation**.
+  Application callbacks must keep data valid even on unwind.
+- Call `mark_headers_ready()` and `mark_request_complete()` at explicit application
+  boundaries, first successful write wins; `set_response_bytes(bytes)` is last-write.
+  T0 is collector creation at the chosen boundary, not socket ingress or browser
+  navigation. Wrapping or reattaching a handle never resets that origin.
+
+Attachment does not finalize a request, consume a streamed body, render
+`Server-Timing`, or change cache/privacy policy. Header rendering and exposure
+remain application-owned. Unmatched routes bypass middleware, and
+`RouterService::oneshot` renders handler errors outside the chain. Use adapter or
+outer-service hooks for terminal/error and streaming measurements as needed.
+Those outer layers must retain a clone of the handle they preinstall; attachment
+does not copy the handle into response extensions.
 
 ## Early Returns
 
@@ -220,10 +319,11 @@ impl Middleware for RateLimiter {
 
 EdgeZero provides these middleware out of the box:
 
-| Middleware      | Purpose                                                                                                                                                              |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `RequestLogger` | Logs request method, path, and response status                                                                                                                       |
-| `FnMiddleware`  | Wraps a closure `Fn(RequestContext, Next<'_>) -> impl Future<Output = Result<Response, EdgeError>>`; build one with `middleware_fn(...)` or `FnMiddleware::new(...)` |
+| Middleware                      | Purpose                                                                                                                                                              |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RequestTimingMiddleware<N, D>` | Attaches a per-request timing collector if absent; configurable exact-path exclusions                                                                                |
+| `RequestLogger`                 | Logs request method, path, and response status                                                                                                                       |
+| `FnMiddleware`                  | Wraps a closure `Fn(RequestContext, Next<'_>) -> impl Future<Output = Result<Response, EdgeError>>`; build one with `middleware_fn(...)` or `FnMiddleware::new(...)` |
 
 If you already hold an `Arc<dyn Middleware>` (`BoxMiddleware`), register it with
 `.middleware_arc(...)` instead of `.middleware(...)`.
