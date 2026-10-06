@@ -146,9 +146,8 @@ fn custom_dispatch(
     let stores = MeasuredApp::stores();
     let env = runtime_env_config(stores);
     if let Err(error) = sandbox.setup_once(|| install_logger(&env)) {
-        Response::from_status(503)
-            .with_body(error.to_string())
-            .send_to_client();
+        eprintln!("logger setup failed: {error}");
+        Response::from_status(503).send_to_client();
         return Ok(());
     }
     log::info!("fixture request {}", obs.correlation);

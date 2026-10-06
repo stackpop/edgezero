@@ -609,7 +609,8 @@ pub fn serve_app<A: Hooks>(serve: Serve) -> ServeSummary<fastly::Error> {
 /// snapshot, before app construction, unless `Hooks::owns_logging` is true.
 /// An unavailable optional configuration store freezes logging as disabled,
 /// even if later reads recover store selectors. Any returned error (logger setup,
-/// required-KV open, request conversion, or response-stream collection) sends a
+/// required-KV open, request conversion, response-stream collection, or an
+/// `EdgeError` that fails to render) sends a
 /// 500 and terminates the SDK loop. Handler `EdgeError`s render as responses and
 /// do not terminate it. Construction panics remain sandbox failures.
 ///

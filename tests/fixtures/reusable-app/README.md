@@ -140,7 +140,7 @@ rendered errors, idle reinitialization, supported request/lifetime/memory limits
 progressive chunks, interrupted streams, finite distinct loopback origins, and
 exclusion of the terminated guest after an injected panic. Logging checks run on
 B, C, custom C and the negative control. Custom C installs its logger with
-`Sandbox::setup_once`, so they also show setup running once per guest across
+`Sandbox::setup_once`, so they also imply setup runs once per guest across
 retained callbacks. They derive service-scoped keys from an observed guest service
 ID and distinguish `fixture-logs ::` endpoint records from echoed stdout. The
 negative control verifies that naively wrapping `run_app` with an enabled global
@@ -214,7 +214,7 @@ These are explicitly unverified, not assertions counted as passed:
 | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Optional runtime-store open fails, then recovers in the same guest                     | Host tests inject degraded then successful configuration snapshots; required-registry recovery is exercised above. Local runtimes cannot make the fixed optional store fail transiently. |
 | `EdgeError` itself fails to render                                                     | The renderer builds fixed valid statuses/headers from JSON values; no public input or injection hook triggers a returned rendering error.                                                |
-| Unavailable heap hostcall                                                              | Only the preflight is implemented. If the heap snapshot fails, the SDK itself stops after the first request. Local runtimes supply the hostcall and cannot disable it.                   |
+| Unavailable heap hostcall                                                              | Only the preflight is implemented. Under a memory limit, a failed heap snapshot makes the SDK stop after the first request. Local runtimes supply the hostcall and cannot disable it.    |
 | Full standard callback/send/cleanup timing                                             | The public retained helper has no post-send callback. Conversion observations and SDK summary timing are labeled separately; unavailable phases stay unknown.                            |
 | Deployed eviction, endpoint handles, resource accounting, capacity, and workload gains | Require separately authorized deployment and application telemetry. Local CPU samples are not cross-run CPU benchmarks; finite origin tests do not establish service-wide capacity.      |
 

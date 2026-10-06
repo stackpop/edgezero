@@ -324,13 +324,14 @@ fn run() -> Result<i32> {
             runners::provider(adapter, &args, &path, &mut records)
         };
         if let Err(error) = result {
-            // Runners record their own contextual failure; add one only when they did not.
+            // Runners record their own contextual failure for this error; add one only
+            // when they did not (an earlier non-fatal fail record must not hide it).
+            let error = error.to_string();
             if !records.values[recorded..]
                 .iter()
-                .any(|r| r["status"] == "fail")
+                .any(|r| r["status"] == "fail" && r["error"] == error.as_str())
             {
-                records
-                    .push(json!({"status":"fail","adapter":adapter,"error":error.to_string()}))?;
+                records.push(json!({"status":"fail","adapter":adapter,"error":error}))?;
             }
         }
     }

@@ -414,7 +414,8 @@ ends the SDK loop. CPU clock observations are not reliable cross-run benchmarks.
 `ServeSummary::requests()` counts attempted callbacks, including a failed one;
 a crash can prevent a final summary. Handler `EdgeError`s render as responses
 and serving continues. Any other returned error (logger setup, a required KV
-store that fails to open, request conversion, response-stream collection) makes
+store that fails to open, request conversion, response-stream collection, or an
+`EdgeError` that itself fails to render) makes
 the SDK send a 500 with the error text and end the loop. Constructor panics
 remain sandbox failures.
 
@@ -490,7 +491,7 @@ sandbox.initialize(|| build_application())?;
 ```
 
 A complete callback looks like this. `serve_custom` returns a `ServeSummary`
-that must be converted with `into_result()`, and the infallible `Hooks::build_app`
+that you inspect or convert with `into_result()`, and the infallible `Hooks::build_app`
 needs an explicit error type for `initialize` to infer:
 
 ```rust

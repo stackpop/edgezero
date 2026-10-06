@@ -359,7 +359,7 @@ where
 ///
 /// The extension callback reads the native request before conversion. Registries
 /// are inserted afterward, with the same precedence and binding policy as standard
-/// dispatch. Drive `App::router().oneshot(request)` with `futures::executor::block_on`
+/// dispatch. Drive `app.router().oneshot(request)` with `futures::executor::block_on`
 /// when the caller needs response extensions or progressive streaming.
 ///
 /// # Errors
