@@ -95,11 +95,7 @@ fn capture_request_ingress(
     );
     let content_length = HeaderFidelity::new(
         Preservation::Unknown,
-        if transport.is_some() {
-            Preservation::Transformed
-        } else {
-            Preservation::Unknown
-        },
+        Preservation::Unknown,
         Preservation::Unknown,
         Preservation::Unavailable,
     );
@@ -342,6 +338,44 @@ mod ingress_tests {
                 .field_multiplicity(),
             Preservation::Unknown
         );
+    }
+
+    #[tokio::test]
+    async fn ingress_content_length_fidelity_is_unknown_with_or_without_transport() {
+        for bound in [false, true] {
+            for count in 0..=2 {
+                let mut request = request_builder()
+                    .uri("/reserved")
+                    .header("host", "example.com")
+                    .body(AxumBody::empty())
+                    .expect("should build request");
+                for _ in 0..count {
+                    request
+                        .headers_mut()
+                        .append("content-length", HeaderValue::from_static("0"));
+                }
+                if bound {
+                    request.extensions_mut().insert(HttpTransport);
+                }
+                let core = into_core_request(request)
+                    .await
+                    .expect("should convert request");
+                assert_eq!(
+                    core.headers().get_all("content-length").iter().count(),
+                    count
+                );
+                let ingress = core
+                    .extensions()
+                    .get::<RequestIngress>()
+                    .expect("should insert metadata");
+                assert_eq!(
+                    ingress
+                        .header_fidelity(&"content-length".parse().expect("should parse name"))
+                        .field_multiplicity(),
+                    Preservation::Unknown
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -754,7 +754,7 @@ mod integration_tests {
     use edgezero_core::body::Body;
     use edgezero_core::http::{HeaderValue, Method, Request, Response, response_builder};
     use edgezero_core::middleware::{Middleware, Next};
-    use edgezero_core::request::{CapturedTarget, RequestIngress};
+    use edgezero_core::request::{CapturedTarget, Preservation, RequestIngress};
     use edgezero_core::router::PreDispatchHook;
     use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
@@ -821,10 +821,18 @@ mod integration_tests {
                         .collect();
                     assert_eq!(cookies, [b"a=\xff".as_slice(), b"b=2".as_slice()]);
                 }
-                "length" => assert_eq!(
-                    request.headers().get_all("content-length").iter().count(),
-                    1
-                ),
+                "length" => {
+                    assert_eq!(
+                        request.headers().get_all("content-length").iter().count(),
+                        1
+                    );
+                    assert_eq!(
+                        ingress
+                            .header_fidelity(&"content-length".parse().expect("should parse name"))
+                            .field_multiplicity(),
+                        Preservation::Unknown
+                    );
+                }
                 "te-cl" => assert!(!request.headers().contains_key("content-length")),
                 "continue" => {
                     *request.method_mut() = Method::GET;

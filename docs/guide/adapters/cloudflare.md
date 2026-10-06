@@ -331,3 +331,7 @@ hook dispatch. Locked local workerd transport tests additionally distinguish
 pre-Worker rejections: its HTTP parser returns 501 for extension methods.
 Real Worker tests assert valid UTF-8 values C3 A9 and C4 80 survive conversion. Local wire FF becomes U+FFFD in Web Headers before Rust, so its runtime UTF-8 copy EF BF BD cannot prove original bytes. Common octet and multiplicity fidelity is `Unknown`: the observed transformations do not prove every particular field changed. Local absolute-form and duplicate Content-Length requests return 500 without a hook verdict. These transport/runtime limits remain separate from runtime-to-core conversion correctness.
 See [the capability matrix](./overview#inbound-request-fidelity).
+
+Captured runtime-target preservation is `Unknown`. Fetch URL normalization is
+a known runtime capability, but the original request target is unavailable, so
+a transformation cannot be established for each individual incoming request.

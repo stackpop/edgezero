@@ -292,3 +292,8 @@ duplicates and FF values. Hyper folds identical Content-Length values and
 rejects conflicting lengths before the hook. The established server path
 therefore records a Content-Length-specific multiplicity limitation. Global
 wire order remains unavailable. See [the capability matrix](./overview#inbound-request-fidelity).
+
+Content-Length field multiplicity is `Unknown`: an HTTP binding does not reveal
+whether the parser folded original fields. This differs from the independently
+tested capability that identical repeated lengths fold and conflicting lengths
+are rejected before dispatch.

@@ -384,7 +384,10 @@ replace it. Ordinary runners and existing converters capture once and delegate.
 Supplied metadata and fidelity are caller assertions; syntax validation does
 not independently establish their provenance.
 
-Viceroy probes retain tested repeated fields and FF header octets. They also
+Viceroy probes retain tested ordinary repeated fields and FF header octets.
+Identical repeated Content-Length fields fold into one; conflicting lengths are
+rejected with 400 before application dispatch. These parser observations do not
+establish preservation for every incoming request. The probes also
 demonstrate that a normalized native shortcut can receive
 `/reserved/../native` as `/native`. The router hook cannot intercept a shortcut
 taken earlier. Original-target support and safe shortcut exclusion remain

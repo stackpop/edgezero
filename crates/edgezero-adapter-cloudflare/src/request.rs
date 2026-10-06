@@ -253,7 +253,7 @@ pub async fn into_core_request(
     let target = CapturedTarget::capture(
         &runtime_url,
         TargetSource::RuntimeUrl,
-        Preservation::Transformed,
+        Preservation::Unknown,
     );
     let uri: Uri = runtime_url
         .parse()

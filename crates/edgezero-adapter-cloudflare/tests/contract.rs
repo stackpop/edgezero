@@ -113,6 +113,7 @@ mod tests {
     async fn ingress_metadata_tracks_runtime_url_origin_and_coalescing() {
         let oversized = format!("https://example.com/{}", "a".repeat(MAX_TARGET_BYTES));
         for url in [
+            "https://example.com/reserved?q=a%2Fb",
             "https://example.com/reserved/../ordinary?q=a%2Fb",
             "https://example.com/reserved/%2e%2e/ordinary",
             "https://example.com/reserved//%2F",
@@ -143,7 +144,7 @@ mod tests {
             match ingress.target() {
                 CapturedTarget::Complete(target) => {
                     assert_eq!(target.value(), exposed);
-                    assert_eq!(target.fidelity(), Preservation::Transformed);
+                    assert_eq!(target.fidelity(), Preservation::Unknown);
                 }
                 CapturedTarget::Unavailable(reason) => {
                     assert_eq!(*reason, TargetUnavailable::TooLarge);

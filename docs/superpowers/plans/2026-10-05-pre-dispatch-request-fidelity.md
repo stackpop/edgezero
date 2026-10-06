@@ -388,3 +388,21 @@ A reviewed immutable dependency revision, consumer repinning and tests on
 Trusted Server's resolved graph remain required. Do not claim consumer F0 or
 the full trace feature complete from toolkit checks. Follow the repository
 PR-creator workflow, including its linked-issue requirement, for publication.
+
+### Approved external-review corrections — 2026-10-06
+
+- [x] Prove canonical Cloudflare URLs and Axum absent/single/repeated visible
+      Content-Length fields do not claim per-request `Transformed` merely because
+      the runtime can normalize or fold them; use `Unknown`.
+- [x] Retain actual parser folding and conversion behavior; rerun real browser
+      contract tests, the native TCP hook and the fixed raw observation matrix.
+- [x] Document Fastly identical Content-Length folding and conflicting-length
+      rejection. Verify the required full gates and independent review, then update
+      the existing PR and Trusted Server consumer pin. No Python is introduced.
+
+Verification: all five required workspace gates and docs lint/format/build pass.
+Native Axum contract tests pass 116/0, real-browser Cloudflare 11/0, Fastly
+Viceroy 6/0 and Spin Wasmtime 12/0. The rebuilt raw matrix retains all 54
+committed observations (20 Fastly, 17 Cloudflare, 17 Spin). Independent review
+approved the metadata correction without changing request conversion or claims
+about original wire bytes.

@@ -244,3 +244,12 @@ requires a reviewed immutable EdgeZero revision and verification against the
 consumer's resolved dependency graph. Successful normal browser workflows on
 all four adapters, early native ordering and terminal finalization remain
 consumer acceptance work. Toolkit tests alone do not complete those gates.
+
+### Per-observation preservation clarification — 2026-10-06
+
+`Transformed` means a change is established for the specific observation. A
+runtime capability to normalize URLs or fold Content-Length fields does not
+prove that every request changed. Cloudflare runtime targets and Axum
+Content-Length multiplicity therefore use `Unknown` when original equality or
+change cannot be established. Conversion behavior and recorded capability
+observations remain unchanged.
