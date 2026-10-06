@@ -87,21 +87,31 @@ pub fn finish(summary: ServeSummary<Error>) -> Result<(), Error> {
     );
     summary.into_result()
 }
+fn install_logger(env: &edgezero_core::env_config::EnvConfig) -> Result<(), Error> {
+    let logging = FastlyLogging::from(env);
+    if logging.use_fastly_logger {
+        init_logger(
+            logging.endpoint.as_deref().unwrap(),
+            logging.level,
+            logging.echo_stdout,
+        )?;
+    }
+    Ok(())
+}
+fn post_commit_error(obs: &Observation, token: &str, error: &dyn std::fmt::Display) {
+    println!(
+        "{}",
+        serde_json::json!({"event":"post_commit_error","instance":obs.instance,"ordinal":obs.ordinal,"token":token,"error":error.to_string()})
+    );
+}
 pub fn rebuilt() -> Result<(), Error> {
-    let mut initialized = false;
+    let mut logger_installed = false;
     finish(serving().run(move |req| -> Result<Response, Error> {
         let stores = MeasuredApp::stores();
         let env = runtime_env_config(stores);
-        if !initialized {
-            let logging = FastlyLogging::from(&env);
-            if logging.use_fastly_logger {
-                init_logger(
-                    logging.endpoint.as_deref().unwrap(),
-                    logging.level,
-                    logging.echo_stdout,
-                )?;
-            }
-            initialized = true;
+        if !logger_installed {
+            install_logger(&env)?;
+            logger_installed = true;
         }
         let app = MeasuredApp::build_app();
         edgezero_adapter_fastly::request::dispatch_with_registries(&app, req, stores, &env, extend)
@@ -117,8 +127,8 @@ fn custom_dispatch(
         .get_header_str("x-request-token")
         .unwrap_or("missing")
         .to_owned();
-    let observation = observation(&req);
-    assert_eq!(sandbox.requests(), observation.ordinal as u64);
+    let obs = observation(&req);
+    assert_eq!(sandbox.requests(), obs.ordinal as u64);
     if req.get_path() == "/panic" {
         panic!("injected callback panic");
     }
@@ -128,13 +138,24 @@ fn custom_dispatch(
                 "x-fixture-attempts",
                 sandbox.initialization_attempts().to_string(),
             )
-            .with_body_json(&serde_json::json!({"instance":observation.instance,
-                "ordinal":observation.ordinal,"retained":sandbox.state().is_some()}))?
+            .with_body_json(&serde_json::json!({"instance":obs.instance,
+                "ordinal":obs.ordinal,"retained":sandbox.state().is_some()}))?
             .send_to_client();
         return Ok(());
     }
+    let stores = MeasuredApp::stores();
+    let env = runtime_env_config(stores);
+    if let Err(error) = sandbox.setup_once(|| install_logger(&env)) {
+        Response::from_status(503)
+            .with_body(error.to_string())
+            .send_to_client();
+        return Ok(());
+    }
+    log::info!("fixture request {}", obs.correlation);
+    // Only the streaming route schedules post-send work.
     let post_send = req
         .get_header_str("x-fixture-backend")
+        .filter(|uri| uri.contains("/chunks"))
         .map(|uri| uri.replace("/chunks", "/post-send"));
     req.set_header("x-fixture-mutated", "true");
     // Per-request mode scopes application state to the current callback.
@@ -153,20 +174,18 @@ fn custom_dispatch(
                 "x-fixture-attempts",
                 state.initialization_attempts().to_string(),
             )
-            .with_body_json(&serde_json::json!({"instance":observation.instance,
-                        "ordinal":observation.ordinal,"retained":state.state().is_some()}))?
+            .with_body_json(&serde_json::json!({"instance":obs.instance,
+                        "ordinal":obs.ordinal,"retained":state.state().is_some()}))?
             .send_to_client();
         return Ok(());
     }
-    initialized(&observation, &token);
-    let stores = MeasuredApp::stores();
-    let env = edgezero_adapter_fastly::runtime_env_config(stores);
+    initialized(&obs, &token);
     let core = edgezero_adapter_fastly::request::into_core_request_with_registries(
         req,
         stores,
         &env,
         |_, extensions| {
-            extensions.insert(observation.clone());
+            extensions.insert(obs.clone());
         },
     )?;
     let proxy = core
@@ -194,40 +213,31 @@ fn custom_dispatch(
         Body::Once(bytes) => {
             native.set_body(bytes.to_vec());
             native.send_to_client();
-            lifecycle("response_committed", &observation, &token);
+            lifecycle("response_committed", &obs, &token);
         }
         Body::Stream(mut stream) => {
             let mut writer = native.stream_to_client();
-            lifecycle("response_committed", &observation, &token);
+            lifecycle("response_committed", &obs, &token);
             while let Some(chunk) = block_on(stream.next()) {
                 match chunk {
                     Ok(bytes) => {
                         if let Err(error) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
-                            println!(
-                                "{}",
-                                serde_json::json!({"event":"post_commit_error","instance":observation.instance,"ordinal":observation.ordinal,"token":token,"error":error.to_string()})
-                            );
+                            post_commit_error(&obs, &token, &error);
                             drop(writer);
-                            lifecycle("guest_completed", &observation, &token);
+                            lifecycle("guest_completed", &obs, &token);
                             return Ok(());
                         }
                     }
                     Err(error) => {
-                        println!(
-                            "{}",
-                            serde_json::json!({"event":"post_commit_error","instance":observation.instance,"ordinal":observation.ordinal,"token":token,"error":error.to_string()})
-                        );
+                        post_commit_error(&obs, &token, &error);
                         drop(writer);
-                        lifecycle("guest_completed", &observation, &token);
+                        lifecycle("guest_completed", &obs, &token);
                         return Ok(());
                     }
                 }
             }
             if let Err(error) = writer.finish() {
-                println!(
-                    "{}",
-                    serde_json::json!({"event":"post_commit_error","instance":observation.instance,"ordinal":observation.ordinal,"token":token,"error":error.to_string()})
-                );
+                post_commit_error(&obs, &token, &error);
             }
         }
     }
@@ -235,7 +245,7 @@ fn custom_dispatch(
         let Ok(uri) = uri.parse::<edgezero_core::http::Uri>() else {
             return Ok(());
         };
-        if uri.host() == Some("127.0.0.1") && uri.scheme_str() == Some("http") {
+        if fixture_core::is_loopback_http(&uri) {
             let outcome = block_on(proxy.forward(edgezero_core::proxy::ProxyRequest::new(
                 edgezero_core::http::Method::GET,
                 uri,
@@ -258,8 +268,8 @@ fn custom_dispatch(
     }
     println!(
         "{}",
-        serde_json::json!({"event":"guest_completed", "instance":observation.instance,"token":token,
-        "ordinal":observation.ordinal,"cpu_ms":fastly::compute_runtime::elapsed_vcpu_ms().ok(),
+        serde_json::json!({"event":"guest_completed", "instance":obs.instance,"token":token,
+        "ordinal":obs.ordinal,"cpu_ms":fastly::compute_runtime::elapsed_vcpu_ms().ok(),
         "heap_mib":fastly::compute_runtime::heap_memory_snapshot_mib().ok()})
     );
     Ok(())
@@ -322,7 +332,7 @@ pub fn faults() -> Result<(), Error> {
     use edgezero_core::http::response_builder;
     let mut retained = None;
     finish(serving().run(move |mut req: Request| -> Result<Response, Error> {
-        let observation = observation(&req);
+        let obs = observation(&req);
         let token = req.get_header_str("x-request-token").unwrap_or("missing").to_owned();
         let path = req.get_path().to_owned();
         if path == "/constructor-panic" {
@@ -330,7 +340,7 @@ pub fn faults() -> Result<(), Error> {
             retained = None;
         }
         let app = retained.get_or_insert_with(MeasuredApp::build_app);
-        initialized(&observation, &token);
+        initialized(&obs, &token);
         let result = match path.as_str() {
             "/collect-error" => {
                 let body = Body::from_stream(futures::stream::iter([
@@ -348,18 +358,18 @@ pub fn faults() -> Result<(), Error> {
                 let env = if path == "/recoverable-store-error" || path == "/terminal-store-error" {
                     EnvConfig::from_vars([("EDGEZERO__STORES__KV__FIXTURE_KV__NAME", "missing_fixture_store")])
                 } else { runtime_env_config(MeasuredApp::stores()) };
-                edgezero_adapter_fastly::request::dispatch_with_registries(app, req, MeasuredApp::stores(), &env, |_, extensions| { extensions.insert(observation.clone()); })
+                edgezero_adapter_fastly::request::dispatch_with_registries(app, req, MeasuredApp::stores(), &env, |_, extensions| { extensions.insert(obs.clone()); })
             }
         };
         match result {
-            Ok(response) => { lifecycle("conversion_completed", &observation, &token); Ok(response) }
+            Ok(response) => { lifecycle("conversion_completed", &obs, &token); Ok(response) }
             Err(error) => {
-                println!("{}", serde_json::json!({"event":"adapter_error","instance":observation.instance,"ordinal":observation.ordinal,"token":token,"path":path,"error":error.to_string(),"source":"controlled_fixture_input"}));
+                println!("{}", serde_json::json!({"event":"adapter_error","instance":obs.instance,"ordinal":obs.ordinal,"token":token,"path":path,"error":error.to_string(),"source":"controlled_fixture_input"}));
                 if path == "/recoverable-store-error" {
                     // Explicit custom policy permits another callback; standard helpers propagate.
                     Ok(Response::from_status(503).with_body("injected selector failed"))
                 } else {
-                    lifecycle("terminal_error", &observation, &token);
+                    lifecycle("terminal_error", &obs, &token);
                     Err(error)
                 }
             }

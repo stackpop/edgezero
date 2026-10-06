@@ -312,10 +312,6 @@ app-demo-cli config validate --strict
 
 ### edgezero config push
 
-`--adapter <name>` is case-insensitive and limits adapter-specific checks to
-`<name>`. Shared schema and secret-presence checks still apply. A passing push
-does not prove portability; run `config validate --strict` in CI for that.
-
 Push the resolved `<name>.toml` app-config into the target adapter's
 config store (spec §13). Same dispatch shape as the other commands:
 each adapter crate owns its own implementation, the CLI is a thin
@@ -332,7 +328,13 @@ flags and exits `2` with a pointer to the typed CLI — it cannot push (see
 
 **Arguments:**
 
-- `--adapter <name>` — target adapter (`axum`, `cloudflare`, `fastly`, `spin`).
+- `--adapter <name>` — target adapter (`axum`, `cloudflare`, `fastly`, `spin`),
+  matched case-insensitively. Adapter-specific checks run only for `<name>`:
+  app-config key syntax, adapter-manifest validation, merged store-id
+  collisions, `#[secret]` reference rules, and the `--strict` capability checks
+  push always runs. Shared schema and secret-presence checks still apply. A
+  passing push does not prove portability; run `config validate --strict` in CI
+  for that.
 - `--manifest <path>` — manifest path (default: `edgezero.toml`).
 - `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
 - `--store <id>` — logical config-store id to push to. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
@@ -388,10 +390,6 @@ A successful non-dry-run push also emits `pushed-key=<key>` and
 
 ### edgezero config diff
 
-`--adapter <name>` is case-insensitive and limits adapter-specific checks to
-`<name>`. Shared schema and secret-presence checks still apply. A passing push
-does not prove portability; run `config validate --strict` in CI for that.
-
 Show what `config push` _would_ change: builds the local blob envelope
 from your typed `<name>.toml` and compares it against the remote (or
 local-emulator) config-store entry, without writing anything. Like
@@ -409,7 +407,12 @@ stub that absorbs its flags and exits `2` with a pointer to the typed CLI.
 
 **Arguments:**
 
-- `--adapter <name>` — target adapter (`axum`, `cloudflare`, `fastly`, `spin`).
+- `--adapter <name>` — target adapter (`axum`, `cloudflare`, `fastly`, `spin`),
+  matched case-insensitively. Adapter-specific checks run only for `<name>`:
+  app-config key syntax, adapter-manifest validation, merged store-id
+  collisions, and `#[secret]` reference rules. Shared schema and secret-presence
+  checks still apply. `diff` runs no `--strict` capability checks; a clean diff
+  does not prove portability. Run `config validate --strict` in CI for that.
 - `--manifest <path>` — manifest path (default: `edgezero.toml`).
 - `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
 - `--store <id>` — logical config-store id to diff against. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).

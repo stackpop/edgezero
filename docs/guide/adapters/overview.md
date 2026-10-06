@@ -32,7 +32,7 @@ Adapters also expose `from_core_response` (or equivalent) to transform an `edgez
 
 ## Dispatch Helper
 
-Adapters surface a dispatch entry point, either a free function or a service builder's `dispatch` method, that bridges from the provider event loop into the shared router (`App::router().oneshot(...)`). It should:
+Adapters surface a dispatch entry point, either a free function or a service builder's `dispatch` method, that bridges from the provider event loop into the shared router (`app.router().oneshot(...)`). It should:
 
 1. Convert the incoming provider request with `into_core_request`
 2. Await the router future
@@ -164,12 +164,12 @@ can change and no refresh policy has been defined.
 Application ownership and request scheduling are separate. An `App` can be
 retained by its caller; each adapter still controls how requests arrive:
 
-| Adapter    | Existing default                         | Explicit retention                                            |
-| ---------- | ---------------------------------------- | ------------------------------------------------------------- |
-| Fastly     | Build for each single-request invocation | `serve_app` with an SDK `Serve`, or a custom `Serve` callback |
-| Cloudflare | Build on each fetch                      | Concrete application-owned cache and `dispatch_app`           |
-| Spin       | Build on each invocation                 | Concrete cache and `dispatch_app` on a compatible host        |
-| Axum       | Build once at server startup             | Already retains the router                                    |
+| Adapter    | Existing default                         | Explicit retention                                                                                                    |
+| ---------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Fastly     | Build for each single-request invocation | `serve_app` with an SDK `Serve`, or [`lifecycle::serve_custom`](/guide/adapters/fastly#custom-dispatch-and-streaming) |
+| Cloudflare | Build on each fetch                      | Concrete application-owned cache and `dispatch_app`                                                                   |
+| Spin       | Build on each invocation                 | Concrete cache and `dispatch_app` on a compatible host                                                                |
+| Axum       | Build once at server startup             | Already retains the router                                                                                            |
 
 Retain owned settings, parsed objects, and bounded caches only when their
 staleness policy is acceptable. Keep native request handles, bodies, store
@@ -197,7 +197,7 @@ clear application-owned interiors.
 | Settings or parsed keys become stale       | Keep them request-scoped until a refresh policy is defined. For retained values, build and validate a complete replacement snapshot, then publish it atomically. Decide whether refresh failure keeps the last valid snapshot or rejects requests. |
 | Caches grow without bound                  | Limit entries and retained bytes, expire or evict entries, and bound origin diversity. A sandbox request limit cannot bound allocation within one request.                                                                                         |
 | Concurrent requests mutate shared state    | Synchronize mutations and acquire an immutable snapshot per request. Release locks before awaiting provider work. Rust's `Send + Sync` bounds do not establish application-level isolation.                                                        |
-| Initialization or required bindings fail   | Surface the error and monitor repeated fresh-instance failures. In custom dispatch, convert a recoverable failure into one response only when the application defines that recovery policy. Avoid unlimited retries.                               |
+| Initialization or required bindings fail   | Surface the error and monitor repeated fresh-instance failures. In custom dispatch, convert a recoverable failure into one response only when the application defines that recovery policy. Bound retries, e.g. with Fastly `Serve` limits.        |
 | Logging is installed twice                 | Choose one owner. With the Fastly helper, set `Hooks::owns_logging()` when application code installs the logger. First-snapshot logging is intentionally fixed; use custom dispatch for another policy.                                            |
 | A stream fails after commitment            | Finish or drop the streaming writer and settle request-owned pending work. Log the partial-response failure; do not attempt a replacement response after sending headers.                                                                          |
 

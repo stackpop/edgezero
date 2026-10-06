@@ -9,7 +9,7 @@ serde_json.workspace = true
 fixture-core.workspace = true
 edgezero-core.workspace = true
 edgezero-adapter-spin.workspace = true
-spin-sdk = { version = "6.0", default-features = false, features = ["http", "key-value"] }
+spin-sdk = { version = "~6.0", default-features = false, features = ["http", "key-value"] }
 anyhow = "1"
 
 [lib]

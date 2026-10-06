@@ -130,13 +130,6 @@ pub fn validate_overlap(left: &Value, right: &Value) -> Result<()> {
         "this pair did not observe overlapping callbacks",
     )
 }
-#[cfg(test)]
-pub fn metric_delta(before: Option<u64>, after: Option<u64>) -> Result<Option<u64>> {
-    match (before, after) {
-        (Some(a), Some(b)) => Ok(Some(b.checked_sub(a).ok_or("negative metric delta")?)),
-        _ => Ok(None),
-    }
-}
 pub fn cookie_values(headers: &Value) -> Vec<&str> {
     headers
         .as_array()
@@ -168,6 +161,25 @@ fn quantiles(mut values: Vec<u64>) -> Value {
         result[format!("p{p}")] = json!(values[(p * values.len()).div_ceil(100).saturating_sub(1)]);
     }
     result
+}
+/// Completion and first-byte quantiles for one cohort, or `None` without
+/// completion samples.
+fn cohort_stats(rows: &[&Value]) -> Option<Value> {
+    let samples = |key: &str| {
+        rows.iter()
+            .filter_map(|r| r[key].as_u64())
+            .collect::<Vec<_>>()
+    };
+    let completion = samples("complete_ns");
+    if completion.is_empty() {
+        return None;
+    }
+    let mut stats = json!({"samples":completion.len(), "completion_ns":quantiles(completion)});
+    let first_bytes = samples("first_byte_ns");
+    if !first_bytes.is_empty() {
+        stats["first_byte_ns"] = quantiles(first_bytes);
+    }
+    Some(stats)
 }
 fn phase_delta(before: Option<f64>, after: Option<f64>) -> Value {
     match (before, after) {
@@ -328,15 +340,8 @@ pub fn summarize(records: &[Value]) -> Value {
             } else {
                 "reused"
             };
-            let variant = r["variant"].as_str().map(str::to_owned).unwrap_or_else(|| {
-                format!(
-                    "{}:{}",
-                    r["adapter"].as_str().unwrap_or("unknown"),
-                    r["mode"].as_str().unwrap_or("unknown")
-                )
-            });
             groups
-                .entry(format!("{variant}:probe:{cohort}"))
+                .entry(format!("{}:probe:{cohort}", variant(r)))
                 .or_default()
                 .push(r);
         }
@@ -349,15 +354,9 @@ pub fn summarize(records: &[Value]) -> Value {
     }
     let mut result = json!({"quantile_method":"nearest rank", "variants":{}, "memory_snapshots":{}, "cpu_comparison":"SDK phase readings only; cross-run performance unverified"});
     for (key, rows) in groups {
-        let values = rows
-            .iter()
-            .filter_map(|r| r["complete_ns"].as_u64())
-            .collect::<Vec<_>>();
-        if values.is_empty() {
+        let Some(mut stats) = cohort_stats(&rows) else {
             continue;
-        }
-        result["variants"][&key] =
-            json!({"samples":values.len(), "completion_ns":quantiles(values)});
+        };
         let mut repetitions: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
         for row in &rows {
             repetitions
@@ -366,30 +365,11 @@ pub fn summarize(records: &[Value]) -> Value {
                 .push(row);
         }
         for (repetition, samples) in repetitions {
-            let completion = samples
-                .iter()
-                .filter_map(|r| r["complete_ns"].as_u64())
-                .collect::<Vec<_>>();
-            if !completion.is_empty() {
-                result["variants"][&key]["repetitions"][&repetition] =
-                    json!({"samples":completion.len(),"completion_ns":quantiles(completion)});
-            }
-            let first_bytes = samples
-                .iter()
-                .filter_map(|r| r["first_byte_ns"].as_u64())
-                .collect::<Vec<_>>();
-            if !first_bytes.is_empty() {
-                result["variants"][&key]["repetitions"][&repetition]["first_byte_ns"] =
-                    quantiles(first_bytes);
+            if let Some(repetition_stats) = cohort_stats(&samples) {
+                stats["repetitions"][&repetition] = repetition_stats;
             }
         }
-        let first = rows
-            .iter()
-            .filter_map(|r| r["first_byte_ns"].as_u64())
-            .collect::<Vec<_>>();
-        if !first.is_empty() {
-            result["variants"][&key]["first_byte_ns"] = quantiles(first);
-        }
+        result["variants"][&key] = stats;
     }
     for (key, values) in memory {
         result["memory_snapshots"][key] = json!({"samples":values.len(),"min_mib":values.iter().min(),"max_mib":values.iter().max(),"source":"SDK host-inclusive rounded snapshot"});
@@ -413,6 +393,15 @@ mod tests {
         ]);
         assert!(summary["guests"][0]["requests"][0]["response_committed"].is_null());
         assert_eq!(summary["build_identity"]["status"], "invalid");
+    }
+    #[test]
+    fn equal_build_fingerprints_across_repetitions_stay_consistent() {
+        let summary = summarize(&[
+            json!({"event":"build","variant":"c","repetition":0,"artifact":{"fnv1a64":"a"}}),
+            json!({"event":"build","variant":"c","repetition":1,"artifact":{"fnv1a64":"a"}}),
+            json!({"event":"build","variant":"b","repetition":0,"artifact":{"fnv1a64":"b"}}),
+        ]);
+        assert_eq!(summary["build_identity"]["status"], "consistent");
     }
     fn measured(event: &str, ordinal: u64, cpu: u64, heap: u64) -> Value {
         json!({"event":event,"variant":"C","repetition":1,"instance":"same",
@@ -524,11 +513,6 @@ mod tests {
         );
     }
     #[test]
-    fn unavailable_metrics() {
-        assert_eq!(metric_delta(None, Some(4)).unwrap(), None);
-        assert!(metric_delta(Some(5), Some(4)).is_err());
-    }
-    #[test]
     fn duplicate_cookies() {
         assert_eq!(
             cookie_values(&json!([["Set-Cookie", "a=1"], ["Set-Cookie", "b=2"]])),
@@ -537,18 +521,14 @@ mod tests {
     }
     #[test]
     fn overlap_requires_same_guest_and_concurrency() {
-        let left = json!({"instance":"a","max_inflight":2,"before":{"inflight":1}});
+        let left = json!({"instance":"a","before":{"inflight":1}});
         for right in [
-            json!({"instance":"b","max_inflight":2,"before":{"inflight":2}}),
-            json!({"instance":"a","max_inflight":2,"before":{"inflight":1}}),
+            json!({"instance":"b","before":{"inflight":2}}),
+            json!({"instance":"a","before":{"inflight":1}}),
         ] {
             assert!(validate_overlap(&left, &right).is_err());
         }
-        validate_overlap(
-            &left,
-            &json!({"instance":"a","max_inflight":2,"before":{"inflight":2}}),
-        )
-        .unwrap();
+        validate_overlap(&left, &json!({"instance":"a","before":{"inflight":2}})).unwrap();
     }
     #[test]
     fn unmatched_workloads_excluded() {

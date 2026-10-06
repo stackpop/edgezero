@@ -55,7 +55,7 @@ With the pinned Viceroy installed, run a small synthetic comparison:
 
 The reported evidence directory contains `events.jsonl` and `summary.json`.
 For matched probe responses, inspect `guest.instance`, `guest.ordinal`,
-`guest.builds`, `guest.configures`, and `guest.shared`:
+`guest.builds`, and `guest.shared`:
 
 - A: a new instance, ordinal 1, and one build on every request.
 - B: the same instance can have ordinal 2 and two builds.
@@ -71,8 +71,7 @@ For production code, read `serve_app_with_request_extensions` in the Fastly
 adapter: it owns one app and performs request setup inside the SDK callback.
 Cloudflare and Spin instead expose `dispatch_app` and let the caller retain a
 concrete app. Axum already retains its app. Existing entry points keep their
-lifecycle defaults until an application explicitly adopts retention. The
-Cloudflare header correction also affects the default response conversion.
+lifecycle defaults until an application explicitly adopts retention.
 
 Builds use `$CARGO` (falling back to `cargo`) and pin `CARGO_TARGET_DIR` to this
 workspace's `target/`, regardless of external Cargo target-dir settings. Update
@@ -135,27 +134,33 @@ SDK CPU phase readings are not valid cross-run benchmarks. Heap snapshots includ
 host resources and are rounded MiB values; flat readings do not rule out small
 leaks. Latency quantiles use nearest rank and retain sample counts.
 
-The smoke checks stable guest identity, increasing ordinals, build/configure counts,
+The smoke checks stable guest identity, increasing ordinals, build counts,
 request-local values, named/default binding reads, duplicate cookies, ordinary
 rendered errors, idle reinitialization, supported request/lifetime/memory limits,
 progressive chunks, interrupted streams, finite distinct loopback origins, and
-exclusion of the terminated guest after an injected panic. Logging tests derive service-scoped
-keys from an observed guest service ID and distinguish `fixture-logs ::` endpoint
-records from echoed stdout. The negative control verifies that naively wrapping
-`run_app` with an enabled global logger fails on its second installation.
+exclusion of the terminated guest after an injected panic. Logging checks run on
+B, C, custom C and the negative control. Custom C installs its logger with
+`Sandbox::setup_once`, so they also show setup running once per guest across
+retained callbacks. They derive service-scoped keys from an observed guest service
+ID and distinguish `fixture-logs ::` endpoint records from echoed stdout. The
+negative control verifies that naively wrapping `run_app` with an enabled global
+logger fails on its second installation.
 
 ## Runtime and measurement limits
 
-The pinned Viceroy 0.17.0 admits at most six requests per guest: one initial
-request plus five `next_request` accepts. Raising `--max-requests` cannot extend
-that local host ceiling. Verify deployed eviction and long-lived memory behavior
-separately. The runner checks the Viceroy version against `.tool-versions` and
-reports a mismatch as unverified.
+Raising `--max-requests` cannot extend the pinned Viceroy's per-guest request
+ceiling (see the Fastly guide). Verify deployed eviction and long-lived memory
+behavior separately. The runner checks the Viceroy version against
+`.tool-versions` and reports a mismatch as unverified.
 
 Cloudflare and Spin may select different guests during overlap or recovery tests;
 those observations are unverified. A success requires the same instance and the
-specific injected failure. `max_inflight` is a guest-lifetime high-water mark;
-overlap checks use the current `before.inflight` observations for the tested pair.
+specific injected failure. Overlap checks use each request's `before.inflight`
+observation for the tested pair.
+
+Spin's `/bindings` config check reads a value the same request seeds, so it proves
+only that the store label resolves. Cloudflare (`wrangler kv key put --local`) and
+Axum (a seeded file) read values written before the request.
 
 Quantiles summarize successful matched probes only. Health replies and injected
 errors are excluded. Each cohort includes per-repetition sample counts and
@@ -205,26 +210,12 @@ absence of small leaks or bounded growth for an arbitrary application.
 
 These are explicitly unverified, not assertions counted as passed:
 
-| Case                                                                                   | Available evidence / limitation                                                                                                                                                                                                                             |
-| -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Optional runtime-store open fails, then recovers in the same guest                     | Production host tests inject degraded then successful configuration snapshots; actual required-registry recovery is exercised above. The fixed optional store has no transient-open-failure control in the inspected local runtime.                         |
-| `EdgeError` itself fails to render                                                     | The current renderer builds fixed valid statuses/headers from JSON values. Its fallible signature remains preserved, but there is no public input or injection hook that triggers this failure. OOM/traps would not demonstrate a returned rendering error. |
-| Unavailable heap hostcall                                                              | The installed runtime supplies it. Preflight and fallback are implemented; no documented fault-injection control was found to demonstrate unavailable-hostcall behavior.                                                                                    |
-| Full standard callback/send/cleanup timing                                             | The public retained helper has no post-send callback. Conversion observations and SDK summary timing are labeled separately; unavailable phases stay unknown.                                                                                               |
-| Deployed eviction, endpoint handles, resource accounting, capacity, and workload gains | Require separately authorized deployment and application telemetry. Local CPU samples are not cross-run CPU benchmarks; finite origin tests do not establish service-wide capacity.                                                                         |
+| Case                                                                                   | Available evidence / limitation                                                                                                                                                          |
+| -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Optional runtime-store open fails, then recovers in the same guest                     | Host tests inject degraded then successful configuration snapshots; required-registry recovery is exercised above. Local runtimes cannot make the fixed optional store fail transiently. |
+| `EdgeError` itself fails to render                                                     | The renderer builds fixed valid statuses/headers from JSON values; no public input or injection hook triggers a returned rendering error.                                                |
+| Unavailable heap hostcall                                                              | Only the preflight is implemented. If the heap snapshot fails, the SDK itself stops after the first request. Local runtimes supply the hostcall and cannot disable it.                   |
+| Full standard callback/send/cleanup timing                                             | The public retained helper has no post-send callback. Conversion observations and SDK summary timing are labeled separately; unavailable phases stay unknown.                            |
+| Deployed eviction, endpoint handles, resource accounting, capacity, and workload gains | Require separately authorized deployment and application telemetry. Local CPU samples are not cross-run CPU benchmarks; finite origin tests do not establish service-wide capacity.      |
 
 No deployment is performed by these fixtures.
-
-## Persistent-state audit
-
-Core's production recursion depth is thread-local and guarded by
-`SecretFieldsRecursionGuard`. Added tests verify normal scope cleanup and host
-unwinding followed by fresh entry. Host unwinding does not prove cleanup after a
-terminating WASM trap. Canonical-form instrumentation and environment locks are
-test-only. Fastly's missing-store warning sets are bounded; their eviction tests
-already cover repeated names. Suppression persists with reuse, so warning counts
-must not be interpreted as failure counts. No request data belongs in these caches.
-
-Restore the existing entry point and remove the concrete retained owner to roll
-back. The default A fixture exercises the original path; limit one alone is not a
-replacement for that rollback test.

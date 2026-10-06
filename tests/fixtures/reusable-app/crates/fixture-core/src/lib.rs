@@ -1,53 +1,3 @@
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use edgezero_core::app::Hooks;
-    use edgezero_core::body::Body;
-    use edgezero_core::http::request_builder;
-    use futures::executor::block_on;
-
-    #[test]
-    fn retained_probe_echoes_each_request_and_preserves_cookies() {
-        let app = FixtureApp::build_app();
-        for (index, token) in ["one", "two"].into_iter().enumerate() {
-            let req = request_builder()
-                .uri(format!("/probe/{token}"))
-                .header("x-request-token", token)
-                .body(Body::from(token))
-                .unwrap();
-            let response = block_on(app.router().oneshot(req)).unwrap();
-            let value: serde_json::Value =
-                serde_json::from_slice(response.body().as_bytes().unwrap()).unwrap();
-            assert_eq!(value["token"], token);
-            assert_eq!(value["path"], token);
-            assert_eq!(value["body"], token);
-            assert_eq!(value["shared"], index + 1);
-        }
-        let req = request_builder()
-            .uri("/cookies")
-            .body(Body::empty())
-            .unwrap();
-        let response = block_on(app.router().oneshot(req)).unwrap();
-        assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
-    }
-
-    #[test]
-    fn rejects_remote_origins_and_keeps_concrete_apps_separate() {
-        let app = FixtureApp::build_app();
-        let other = OtherApp::build_app();
-        let req = request_builder()
-            .uri("/origin/x")
-            .header("x-fixture-backend", "https://example.com/")
-            .body(Body::empty())
-            .unwrap();
-        let response = block_on(app.router().oneshot(req)).unwrap();
-        assert_eq!(response.status().as_u16(), 400);
-        let req = request_builder().uri("/other").body(Body::empty()).unwrap();
-        let response = block_on(other.router().oneshot(req)).unwrap();
-        assert_eq!(response.body().as_bytes().unwrap(), b"other-app");
-    }
-}
-
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::http::{Method, Response, response_builder};
 use edgezero_core::proxy::ProxyRequest;
@@ -58,11 +8,8 @@ use std::sync::{Arc, OnceLock};
 
 static INSTANCE: OnceLock<String> = OnceLock::new();
 static BUILDS: AtomicUsize = AtomicUsize::new(0);
-static CONFIGURES: AtomicUsize = AtomicUsize::new(0);
 static ORDINAL: AtomicUsize = AtomicUsize::new(0);
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
-// Guest-lifetime high-water mark; pair overlap uses the current before.inflight.
-static MAX_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn instance_id() -> Option<&'static str> {
     INSTANCE.get().map(String::as_str)
@@ -123,7 +70,6 @@ impl Hooks for FixtureApp {
         app
     }
     fn configure(app: &mut App) {
-        CONFIGURES.fetch_add(1, Ordering::SeqCst);
         app.set_name("fixture");
     }
     fn routes() -> RouterService {
@@ -142,6 +88,28 @@ impl Hooks for FixtureApp {
             .build()
     }
 }
+/// Swaps only the KV binding metadata to inject a required-binding failure.
+///
+/// Fixtures pair this type with the retained `App` built from `FixtureApp`, so a
+/// second construction does not invalidate the recovery fixture's one-build
+/// assertion. That deliberately breaks the `dispatch_app` precondition that the
+/// app is built from `A`; it is correct only because `dispatch_app` currently
+/// reads nothing but `A::stores()`. If an adapter starts consulting another hook
+/// (for example `A::owns_logging()`), this pairing must be revisited.
+pub struct MissingBindingApp;
+impl Hooks for MissingBindingApp {
+    fn routes() -> RouterService {
+        FixtureApp::routes()
+    }
+    fn stores() -> StoresMetadata {
+        let mut stores = FixtureApp::stores();
+        stores.kv = Some(StoreMetadata {
+            default: "missing_fixture_kv",
+            ids: &["missing_fixture_kv"],
+        });
+        stores
+    }
+}
 impl Hooks for OtherApp {
     fn routes() -> RouterService {
         RouterService::builder().get("/other", other).build()
@@ -153,7 +121,7 @@ async fn other(_ctx: RequestContext) -> Result<String, EdgeError> {
     Ok("other-app".into())
 }
 
-fn record(ctx: &RequestContext) -> serde_json::Value {
+fn record(ctx: &RequestContext) -> Result<serde_json::Value, EdgeError> {
     let req = ctx.request();
     let token = req
         .headers()
@@ -164,23 +132,24 @@ fn record(ctx: &RequestContext) -> serde_json::Value {
         .extensions()
         .get::<Observation>()
         .cloned()
-        .unwrap_or_else(|| observe(token, None));
+        .ok_or_else(|| {
+            EdgeError::internal(std::io::Error::other("observation middleware absent"))
+        })?;
     let shared = req
         .extensions()
         .get::<Arc<AtomicUsize>>()
         .unwrap()
         .fetch_add(1, Ordering::SeqCst)
         + 1;
-    serde_json::json!({
+    Ok(serde_json::json!({
         "instance": observation.instance, "ordinal": observation.ordinal,
         "correlation": observation.correlation, "native_id": observation.native_id,
-        "builds": BUILDS.load(Ordering::SeqCst), "configures": CONFIGURES.load(Ordering::SeqCst),
+        "builds": BUILDS.load(Ordering::SeqCst),
         "path": ctx.path_params().get("id"), "token": token,
         "mutated": req.headers().get("x-fixture-mutated").is_some(),
         "body": String::from_utf8_lossy(ctx.body().as_bytes().unwrap_or_default()),
-        "shared": shared, "max_inflight": MAX_INFLIGHT.load(Ordering::SeqCst),
-        "inflight": INFLIGHT.load(Ordering::SeqCst),
-    })
+        "shared": shared, "inflight": INFLIGHT.load(Ordering::SeqCst),
+    }))
 }
 
 #[action]
@@ -198,7 +167,7 @@ async fn probe(mut ctx: RequestContext) -> Result<String, EdgeError> {
         }
     };
     *ctx.request_mut().body_mut() = Body::from(bytes);
-    Ok(record(&ctx).to_string())
+    Ok(record(&ctx)?.to_string())
 }
 
 #[action]
@@ -218,6 +187,11 @@ async fn rendered_error(_ctx: RequestContext) -> Result<Response, EdgeError> {
     Err(EdgeError::bad_request("fixture error"))
 }
 
+/// Fixtures accept only harness-controlled local origins, never arbitrary Internet targets.
+pub fn is_loopback_http(uri: &edgezero_core::http::Uri) -> bool {
+    uri.scheme_str() == Some("http") && matches!(uri.host(), Some("127.0.0.1" | "localhost"))
+}
+
 async fn fetch_backend(ctx: &RequestContext) -> Result<Response, EdgeError> {
     let uri = ctx
         .request()
@@ -228,8 +202,7 @@ async fn fetch_backend(ctx: &RequestContext) -> Result<Response, EdgeError> {
     let uri: edgezero_core::http::Uri = uri
         .parse()
         .map_err(|_| EdgeError::bad_request("invalid backend URI"))?;
-    // Fixtures accept only harness-controlled local origins, never arbitrary Internet targets.
-    if uri.scheme_str() != Some("http") || !matches!(uri.host(), Some("127.0.0.1" | "localhost")) {
+    if !is_loopback_http(&uri) {
         return Err(EdgeError::bad_request("backend must be loopback HTTP"));
     }
     ctx.proxy_handle()
@@ -251,50 +224,54 @@ impl Drop for InFlight {
 }
 #[action]
 async fn overlap(ctx: RequestContext) -> Result<String, EdgeError> {
-    let count = INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+    INFLIGHT.fetch_add(1, Ordering::SeqCst);
     let _guard = InFlight;
-    MAX_INFLIGHT.fetch_max(count, Ordering::SeqCst);
-    let before = record(&ctx);
+    let before = record(&ctx)?;
     let _response = fetch_backend(&ctx).await?;
-    let mut after = record(&ctx);
+    let mut after = record(&ctx)?;
     after["before"] = before;
     Ok(after.to_string())
+}
+
+/// A missing server-side binding is a deployment fault, not a client error.
+fn missing_binding(message: &'static str) -> EdgeError {
+    EdgeError::internal(std::io::Error::other(message))
 }
 
 #[action]
 async fn bindings(ctx: RequestContext) -> Result<String, EdgeError> {
     let config = ctx
         .config_store("fixture_config")
-        .ok_or_else(|| EdgeError::bad_request("config handle absent"))?;
+        .ok_or_else(|| missing_binding("config handle absent"))?;
     let marker = config.get("marker").await.map_err(EdgeError::internal)?;
     let default_marker = ctx
         .config_store_default()
-        .unwrap()
+        .ok_or_else(|| missing_binding("default config handle absent"))?
         .get("marker")
         .await
         .map_err(EdgeError::internal)?;
     let kv = ctx
         .kv_store("fixture_kv")
-        .ok_or_else(|| EdgeError::bad_request("KV handle absent"))?;
+        .ok_or_else(|| missing_binding("KV handle absent"))?;
     kv.put("fixture-marker", &"local-fixture")
         .await
         .map_err(EdgeError::internal)?;
     let kv_marker: Option<String> = ctx
         .kv_store_default()
-        .unwrap()
+        .ok_or_else(|| missing_binding("default kv handle absent"))?
         .get("fixture-marker")
         .await
         .map_err(EdgeError::internal)?;
     let secret = ctx
         .secret_store("fixture_secrets")
-        .ok_or_else(|| EdgeError::bad_request("secret handle absent"))?;
+        .ok_or_else(|| missing_binding("secret handle absent"))?;
     let named_secret = secret
         .get_bytes("fixture_marker")
         .await
         .map_err(EdgeError::internal)?;
     let default_secret = ctx
         .secret_store_default()
-        .unwrap()
+        .ok_or_else(|| missing_binding("default secret handle absent"))?
         .get_bytes("fixture_marker")
         .await
         .map_err(EdgeError::internal)?;
@@ -345,5 +322,55 @@ impl edgezero_core::middleware::Middleware for ObserveRequest {
             response.extensions_mut().insert(lifetime);
         }
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use edgezero_core::app::Hooks;
+    use edgezero_core::body::Body;
+    use edgezero_core::http::request_builder;
+    use futures::executor::block_on;
+
+    #[test]
+    fn retained_probe_echoes_each_request_and_preserves_cookies() {
+        let app = FixtureApp::build_app();
+        for (index, token) in ["one", "two"].into_iter().enumerate() {
+            let req = request_builder()
+                .uri(format!("/probe/{token}"))
+                .header("x-request-token", token)
+                .body(Body::from(token))
+                .unwrap();
+            let response = block_on(app.router().oneshot(req)).unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(response.body().as_bytes().unwrap()).unwrap();
+            assert_eq!(value["token"], token);
+            assert_eq!(value["path"], token);
+            assert_eq!(value["body"], token);
+            assert_eq!(value["shared"], index + 1);
+        }
+        let req = request_builder()
+            .uri("/cookies")
+            .body(Body::empty())
+            .unwrap();
+        let response = block_on(app.router().oneshot(req)).unwrap();
+        assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+    }
+
+    #[test]
+    fn rejects_remote_origins_and_keeps_concrete_apps_separate() {
+        let app = FixtureApp::build_app();
+        let other = OtherApp::build_app();
+        let req = request_builder()
+            .uri("/origin/x")
+            .header("x-fixture-backend", "https://example.com/")
+            .body(Body::empty())
+            .unwrap();
+        let response = block_on(app.router().oneshot(req)).unwrap();
+        assert_eq!(response.status().as_u16(), 400);
+        let req = request_builder().uri("/other").body(Body::empty()).unwrap();
+        let response = block_on(other.router().oneshot(req)).unwrap();
+        assert_eq!(response.body().as_bytes().unwrap(), b"other-app");
     }
 }

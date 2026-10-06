@@ -312,8 +312,8 @@ Configure the Cloudflare adapter in `edgezero.toml`. See [Configuration](/guide/
 
 ## Retaining an application
 
-For explicit retention, keep a cache owned by one concrete application and pass
-select its `Hooks` type on every fetch:
+For explicit retention, keep a cache owned by one concrete application and
+select its `Hooks` type with `dispatch_app::<MyApp>` on every fetch:
 
 ```rust
 use edgezero_core::app::{App, Hooks};

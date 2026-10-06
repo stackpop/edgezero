@@ -21,8 +21,8 @@ The following focused changes accompany retention and apply to existing users:
   adapter, case-insensitively. Shared schema and secret-presence checks remain;
   `config validate --strict` checks portability across declared registered adapters.
 - Spin CLI secret-reference validation reports fields and rules without including
-  secret-reference values. This is an explicit exception to the original
-  error-redaction non-goal and does not change runtime error policy.
+  secret-reference values. This is one of the CLI diagnostic scope exceptions
+  listed under Non-goals (§3) and does not change runtime error policy.
 
 ## 1. Objective
 
@@ -271,7 +271,7 @@ and retained entry points; stream translation and response ownership stay unchan
 | Fastly custom   | Explicit header commitment, chunk pumping, stream finish/drop, response-extension inspection, and application finalization remain possible.    |
 | Cloudflare      | Preserve current stream translation and native response ownership.                                                                             |
 | Spin            | Preserve fully buffered output and the current 16 MiB cap on streamed response collection; already buffered bodies do not use that stream cap. |
-| Axum            | Preserve current streaming response conversion.                                                                                                |
+| Axum            | Preserve current conversion, which collects streamed bodies into an in-memory buffer before sending.                                          |
 
 Fastly and Spin inbound conversions buffer bodies. This feature must not be described as providing end-to-end streaming or removing body costs.
 
@@ -296,6 +296,8 @@ Cloning a wrapper or satisfying `Send + Sync` is not proof of host-resource vali
 Keep runtime configuration reads and store registry construction per request. Retained app state is a separate snapshot and will not automatically follow selector changes. A refresh must publish a coherent snapshot; in-flight requests keep the snapshot they acquired. Applications may choose not to refresh within an instance, but must document the resulting staleness policy.
 
 Audit all process-global and thread-local state, including `OnceLock` caches, warning suppression, and recursion guards. Static warning suppression can reduce log volume across requests; warning rate must not be interpreted as failure rate. The current bounded recent-name set can evict entries, so suppression is not an absolute once-per-sandbox guarantee. Verify guard cleanup on supported exit/error paths; the presence of a thread-local guard alone does not demonstrate leakage.
+
+Audit result: core's recursion depth is thread-local and guarded by `SecretFieldsRecursionGuard`. Tests verify normal scope cleanup and host unwinding followed by fresh entry; host unwinding does not prove cleanup after a terminating WASM trap. Canonical-form instrumentation and environment locks are test-only. Fastly's missing-store warning sets are bounded, and their eviction tests cover repeated names. No request data belongs in these caches.
 
 **Dynamic backends:** `proxy::ensure_backend` creates names from scheme, host, and port, so requests targeting many distinct origins exercise growing registration diversity. Current Fastly documentation describes node-level registration reuse even without sandbox reuse, and a service-wide concurrent dynamic-backend limit that blocks awaiting capacity rather than necessarily returning an immediate registration error. Do not model this as a per-sandbox counter that resets all capacity on every request. Use authorized, bounded origin sets and consider static backends for predictable origins. Test repeated and distinct origins, registration conflicts, and time waiting for capacity. Tune sandbox request limits using measured behavior; `with_max_requests` alone cannot bound service-wide registrations, fan-out within a request, or time blocked inside a request. The between-request lifetime check cannot interrupt a blocked registration. See [registration scope](https://www.fastly.com/documentation/guides/integrations/non-fastly-services/developer-guide-backends/) and [dynamic-backend limit behavior](https://www.fastly.com/documentation/reference/compute/errors).
 
@@ -382,6 +384,8 @@ Before enabling `with_max_memory` in a local comparison, verify that the actual 
 
 Viceroy's versioned upstream tests demonstrate a multi-request implementation: [0.17.0](https://github.com/fastly/Viceroy/blob/v0.17.0/cli/tests/integration/reusable_sessions.rs#L7) and [0.21.0](https://github.com/fastly/Viceroy/blob/v0.21.0/cli/tests/integration/reusable_sandboxes.rs#L7). This makes local experiments plausible; it is not evidence that these EdgeZero changes have run successfully.
 
+Observed with the pinned standalone Viceroy 0.17.0: a guest admits at most six requests (one initial request plus five `next_request` accepts), so raising the SDK request limit or the fixture's `--max-requests` cannot extend that local ceiling.
+
 - **Fastly:** run A/B/C below, stream completion, duplicate cookies, repeated logging, limit/idle termination, and restart isolation.
 - **Cloudflare:** use a local Workers runtime to compare per-fetch build versus retained concrete app; force overlapping requests with distinct inputs and a controlled await barrier. Restart to validate cold initialization. Record availability/version rather than assuming the runtime exists.
 - **Spin:** run the SDK6/P3 fixture on a compatible local host, with both sequential and concurrent instance reuse. Exercise supported reuse-count/concurrency/idle controls and record chosen values.
@@ -450,7 +454,7 @@ The implementation is acceptable when:
 
 Suggested implementation sequence: public prebuilt dispatch and core contracts; Fastly lifecycle; provider fixtures and experiments; guides and examples. Each stage preserves defaults. No cross-provider cache abstraction is required to deliver this design.
 
-Rollback is an entry-point choice: return to the existing `run_app` path and remove the concrete retained-app cache. On Fastly, also restore the single-request entry point. Test the rollback fixture rather than assuming a lower request limit recreates every aspect of the old initialization path. No persisted data migration is part of this feature.
+Rollback is an entry-point choice: return to the existing `run_app` path and remove the concrete retained-app cache. On Fastly, also restore the single-request entry point. The default Fastly A fixture exercises the original path; test it rather than assuming a lower request limit recreates every aspect of the old initialization path. No persisted data migration is part of this feature.
 
 ## 11. Review decisions
 

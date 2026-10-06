@@ -141,6 +141,7 @@ jobs:
         run: cargo clippy -p edgezero-adapter-${{ matrix.adapter }} --features "${{ matrix.features }}" --target ${{ matrix.target }} --all-targets -- -D warnings
 
       - name: Clippy ${{ matrix.adapter }} lifecycle fixture
+        if: matrix.features != 'fastly cli'
         run: cargo clippy --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-${{ matrix.adapter }} --target ${{ matrix.target }} --all-targets -- -D warnings
 
   format-docs:

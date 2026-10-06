@@ -54,8 +54,9 @@ not a memory saving, and a very large streamed response can exhaust memory or be
 rejected. For progressive delivery (SSE or long-lived chunked responses), use Cloudflare's
 standard dispatcher or Fastly's custom [`lifecycle::serve_custom` callbacks](/guide/adapters/fastly#custom-dispatch-and-streaming).
 The Fastly callback must explicitly commit, pump and flush chunks, and finish the
-writer. `into_core_request_with_registries` preserves store wiring while leaving
-the core response available for this path.
+writer. Convert with `request::into_core_request_with_registries` (the bare
+`into_core_request` inserts no store registries) and drive `app.router().oneshot(..)`
+yourself, so the core response stays available for streaming.
 
 ## Server-Sent Events
 
@@ -118,7 +119,8 @@ This happens transparently in the adapter layer using shared decoders from `edge
 
 ## Memory Considerations
 
-On Cloudflare, the one adapter that forwards chunks as they are produced (see
+On paths that forward chunks as they are produced (Cloudflare's standard
+dispatcher and Fastly `lifecycle::serve_custom` callbacks; see
 [How Streaming Works](#how-streaming-works)), streaming is what makes these
 workloads fit:
 

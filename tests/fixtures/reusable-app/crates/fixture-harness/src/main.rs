@@ -8,7 +8,10 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -162,6 +165,30 @@ pub fn checked(command: &mut Command) -> Result<()> {
         format!("command {command:?} failed: {status}"),
     )
 }
+/// Process groups of live runtimes, killed by the Ctrl-C handler because a
+/// terminal SIGINT reaches only the harness's own foreground group.
+static LIVE_GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+fn signal_group(id: u32, signal: &str) {
+    #[cfg(unix)]
+    let target = format!("-{id}");
+    #[cfg(not(unix))]
+    let target = id.to_string();
+    let _ = Command::new("kill")
+        .args([signal, "--", &target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+fn kill_live_groups_and_exit() {
+    for id in LIVE_GROUPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+    {
+        signal_group(*id, "-KILL");
+    }
+    std::process::exit(130);
+}
 pub struct Process(Child);
 impl Process {
     pub fn start(command: &mut Command, log: &Path, port: u16) -> Result<Self> {
@@ -177,6 +204,10 @@ impl Process {
                 .stderr(Stdio::from(file))
                 .spawn()?,
         );
+        LIVE_GROUPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(p.0.id());
         let start = Instant::now();
         loop {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
@@ -196,15 +227,8 @@ impl Process {
 }
 impl Drop for Process {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        let target = format!("-{}", self.0.id());
-        #[cfg(not(unix))]
-        let target = self.0.id().to_string();
-        let _ = Command::new("kill")
-            .args(["-TERM", "--", &target])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let id = self.0.id();
+        signal_group(id, "-TERM");
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             if matches!(self.0.try_wait(), Ok(Some(_))) {
@@ -214,14 +238,14 @@ impl Drop for Process {
         }
         // The parent may have exited while a descendant still holds sockets.
         #[cfg(unix)]
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &target])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        signal_group(id, "-KILL");
         #[cfg(not(unix))]
         let _ = self.0.kill();
         let _ = self.0.wait();
+        LIVE_GROUPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|live| *live != id);
     }
 }
 pub fn req(port: u16, path: &str) -> Result<Value> {
@@ -252,8 +276,22 @@ pub fn artifact(path: &Path) -> Result<Value> {
         json!({"path":path,"bytes":bytes.len(),"fnv1a64":format!("{fingerprint:016x}"),"purpose":"non-security build identity"}),
     )
 }
+/// The compiler that `$CARGO` builds with: `$RUSTC` when set, else the
+/// `rustc` beside `$CARGO`, else whichever `rustc` is on `PATH`.
+fn rustc() -> PathBuf {
+    if let Some(rustc) = std::env::var_os("RUSTC") {
+        return rustc.into();
+    }
+    std::env::var_os("CARGO")
+        .map(|cargo| {
+            Path::new(&cargo).with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX))
+        })
+        .filter(|rustc| rustc.is_file())
+        .unwrap_or_else(|| "rustc".into())
+}
 fn run() -> Result<i32> {
     let args = Args::parse()?;
+    ctrlc::set_handler(kill_live_groups_and_exit)?;
     let path = args
         .output
         .clone()
@@ -272,21 +310,40 @@ fn run() -> Result<i32> {
         values: Vec::new(),
     };
     records.push(json!({"event":"run","seed":args.seed,"suite":args.suite,"construction_rounds":args.construction_rounds,"max_requests":args.max_requests}))?;
-    records.push(json!({"event":"build_environment","rustc":String::from_utf8_lossy(&Command::new("rustc").arg("--version").output()?.stdout).trim(),"host_os":std::env::consts::OS,"host_arch":std::env::consts::ARCH,"lockfile":artifact(&path.join("Cargo.lock"))?}))?;
+    records.push(json!({"event":"build_environment","rustc":String::from_utf8_lossy(&Command::new(rustc()).arg("--version").output()?.stdout).trim(),"host_os":std::env::consts::OS,"host_arch":std::env::consts::ARCH,"lockfile":artifact(&path.join("Cargo.lock"))?}))?;
     let adapters = if args.adapter == "all" {
         vec!["fastly", "cloudflare", "spin", "axum"]
     } else {
         vec![args.adapter.as_str()]
     };
     for adapter in adapters {
+        let recorded = records.values.len();
         let result = if adapter == "fastly" {
             runners::fastly(&args, &path, &mut records)
         } else {
             runners::provider(adapter, &args, &path, &mut records)
         };
         if let Err(error) = result {
-            records.push(json!({"status":"fail","adapter":adapter,"error":error.to_string()}))?;
+            // Runners record their own contextual failure; add one only when they did not.
+            if !records.values[recorded..]
+                .iter()
+                .any(|r| r["status"] == "fail")
+            {
+                records
+                    .push(json!({"status":"fail","adapter":adapter,"error":error.to_string()}))?;
+            }
         }
+    }
+    let summary = evidence::summarize(&records.values);
+    if summary["build_identity"]["status"] == "invalid" {
+        let builds = records
+            .values
+            .iter()
+            .filter(|r| r["event"] == "build")
+            .map(|r| json!({"variant":r["variant"],"adapter":r["adapter"],"repetition":r["repetition"],"fnv1a64":r["artifact"]["fnv1a64"]}))
+            .collect::<Vec<_>>();
+        records
+            .push(json!({"status":"fail","reason":"mixed build fingerprints","builds":builds}))?;
     }
     let code = if records.values.iter().any(|r| r["status"] == "fail") {
         1
@@ -298,12 +355,6 @@ fn run() -> Result<i32> {
         2
     } else {
         0
-    };
-    let summary = evidence::summarize(&records.values);
-    let code = if summary["build_identity"]["status"] == "invalid" {
-        1
-    } else {
-        code
     };
     fs::write(
         path.join("summary.json"),

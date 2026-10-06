@@ -276,7 +276,7 @@ While Axum provides a convenient development environment, always test on actual 
 
 `dev_server::run_app` already constructs one app per server startup and serves
 clones of its router. No additional reuse option is needed. Retained application
-state must support concurrent requests; each request retains its own metadata,
+state must support concurrent requests; each request gets its own metadata,
 extensions, and body. Restarting the server creates a fresh app. Native Axum
 measurements are a useful ownership reference but do not establish WASM runtime
 performance or resource lifetimes.

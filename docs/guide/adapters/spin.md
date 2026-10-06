@@ -343,8 +343,9 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
 
 The pinned SDK 6 macro exports a P3 HTTP interface. The `wasm32-wasip2` Rust target
 name does not establish the component's HTTP lifecycle. Verify the emitted
-interface and host together; detect reuse/concurrency controls from the actual
-host's help output instead of assuming newer flags are available.
+interface and host together. spin-sdk 6 requires Spin 3.7 or later. See Spin's
+[instance-reuse documentation](https://spinframework.dev/v4/http-trigger#controlling-instance-reuse)
+for the reuse and concurrency controls your host version supports.
 
 Test both sequential reuse and overlapping invocations in the same instance.
 Different guest instances are not evidence of concurrent isolation. Keep
