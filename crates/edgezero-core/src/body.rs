@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io;
+use std::num::NonZeroUsize;
 
 use bytes::Bytes;
 use futures_util::stream::{LocalBoxStream, Stream, StreamExt};
@@ -13,21 +14,181 @@ pub type BodyStream = LocalBoxStream<'static, Result<Bytes, EdgeError>>;
 /// Lightweight HTTP body that can either contain a single `Bytes` buffer or a streaming source of
 /// chunks. The streaming variant is implemented with `LocalBoxStream` so it remains compatible with
 /// `wasm32` targets that lack thread support.
+///
+/// Raw matches outside core require a wildcard, even when all current variants are named:
+///
+/// ```compile_fail
+/// use edgezero_core::Body;
+/// fn kind(body: Body) -> usize {
+///     match body {
+///         Body::Once(_) => 0,
+///         Body::Stream(_) => 1,
+///         Body::Managed(_) => 2,
+///     }
+/// }
+/// ```
+///
+/// ```
+/// use edgezero_core::Body;
+/// fn kind(body: Body) -> usize {
+///     match body {
+///         Body::Once(_) => 0,
+///         Body::Stream(_) => 1,
+///         Body::Managed(_) => 2,
+///         _ => 3,
+///     }
+/// }
+/// ```
+#[non_exhaustive]
 pub enum Body {
+    Managed(ManagedBody),
     Once(Bytes),
     Stream(BodyStream),
 }
 
+/// Logical body ownership without ingress policy or cache provenance.
+/// This view is exhaustive, so transports need no wildcard:
+///
+/// ```
+/// use edgezero_core::{Body, BodyContent};
+/// fn kind(body: Body) -> usize {
+///     match body.into_content() {
+///         BodyContent::Once(_) => 0,
+///         BodyContent::Stream(_) => 1,
+///     }
+/// }
+/// ```
+pub enum BodyContent {
+    Once(Bytes),
+    Stream(BodyStream),
+}
+
+/// Opaque ingress policy and transfer provenance. Only core creates cached provenance.
+pub struct ManagedBody {
+    inner: Box<ManagedBodyState>,
+}
+
+struct ManagedBodyState {
+    policy: BufferedJsonPolicy,
+    transfer: BodyTransfer,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct BufferedJsonPolicy {
+    ceiling: NonZeroUsize,
+    ingress_is_json: bool,
+}
+
+impl BufferedJsonPolicy {
+    pub(crate) fn ceiling(self) -> NonZeroUsize {
+        self.ceiling
+    }
+    pub(crate) fn ingress_is_json(self) -> bool {
+        self.ingress_is_json
+    }
+}
+
+pub(crate) enum BodyTransfer {
+    Cached(Bytes),
+    Initial(BodyContent),
+}
+
+impl BodyTransfer {
+    fn into_content(self) -> BodyContent {
+        match self {
+            Self::Initial(content) => content,
+            Self::Cached(bytes) => BodyContent::Once(bytes),
+        }
+    }
+}
+
+impl From<BodyContent> for Body {
+    #[inline]
+    fn from(content: BodyContent) -> Self {
+        match content {
+            BodyContent::Once(bytes) => Self::Once(bytes),
+            BodyContent::Stream(stream) => Self::Stream(stream),
+        }
+    }
+}
+
+#[expect(
+    clippy::arbitrary_source_item_ordering,
+    reason = "policy transfer helpers precede the existing logical content operations"
+)]
 impl Body {
+    /// Attaches a validated positive ceiling and original ingress classification.
+    /// Original policy/provenance win on reattachment. Never polls or copies content.
+    #[must_use]
+    #[inline]
+    pub fn with_buffered_json_policy(self, ceiling: NonZeroUsize, ingress_is_json: bool) -> Self {
+        match self {
+            Self::Managed(_) => self,
+            Self::Once(_) | Self::Stream(_) => Self::Managed(ManagedBody {
+                inner: Box::new(ManagedBodyState {
+                    policy: BufferedJsonPolicy {
+                        ceiling,
+                        ingress_is_json,
+                    },
+                    transfer: BodyTransfer::Initial(self.into_content()),
+                }),
+            }),
+        }
+    }
+
+    /// Consumes raw content, discarding policy/provenance without polling.
+    /// For application-owned operations and transports, not context reconstruction.
+    #[must_use]
+    #[inline]
+    pub fn into_content(self) -> BodyContent {
+        let (_, transfer) = self.into_transfer();
+        transfer.into_content()
+    }
+
+    pub(crate) fn into_transfer(self) -> (Option<BufferedJsonPolicy>, BodyTransfer) {
+        match self {
+            Self::Once(bytes) => (None, BodyTransfer::Initial(BodyContent::Once(bytes))),
+            Self::Stream(stream) => (None, BodyTransfer::Initial(BodyContent::Stream(stream))),
+            Self::Managed(managed) => {
+                let state = *managed.inner;
+                (Some(state.policy), state.transfer)
+            }
+        }
+    }
+
+    pub(crate) fn from_transfer(
+        policy: Option<BufferedJsonPolicy>,
+        transfer: BodyTransfer,
+    ) -> Self {
+        match policy {
+            Some(selected) => Self::Managed(ManagedBody {
+                inner: Box::new(ManagedBodyState {
+                    policy: selected,
+                    transfer,
+                }),
+            }),
+            None => transfer.into_content().into(),
+        }
+    }
+
+    fn buffered_bytes(&self) -> Option<&Bytes> {
+        match self {
+            Self::Once(bytes) => Some(bytes),
+            Self::Stream(_) => None,
+            Self::Managed(managed) => match &managed.inner.transfer {
+                BodyTransfer::Initial(BodyContent::Once(bytes)) | BodyTransfer::Cached(bytes) => {
+                    Some(bytes)
+                }
+                BodyTransfer::Initial(BodyContent::Stream(_)) => None,
+            },
+        }
+    }
     /// Returns the in-memory bytes for a buffered body, or `None` if this is
     /// a streaming body. To consume a streaming body into bytes, use
     /// [`Body::into_bytes_bounded`].
     #[inline]
     pub fn as_bytes(&self) -> Option<&[u8]> {
-        match self {
-            Body::Once(bytes) => Some(bytes.as_ref()),
-            Body::Stream(_) => None,
-        }
+        self.buffered_bytes().map(Bytes::as_ref)
     }
 
     #[must_use]
@@ -72,9 +233,9 @@ impl Body {
     /// [`Body::into_bytes_bounded`].
     #[inline]
     pub fn into_bytes(self) -> Option<Bytes> {
-        match self {
-            Body::Once(bytes) => Some(bytes),
-            Body::Stream(_) => None,
+        match self.into_content() {
+            BodyContent::Once(bytes) => Some(bytes),
+            BodyContent::Stream(_) => None,
         }
     }
 
@@ -86,14 +247,14 @@ impl Body {
     /// Returns [`EdgeError::bad_request`] if the body exceeds `max_size` bytes; or [`EdgeError::internal`] if the upstream stream errors.
     #[inline]
     pub async fn into_bytes_bounded(self, max_size: usize) -> Result<Bytes, EdgeError> {
-        match self {
-            Body::Once(bytes) => {
+        match self.into_content() {
+            BodyContent::Once(bytes) => {
                 if bytes.len() > max_size {
                     return Err(EdgeError::bad_request("request body too large"));
                 }
                 Ok(bytes)
             }
-            Body::Stream(mut stream) => {
+            BodyContent::Stream(mut stream) => {
                 let mut buf = Vec::new();
                 while let Some(result) = StreamExt::next(&mut stream).await {
                     let chunk = result?;
@@ -112,15 +273,15 @@ impl Body {
 
     #[inline]
     pub fn into_stream(self) -> Option<BodyStream> {
-        match self {
-            Body::Once(_) => None,
-            Body::Stream(stream) => Some(stream),
+        match self.into_content() {
+            BodyContent::Once(_) => None,
+            BodyContent::Stream(stream) => Some(stream),
         }
     }
 
     #[inline]
     pub fn is_stream(&self) -> bool {
-        matches!(self, Body::Stream(_))
+        self.buffered_bytes().is_none()
     }
 
     /// # Errors
@@ -156,9 +317,9 @@ impl Body {
     where
         T: DeserializeOwned,
     {
-        match self {
-            Body::Once(bytes) => serde_json::from_slice(bytes.as_ref()),
-            Body::Stream(_) => Err(serde_json::Error::io(io::Error::other(
+        match self.buffered_bytes() {
+            Some(bytes) => serde_json::from_slice(bytes.as_ref()),
+            None => Err(serde_json::Error::io(io::Error::other(
                 "streaming body cannot be materialised as JSON",
             ))),
         }
@@ -175,12 +336,12 @@ impl Default for Body {
 impl fmt::Debug for Body {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Body::Once(bytes) => f
+        match self.buffered_bytes() {
+            Some(bytes) => f
                 .debug_struct("Body::Once")
                 .field("len", &bytes.len())
                 .finish(),
-            Body::Stream(_) => f.debug_tuple("Body::Stream").finish(),
+            None => f.debug_tuple("Body::Stream").finish(),
         }
     }
 }
@@ -224,11 +385,65 @@ impl From<String> for Body {
 mod tests {
     use super::*;
     use crate::error::ResponseLimitReason;
+    use crate::http::StatusCode;
     use futures::executor::block_on;
     use futures_util::stream;
     use std::cell::Cell;
     use std::io;
     use std::rc::Rc;
+    use std::task::Poll;
+
+    #[test]
+    fn managed_content_accessors_and_manual_collection_ignore_ingress_ceiling() {
+        let cap = NonZeroUsize::new(1).expect("positive cap");
+        let bytes = Bytes::from_static(b"\"value\"");
+        let buffered = Body::from_bytes(bytes.clone()).with_buffered_json_policy(cap, true);
+        assert_eq!(buffered.as_bytes(), Some(bytes.as_ref()));
+        assert!(!buffered.is_stream());
+        assert_eq!(buffered.to_json::<String>().expect("raw JSON"), "value");
+        assert!(format!("{buffered:?}").contains("Body::Once"));
+        let moved = buffered.into_bytes().expect("bytes");
+        assert_eq!(moved.as_ptr(), bytes.as_ptr());
+        for make in [false, true] {
+            let raw = || {
+                if make {
+                    Body::stream(stream::iter([bytes.clone()]))
+                } else {
+                    Body::from_bytes(bytes.clone())
+                }
+            };
+            assert_eq!(
+                block_on(
+                    raw()
+                        .with_buffered_json_policy(cap, true)
+                        .into_bytes_bounded(7)
+                )
+                .expect("caller cap"),
+                bytes
+            );
+            assert_eq!(
+                block_on(
+                    raw()
+                        .with_buffered_json_policy(cap, true)
+                        .into_bytes_bounded(6)
+                )
+                .expect_err("manual overflow")
+                .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let polls = Rc::new(Cell::new(0_usize));
+        let observed = Rc::clone(&polls);
+        let lazy = Body::from_stream(stream::poll_fn(move |_| {
+            observed.set(observed.get().saturating_add(1));
+            Poll::Ready(None)
+        }))
+        .with_buffered_json_policy(cap, true);
+        assert!(lazy.is_stream());
+        assert!(lazy.as_bytes().is_none());
+        assert!(matches!(lazy.into_content(), BodyContent::Stream(_)));
+        assert_eq!(polls.get(), 0);
+    }
 
     #[test]
     fn as_bytes_returns_none_for_stream() {

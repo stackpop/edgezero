@@ -49,6 +49,10 @@ enum SendFailure {
 }
 
 #[cfg(any(feature = "fastly", test))]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "keep batch observation allocation-free despite one-word Body carrier growth"
+)]
 enum FastlyBatchObservation {
     Continue(OutboundBatchItem),
     Cutoff,
@@ -186,7 +190,7 @@ mod fastly_impl {
     use async_stream::stream;
     use async_trait::async_trait;
     use bytes::Bytes;
-    use edgezero_core::body::{Body, BodyStream};
+    use edgezero_core::body::{Body, BodyContent, BodyStream};
     use edgezero_core::compression::{
         ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_deflate_stream,
         decode_gzip_stream,
@@ -442,8 +446,8 @@ mod fastly_impl {
                 ..
             } = parts;
             let fastly_request = build_fastly_request(&method, &uri, &headers, cache_policy);
-            let response = match body {
-                Body::Once(bytes) => {
+            let response = match body.into_content() {
+                BodyContent::Once(bytes) => {
                     validate_request_body_length(&bytes, max_request_body_bytes)?;
                     let mut buffered_request = fastly_request;
                     buffered_request.set_body(bytes.to_vec());
@@ -453,7 +457,7 @@ mod fastly_impl {
                         .map_err(|error| map_send_error(&error, budget, &self.clock))?;
                     wait_pending(pending, budget, &self.clock)?
                 }
-                Body::Stream(source) => {
+                BodyContent::Stream(source) => {
                     send_streamed(
                         fastly_request,
                         backend,
@@ -511,7 +515,7 @@ mod fastly_impl {
                 uri,
                 ..
             } = parts;
-            let Body::Once(bytes) = body else {
+            let BodyContent::Once(bytes) = body.into_content() else {
                 return Err(EdgeError::internal(anyhow::anyhow!(
                     "Fastly batch preflight admitted a streamed upload"
                 )));

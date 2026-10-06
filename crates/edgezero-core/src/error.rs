@@ -168,6 +168,9 @@ pub enum EdgeError {
     NotFound { path: String },
     #[error("not implemented: {message}")]
     NotImplemented { message: String },
+    /// Framework-managed request buffering exceeded its effective cap. HTTP 413.
+    #[error("{message}")]
+    PayloadTooLarge { message: String },
     #[error("{message}")]
     RequestHeaderFieldsTooLarge { message: String },
     #[error("{message}")]
@@ -259,7 +262,8 @@ impl EdgeError {
     pub fn inner(&self) -> Option<&AnyError> {
         match self {
             EdgeError::Internal { source } => Some(source),
-            EdgeError::BadGateway { .. }
+            EdgeError::PayloadTooLarge { .. }
+            | EdgeError::BadGateway { .. }
             | EdgeError::BadRequest { .. }
             | EdgeError::ConfigOutOfDate { .. }
             | EdgeError::GatewayTimeout { .. }
@@ -299,6 +303,7 @@ impl EdgeError {
             EdgeError::MethodNotAllowed { .. } => "method_not_allowed",
             EdgeError::NotFound { .. } => "not_found",
             EdgeError::NotImplemented { .. } => "not_implemented",
+            EdgeError::PayloadTooLarge { .. } => "payload_too_large",
             EdgeError::RequestHeaderFieldsTooLarge { .. } => "request_header_fields_too_large",
             EdgeError::RequestTimeout { .. } => "request_timeout",
             EdgeError::ResponseTooLarge { .. } => "response_too_large",
@@ -314,6 +319,7 @@ impl EdgeError {
     pub fn message(&self) -> String {
         match self {
             EdgeError::BadGateway { message, .. }
+            | EdgeError::PayloadTooLarge { message }
             | EdgeError::BadRequest { message }
             | EdgeError::ConfigOutOfDate { message, .. }
             | EdgeError::GatewayTimeout { message, .. }
@@ -356,6 +362,13 @@ impl EdgeError {
     #[inline]
     pub fn not_implemented<S: Into<String>>(message: S) -> Self {
         EdgeError::NotImplemented {
+            message: message.into(),
+        }
+    }
+
+    #[inline]
+    pub fn payload_too_large<S: Into<String>>(message: S) -> Self {
+        Self::PayloadTooLarge {
             message: message.into(),
         }
     }
@@ -433,6 +446,7 @@ impl EdgeError {
             EdgeError::NotFound { .. } => StatusCode::NOT_FOUND,
             EdgeError::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             EdgeError::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
+            EdgeError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             EdgeError::StoreExtraction { reason, .. } => reason.wire_status(),
             EdgeError::UriTooLong { .. } => StatusCode::URI_TOO_LONG,
             EdgeError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -478,7 +492,8 @@ impl EdgeError {
     pub fn store_extraction_reason(&self) -> Option<StoreExtractionReason> {
         match self {
             Self::StoreExtraction { reason, .. } => Some(*reason),
-            Self::BadGateway { .. }
+            Self::PayloadTooLarge { .. }
+            | Self::BadGateway { .. }
             | Self::BadRequest { .. }
             | Self::ConfigOutOfDate { .. }
             | Self::GatewayTimeout { .. }
@@ -513,6 +528,7 @@ impl EdgeError {
         match self {
             EdgeError::BadGateway { .. } => "bad gateway".to_owned(),
             EdgeError::GatewayTimeout { .. } => "gateway timeout".to_owned(),
+            EdgeError::PayloadTooLarge { .. } => "request body too large".to_owned(),
             EdgeError::Internal { .. } => "internal server error".to_owned(),
             EdgeError::ResponseTooLarge { .. } => {
                 "upstream response exceeded configured limits".to_owned()
@@ -569,7 +585,8 @@ impl IntoResponse for EdgeError {
                 field_path: Some(field_path),
                 ..
             } => Some(field_path.as_str()),
-            EdgeError::BadGateway { .. }
+            EdgeError::PayloadTooLarge { .. }
+            | EdgeError::BadGateway { .. }
             | EdgeError::BadRequest { .. }
             | EdgeError::ConfigOutOfDate { .. }
             | EdgeError::GatewayTimeout { .. }
@@ -945,6 +962,7 @@ mod tests {
             | EdgeError::ServiceUnavailable { .. }
             | EdgeError::StoreExtraction { .. }
             | EdgeError::UriTooLong { .. }
+            | EdgeError::PayloadTooLarge { .. }
             | EdgeError::Validation { .. } => panic!("expected ConfigOutOfDate"),
         }
     }

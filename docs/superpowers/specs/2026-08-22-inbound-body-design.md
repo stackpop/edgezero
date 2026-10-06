@@ -11,6 +11,25 @@
 > state machine. Outbound streaming proxy-forward consumes the resulting
 > `BodyCell`/`into_request()` contract but does not own it.
 
+## Native JSON policy addendum, issue #393
+
+The portable 8 MiB JSON default and unmanaged overflow 400 described below remain unchanged.
+Axum-managed JSON buffering now selects a configurable 2 MiB default, exactly 2,097,152 bytes,
+and typed `PayloadTooLarge`/413. JSON helpers always select the policy; generic buffering selects
+it for captured JSON/+json ingress. Explicit caller caps may tighten it, and ordinary Form keeps
+its 1 MiB cap. Taken streams, fallback discard, forwarding, and manual collection remain excluded.
+
+Public `Body` is non-exhaustive with an opaque, nonrecursive policy carrier. Private initial/cache
+provenance preserves the original ceiling/classification across successful fresh/routed context
+reconstruction despite head mutation. Cached rechecks stay stateless. Exhaustive `BodyContent`
+exposes raw buffered/streamed ownership to transports without policy; no grant, clock, route,
+deadline, or completion is added to the metadata carrier.
+
+Implementation is provisional on the hosting stack by explicit user approval. Accepted #275
+integration and affected evidence must be re-audited after the later rebase. See the
+[#393 spec](2026-10-06-axum-buffered-json-body-limit-design.md) and its implementation plan for
+configuration, compatibility, and required evidence. Historical examples below are not rewritten.
+
 ## 1. Scope
 
 The goal is to stop adapters from pre-buffering unbounded inbound bodies while preserving

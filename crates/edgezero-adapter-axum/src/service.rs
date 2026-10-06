@@ -37,6 +37,7 @@ use crate::connection::{ConnectionExit, serve_http1};
 use crate::outbound::AxumOutboundClient;
 use crate::request::into_core_request_parts;
 use crate::response::{AxumEgressBody, EgressConnection, prepare_egress_response};
+use crate::run_options::JsonBodyLimit;
 
 /// Private Hyper service error used only to close/reset an admission-aborted connection.
 #[derive(Debug, thiserror::Error)]
@@ -49,6 +50,7 @@ pub(crate) struct AxumServiceState {
     app: Arc<App>,
     config_registry: Option<ConfigRegistry>,
     config_store_handle: Option<ConfigStoreHandle>,
+    json_body_limit: JsonBodyLimit,
     kv_handle: Option<KvHandle>,
     kv_registry: Option<KvRegistry>,
     outbound_transport: Option<Arc<reqwest::Client>>,
@@ -70,14 +72,20 @@ impl AxumServiceState {
         Self::with_transport(
             app,
             AxumOutboundClient::try_transport().expect("test transport"),
+            JsonBodyLimit::DEFAULT,
         )
     }
 
-    pub(crate) fn with_transport(app: App, transport: Arc<reqwest::Client>) -> Self {
+    pub(crate) fn with_transport(
+        app: App,
+        transport: Arc<reqwest::Client>,
+        json_body_limit: JsonBodyLimit,
+    ) -> Self {
         Self {
             app: Arc::new(app),
             config_registry: None,
             config_store_handle: None,
+            json_body_limit,
             kv_handle: None,
             kv_registry: None,
             outbound_transport: Some(transport),
@@ -307,6 +315,7 @@ impl AxumServiceState {
             native_body,
             Some((read_deadline, monotonic_clock)),
             Some(outbound_transport),
+            self.json_body_limit,
         ) {
             Ok(converted) => converted,
             Err(error) => {
@@ -410,6 +419,7 @@ mod tests {
 
     use super::*;
     use bytes::{Bytes, BytesMut};
+    use edgezero_core::action;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{
         BoundedStoreRead, ConfigStore, ConfigStoreError, ConfigStoreHandle,
@@ -417,6 +427,7 @@ mod tests {
     };
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
+    use edgezero_core::extractor::Json;
     use edgezero_core::http::{
         HeaderMap, HeaderValue, Response as CoreResponse, StatusCode, response_builder,
     };
@@ -462,6 +473,65 @@ mod tests {
             }
             buffered.extend_from_slice(&bytes);
         }
+    }
+
+    #[action]
+    async fn json_limit_probe(Json(value): Json<String>) -> Result<String, EdgeError> {
+        Ok(value.len().to_string())
+    }
+
+    #[tokio::test]
+    async fn managed_json_overflow_drops_source_once_stops_polling_and_keeps_error_egress() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let guard = DropSignal(Arc::clone(&drops));
+        let source = poll_fn(move |_| {
+            let _retained = &guard;
+            let index = observed.fetch_add(1, Ordering::SeqCst);
+            let chunk = match index {
+                0 => Bytes::from_static(b"\"ab"),
+                1 => Bytes::from_static(b"cdef\""),
+                _ => panic!("source polled after oversized chunk"),
+            };
+            Poll::Ready(Some(Ok::<_, io::Error>(chunk)))
+        });
+        let router = RouterService::builder()
+            .post("/json", json_limit_probe)
+            .build();
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let mut app = App::new(router);
+        app.set_response_egress_observer(RecordingEgressObserver(Arc::clone(&reports)));
+        app.set_error_response_renderer(|error| {
+            assert_eq!(error.kind(), "payload_too_large");
+            CoreResponse::new(Body::from("custom renderer"))
+        });
+        let mut service = AxumServiceState::from_app(app);
+        service.json_body_limit = JsonBodyLimit::new(4).expect("cap");
+        let request = Request::builder()
+            .method("POST")
+            .uri("/json")
+            .header("content-type", "application/json")
+            .body(AxumBody::from_stream(source))
+            .expect("request");
+        let response = service
+            .dispatch_request(request, &EgressConnection::default(), None)
+            .await
+            .expect("dispatch");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            to_bytes(response.into_body(), 1024).await.expect("egress"),
+            "custom renderer"
+        );
+        let observed_reports = reports.lock().expect("reports");
+        assert_eq!(observed_reports.len(), 1);
+        assert_eq!(
+            observed_reports[0].outcome,
+            ResponseEgressOutcome::HostHandoff
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     struct FixedConfigStore(String);

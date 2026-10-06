@@ -1,6 +1,6 @@
 use std::mem;
 
-use crate::body::{Body, BodyStream};
+use crate::body::{Body, BodyContent, BodyStream};
 use crate::error::{BadGatewayDecodeReason, BadGatewayReason, EdgeError, ResponseLimitReason};
 use crate::http::header::{
     CONNECTION, CONTENT_LENGTH, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
@@ -77,6 +77,8 @@ pub fn prepare_response_egress(
     request_method: &Method,
     mut response: Response,
 ) -> Result<PreparedResponseEgress, ResponseEgressFramingError> {
+    let content = mem::take(response.body_mut()).into_content();
+    *response.body_mut() = content.into();
     let mut declared_length = parse_content_length(response.headers())?;
     if response.status().is_informational() {
         return Err(ResponseEgressFramingError::UnsupportedStatus);
@@ -118,22 +120,19 @@ pub fn prepare_response_egress(
             .map_err(|_error| ResponseEgressFramingError::InvalidContentLength)?;
         response.headers_mut().insert(CONTENT_LENGTH, canonical);
         if !suppress_body {
-            match response.body() {
-                Body::Once(bytes) => {
+            *response.body_mut() = match mem::take(response.body_mut()).into_content() {
+                BodyContent::Once(bytes) => {
                     let actual = u64::try_from(bytes.len())
                         .map_err(|_error| ResponseEgressFramingError::ContentLengthMismatch)?;
                     if actual != length {
                         return Err(ResponseEgressFramingError::ContentLengthMismatch);
                     }
+                    Body::from_bytes(bytes)
                 }
-                Body::Stream(_) => {
-                    let body = mem::take(response.body_mut());
-                    if let Body::Stream(stream) = body {
-                        *response.body_mut() =
-                            Body::from_stream(limit_declared_stream(stream, length));
-                    }
+                BodyContent::Stream(stream) => {
+                    Body::from_stream(limit_declared_stream(stream, length))
                 }
-            }
+            };
         }
     }
 
@@ -236,6 +235,7 @@ pub fn response_egress_source_error_category(error: &EdgeError) -> &'static str 
         EdgeError::MethodNotAllowed { .. } => "method_not_allowed",
         EdgeError::NotFound { .. } => "not_found",
         EdgeError::NotImplemented { .. } => "not_implemented",
+        EdgeError::PayloadTooLarge { .. } => "payload_too_large",
         EdgeError::RequestHeaderFieldsTooLarge { .. } => "request_header_fields_too_large",
         EdgeError::RequestTimeout { .. } => "request_timeout",
         EdgeError::ResponseTooLarge { reason, .. } => match reason {
@@ -357,6 +357,27 @@ mod tests {
             panic!("{failure_message}");
         };
         error
+    }
+
+    #[test]
+    fn raw_managed_response_builders_are_normalized_at_egress() {
+        use std::num::NonZeroUsize;
+        for streaming in [false, true] {
+            let raw = if streaming {
+                Body::stream(stream::iter([Bytes::from_static(b"reply")]))
+            } else {
+                Body::from("reply")
+            };
+            let body = raw.with_buffered_json_policy(NonZeroUsize::new(1).expect("cap"), true);
+            let response = Response::new(body);
+            let prepared = prepare_response_egress(&Method::GET, response).expect("framing");
+            let normalized = prepared.into_response();
+            assert!(!matches!(normalized.body(), Body::Managed(_)));
+            assert_eq!(
+                block_on(normalized.into_body().into_bytes_bounded(5)).expect("egress caller cap"),
+                "reply"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::env::vars_os;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 use std::time::{Duration, Instant};
@@ -8,6 +9,43 @@ use edgezero_core::addr;
 use edgezero_core::app::StoresMetadata;
 use edgezero_core::env_config::EnvConfig;
 use log::LevelFilter;
+
+/// Validated native JSON buffering ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JsonBodyLimit(NonZeroUsize);
+
+impl JsonBodyLimit {
+    pub(crate) const DEFAULT: Self =
+        Self(NonZeroUsize::new(0x0020_0000).expect("positive default"));
+
+    pub(crate) fn from_config(env: &EnvConfig) -> anyhow::Result<Self> {
+        let Some(raw) = env.get(&["adapter", "json_body_limit_bytes"]) else {
+            return Ok(Self::DEFAULT);
+        };
+        if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(Self::invalid());
+        }
+        Self::new(raw.parse::<usize>().map_err(|_error| Self::invalid())?)
+    }
+
+    pub(crate) fn get(self) -> NonZeroUsize {
+        self.0
+    }
+
+    fn invalid() -> anyhow::Error {
+        failure(
+            "settings",
+            "JSON_BODY_LIMIT_BYTES",
+            "invalid positive representable integer bytes",
+        )
+    }
+    pub(crate) fn new(limit: usize) -> anyhow::Result<Self> {
+        NonZeroUsize::new(limit)
+            .filter(|value| value.get() <= isize::MAX.unsigned_abs())
+            .map(Self)
+            .ok_or_else(Self::invalid)
+    }
+}
 
 /// Validated explicit production hosting options. Construction never selects a
 /// policy from build profile, cwd or container detection. Explicit constructors
@@ -19,6 +57,7 @@ pub struct AxumRunOptions {
     data_dir: Option<PathBuf>,
     env: EnvConfig,
     grace: Duration,
+    json_body_limit: JsonBodyLimit,
     level: LevelFilter,
     non_unicode_overrides: Vec<Vec<String>>,
 }
@@ -103,6 +142,7 @@ impl AxumRunOptions {
                 .map_err(|_error| failure("settings", "LOGGING__LEVEL", "invalid level"))?;
         }
         options.grace = shutdown_grace(&env)?;
+        options.json_body_limit = JsonBodyLimit::from_config(&env)?;
         if let Some(root) = env.get(&["adapter", "config_dir"]) {
             options = options.with_config_dir(root)?;
         }
@@ -111,6 +151,10 @@ impl AxumRunOptions {
         }
         options.env = env;
         Ok(options)
+    }
+
+    pub(crate) fn json_body_limit(&self) -> JsonBodyLimit {
+        self.json_body_limit
     }
 
     pub(crate) fn logging_level(&self) -> LevelFilter {
@@ -132,6 +176,7 @@ impl AxumRunOptions {
             data_dir: None,
             env: EnvConfig::default(),
             grace: Duration::from_secs(10),
+            json_body_limit: JsonBodyLimit::DEFAULT,
             level: LevelFilter::Info,
             non_unicode_overrides: Vec::new(),
         })
@@ -213,6 +258,16 @@ impl AxumRunOptions {
         Ok(self)
     }
 
+    /// Selects the ceiling for framework-managed JSON buffering, in bytes.
+    ///
+    /// # Errors
+    /// Rejects zero and values above the collector's representable capacity.
+    #[inline]
+    pub fn with_json_body_limit_bytes(mut self, limit: usize) -> anyhow::Result<Self> {
+        self.json_body_limit = JsonBodyLimit::new(limit)?;
+        Ok(self)
+    }
+
     #[inline]
     #[must_use]
     pub fn with_logging_level(mut self, level: LevelFilter) -> Self {
@@ -246,6 +301,7 @@ fn fixed_setting(path: &[String]) -> Option<&'static str> {
         ["adapter", "config_dir"] => Some("CONFIG_DIR"),
         ["adapter", "data_dir"] => Some("DATA_DIR"),
         ["adapter", "shutdown_grace_seconds"] => Some("SHUTDOWN_GRACE_SECONDS"),
+        ["adapter", "json_body_limit_bytes"] => Some("JSON_BODY_LIMIT_BYTES"),
         ["logging", "level"] => Some("LOGGING__LEVEL"),
         _ => None,
     }
@@ -297,6 +353,53 @@ fn validate_root(root: &Path, setting: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use edgezero_core::app::StoreMetadata;
+
+    #[test]
+    fn json_body_limit_is_positive_decimal_and_representable() {
+        let key = "EDGEZERO__ADAPTER__JSON_BODY_LIMIT_BYTES";
+        let defaults = AxumRunOptions::from_vars(Vec::<(String, String)>::new()).expect("defaults");
+        assert_eq!(defaults.json_body_limit.get().get(), 0x0020_0000);
+        for bytes in [
+            1,
+            64,
+            9 * 1024 * 1024,
+            usize::try_from(isize::MAX).expect("maximum"),
+        ] {
+            let options = AxumRunOptions::from_vars([(key, bytes.to_string())]).expect("valid");
+            assert_eq!(options.json_body_limit.get().get(), bytes);
+            assert_eq!(
+                defaults
+                    .clone()
+                    .with_json_body_limit_bytes(bytes)
+                    .expect("builder")
+                    .json_body_limit
+                    .get()
+                    .get(),
+                bytes
+            );
+        }
+        for raw in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            " 64",
+            "64 ",
+            "1.5",
+            "2MiB",
+            "sentinel-limit",
+            "9999999999999999999999999999999999",
+        ] {
+            let error = AxumRunOptions::from_vars([(key, raw)])
+                .err()
+                .expect("invalid");
+            assert!(error.to_string().contains("JSON_BODY_LIMIT_BYTES"));
+            assert!(!format!("{error:?}").contains("sentinel"));
+            assert_eq!(error.chain().count(), 1);
+        }
+        assert!(defaults.clone().with_json_body_limit_bytes(0).is_err());
+        assert!(defaults.with_json_body_limit_bytes(usize::MAX).is_err());
+    }
 
     #[test]
     fn defaults_and_invalid_supplied_scalars_are_distinct() {

@@ -97,6 +97,28 @@ async fn login(Json(body): Json<LoginRequest>) -> Text<String> {
 }
 ```
 
+#### Buffered body limits
+
+Portable ordinary JSON extraction defaults to 8 MiB. On Axum, ordinary `Json` and
+`ValidatedJson` instead use the native ceiling, which defaults to 2 MiB, exactly 2,097,152 bytes.
+See [Axum body-limit configuration](./adapters/axum.md#buffered-json-body-limits).
+
+`json_within(max)` and `ValidatedJsonWithin<T, MAX>` may tighten that ceiling but cannot
+raise it. Native JSON-policy overflow returns typed HTTP 413; malformed JSON remains 400.
+JSON helpers apply the ceiling even without a JSON Content-Type. Generic buffered reads,
+including `body_bytes`, `form_within`, and the Form family, also apply it on original
+`application/json` or `application/*+json` ingress. Ordinary Form keeps its 1 MiB caller cap;
+non-JSON generic reads keep their existing caps and 400 overflow behavior.
+
+The original ceiling and classification survive `into_request` followed by fresh or routed
+context construction, even after headers or extensions change. Successful cached reconstruction
+reuses the same bytes and retains non-poisoning stricter rechecks. Initial overflow stays sticky.
+
+`take_body` and stream forwarding remain incremental without a new total-size cap. Low-level
+manual collection uses only its supplied cap. Public `Body` is non-exhaustive; ordinary callers
+should prefer its accessors. Transport code can match both cases of the exhaustive `BodyContent`
+returned by `Body::into_content`, which deliberately removes ingress metadata.
+
 ### Validated Extractors
 
 Use `validator` crate integration for input validation:

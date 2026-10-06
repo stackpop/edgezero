@@ -7,6 +7,7 @@
     reason = "subprocess fixtures group setup, process ownership and acceptance scenarios"
 )]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     use std::io::{self, BufRead as _, BufReader, Read, Write as _};
     use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -238,6 +239,224 @@ mod tests {
         TcpStream::connect_timeout(&addr, Duration::from_millis(50))
             .expect_err("failed startup never accepts connections");
         log
+    }
+
+    fn exact_json(bytes: usize) -> Vec<u8> {
+        assert!(bytes >= 2);
+        let mut body = vec![b'x'; bytes];
+        body[0] = b'"';
+        *body.last_mut().expect("JSON closing quote") = b'"';
+        body
+    }
+
+    fn upload(
+        server: &Server,
+        path: &str,
+        media: Option<&str>,
+        body: Vec<u8>,
+        chunked: bool,
+    ) -> String {
+        let mut socket = server.socket().expect("upload connection");
+        let mut writer = socket.try_clone().expect("upload writer");
+        let content_type =
+            media.map_or_else(String::new, |value| format!("Content-Type: {value}\r\n"));
+        let framing = if chunked {
+            "Transfer-Encoding: chunked\r\n".to_owned()
+        } else {
+            format!("Content-Length: {}\r\n", body.len())
+        };
+        let request_head = format!(
+            "POST {path} HTTP/1.1\r\nHost: fixture\r\n{content_type}{framing}Connection: close\r\n\r\n"
+        );
+        let sending = thread::spawn(move || -> io::Result<()> {
+            writer.write_all(request_head.as_bytes())?;
+            for chunk in body.chunks(0x4000) {
+                if chunked {
+                    write!(writer, "{:x}\r\n", chunk.len())?;
+                }
+                writer.write_all(chunk)?;
+                if chunked {
+                    writer.write_all(b"\r\n")?;
+                }
+            }
+            if chunked {
+                writer.write_all(b"0\r\n\r\n")?;
+            }
+            Ok(())
+        });
+        let mut response = String::new();
+        let reading = socket.read_to_string(&mut response);
+        let sent = sending.join().expect("bounded upload writer");
+        let (head, payload) = response
+            .split_once("\r\n\r\n")
+            .expect("usable response head");
+        let is_413 = head.starts_with("HTTP/1.1 413");
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("response length"))
+            })
+            .expect("finite response framing");
+        assert_eq!(payload.len(), length, "complete response: {response}");
+        if let Err(error) = reading {
+            assert!(
+                is_413 && error.kind() == io::ErrorKind::ConnectionReset,
+                "response read: {error}"
+            );
+        }
+        if let Err(error) = sent {
+            assert!(is_413, "upload failure without 413: {error}");
+        }
+        response
+    }
+
+    fn assert_upload_status(response: &str, status: u16) {
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "{response}"
+        );
+        if status == 413 {
+            let (_, body) = response.split_once("\r\n\r\n").expect("response");
+            let value: Value = serde_json::from_str(body).expect("usable error body");
+            assert_eq!(value["error"]["kind"], "payload_too_large");
+            assert_eq!(value["error"]["message"], "request body too large");
+        }
+    }
+
+    #[test]
+    fn json_body_limit_wire_content_length_and_chunked() {
+        let roots = Roots::new();
+        let addr = address();
+        let mut server = Server::spawn(command("bare", &roots, addr), addr);
+        server.ready();
+        server.wait_line("HOOK_ENTERED");
+        for chunked in [false, true] {
+            assert_upload_status(
+                &upload(
+                    &server,
+                    "/json",
+                    Some("application/json"),
+                    exact_json(0x0020_0000),
+                    chunked,
+                ),
+                200,
+            );
+            server.wait_line("JSON_HANDLER_ENTERED");
+            assert_upload_status(
+                &upload(
+                    &server,
+                    "/json",
+                    Some("application/json"),
+                    exact_json(0x0020_0001),
+                    chunked,
+                ),
+                413,
+            );
+        }
+        server.signal("TERM");
+        assert!(server.wait().success());
+        assert_eq!(server.log().matches("JSON_HANDLER_ENTERED").count(), 2);
+    }
+
+    #[test]
+    fn json_limit_overrides_helpers_generic_reads_and_taken_streams() {
+        for mode in ["bare", "bare-dev", "embedding-bare"] {
+            let roots = Roots::new();
+            let addr = address();
+            let mut launch = command(mode, &roots, addr);
+            launch.env("EDGEZERO__ADAPTER__JSON_BODY_LIMIT_BYTES", "64");
+            if mode == "embedding-bare" {
+                launch.env("FIXTURE_JSON_LIMIT", "64").env(
+                    "EDGEZERO__ADAPTER__JSON_BODY_LIMIT_BYTES",
+                    "INVALID_SENTINEL",
+                );
+            }
+            let mut server = Server::spawn(launch, addr);
+            server.ready();
+            for media in [
+                None,
+                Some("text/plain"),
+                Some("APPLICATION/JSON; charset=utf-8"),
+                Some("application/vnd.fixture+json"),
+            ] {
+                assert_upload_status(&upload(&server, "/json", media, exact_json(64), false), 200);
+                assert_upload_status(&upload(&server, "/json", media, exact_json(65), true), 413);
+            }
+            assert_upload_status(
+                &upload(&server, "/json-explicit", None, exact_json(65), false),
+                413,
+            );
+            assert_upload_status(
+                &upload(&server, "/json-small", None, exact_json(32), false),
+                200,
+            );
+            assert_upload_status(
+                &upload(&server, "/json-small", None, exact_json(33), false),
+                413,
+            );
+            assert_upload_status(
+                &upload(&server, "/json", None, b"invalid json".to_vec(), false),
+                400,
+            );
+            for media in [
+                "application/json",
+                "Application/Problem+JSON; charset=utf-8",
+            ] {
+                assert_upload_status(
+                    &upload(&server, "/generic", Some(media), exact_json(65), true),
+                    413,
+                );
+            }
+            assert_upload_status(
+                &upload(
+                    &server,
+                    "/generic",
+                    Some("text/plain"),
+                    exact_json(65),
+                    false,
+                ),
+                200,
+            );
+            for media in ["application/json", "application/octet-stream"] {
+                assert_upload_status(
+                    &upload(&server, "/taken", Some(media), exact_json(4096), true),
+                    200,
+                );
+            }
+        }
+        let roots = Roots::new();
+        let addr = address();
+        let cap = 9 * 1024 * 1024;
+        let mut launch = command("bare", &roots, addr);
+        launch.env("EDGEZERO__ADAPTER__JSON_BODY_LIMIT_BYTES", cap.to_string());
+        let mut server = Server::spawn(launch, addr);
+        server.ready();
+        assert_upload_status(&upload(&server, "/json", None, exact_json(cap), true), 200);
+        assert_upload_status(
+            &upload(&server, "/json", None, exact_json(cap + 1), false),
+            413,
+        );
+    }
+
+    #[test]
+    fn invalid_json_limits_fail_before_application_hooks_in_dev_and_production() {
+        use std::os::unix::ffi::OsStringExt as _;
+        for mode in ["bare", "bare-dev"] {
+            for value in [
+                OsString::from("0"),
+                OsString::from("INVALID_SENTINEL"),
+                OsString::from_vec(vec![0xff]),
+            ] {
+                let roots = Roots::new();
+                let addr = address();
+                let mut launch = command(mode, &roots, addr);
+                launch.env("EDGEZERO__ADAPTER__JSON_BODY_LIMIT_BYTES", value);
+                let log = failed(launch, addr, "JSON_BODY_LIMIT_BYTES");
+                assert!(!log.contains("HOOK_ENTERED"));
+            }
+        }
     }
 
     #[test]
