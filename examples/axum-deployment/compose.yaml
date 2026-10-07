@@ -1,0 +1,18 @@
+# Packaging example for a no-store generated app. No readiness/SIGTERM claim.
+services:
+  app:
+    image: ${AXUM_IMAGE:?Set AXUM_IMAGE to a tested image digest}
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:${AXUM_PORT:-8787}:8787"
+    environment:
+      EDGEZERO__ADAPTER__HOST: "0.0.0.0"
+      EDGEZERO__ADAPTER__PORT: "8787"
+    # Production must set this longer than the accepted app drain budget.
+    # Current packaging fixture uses the development entrypoint.
+    stop_grace_period: 30s

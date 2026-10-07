@@ -3,6 +3,11 @@ name: Deploy actions
 on:
   pull_request:
     paths:
+      - scripts/*axum_container*.sh
+      - scripts/tests/test_axum_container*.py
+      - examples/container-publishing/**
+      - examples/axum-deployment/**
+      - docs/guide/*axum-containers.md
       # ANY workflow or action change must start the repository-wide pin gate (and
       # the smokes) — including a brand-new action directory or an unrelated
       # workflow like test.yml that could introduce a floating ref.
@@ -27,6 +32,11 @@ on:
   push:
     branches: [main]
     paths:
+      - scripts/*axum_container*.sh
+      - scripts/tests/test_axum_container*.py
+      - examples/container-publishing/**
+      - examples/axum-deployment/**
+      - docs/guide/*axum-containers.md
       # ANY workflow or action change must start the repository-wide pin gate (and
       # the smokes) — including a brand-new action directory or an unrelated
       # workflow like test.yml that could introduce a floating ref.
@@ -97,15 +107,20 @@ jobs:
         # warning floor (info-level notes in unrelated workflows are not failures).
         run: |
           "$RUNNER_TEMP/tools/bin/actionlint" -shellcheck='shellcheck -S warning'
+          "$RUNNER_TEMP/tools/bin/actionlint" -shellcheck='shellcheck -S warning' examples/container-publishing/release.yml
 
       - name: Third-party actions pinned to a ref
-        run: .github/actions/deploy-core/tests/check-action-pins.sh
+        run: |
+          .github/actions/deploy-core/tests/check-action-pins.sh
+          .github/actions/deploy-core/tests/check-action-pins.sh examples/container-publishing/release.yml
 
       - name: Zizmor security scan
         run: |
           "$RUNNER_TEMP/tools/bin/zizmor" --offline \
             .github/workflows/deploy-action.yml \
             .github/workflows/fastly-installer-check.yml \
+            .github/workflows/axum-container.yml \
+            examples/container-publishing/release.yml \
             .github/actions/build-app-cli/action.yml \
             .github/actions/deploy-fastly/action.yml \
             .github/actions/healthcheck-fastly/action.yml \
@@ -121,7 +136,12 @@ jobs:
             .github/actions/*/scripts/*.sh \
             .github/actions/deploy-core/tests/*.sh \
             scripts/install-actionlint.sh \
-            scripts/install-yq.sh
+            scripts/install-yq.sh \
+            scripts/*axum_container*.sh \
+            examples/container-publishing/publish.sh
+
+      - name: Container helper unit tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_axum_container*.py' -v
 
       - name: Bash contract tests
         run: .github/actions/deploy-core/tests/run.sh

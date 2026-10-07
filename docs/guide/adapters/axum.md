@@ -355,6 +355,12 @@ startup alone does not implement signal handling. #399 owns native amd64/arm64
 CI and publishing guidance; #400 owns Docker/Kubernetes/cloud operations.
 Application owners publish their own images. No public EdgeZero image is needed.
 
+See [Publishing Axum containers](../publishing-axum-containers.md) for native
+architecture CI, artifact identity, the strict scan gate and the app-owned GHCR
+recipe. [Deploying Axum containers](../deploying-axum-containers.md) covers the
+no-store Docker/Compose example and the remaining runtime, Kubernetes and
+ECS/Fargate acceptance gates.
+
 ## Configuration
 
 Configure the Axum adapter in `edgezero.toml`. See [Configuration](/guide/configuration) for the full

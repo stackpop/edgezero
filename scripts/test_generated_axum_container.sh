@@ -6,6 +6,26 @@ set -euo pipefail
 # Usage: ./scripts/test_generated_axum_container.sh /path/to/container-probe
 # Requires Docker, Python 3.11+, curl, OpenSSL, readelf and network access for image builds.
 APP_DIR="$(cd "${1:?pass a prepared disposable generated workspace}" && pwd)"
+shift
+BORROWED_IMAGE=""
+PLATFORM=""
+EVIDENCE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --image) BORROWED_IMAGE="${2:?--image requires a reference}"; shift 2 ;;
+    --platform) PLATFORM="${2:?--platform requires linux/amd64 or linux/arm64}"; shift 2 ;;
+    --evidence-dir) EVIDENCE="${2:?--evidence-dir requires a directory}"; shift 2 ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+[[ -z "$PLATFORM" || "$PLATFORM" == linux/amd64 || "$PLATFORM" == linux/arm64 ]] \
+  || { echo 'Unsupported platform' >&2; exit 2; }
+[[ "$BORROWED_IMAGE" != -* ]] || { echo 'Invalid image reference' >&2; exit 2; }
+if [[ -n "$EVIDENCE" ]]; then
+  [[ ! -e "$EVIDENCE" ]] || { echo 'Evidence directory must not exist' >&2; exit 2; }
+  mkdir -p "$EVIDENCE"
+  EVIDENCE="$(cd "$EVIDENCE" && pwd)"
+fi
 for tool in docker python3 curl openssl readelf sha256sum; do
   command -v "$tool" >/dev/null || { echo "Missing prerequisite: $tool" >&2; exit 1; }
 done
@@ -22,7 +42,7 @@ for file in Dockerfile .dockerignore Cargo.lock .tool-versions; do
 done
 WORK="$(mktemp -d -t edgezero-container.XXXXXX)"
 ID="edgezero-smoke-$$-$RANDOM"
-IMAGE="$ID:app"
+IMAGE="${BORROWED_IMAGE:-$ID:app}"
 PROBE="$ID:context"
 NETWORK="$ID"
 CONTAINERS=()
@@ -33,9 +53,17 @@ cleanup() {
     docker rm -f "$container" >/dev/null 2>&1 || true
   done
   docker network rm "$NETWORK" >/dev/null 2>&1 || true
-  docker image rm "$IMAGE" "$PROBE" >/dev/null 2>&1 || true
+  docker image rm "$PROBE" >/dev/null 2>&1 || true
+  if [[ -z "$BORROWED_IMAGE" ]]; then docker image rm "$IMAGE" >/dev/null 2>&1 || true; fi
   # Always remove disposable private keys, including on failure.
   rm -f "$WORK/tls/ca.key" "$WORK/tls/server.key"
+  if [[ -n "$EVIDENCE" ]]; then
+    # Contexts and TLS directories are not uploadable evidence.
+    for log in "$WORK"/*.log "$WORK"/*-body "$WORK/root-body"; do
+      [[ ! -f "$log" ]] || cp "$log" "$EVIDENCE/"
+    done
+    printf '%s\n' "$status" > "$EVIDENCE/exit-status"
+  fi
   if test "$status" -eq 0; then
     rm -rf "$WORK"
   else
@@ -45,7 +73,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> Packaging fixture $NAME; host $(docker info --format '{{.Architecture}}')"
+HOST_ARCH="$(docker info --format '{{.Architecture}}')"
+case "$HOST_ARCH" in
+  x86_64|amd64) HOST_PLATFORM=linux/amd64 ;;
+  aarch64|arm64) HOST_PLATFORM=linux/arm64 ;;
+  *) echo "Unsupported native host: $HOST_ARCH" >&2; exit 1 ;;
+esac
+PLATFORM="${PLATFORM:-$HOST_PLATFORM}"
+[[ "$PLATFORM" == "$HOST_PLATFORM" ]] || { echo 'Native host/platform mismatch' >&2; exit 1; }
+echo "==> Packaging fixture $NAME; native $PLATFORM"
 sha256sum "$APP_DIR/Cargo.lock" "$APP_DIR/.tool-versions"
 python3 - "$APP_DIR/Cargo.toml" <<'PY'
 import sys, tomllib
@@ -73,7 +109,7 @@ printf 'disposable secret\n' > "$CONTEXT/.cargo/credentials.toml"
 printf 'disposable config\n' > "$CONTEXT/$NAME.toml"
 # Test Docker's actual context rules, not a substring interpretation of ignore patterns.
 cat > "$WORK/context.Dockerfile" <<'DOCKER'
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 COPY . /context
 ARG APP_NAME
 RUN test ! -e "/context/$APP_NAME.toml" \
@@ -87,8 +123,13 @@ RUN test ! -e "/context/$APP_NAME.toml" \
     && ! find /context -name container-sentinel | grep .
 DOCKER
 docker build --progress=plain --build-arg "APP_NAME=$NAME" -f "$WORK/context.Dockerfile" -t "$PROBE" "$CONTEXT" 2>&1 | tee "$WORK/context.log"
-docker build --progress=plain -t "$IMAGE" "$CONTEXT" 2>&1 | tee "$WORK/build.log"
-docker image inspect "$IMAGE" --format 'image={{.Id}} architecture={{.Architecture}} user={{.Config.User}}'
+if [[ -z "$BORROWED_IMAGE" ]]; then
+  docker build --progress=plain -t "$IMAGE" "$CONTEXT" 2>&1 | tee "$WORK/build.log"
+fi
+IMAGE_PLATFORM="$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')"
+[[ "$IMAGE_PLATFORM" == "$PLATFORM" ]] || { echo 'Image/platform mismatch' >&2; exit 1; }
+docker image inspect "$IMAGE" --format 'image={{.Id}} architecture={{.Architecture}} user={{.Config.User}}' \
+  | tee "$WORK/image.log"
 docker history --no-trunc "$IMAGE" > "$WORK/history.log"
 
 CONTAINERS+=("$ID-export")
@@ -99,7 +140,7 @@ docker cp "$ID-export:/usr/local/bin/app" "$WORK/app"
 readelf -h -l -d "$WORK/app" > "$WORK/elf.log"
 grep -E 'Machine:|interpreter|NEEDED' "$WORK/elf.log"
 test -s "$WORK/os-roots.pem"
-python3 - "$WORK/runtime.tar" <<'PY'
+python3 - "$WORK/runtime.tar" "$PLATFORM" <<'PY'
 import sys, tarfile
 with tarfile.open(sys.argv[1]) as archive:
     paths = {m.name.lstrip('./') for m in archive}
@@ -110,7 +151,10 @@ with tarfile.open(sys.argv[1]) as archive:
     assert 'usr/local/bin/app' in paths
     header = archive.extractfile('usr/local/bin/app').read(20)
     assert header[:4] == b'\x7fELF', 'not a native ELF executable'
-    print('ELF class', header[4], 'machine', int.from_bytes(header[18:20], 'little'))
+    machine = int.from_bytes(header[18:20], 'little')
+    assert header[4:6] == bytes((2, 1)), 'expected ELF64 little-endian'
+    assert machine == {'linux/amd64': 62, 'linux/arm64': 183}[sys.argv[2]], 'ELF/platform mismatch'
+    print('ELF class', header[4], 'machine', machine)
 PY
 docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges:true \
   --entrypoint sh "$IMAGE" -ec '
@@ -191,4 +235,4 @@ status="$(curl --silent --max-time 35 -o "$WORK/wrong-host-body" -w '%{http_code
 [[ "$status" =~ ^5[0-9][0-9]$ ]]
 if grep -q 'edgezero controlled TLS' "$WORK/wrong-host-body"; then exit 1; fi
 echo 'PASS: generated app context, native libraries, UID, read-only root, capabilities, mounts, HTTP and controlled TLS.'
-echo 'Packaging only; no readiness, durable restart, SIGTERM or multi-architecture certification.'
+echo 'Packaging only; no readiness, durable restart, SIGTERM or production certification.'
