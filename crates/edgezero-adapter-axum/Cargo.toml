@@ -21,6 +21,8 @@ axum = [
     "dep:http-body",
     "dep:hyper",
     "dep:hyper-util",
+    "dep:ipnet",
+    "dep:getrandom",
     "dep:mime",
     "dep:reqwest",
     "dep:redb",
@@ -47,10 +49,12 @@ bytes = { workspace = true }
 ctor = { workspace = true, optional = true }
 futures = { workspace = true }
 futures-util = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
 http = { workspace = true }
 http-body = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
+ipnet = { workspace = true, optional = true }
 log = { workspace = true }
 mime = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
@@ -80,6 +84,8 @@ flate2 = { workspace = true }
 http-body = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+rustls = { workspace = true }
 serde = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
+tokio-rustls = { workspace = true }

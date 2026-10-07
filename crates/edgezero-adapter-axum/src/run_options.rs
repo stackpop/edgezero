@@ -10,6 +10,9 @@ use edgezero_core::app::StoresMetadata;
 use edgezero_core::env_config::EnvConfig;
 use log::LevelFilter;
 
+use crate::diagnostics::NativeDiagnosticsHandle;
+use crate::proxy::TrustedProxyPolicy;
+
 /// Validated native JSON buffering ceiling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JsonBodyLimit(NonZeroUsize);
@@ -55,11 +58,14 @@ pub struct AxumRunOptions {
     addr: SocketAddr,
     config_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
+    diagnostics: NativeDiagnosticsHandle,
     env: EnvConfig,
     grace: Duration,
     json_body_limit: JsonBodyLimit,
     level: LevelFilter,
     non_unicode_overrides: Vec<Vec<String>>,
+    request_records: bool,
+    trusted_proxy_policy: TrustedProxyPolicy,
 }
 
 impl AxumRunOptions {
@@ -73,6 +79,10 @@ impl AxumRunOptions {
 
     pub(crate) fn data_dir(&self) -> Option<&Path> {
         self.data_dir.as_deref()
+    }
+
+    pub(crate) fn diagnostics(&self) -> NativeDiagnosticsHandle {
+        self.diagnostics.clone()
     }
 
     pub(crate) fn env_config(&self) -> &EnvConfig {
@@ -143,6 +153,7 @@ impl AxumRunOptions {
         }
         options.grace = shutdown_grace(&env)?;
         options.json_body_limit = JsonBodyLimit::from_config(&env)?;
+        (options.trusted_proxy_policy, options.request_records) = native_settings(&env)?;
         if let Some(root) = env.get(&["adapter", "config_dir"]) {
             options = options.with_config_dir(root)?;
         }
@@ -174,16 +185,27 @@ impl AxumRunOptions {
             addr,
             config_dir: None,
             data_dir: None,
+            diagnostics: NativeDiagnosticsHandle::new(),
             env: EnvConfig::default(),
             grace: Duration::from_secs(10),
             json_body_limit: JsonBodyLimit::DEFAULT,
             level: LevelFilter::Info,
             non_unicode_overrides: Vec::new(),
+            request_records: true,
+            trusted_proxy_policy: TrustedProxyPolicy::no_trust(),
         })
+    }
+
+    pub(crate) fn request_records(&self) -> bool {
+        self.request_records
     }
 
     pub(crate) fn shutdown_grace(&self) -> Duration {
         self.grace
+    }
+
+    pub(crate) fn trusted_proxy_policy(&self) -> TrustedProxyPolicy {
+        self.trusted_proxy_policy.clone()
     }
 
     pub(crate) fn validate_stores(&self, metadata: StoresMetadata) -> anyhow::Result<()> {
@@ -258,6 +280,14 @@ impl AxumRunOptions {
         Ok(self)
     }
 
+    /// Shares native counters and the optional observer with this runner.
+    #[inline]
+    #[must_use]
+    pub fn with_diagnostics(mut self, diagnostics: NativeDiagnosticsHandle) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
     /// Selects the ceiling for framework-managed JSON buffering, in bytes.
     ///
     /// # Errors
@@ -275,6 +305,14 @@ impl AxumRunOptions {
         self
     }
 
+    /// Enables only default native request logs; observers and accounting remain active.
+    #[inline]
+    #[must_use]
+    pub fn with_request_records(mut self, enabled: bool) -> Self {
+        self.request_records = enabled;
+        self
+    }
+
     /// Selects a positive, representable integer-second drain budget.
     ///
     /// # Errors
@@ -285,6 +323,40 @@ impl AxumRunOptions {
         self.grace = grace;
         Ok(self)
     }
+
+    /// Installs an explicit immutable incoming-proxy policy without reading the environment.
+    #[inline]
+    #[must_use]
+    pub fn with_trusted_proxy_policy(mut self, policy: TrustedProxyPolicy) -> Self {
+        self.trusted_proxy_policy = policy;
+        self
+    }
+}
+
+pub(crate) fn native_settings(env: &EnvConfig) -> anyhow::Result<(TrustedProxyPolicy, bool)> {
+    let policy = TrustedProxyPolicy::from_values(
+        env.get(&["adapter", "trusted_proxy_cidrs"]),
+        env.get(&["adapter", "forwarding_header_family"]),
+    )
+    .map_err(|_error| {
+        failure(
+            "settings",
+            "TRUSTED_PROXY_POLICY",
+            "invalid literal networks or forwarding family",
+        )
+    })?;
+    let records = match env.get(&["logging", "request_records"]) {
+        None | Some("true") => true,
+        Some("false") => false,
+        Some(_) => {
+            return Err(failure(
+                "settings",
+                "LOGGING__REQUEST_RECORDS",
+                "invalid boolean",
+            ));
+        }
+    };
+    Ok((policy, records))
 }
 
 pub(crate) fn failure(stage: &str, subject: &str, category: &str) -> anyhow::Error {
@@ -301,6 +373,9 @@ fn fixed_setting(path: &[String]) -> Option<&'static str> {
         ["adapter", "config_dir"] => Some("CONFIG_DIR"),
         ["adapter", "data_dir"] => Some("DATA_DIR"),
         ["adapter", "shutdown_grace_seconds"] => Some("SHUTDOWN_GRACE_SECONDS"),
+        ["adapter", "trusted_proxy_cidrs"] => Some("TRUSTED_PROXY_CIDRS"),
+        ["adapter", "forwarding_header_family"] => Some("FORWARDING_HEADER_FAMILY"),
+        ["logging", "request_records"] => Some("LOGGING__REQUEST_RECORDS"),
         ["adapter", "json_body_limit_bytes"] => Some("JSON_BODY_LIMIT_BYTES"),
         ["logging", "level"] => Some("LOGGING__LEVEL"),
         _ => None,
@@ -353,6 +428,59 @@ fn validate_root(root: &Path, setting: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use edgezero_core::app::StoreMetadata;
+
+    #[test]
+    fn native_settings_defaults_explicit_builders_and_strict_values() {
+        let defaults = AxumRunOptions::from_vars(Vec::<(String, String)>::new()).expect("defaults");
+        assert!(defaults.request_records());
+        assert_eq!(
+            defaults.trusted_proxy_policy(),
+            TrustedProxyPolicy::no_trust()
+        );
+        let configured = AxumRunOptions::from_vars([
+            ("EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS", "127.0.0.2/32"),
+            ("EDGEZERO__ADAPTER__FORWARDING_HEADER_FAMILY", "forwarded"),
+            ("EDGEZERO__LOGGING__REQUEST_RECORDS", "false"),
+        ])
+        .expect("configured");
+        assert!(!configured.request_records());
+        assert_ne!(
+            configured.trusted_proxy_policy(),
+            TrustedProxyPolicy::no_trust()
+        );
+        let explicit = AxumRunOptions::new(defaults.addr())
+            .expect("explicit")
+            .with_request_records(false)
+            .with_trusted_proxy_policy(configured.trusted_proxy_policy());
+        assert!(!explicit.request_records());
+        assert_eq!(
+            explicit.trusted_proxy_policy(),
+            configured.trusted_proxy_policy()
+        );
+        assert!(
+            explicit
+                .env_config()
+                .get(&["adapter", "trusted_proxy_cidrs"])
+                .is_none()
+        );
+        for (key, value) in [
+            ("EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS", "127.0.0.2"),
+            ("EDGEZERO__ADAPTER__TRUSTED_PROXY_CIDRS", "sentinel-policy"),
+            (
+                "EDGEZERO__ADAPTER__FORWARDING_HEADER_FAMILY",
+                "sentinel-family",
+            ),
+            ("EDGEZERO__LOGGING__REQUEST_RECORDS", "TRUE"),
+            ("EDGEZERO__LOGGING__REQUEST_RECORDS", "false "),
+            ("EDGEZERO__LOGGING__REQUEST_RECORDS", ""),
+        ] {
+            let error = AxumRunOptions::from_vars([(key, value)])
+                .err()
+                .expect("invalid supplied setting");
+            assert_eq!(error.chain().count(), 1);
+            assert!(!error.to_string().contains("sentinel"));
+        }
+    }
 
     #[test]
     fn json_body_limit_is_positive_decimal_and_representable() {

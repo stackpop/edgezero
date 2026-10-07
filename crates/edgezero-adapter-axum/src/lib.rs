@@ -9,9 +9,13 @@ pub mod context;
 #[cfg(feature = "axum")]
 pub mod dev_server;
 #[cfg(feature = "axum")]
+pub mod diagnostics;
+#[cfg(feature = "axum")]
 pub mod key_value_store;
 #[cfg(feature = "axum")]
 pub mod outbound;
+#[cfg(feature = "axum")]
+pub mod proxy;
 #[cfg(feature = "axum")]
 pub mod request;
 #[cfg(feature = "axum")]

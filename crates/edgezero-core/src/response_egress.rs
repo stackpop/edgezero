@@ -300,7 +300,68 @@ pub struct ResponseEgressReport {
     pub route: Option<RouteMetadata>,
 }
 
-type ResponseEgressCompletionCallback = Box<dyn FnOnce(&ResponseEgressReport) + Send + 'static>;
+type ResponseEgressCompletionCallback =
+    Box<dyn FnOnce(&ResponseEgressReport, MonotonicInstant) + Send + 'static>;
+
+/// Bounded reason retained independently of an error renderer's response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ResponseEgressFailureKind {
+    FallbackBodyExceeded,
+    FallbackReadTimedOut,
+    PropagatedError,
+}
+
+/// Framework-owned failure classification with no diagnostic source or input text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResponseEgressFailureClassification {
+    error_kind: Option<&'static str>,
+    framework_route_error: bool,
+    kind: ResponseEgressFailureKind,
+}
+
+impl ResponseEgressFailureClassification {
+    pub(crate) const fn error(kind: &'static str) -> Self {
+        Self {
+            kind: ResponseEgressFailureKind::PropagatedError,
+            error_kind: Some(kind),
+            framework_route_error: false,
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn error_kind(self) -> Option<&'static str> {
+        self.error_kind
+    }
+
+    pub(crate) const fn fallback(kind: ResponseEgressFailureKind) -> Self {
+        Self {
+            kind,
+            error_kind: None,
+            framework_route_error: false,
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn is_framework_route_error(self) -> bool {
+        self.framework_route_error
+    }
+
+    #[must_use]
+    #[inline]
+    pub const fn kind(self) -> ResponseEgressFailureKind {
+        self.kind
+    }
+
+    pub(crate) const fn routing(kind: &'static str) -> Self {
+        Self {
+            framework_route_error: true,
+            ..Self::error(kind)
+        }
+    }
+}
 
 /// Non-clone owner of one response-scoped terminal callback.
 ///
@@ -425,13 +486,18 @@ struct ResponseEgressResourceState<T> {
 }
 
 impl ResponseEgressCompletion {
+    #[cfg(test)]
     fn complete(&mut self, report: &ResponseEgressReport) {
+        self.complete_at(report, report.request_start);
+    }
+
+    fn complete_at(&mut self, report: &ResponseEgressReport, observed_at: MonotonicInstant) {
         let Some(callback) = self.callback.take() else {
             return;
         };
-        let result = catch_unwind(AssertUnwindSafe(|| callback(report)));
+        let result = catch_unwind(AssertUnwindSafe(|| callback(report, observed_at)));
         if result.is_err() {
-            log::error!("response-egress completion panicked after terminal transition");
+            log_callback_fault("response-egress completion panicked after terminal transition");
         }
     }
 
@@ -455,9 +521,9 @@ impl ResponseEgressCompletion {
     #[must_use]
     #[inline]
     pub fn join(mut self, mut other: Self) -> Self {
-        Self::new(move |report| {
-            self.complete(report);
-            other.complete(report);
+        Self::new_with_terminal_time(move |report, observed_at| {
+            self.complete_at(report, observed_at);
+            other.complete_at(report, observed_at);
         })
     }
 
@@ -489,6 +555,18 @@ impl ResponseEgressCompletion {
     pub fn new<Complete>(complete: Complete) -> Self
     where
         Complete: FnOnce(&ResponseEgressReport) + Send + 'static,
+    {
+        Self::new_with_terminal_time(move |report, _observed_at| complete(report))
+    }
+
+    /// Retains a callback receiving the existing terminal transition's instant.
+    /// The instant is captured before any application callback or logger runs.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn new_with_terminal_time<Complete>(complete: Complete) -> Self
+    where
+        Complete: FnOnce(&ResponseEgressReport, MonotonicInstant) + Send + 'static,
     {
         Self {
             callback: Some(Box::new(complete)),
@@ -527,6 +605,7 @@ pub struct ResponseEgressObserverHandle {
 pub struct ResponseEgressEnvelope {
     clock: MonotonicClock,
     completion: ResponseEgressCompletion,
+    failure_classification: Option<ResponseEgressFailureClassification>,
     observer: ResponseEgressObserverHandle,
     policy: ResponseEgressPolicyCallback,
     request_method: Method,
@@ -616,7 +695,7 @@ impl ResponseEgressEnvelope {
         let Ok(selected_policy) =
             catch_unwind(AssertUnwindSafe(|| (self.policy)(&head, egress_started_at)))
         else {
-            log::error!("response-egress policy panicked before conversion");
+            log_callback_fault("response-egress policy panicked before conversion");
             return Err(Box::new(ResponseEgressBeginFailure {
                 attempt,
                 cause: ResponseEgressOutcome::ConversionError,
@@ -644,7 +723,7 @@ impl ResponseEgressEnvelope {
             )),
         };
         let Ok(prepared) = prepare_response_egress(&self.request_method, self.response) else {
-            log::error!("response-egress framing validation failed before commit");
+            log_callback_fault("response-egress framing validation failed before commit");
             return Err(Box::new(ResponseEgressBeginFailure {
                 attempt,
                 cause: ResponseEgressOutcome::ConversionError,
@@ -671,6 +750,13 @@ impl ResponseEgressEnvelope {
         )
     }
 
+    /// Returns the framework-owned category captured before rendering.
+    #[must_use]
+    #[inline]
+    pub const fn failure_classification(&self) -> Option<ResponseEgressFailureClassification> {
+        self.failure_classification
+    }
+
     pub(crate) fn new(
         response: Response,
         metadata: ResponseEgressRequestMetadata,
@@ -680,6 +766,7 @@ impl ResponseEgressEnvelope {
         clock: MonotonicClock,
     ) -> Self {
         Self {
+            failure_classification: None,
             clock,
             completion,
             observer,
@@ -705,13 +792,30 @@ impl ResponseEgressEnvelope {
     pub fn response_mut(&mut self) -> &mut Response {
         &mut self.response
     }
+
+    /// Composes adapter diagnostics without replacing application ownership.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn with_completion(mut self, completion: ResponseEgressCompletion) -> Self {
+        self.completion = self.completion.join(completion);
+        self
+    }
+
+    pub(crate) fn with_failure(
+        mut self,
+        failure: Option<ResponseEgressFailureClassification>,
+    ) -> Self {
+        self.failure_classification = failure;
+        self
+    }
 }
 
 impl ResponseEgressObserverHandle {
     fn complete(&self, report: &ResponseEgressReport) {
         let result = catch_unwind(AssertUnwindSafe(|| self.observer.complete(report)));
         if result.is_err() {
-            log::error!("response-egress observer panicked after terminal transition");
+            log_callback_fault("response-egress observer panicked after terminal transition");
         }
     }
 
@@ -927,7 +1031,7 @@ impl ResponseEgressAttempt {
             if let Some(elapsed) = observed_at.checked_duration_since(self.egress_started_at) {
                 elapsed
             } else {
-                log::error!("response-egress monotonic clock moved backwards");
+                log_callback_fault("response-egress monotonic clock moved backwards");
                 outcome = ResponseEgressOutcome::Unspecified;
                 Duration::ZERO
             };
@@ -942,7 +1046,7 @@ impl ResponseEgressAttempt {
         };
         self.state = AttemptState::Terminal(report);
         if let AttemptState::Terminal(terminal_report) = &self.state {
-            self.completion.complete(terminal_report);
+            self.completion.complete_at(terminal_report, observed_at);
             self.observer.complete(terminal_report);
             true
         } else {
@@ -985,6 +1089,12 @@ pub fn default_response_egress_policy(
     ResponseEgressPolicy {
         write_deadline: Deadline::at_instant(deadline),
     }
+}
+
+fn log_callback_fault(category: &'static str) {
+    // A logger panic must not escape the owner's independent unwind boundary.
+    // Never retry through a logger that has itself failed.
+    let _result = catch_unwind(AssertUnwindSafe(|| log::error!("{category}")));
 }
 
 #[cfg(test)]
@@ -1785,6 +1895,158 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].bytes_written, u64::MAX);
         assert_eq!(reports[0].outcome, ResponseEgressOutcome::TransportError);
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one isolated facade fixture exercises all three owner fault boundaries"
+    )]
+    fn core_fault_reporting_with_panicking_facade_is_isolated() {
+        use log::{Level, LevelFilter, Log, Metadata, Record, set_logger, set_max_level};
+        use std::env::{current_exe, var_os};
+        use std::process::Command;
+
+        struct PanickingLogger;
+        static LOGGER: PanickingLogger = PanickingLogger;
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        impl Log for PanickingLogger {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                metadata.level() == Level::Error
+            }
+            fn flush(&self) {}
+            fn log(&self, record: &Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    CALLS.fetch_add(1, Ordering::SeqCst);
+                    panic!("fixture logger fault");
+                }
+            }
+        }
+        const CHILD: &str = "EDGEZERO_TEST_CORE_FAULT_LOGGER";
+        if var_os(CHILD).is_none() {
+            let output = Command::new(current_exe().expect("test executable"))
+                .args(["--exact", "response_egress::tests::core_fault_reporting_with_panicking_facade_is_isolated", "--nocapture"])
+                .env(CHILD, "1").output().expect("isolated child");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        set_logger(&LOGGER).expect("single child logger");
+        set_max_level(LevelFilter::Error);
+        let started = MonotonicInstant::now();
+        let terminal = started
+            .checked_add(Duration::from_millis(42))
+            .expect("instant");
+        let after_callback = terminal
+            .checked_add(Duration::from_secs(3))
+            .expect("instant");
+        let current = Arc::new(Mutex::new(terminal));
+        let clock_current = Arc::clone(&current);
+        let clock = MonotonicClock::new(move || *clock_current.lock().expect("clock"));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let app_events = Arc::clone(&events);
+        let native_events = Arc::clone(&events);
+        let observed = Arc::new(Mutex::new(None));
+        let native_observed = Arc::clone(&observed);
+        let callback_current = Arc::clone(&current);
+        let completion = ResponseEgressCompletion::new(move |_| {
+            app_events.lock().expect("events").push("app");
+            *callback_current.lock().expect("clock") = after_callback;
+            panic!("application completion fault");
+        })
+        .join(ResponseEgressCompletion::new_with_terminal_time(
+            move |_, at| {
+                native_events.lock().expect("events").push("native");
+                *native_observed.lock().expect("observed") = Some(at);
+            },
+        ));
+        let headers = HeaderMap::new();
+        let head = ResponseEgressHead::new(
+            StatusCode::OK,
+            Version::HTTP_11,
+            &headers,
+            None,
+            started,
+            None,
+        );
+        let mut attempt = ResponseEgressAttempt::new(
+            &head,
+            started,
+            completion,
+            ResponseEgressObserverHandle::new(OrderedObserver(Arc::clone(&events))),
+            clock.clone(),
+        );
+        assert!(attempt.terminate(ResponseEgressOutcome::Completed, terminal));
+        assert!(!attempt.terminate(ResponseEgressOutcome::SourceError, after_callback));
+        assert_eq!(
+            *events.lock().expect("events"),
+            vec!["app", "native", "observer"]
+        );
+        assert_eq!(*observed.lock().expect("observed"), Some(terminal));
+        assert_eq!(clock.now(), after_callback);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+
+        let mut observer_attempt = ResponseEgressAttempt::new(
+            &head,
+            started,
+            ResponseEgressCompletion::empty(),
+            ResponseEgressObserverHandle::new(PanickingObserver),
+            clock.clone(),
+        );
+        assert!(observer_attempt.terminate(ResponseEgressOutcome::Completed, terminal));
+        assert!(!observer_attempt.terminate(ResponseEgressOutcome::TransportError, after_callback));
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+
+        let policy_calls = Arc::new(Mutex::new(Vec::new()));
+        let callback_calls = Arc::clone(&policy_calls);
+        let envelope = ResponseEgressEnvelope::new(
+            Response::new(Body::empty()),
+            ResponseEgressRequestMetadata::new(Method::GET, started, None),
+            ResponseEgressCompletion::new_with_terminal_time(move |_, at| {
+                callback_calls.lock().expect("calls").push(at);
+            }),
+            Arc::new(|_, _| panic!("application policy fault")),
+            ResponseEgressObserverHandle::default(),
+            clock,
+        );
+        let failure = envelope.begin().err().expect("bounded policy failure");
+        assert!(policy_calls.lock().expect("calls").is_empty());
+        let (mut policy_attempt, _clock, cause) = failure.into_parts();
+        assert_eq!(cause, ResponseEgressOutcome::ConversionError);
+        assert!(policy_attempt.terminate(cause, after_callback));
+        assert_eq!(*policy_calls.lock().expect("calls"), vec![after_callback]);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn timed_nested_completion_preserves_terminal_instant_and_order() {
+        let events = Arc::new(Mutex::new(Vec::<(u8, MonotonicInstant)>::new()));
+        let started = MonotonicInstant::now();
+        let terminal = started
+            .checked_add(Duration::from_millis(42))
+            .expect("instant");
+        let first = Arc::clone(&events);
+        let second = Arc::clone(&events);
+        let third = Arc::clone(&events);
+        let mut completion = ResponseEgressCompletion::new(move |_| {
+            first.lock().expect("events").push((1, terminal));
+        })
+        .join(ResponseEgressCompletion::new_with_terminal_time(
+            move |_, at| second.lock().expect("events").push((2, at)),
+        ))
+        .join(ResponseEgressCompletion::new_with_terminal_time(
+            move |_, at| third.lock().expect("events").push((3, at)),
+        ));
+        let report = completed_report(started);
+        completion.complete_at(&report, terminal);
+        completion.complete_at(&report, started);
+        assert_eq!(
+            *events.lock().expect("events"),
+            vec![(1, terminal), (2, terminal), (3, terminal)]
+        );
     }
 
     #[test]

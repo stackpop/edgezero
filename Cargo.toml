@@ -62,12 +62,14 @@ fern = "0.7"
 flate2 = { version = "=1.1.9", default-features = false, features = ["rust_backend"] }
 futures = { version = "0.3", features = ["std", "executor"] }
 futures-util = { version = "0.3", features = ["alloc", "io"] }
+getrandom = "=0.4.2"
 handlebars = "6"
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+ipnet = "=2.12.0"
 log = "0.4"
 miniz_oxide = { version = "=0.8.9", default-features = false, features = ["simd", "with-alloc"] }
 log-fastly = "=0.13.1"
@@ -83,6 +85,7 @@ simd-adler32 = { version = "=0.3.9", default-features = false }
 # file (`<spin.toml dir>/.spin/sqlite_key_value.db`) using the schema
 # vendored from spinframework/spin's `crates/key-value-spin/src/store.rs`.
 rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+rustls = { version = "=0.23.40", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 ryu = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -102,6 +105,7 @@ tempfile = "3"
 toml_edit = "0.25"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["tls12", "aws_lc_rs"] }
 trybuild = "1"
 toml = { version = "1.1" }
 tower = { version = "0.5", features = ["util"] }
