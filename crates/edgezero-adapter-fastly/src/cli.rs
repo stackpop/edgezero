@@ -418,23 +418,11 @@ impl Adapter for FastlyCliAdapter {
                 }))
             }
             // The CLI resolves the activated version (deploy output, then the
-            // Fastly API), so the built-in deploy reports none.
-            AdapterAction::Deploy => deploy(args).map(|()| {
-                ActionOutcome::Deploy(DeployOutcome {
-                    service_id: None,
-                    version: None,
-                })
-            }),
+            // Fastly API), so the built-in deploy reports nothing.
+            AdapterAction::Deploy => deploy(args).map(|()| ActionOutcome::Empty),
             AdapterAction::Serve => serve(args).map(|()| ActionOutcome::Empty),
             // Fastly staging lifecycle.
-            AdapterAction::DeployStaging => deploy_staging(args).map(|version| {
-                ActionOutcome::Deploy(DeployOutcome {
-                    // `deploy_staging` already resolved this (flag, then
-                    // `FASTLY_SERVICE_ID`), so it cannot fail here.
-                    service_id: resolve_service_id(args).ok(),
-                    version: Some(version),
-                })
-            }),
+            AdapterAction::DeployStaging => deploy_staging(args).map(ActionOutcome::Deploy),
             AdapterAction::EmitVersion => {
                 emit_active_version(args).map(ActionOutcome::ActiveVersion)
             }
@@ -5194,7 +5182,7 @@ fn resolve_manifest_dir(args: &[String]) -> Result<PathBuf, String> {
 /// `deploy --adapter fastly --service-id <id> --staging`:
 /// build, upload to a new draft version (no activation), stage it, and
 /// emit `version=<N>`.
-fn deploy_staging(args: &[String]) -> Result<u64, String> {
+fn deploy_staging(args: &[String]) -> Result<DeployOutcome, String> {
     let service_id = resolve_service_id(args)?;
     validate_service_id(&service_id)?;
     // The Fastly CLI reads FASTLY_API_TOKEN from the env; fail fast
@@ -5313,8 +5301,11 @@ fn deploy_staging(args: &[String]) -> Result<u64, String> {
         manifest_dir,
     )?;
 
-    // 6. Report the staged version; the CLI emits it (`version=<N>`).
-    Ok(version)
+    // 6. Report the service and staged version; the CLI emits `version=<N>`.
+    Ok(DeployOutcome {
+        service_id: Some(service_id),
+        version: Some(version),
+    })
 }
 
 /// Point a staged draft's `edgezero_runtime_env` link at the STAGING selector
@@ -5668,12 +5659,16 @@ fn curl_status(args: &[String]) -> Result<u16, String> {
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.trim().parse::<u16>().map_err(|err| {
-        format!(
+    match stdout.trim().parse::<u16>() {
+        // curl writes `000` when no HTTP response arrived; that is a transport
+        // failure, not a status code.
+        Ok(0) => Err("curl got no HTTP response (status 000)".to_owned()),
+        Ok(code) => Ok(code),
+        Err(err) => Err(format!(
             "could not parse HTTP status from curl output {:?}: {err}",
             stdout.trim()
-        )
-    })
+        )),
+    }
 }
 
 /// `rollback --adapter fastly ...`: production activates the explicit
@@ -8342,13 +8337,14 @@ exit 1
         GUARD.get_or_init(|| Mutex::new(()))
     }
 
-    /// A fake `curl` that answers every health probe with HTTP `code`.
+    /// A fake `curl` that answers every health probe with HTTP `code`,
+    /// written as curl's three-digit `%{http_code}` (`0` prints `000`).
     #[cfg(unix)]
     fn fake_curl(code: u16) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempdir().expect("tempdir");
         let script_path = dir.path().join("curl");
-        fs::write(&script_path, format!("#!/bin/sh\necho {code}\n")).expect("write script");
+        fs::write(&script_path, format!("#!/bin/sh\necho {code:03}\n")).expect("write script");
         let mut perms = fs::metadata(&script_path).expect("meta").permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).expect("chmod +x");
@@ -8400,7 +8396,7 @@ exit 1
         drop(healthy_path);
 
         let unhealthy_curl = fake_curl(503);
-        let _path = PathPrepend::new(unhealthy_curl.path());
+        let unhealthy_path = PathPrepend::new(unhealthy_curl.path());
         let unhealthy =
             healthcheck(&args("2")).expect("an unhealthy probe is an outcome, not an error");
         assert!(!unhealthy.healthy());
@@ -8413,6 +8409,16 @@ exit 1
             failure.contains("failed after 2 attempt(s)"),
             "keeps the pre-existing message: {failure}"
         );
+        drop(unhealthy_path);
+
+        // curl's `000` means no HTTP response arrived: no status code.
+        let silent_curl = fake_curl(0);
+        let _silent_path = PathPrepend::new(silent_curl.path());
+        let silent = healthcheck(&args("1")).expect("a silent probe is an outcome");
+        assert!(!silent.healthy());
+        assert_eq!(silent.status_code, None, "`000` is not a status code");
+        let silent_failure = silent.failure.expect("carries its reason");
+        assert!(silent_failure.contains("status 000"), "{silent_failure}");
     }
 
     /// `version_verified` claims the version was ACTIVE before AND after the

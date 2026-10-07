@@ -50,6 +50,46 @@ crate = "crates/demo-fastly"
 deploy = "echo 'SUCCESS: Deployed package (service SVC1, version 12)'"
 "#;
 
+    /// A Fastly app with no config stores, so a staged deploy needs only
+    /// `fastly compute update` to answer (no runtime-env relink).
+    const FASTLY_STAGING_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-fastly"
+manifest = "fastly.toml"
+"#;
+
+    /// A Fastly app with one config store, for `config gc`.
+    const FASTLY_GC_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-fastly"
+manifest = "fastly.toml"
+
+[stores.config]
+ids = ["app_config"]
+"#;
+
+    /// An app whose axum session probe succeeds, and a cloudflare adapter
+    /// with no override (its probe is the native `wrangler whoami`).
+    const AUTH_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+
+[adapters.axum.commands]
+auth-status = "echo logged-in"
+
+[adapters.cloudflare.adapter]
+crate = "crates/demo-cloudflare"
+"#;
+
     /// The versions API answer: 6 inactive, 7 active.
     const VERSIONS: &str = r#"[{"number":6,"active":false},{"number":7,"active":true}]"#;
 
@@ -104,6 +144,35 @@ deploy = "echo 'SUCCESS: Deployed package (service SVC1, version 12)'"
         dir
     }
 
+    /// `edgezero <args>` in `dir`, with every variable that could change a
+    /// result removed: the Fastly credentials, and the `EDGEZERO__*` and
+    /// `DEMO_APP__*` overlays that `provision`, `config validate` and
+    /// `config gc` read.
+    fn command(dir: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_edgezero"));
+        command
+            .args(args)
+            .current_dir(dir)
+            .env("EDGEZERO_MANIFEST", dir.join("edgezero.toml"))
+            .env_remove("FASTLY_API_TOKEN")
+            .env_remove("FASTLY_SERVICE_ID");
+        for (key, _) in env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("EDGEZERO__") || name.starts_with("DEMO_APP__") {
+                command.env_remove(&key);
+            }
+        }
+        command
+    }
+
+    /// Put `bin_dir` first on the command's `PATH`.
+    fn prepend_path(command: &mut Command, bin_dir: &Path) {
+        let path = env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin_dir.to_path_buf()];
+        paths.extend(env::split_paths(&path));
+        command.env("PATH", env::join_paths(paths).expect("join PATH"));
+    }
+
     /// Run `edgezero <args>` in `dir`, optionally with `bin_dir` first on `PATH`.
     fn edgezero(dir: &Path, args: &[&str], bin_dir: Option<&Path>) -> Output {
         edgezero_with_token(dir, args, bin_dir, None)
@@ -116,21 +185,12 @@ deploy = "echo 'SUCCESS: Deployed package (service SVC1, version 12)'"
         bin_dir: Option<&Path>,
         token: Option<&str>,
     ) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_edgezero"));
-        command
-            .args(args)
-            .current_dir(dir)
-            .env("EDGEZERO_MANIFEST", dir.join("edgezero.toml"))
-            .env_remove("FASTLY_API_TOKEN")
-            .env_remove("FASTLY_SERVICE_ID");
+        let mut command = command(dir, args);
         if let Some(value) = token {
             command.env("FASTLY_API_TOKEN", value);
         }
         if let Some(bin) = bin_dir {
-            let path = env::var_os("PATH").unwrap_or_default();
-            let mut paths = vec![bin.to_path_buf()];
-            paths.extend(env::split_paths(&path));
-            command.env("PATH", env::join_paths(paths).expect("join PATH"));
+            prepend_path(&mut command, bin);
         }
         command.output().expect("run edgezero")
     }
@@ -179,13 +239,57 @@ deploy = "echo 'SUCCESS: Deployed package (service SVC1, version 12)'"
     }
 
     fn fake_curl_script(body: &str) -> TempDir {
+        fake_binary("curl", body)
+    }
+
+    /// A temp dir holding an executable `name` that runs the shell `body`.
+    fn fake_binary(name: &str, body: &str) -> TempDir {
         let dir = TempDir::new().expect("temp dir");
-        let script = dir.path().join("curl");
-        fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("write curl");
+        let script = dir.path().join(name);
+        fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("write fake binary");
         let mut perms = fs::metadata(&script).expect("meta").permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&script, perms).expect("chmod +x");
         dir
+    }
+
+    /// A fake `fastly` for `config gc`: one config store (`app_config`, id
+    /// `store-1`) holding only a plain `greeting` entry, so there is nothing to
+    /// reclaim. Any `delete` is logged to `deletes.log` next to the script.
+    fn fake_fastly_gc() -> TempDir {
+        fake_binary(
+            "fastly",
+            "case \"$1 $2\" in\n\
+             \x20 'config-store list') echo '[{\"name\":\"app_config\",\"id\":\"store-1\"}]';;\n\
+             \x20 'config-store-entry list') echo '[{\"item_key\":\"greeting\",\"item_value\":\"hello\",\"created_at\":\"2026-07-01T00:00:00Z\"}]';;\n\
+             \x20 'config-store-entry delete') echo \"$*\" >> \"$(dirname \"$0\")/deletes.log\";;\n\
+             esac",
+        )
+    }
+
+    /// A fake `fastly` whose `compute update` makes draft version 8.
+    fn fake_fastly_staging() -> TempDir {
+        fake_binary(
+            "fastly",
+            "if [ \"$1 $2\" = 'compute update' ]; then \
+             echo 'SUCCESS: Updated package (service SVC1, version 8)'; fi",
+        )
+    }
+
+    /// A project holding `manifest` and an empty `fastly.toml`.
+    fn fastly_project(manifest: &str) -> TempDir {
+        let dir = project_with(manifest);
+        fs::write(dir.path().join("fastly.toml"), "name = \"app\"\n").expect("fastly.toml");
+        dir
+    }
+
+    /// The text stdout of a manifest command: the `[edgezero] executing …`
+    /// line, then what the command printed (`child_output`).
+    fn executed(command: &str, adapter: &str, dir: &Path, child_output: &str) -> String {
+        format!(
+            "[edgezero] executing `{command}` for adapter `{adapter}` in {}\n{child_output}",
+            dir.display()
+        )
     }
 
     /// The Fastly API calls a [`fake_curl_api`] served, in order.
@@ -227,17 +331,16 @@ deploy = "echo 'SUCCESS: Deployed package (service SVC1, version 12)'"
         let dir = project();
         let output = edgezero(dir.path(), &["build", "--adapter", "axum"], None);
         assert!(output.status.success(), "stderr: {}", stderr_of(&output));
-        let stdout = stdout_of(&output);
-        assert!(
-            stdout.starts_with(
-                "[edgezero] executing `echo child-wrote-to-stdout` for adapter `axum` in "
-            ),
-            "stdout: {stdout:?}"
+        assert_eq!(
+            stdout_of(&output),
+            executed(
+                "echo child-wrote-to-stdout",
+                "axum",
+                dir.path(),
+                "child-wrote-to-stdout\n"
+            )
         );
-        assert!(
-            stdout.ends_with("\nchild-wrote-to-stdout\n"),
-            "stdout: {stdout:?}"
-        );
+        assert!(output.stderr.is_empty(), "stderr: {}", stderr_of(&output));
     }
 
     #[test]
@@ -413,6 +516,30 @@ deploy = "echo 'SUCCESS: Deployed package (service SVC1, version 12)'"
     }
 
     #[test]
+    fn build_rejects_every_passthrough_format_spelling() {
+        let dir = project();
+        for args in [
+            &["build", "--adapter", "axum", "--release", "--format=json"][..],
+            // clap drops a leading `--`, so this cannot be told apart from a
+            // misplaced flag: `build` never forwards `--format`.
+            &["build", "--adapter", "axum", "--", "--format", "json"][..],
+        ] {
+            let output = edgezero(dir.path(), args, None);
+            assert_eq!(output.status.code(), Some(1_i32), "{args:?}");
+            assert!(
+                output.stdout.is_empty(),
+                "{args:?}: {:?}",
+                stdout_of(&output)
+            );
+            assert!(
+                stderr_of(&output).contains("after a passthrough argument"),
+                "{args:?}: {}",
+                stderr_of(&output)
+            );
+        }
+    }
+
+    #[test]
     fn json_config_validate_failure_has_no_result() {
         // No `demo-app.toml`: the raw validator requires it.
         let dir = project();
@@ -517,11 +644,7 @@ deploy = "echo 'SUCCESS: Deployed package (service SVC1, version 12)'"
         let curl = fake_curl_api(200);
         let text = edgezero_with_token(dir.path(), &ROLLBACK, Some(curl.path()), Some("t"));
         assert!(text.status.success(), "stderr: {}", stderr_of(&text));
-        assert!(
-            stdout_of(&text).ends_with("rolled-back-to=6\n"),
-            "stdout: {:?}",
-            stdout_of(&text)
-        );
+        assert_eq!(stdout_of(&text), "rolled-back-to=6\n");
 
         let mut args = ROLLBACK.to_vec();
         args.extend(["--format", "json"]);
@@ -542,14 +665,17 @@ deploy = "echo 'SUCCESS: Deployed package (service SVC1, version 12)'"
         let dir = project_with(FASTLY_MANIFEST);
         let text = edgezero(dir.path(), &DEPLOY, None);
         assert!(text.status.success(), "stderr: {}", stderr_of(&text));
-        let stdout = stdout_of(&text);
-        // The manifest command receives `--service-id SVC1` as passthrough.
-        assert!(
-            stdout.ends_with(
+        // The manifest command receives `--service-id SVC1` as passthrough. The
+        // tee echoes the child live, then the CLI prints the version line.
+        assert_eq!(
+            stdout_of(&text),
+            executed(
+                "echo 'SUCCESS: Deployed package (service SVC1, version 12)'",
+                "fastly",
+                dir.path(),
                 "SUCCESS: Deployed package (service SVC1, version 12) --service-id SVC1\n\
                  version=12\n"
-            ),
-            "the tee echoes the child live, then the version line: {stdout:?}"
+            )
         );
 
         let mut args = DEPLOY.to_vec();
@@ -592,5 +718,283 @@ deploy = "echo 'SUCCESS: Deployed package (service SVC1, version 12)'"
             .as_str()
             .expect("error message");
         assert!(message.starts_with("deploy succeeded but"), "{message}");
+    }
+
+    #[test]
+    fn auth_status_text_failure_is_unchanged() {
+        let dir = project();
+        let output = edgezero(dir.path(), &["auth", "status", "--adapter", "axum"], None);
+        assert_eq!(output.status.code(), Some(1_i32));
+        assert_eq!(
+            stdout_of(&output),
+            executed(
+                "echo child-wrote-to-stdout; false",
+                "axum",
+                dir.path(),
+                "child-wrote-to-stdout\n"
+            )
+        );
+        assert_eq!(
+            stderr_of(&output),
+            "[edgezero] auth status command `echo child-wrote-to-stdout; false` exited with \
+             status exit status: 1\n"
+        );
+    }
+
+    #[test]
+    fn auth_status_text_and_json_when_authenticated() {
+        let dir = project_with(AUTH_MANIFEST);
+        let text = edgezero(dir.path(), &["auth", "status", "--adapter", "axum"], None);
+        assert!(text.status.success(), "stderr: {}", stderr_of(&text));
+        assert_eq!(
+            stdout_of(&text),
+            executed("echo logged-in", "axum", dir.path(), "logged-in\n")
+        );
+
+        let output = edgezero(
+            dir.path(),
+            &["auth", "status", "--adapter", "axum", "--format", "json"],
+            None,
+        );
+        assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+        assert_eq!(
+            sole_json_document(&output),
+            json!({
+                "command": "auth status",
+                "error": null,
+                "ok": true,
+                "result": {"adapter": "axum", "state": "authenticated"},
+                "schema_version": 1_i32
+            })
+        );
+        assert!(stderr_of(&output).contains("logged-in\n"));
+    }
+
+    #[test]
+    fn auth_status_without_the_native_cli_has_no_result() {
+        let dir = project_with(AUTH_MANIFEST);
+        let empty_path = TempDir::new().expect("temp dir");
+        let output = command(
+            dir.path(),
+            &[
+                "auth",
+                "status",
+                "--adapter",
+                "cloudflare",
+                "--format",
+                "json",
+            ],
+        )
+        .env("PATH", empty_path.path())
+        .output()
+        .expect("run edgezero");
+        assert_eq!(output.status.code(), Some(1_i32));
+        let envelope = sole_json_document(&output);
+        assert_eq!(envelope["ok"], json!(false));
+        assert!(envelope["result"].is_null(), "{envelope}");
+        let message = envelope["error"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains("`wrangler` not found on PATH"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn provision_text_is_unchanged() {
+        let dir = project();
+        let output = edgezero(dir.path(), &["provision", "--adapter", "axum"], None);
+        assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+        assert_eq!(
+            stdout_of(&output),
+            "axum KV store `sessions` is in-memory; nothing to provision\n"
+        );
+        assert!(output.stderr.is_empty(), "stderr: {}", stderr_of(&output));
+    }
+
+    #[test]
+    fn config_validate_text_is_unchanged() {
+        let dir = project();
+        // No `demo-app.toml` yet: the failure goes to stderr only.
+        let failed = edgezero(dir.path(), &["config", "validate"], None);
+        assert_eq!(failed.status.code(), Some(1_i32));
+        assert!(failed.stdout.is_empty(), "stdout: {:?}", stdout_of(&failed));
+        assert_eq!(
+            stderr_of(&failed),
+            "[edgezero] failed to read demo-app.toml: No such file or directory (os error 2)\n"
+        );
+
+        fs::write(dir.path().join("demo-app.toml"), "").expect("write app config");
+        let output = edgezero(dir.path(), &["config", "validate"], None);
+        assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+        assert_eq!(
+            stdout_of(&output),
+            "[edgezero] config validate (raw): edgezero.toml OK\n"
+        );
+    }
+
+    /// The `config gc` report lines for the [`fake_fastly_gc`] store, with the
+    /// `older_than` window `secs`.
+    fn gc_report_lines(secs: u64) -> String {
+        format!(
+            "[edgezero] fastly config-store `app_config` (id=store-1): 1 entries, 1 root(s), 0 \
+             referenced chunk(s), 0 orphan(s) in 0 generation(s) older than {secs}s, 0 orphan(s) \
+             too recent\n\
+             [edgezero] keeping 1 retained root(s) (0 referenced chunk(s) held by them):\n\
+             [edgezero]   keeping `greeting`\n\
+             [edgezero] nothing to reclaim\n"
+        )
+    }
+
+    #[test]
+    fn config_gc_dry_run_text_and_json() {
+        let dir = fastly_project(FASTLY_GC_MANIFEST);
+        let fastly = fake_fastly_gc();
+        let text = edgezero(
+            dir.path(),
+            &["config", "gc", "--adapter", "fastly"],
+            Some(fastly.path()),
+        );
+        assert!(text.status.success(), "stderr: {}", stderr_of(&text));
+        let stdout = stdout_of(&text);
+        assert!(
+            stdout.starts_with(&gc_report_lines(0)),
+            "the report, then the dry-run advisory: {stdout:?}"
+        );
+        let advisory = stdout.strip_prefix(&gc_report_lines(0)).unwrap_or_default();
+        assert!(
+            advisory.starts_with("[edgezero] dry-run: previewing ALL orphans")
+                && advisory.ends_with("(a bare `--yes` is rejected).\n")
+                && advisory.lines().count() == 1,
+            "one advisory line: {advisory:?}"
+        );
+
+        // No `--yes`: a dry run by default, with no `--older-than` window.
+        let output = edgezero(
+            dir.path(),
+            &["config", "gc", "--adapter", "fastly", "--format", "json"],
+            Some(fastly.path()),
+        );
+        assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+        assert_eq!(
+            sole_json_document(&output)["result"],
+            json!({
+                "adapter": "fastly", "deleted": null, "dry_run": true, "failed": [],
+                "kept_roots": ["greeting"], "older_than_secs": null, "planned_deletions": [],
+                "store": {"id": "store-1", "logical": "app_config", "platform": "app_config"},
+                "stranded": [],
+                "summary": {
+                    "entries": 1_i32, "generations_planned": 0_i32, "orphans_planned": 0_i32,
+                    "orphans_too_recent": 0_i32, "referenced_chunks": 0_i32, "roots": 1_i32,
+                    "unprovable": 0_i32
+                },
+                "uncertain": [], "warnings": []
+            })
+        );
+        assert!(stderr_of(&output).contains(&gc_report_lines(0)));
+        assert!(
+            !fastly.path().join("deletes.log").exists(),
+            "nothing deleted"
+        );
+    }
+
+    #[test]
+    fn config_gc_real_run_with_nothing_to_reclaim_reports_zero_deleted() {
+        let dir = fastly_project(FASTLY_GC_MANIFEST);
+        let fastly = fake_fastly_gc();
+        let args = [
+            "config",
+            "gc",
+            "--adapter",
+            "fastly",
+            "--yes",
+            "--older-than",
+            "1h",
+        ];
+        let text = edgezero(dir.path(), &args, Some(fastly.path()));
+        assert!(text.status.success(), "stderr: {}", stderr_of(&text));
+        assert_eq!(stdout_of(&text), gc_report_lines(3600));
+
+        let mut json_args = args.to_vec();
+        json_args.extend(["--format", "json"]);
+        let output = edgezero(dir.path(), &json_args, Some(fastly.path()));
+        assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+        let result = &sole_json_document(&output)["result"];
+        assert_eq!(result["dry_run"], json!(false));
+        assert_eq!(result["deleted"], json!(0_i32), "a real run, not a dry run");
+        assert_eq!(result["older_than_secs"], json!(3600_i32));
+        assert_eq!(stderr_of(&output), gc_report_lines(3600));
+        assert!(
+            !fastly.path().join("deletes.log").exists(),
+            "nothing deleted"
+        );
+    }
+
+    #[test]
+    fn staged_deploy_text_and_json_resolve_the_service_from_the_env() {
+        let dir = fastly_project(FASTLY_STAGING_MANIFEST);
+        let fastly = fake_fastly_staging();
+        // No `--service-id`: the adapter falls back to `FASTLY_SERVICE_ID`.
+        let run = |format: &[&str]| {
+            let mut args = vec!["deploy", "--adapter", "fastly", "--staging"];
+            args.extend(format);
+            let mut command = command(dir.path(), &args);
+            prepend_path(&mut command, fastly.path());
+            command
+                .env("FASTLY_API_TOKEN", "t")
+                .env("FASTLY_SERVICE_ID", "SVC1")
+                .output()
+                .expect("run edgezero")
+        };
+        let lines = "app declares no config stores, so staged version 8 has no config selector \
+                     to isolate; keeping the inherited runtime-env link\n\
+                     version=8\n";
+
+        let text = run(&[]);
+        assert!(text.status.success(), "stderr: {}", stderr_of(&text));
+        assert_eq!(stdout_of(&text), lines);
+
+        let output = run(&["--format", "json"]);
+        assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+        assert_eq!(
+            sole_json_document(&output)["result"],
+            json!({"adapter": "fastly", "service_id": "SVC1", "staging": true, "version": 8_i32})
+        );
+        assert_eq!(stderr_of(&output), lines);
+    }
+
+    #[test]
+    fn staged_rollback_text_and_json() {
+        let dir = project();
+        let curl = fake_curl_api(200);
+        let args = [
+            "rollback",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "SVC1",
+            "--version",
+            "8",
+            "--staging",
+        ];
+        let line = "[edgezero] deactivated staged version 8 on Fastly service SVC1\n";
+        let text = edgezero_with_token(dir.path(), &args, Some(curl.path()), Some("t"));
+        assert!(text.status.success(), "stderr: {}", stderr_of(&text));
+        assert_eq!(stdout_of(&text), line);
+        assert_eq!(api_calls(&curl), ["PUT"]);
+
+        let mut json_args = args.to_vec();
+        json_args.extend(["--format", "json"]);
+        let output = edgezero_with_token(dir.path(), &json_args, Some(curl.path()), Some("t"));
+        assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+        assert_eq!(
+            sole_json_document(&output)["result"],
+            json!({
+                "adapter": "fastly", "rolled_back_to": null, "service_id": "SVC1",
+                "staging": true, "version": 8_i32
+            })
+        );
+        assert_eq!(stderr_of(&output), line);
     }
 }

@@ -342,7 +342,7 @@ pub struct GcReport {
 }
 
 /// The deletes a `config gc` run could not complete.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GcFailure {
     /// The operator-facing report and recovery text.
     pub diagnostic: String,

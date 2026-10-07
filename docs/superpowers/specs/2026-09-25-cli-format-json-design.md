@@ -1,9 +1,11 @@
 # Machine-readable CLI output (`--format json`) — Design
 
 - **Issue:** [#383](https://github.com/stackpop/edgezero/issues/383)
-- **Status:** Approved; implemented (revision 2 records what implementation changed, see §13)
+- **Status:** Proposed, awaiting maintainer approval; implemented in
+  [#388](https://github.com/stackpop/edgezero/pull/388) (§13 records what
+  implementation and review changed)
 - **Date:** 2026-09-25
-- **Delivery:** a single implementation PR, opened only after this spec is approved
+- **Delivery:** a single implementation PR ([#388](https://github.com/stackpop/edgezero/pull/388))
 
 ## 1. Summary
 
@@ -22,7 +24,8 @@ lines. The CLI then owns both renderings.
 
 1. Scripts can gate on structured results without parsing log lines.
 2. Every existing invocation behaves exactly as before: same bytes, same
-   streams, same exit codes.
+   streams, same exit codes. The one exception is `build` with a `--format`
+   token among its passthrough arguments, which is now rejected (§5.2).
 3. Under `--format json`, no byte on stdout is anything other than the
    envelope. This holds by construction and is enforced by lint and tests,
    not by convention.
@@ -108,9 +111,12 @@ it cannot honour.
 
 - `--format=json` and `--format json` are both accepted, as clap handles either.
 - `build` collects passthrough arguments with `trailing_var_arg`, so
-  `--format` has to come before the first passthrough token. After that point
-  it is forwarded to the adapter. This is documented and covered by a parse
-  test.
+  `--format` has to come before the first passthrough token. A `--format` (or
+  `--format=…`) token among the passthrough arguments is rejected with exit 1
+  and an empty stdout, instead of being forwarded and silently printing text.
+  clap drops a leading `--`, so `build --adapter x -- --format json` is
+  rejected too: `build` cannot forward a `--format` to its build command. No
+  built-in build command takes one.
 - `deploy` passes arguments through only after `--`, so `--format` can go
   anywhere before `--`.
 
@@ -179,8 +185,8 @@ Rules:
 - The envelope is written only by `edgezero_cli::output`, and only once per
   run.
 - An empty stdout with a non-zero exit means no envelope was produced. That
-  happens on usage errors, stub commands and panics, and consumers must treat
-  it as failure.
+  happens on usage errors, stub commands, a `build` that rejects a late
+  `--format` (§5.2), and panics, and consumers must treat it as failure.
 
 ### 6.3 Where the envelope is written
 
@@ -205,7 +211,8 @@ Exit codes do not change.
 | Command failure | 1 (bundled binary) / 2 (template-generated CLIs) | envelope, `ok: false` |
 | Usage error (reported by clap) | 2 | empty. clap parses before the format is known, and its message goes to stderr as today |
 | Bundled stub (`config push` / `config diff`) | 2 | empty |
-| `--help` / `--version` (clap) | 0 | clap's text, not an envelope |
+| `build` with `--format` among its passthrough arguments (§5.2) | 1 | empty |
+| `--help` (clap) | 0 | clap's text, not an envelope |
 
 In a generated CLI, exit code 2 covers a command failure, a usage error and an
 unsupported `config diff`. Only the envelope tells them apart: an empty stdout
@@ -280,16 +287,19 @@ changing the trait breaks no external implementor.
 #[non_exhaustive]
 pub enum ActionOutcome {
     ActiveVersion(ActiveVersionOutcome), // { service_id, version: Option<u64> }
-    AuthStatus(AuthStatusOutcome),       // { failure: Option<String>, state: AuthState }
+    AuthStatus(AuthStatusOutcome),       // { state: AuthState }
     Build(BuildOutcome),                 // { artifact: Option<PathBuf> }
-    Deploy(DeployOutcome),               // { version: Option<u64> }
-    Empty,                               // login, logout, serve, manifest command overrides
-    Healthcheck(HealthcheckOutcome),     // { attempts, domain, failure, healthy, path, service_id,
-                                         //   staging, staging_ip, status_code, version, version_verified }
+    Deploy(DeployOutcome),               // { service_id: Option<String>, version: Option<u64> }
+    Empty,                               // login, logout, serve, production deploy,
+                                         //   manifest command overrides
+    Healthcheck(HealthcheckOutcome),     // { attempts, domain, failure: Option<String>, path,
+                                         //   service_id, staging, staging_ip, status_code,
+                                         //   version, version_verified }; healthy() derives
+                                         //   from `failure`
     Rollback(RollbackOutcome),           // { rolled_back_to, service_id, staging, version }
 }
 
-pub enum AuthState { Authenticated, NotApplicable, Unauthenticated }
+pub enum AuthState { Authenticated, NotApplicable, Unauthenticated { reason: String } }
 
 fn execute(&self, action: AdapterAction, args: &[String]) -> Result<ActionOutcome, String>;
 fn provision(/* unchanged params */) -> Result<ProvisionReport, String>;
@@ -304,11 +314,12 @@ adding a variant fails to compile until the schema covers it.
 **Outcomes versus errors.** A negative result that the command still finished
 measuring is an `Ok` outcome carrying a `failure` message, not an `Err`:
 
-- an unhealthy healthcheck is `healthy: false`;
-- a non-zero exit from `auth status` is `Unauthenticated`
+- an unhealthy healthcheck has `failure: Some(message)`, so `healthy()` is
+  `false`;
+- a non-zero exit from `auth status` is `Unauthenticated { reason }`
   (`cli_support::native_auth_status`, or a manifest `auth-status` command);
-- a gc run with failed deletes has a non-empty `failed` list and a
-  `failure_diagnostic` holding exactly the error text it returned before.
+- a gc run with failed deletes has `failure: Some(GcFailure)`, whose
+  `diagnostic` holds exactly the error text it returned before.
 
 The CLI turns these into a non-zero exit, using the same message as before.
 `Err(String)` is kept for "could not determine a result": bad arguments, API
@@ -327,8 +338,7 @@ pub struct ProvisionEntry {
 pub struct GcReport {
     pub deleted: Option<usize>,           // None on a dry run
     pub entries: usize,
-    pub failed: Vec<String>,
-    pub failure_diagnostic: Option<String>,
+    pub failure: Option<GcFailure>,       // None unless a delete failed
     pub generations_planned: usize,
     pub kept_roots: Vec<String>,
     pub planned: Vec<GcCandidate>,        // { age_secs, key }
@@ -336,11 +346,16 @@ pub struct GcReport {
     pub retained_recent: usize,
     pub roots: usize,
     pub store_id: Option<String>,
-    pub stranded: Vec<String>,
     pub text_lines: Vec<String>,          // text-mode lines only; not on the wire
-    pub uncertain: Vec<String>,
     pub unprovable: usize,
     pub warnings: Vec<String>,
+}
+
+pub struct GcFailure {
+    pub diagnostic: String,               // the operator-facing report and recovery text
+    pub failed: Vec<String>,              // never empty
+    pub stranded: Vec<String>,
+    pub uncertain: Vec<String>,
 }
 ```
 
@@ -436,8 +451,11 @@ Every command's `result` includes `adapter` (string), except
   today's non-zero exit.
 - A native CLI that is missing or fails to spawn gives `ok: false` with
   `result: null`.
-- `state` comes from the native CLI's exit status, or from a manifest
-  `commands.auth_status` override. Account details are not parsed.
+- `state` comes from the probe command's exit status, or from a manifest
+  `commands.auth_status` override. Output and account details are not parsed,
+  so `authenticated` means "the probe exited 0", not "a token works": some
+  `wrangler whoami` versions exit 0 when logged out, and `fastly profile list`
+  only lists saved profiles.
 
 ### `build`
 
@@ -460,7 +478,9 @@ adapter cannot know the path.
   output, then falling back to the API).
 - Otherwise `version` is `null`.
 - `service_id` is the id the adapter resolved (a Fastly staged deploy falls
-  back to `FASTLY_SERVICE_ID`), else `--service-id` as passed, else `null`.
+  back to `FASTLY_SERVICE_ID`), else `--service-id` as passed, else `null`. A
+  production deploy reads only `--service-id`, so one that relies on
+  `FASTLY_SERVICE_ID` reports `null`.
 - A production deploy that went live but whose version could not be resolved
   gives `ok: false` with `result` present and `version: null`.
 
@@ -565,25 +585,36 @@ never on string matches (#383), and text tests assert exact bytes.
    survives a failure, command names match their spelling, and `OutputScope`
    routes only while it is alive.
 2. **Text is byte-identical to `main`.** Because text output is not
-   re-rendered (§7.1), this is verified by running the branch and `main`
-   binaries through the same 21 hermetic scenarios and diffing stdout, stderr
-   and exit code. The scenarios cover success and failure paths for build,
-   auth, provision, validate, deploy, healthcheck (fake `curl`), active-version,
-   rollback, gc, a usage error, and the stub. One case is pinned permanently as
-   a test: `healthcheck_text_bytes_match_the_line_contract` asserts the exact
-   healthcheck bytes the CI action parses.
+   re-rendered (§7.1), this was first verified by running the branch and
+   `main` binaries through the same 21 hermetic scenarios and diffing stdout,
+   stderr and exit code. The text output of all nine commands is now pinned as
+   exact bytes in the end-to-end tests below, so the contract cannot drift. The
+   one intended change is `build` rejecting a passthrough `--format` (§5.2).
 3. **End-to-end stream tests** (`edgezero-cli/tests/format_json.rs`). These run
-   `env!("CARGO_BIN_EXE_edgezero")` in a temp project and need no network or
-   credentials. Each asserts that stdout parses as exactly one JSON value:
-   - `build --format json`, where a manifest command writes to stdout: its
-     output appears only on stderr;
-   - `auth status --format json` with a failing manifest probe: exit 1, and the
-     envelope carries the `unauthenticated` partial result;
-   - `provision` and `config validate`, with the parsed structure asserted;
-   - `healthcheck --format json` against a fake `curl` answering 503: exit 1,
-     the full partial result is present, and the line contract is on stderr;
-   - text-mode `build` output is unchanged, a usage error leaves stdout empty,
-     and the bundled stub still absorbs `--format json`.
+   `env!("CARGO_BIN_EXE_edgezero")` in a temp project, with fake `curl` /
+   `fastly` binaries on `PATH`, and need no network or credentials. The
+   harness clears `FASTLY_API_TOKEN`, `FASTLY_SERVICE_ID`, and every
+   `EDGEZERO__*` and `DEMO_APP__*` variable. Each JSON test asserts that stdout
+   parses as exactly one JSON value. There are 28 tests:
+   - **build:** child stdout reaches only stderr under JSON; exact text bytes;
+     a usage error leaves stdout empty; a passthrough `--format`, `--format=json`
+     or `-- --format json` is rejected with exit 1 and an empty stdout.
+   - **auth status:** a failing probe gives the `unauthenticated` partial
+     result; a passing probe gives `authenticated`; a missing native CLI gives
+     `result: null`; exact text bytes on success and failure.
+   - **provision** and **config validate:** the parsed structure, exact text
+     bytes, and a validate failure with `result: null`.
+   - **config gc:** a default dry run (`dry_run: true`, `deleted: null`,
+     `older_than_secs: null`) and a real run with nothing to reclaim
+     (`deleted: 0`, `older_than_secs: 3600`), both with exact text bytes.
+   - **healthcheck:** the exact line-contract bytes; an unhealthy probe's full
+     partial result; `version_verified` only when both API checks ran.
+   - **deploy:** the version read from captured output; a deploy that went live
+     without a version keeps its result; a staged deploy resolving its service
+     from `FASTLY_SERVICE_ID`; exact text bytes.
+   - **rollback** and **active-version:** production and staged rollback, and
+     an active version present or absent, each in text and JSON.
+   - the bundled `config diff` stub still absorbs `--format json`.
 4. **Argument parsing** (`args.rs`). Every in-scope command defaults to `Text`
    and accepts `--format json` and `--format=text`. `unified` and `structured`
    are rejected. `build --adapter fastly --format json --release` parses the
@@ -635,7 +666,7 @@ In `docs/guide/cli-reference.md`:
 
 | Risk | Mitigation |
 | --- | --- |
-| Text output drifts, breaking CI actions | Text output is not re-rendered (§7.1). A 21-scenario byte diff against `main`, plus a permanent healthcheck byte test (§9.2). |
+| Text output drifts, breaking CI actions | Text output is not re-rendered (§7.1). A 21-scenario byte diff against `main`, and exact-byte text tests for all nine commands (§9.2, §9.3). |
 | A missed stdout writer corrupts JSON | The `print_stdout` deny, the `disallowed-methods` spawn lint, and the end-to-end test (§9.3). |
 | JSON numbers above 2^53 lose precision in JavaScript consumers | Fastly service versions are small integers. u64 values are documented as JSON numbers, and none of today's fields comes close. |
 | A native CLI reads from or checks stdout as a TTY and behaves differently when stdout is redirected to stderr | Only under `--format json`, which is new and opt-in. Interactive `auth login` is out of scope. |
@@ -683,3 +714,28 @@ Revision 3 records the changes from the review of the implementation PR
 - `active-version` has no `--require-active` flag (only the CLI's internal
   deploy fallback passes it), so §6.1 and §8 no longer promise a partial result
   for it.
+
+Revision 4 records the changes from the second review of #388. None changes a
+result shape.
+
+- **Status** is "Proposed, awaiting maintainer approval" until a maintainer
+  approves this spec on #383 or #388.
+- **§7.2** now shows the outcome types as implemented: `failure` on
+  `HealthcheckOutcome` with a derived `healthy()`, `Unauthenticated { reason }`,
+  `DeployOutcome { service_id, version }`, and `GcReport.failure: Option<GcFailure>`.
+- **`build`'s passthrough `--format` rejection** is the one exception to
+  Goal 2, including `build -- --format json` (§5.2), and appears in the
+  empty-stdout cases (§6.2, §6.4).
+- **`auth status` `authenticated`** is documented as "the probe exited 0"
+  (§8).
+- **`healthcheck`** treats curl's `000` as a probe that got no response, not
+  as status `0`: `status_code` keeps the last real HTTP status, or `null` if
+  no probe got one.
+- **The Fastly production deploy** returns `ActionOutcome::Empty`, like the
+  other adapters, and the staged deploy reports the service id it used.
+- **A failed write of the envelope** no longer hides the command's own error:
+  the write error is logged and the command's outcome is returned.
+- **`std::os::unix::process::CommandExt::exec`** is a disallowed method, in the
+  workspace and the generated project.
+- **§9** lists the 28 end-to-end tests, including exact text bytes for all nine
+  commands.

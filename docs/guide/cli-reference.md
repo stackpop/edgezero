@@ -671,11 +671,12 @@ With `--format json`:
 
 An **empty stdout** with a non-zero exit means no envelope was produced. That
 happens on command-line usage errors (clap reports them before `--format` is
-read), on the bundled binary's `config push` / `config diff` stubs, and on a
-crash. Treat it as a failure.
+read), on the bundled binary's `config push` / `config diff` stubs, on a
+`build` that rejects a `--format` among its passthrough arguments (exit `1`,
+see [`build`](#results)), and on a crash. Treat it as a failure.
 
-`--help` and `--version` are handled by clap before `--format` is read: they
-print clap's text to stdout and exit `0`, with no envelope.
+`--help` is handled by clap before `--format` is read: it prints clap's text to
+stdout and exits `0`, with no envelope.
 
 The routing relies on the EdgeZero logger (`edgezero_cli::init_cli_logger()`).
 A downstream CLI that installs a different logger, such as `simple_logger`,
@@ -715,6 +716,8 @@ failure (`1` for the bundled `edgezero` binary, `2` for a CLI generated from the
 template). Branch on `ok` rather than on the specific non-zero code. In a
 generated CLI, `2` also means a usage error or an unsupported `config diff`;
 only the envelope tells them apart, and an empty stdout means there is none.
+In the bundled binary, a `1` with an empty stdout usually means a `build` that
+rejected a late `--format`.
 
 ### Compatibility
 
@@ -748,6 +751,10 @@ Every result except `config validate`'s also has a non-null `adapter` string.
 | ------- | ------ | -------- | --------------------------------------------------------------- |
 | `state` | string | no       | `authenticated`, `unauthenticated`, or `not_applicable` (axum). |
 
+`state` reflects the probe command's exit status only (the probes are listed
+under [Adapter built-ins](#edgezero-auth)): `authenticated` means the probe
+exited `0`, not that a token was checked. Some `wrangler whoami` versions exit
+`0` when logged out, and `fastly profile list` only lists saved profiles.
 `unauthenticated` gives `ok: false` with the result present. A missing native
 CLI gives `result: null`.
 
@@ -757,8 +764,11 @@ CLI gives `result: null`.
 | ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------- |
 | `artifact` | string | yes      | The built file's path; `null` when a manifest `commands.build` override ran or the adapter does not track it (axum). |
 
-`--format` must come before the first passthrough argument. A `--format` after
-one is rejected rather than forwarded to the build command.
+`--format` must come before the first passthrough argument. A `--format` (or
+`--format=…`) among the passthrough arguments is rejected with exit `1` rather
+than forwarded to the build command; stdout is empty unless `--format json`
+also came before the passthrough arguments. This includes
+`build --adapter <name> -- --format json`: `build` cannot forward a `--format`.
 
 **`deploy`**
 
@@ -767,6 +777,9 @@ one is rejected rather than forwarded to the build command.
 | `service_id` | string  | yes      | The service the adapter resolved (a Fastly `--staging` deploy falls back to `FASTLY_SERVICE_ID`), else `--service-id` as passed, else `null`. |
 | `staging`    | boolean | no       | Whether `--staging` was passed.                                                                                                               |
 | `version`    | integer | yes      | The staged version for `--staging`, the activated version for a Fastly production deploy with `--service-id`, and `null` otherwise.           |
+
+A production deploy reads only `--service-id`, so a Fastly production deploy
+that relies on `FASTLY_SERVICE_ID` reports `service_id: null`.
 
 A Fastly production deploy that went live but whose version could not be
 resolved gives `ok: false` with the result present and `version: null`. Check

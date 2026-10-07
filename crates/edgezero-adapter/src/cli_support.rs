@@ -268,6 +268,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn native_auth_status_maps_exit_status_to_state() {
         let ok = native_auth_status("true", &[], "hint").expect("spawns");

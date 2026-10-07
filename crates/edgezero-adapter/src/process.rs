@@ -52,29 +52,48 @@ pub fn status(command: &mut Command) -> io::Result<ExitStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
     /// Serialises tests that flip the process-wide policy.
     static POLICY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    /// Sets the policy, and restores the previous one on drop (even if the
+    /// test panics, so later tests start from the original policy).
+    struct PolicyOverride(bool);
+
+    impl PolicyOverride {
+        fn set(to_stderr: bool) -> Self {
+            Self(set_child_stdout_to_stderr(to_stderr))
+        }
+    }
+
+    impl Drop for PolicyOverride {
+        fn drop(&mut self) {
+            set_child_stdout_to_stderr(self.0);
+        }
+    }
+
+    /// Takes [`POLICY_LOCK`], recovering it if an earlier test panicked.
+    fn policy_lock() -> MutexGuard<'static, ()> {
+        POLICY_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     #[test]
     fn set_returns_previous_and_get_reflects_it() {
-        let _guard = POLICY_LOCK.lock().expect("lock");
-        let original = set_child_stdout_to_stderr(true);
+        let _guard = policy_lock();
+        let _policy = PolicyOverride::set(true);
         assert!(child_stdout_to_stderr());
         assert!(set_child_stdout_to_stderr(false));
         assert!(!child_stdout_to_stderr());
-        set_child_stdout_to_stderr(original);
     }
 
     #[cfg(unix)]
     #[test]
     fn status_reports_child_exit() {
-        let _guard = POLICY_LOCK.lock().expect("lock");
-        let original = set_child_stdout_to_stderr(true);
+        let _guard = policy_lock();
+        let _policy = PolicyOverride::set(true);
         let ok = status(Command::new("sh").args(["-c", "echo routed; exit 0"])).expect("spawn");
         let failed = status(Command::new("sh").args(["-c", "exit 3"])).expect("spawn");
-        set_child_stdout_to_stderr(original);
         assert!(ok.success());
         assert_eq!(failed.code(), Some(3_i32));
     }

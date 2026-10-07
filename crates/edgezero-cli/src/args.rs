@@ -233,7 +233,9 @@ pub enum AuthSub {
     Status {
         #[arg(long)]
         adapter: String,
-        /// Output format: `text` (default) or `json`.
+        /// Output format: `text` (default, the human-readable output) or
+        /// `json` (a single versioned JSON envelope on stdout; everything else
+        /// goes to stderr).
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
     },

@@ -6,6 +6,11 @@
 //! reuses any subset of edgezero's built-in commands. The default
 //! `edgezero` binary (`main.rs`) is a thin wrapper over this library.
 //!
+//! Run one command per process. Under `--format json` a `run_*` handler
+//! reroutes process-wide output (the logger and inheriting children) for the
+//! duration of the call, so overlapping runs on separate threads are not
+//! supported.
+//!
 //! `run_demo` is an additional contributor-only handler, available only
 //! under the `demo-example` feature — it runs the in-repo `app-demo`
 //! example and is not meant for downstream CLIs.
@@ -135,6 +140,16 @@ impl log::Log for CliLogger {
             log::Level::Debug | log::Level::Trace => {}
         }
     }
+}
+
+/// How a production Fastly deploy that went live ended.
+#[cfg(feature = "cli")]
+enum ProductionDeploy {
+    /// The version the deploy activated.
+    Live(u64),
+    /// The deploy went live, but its version could not be resolved (the
+    /// message says why).
+    LiveVersionUnknown(String),
 }
 
 /// Route [`CliLogger`]'s `info` output to stderr (`true`) or stdout (`false`).
@@ -293,32 +308,7 @@ fn deploy(args: &DeployArgs) -> Outcome<DeployResult> {
     passthrough.extend_from_slice(&args.adapter_args);
 
     if args.staging {
-        // Thread the app's declared config-store logical ids so the staged
-        // relink knows which selectors to redirect to `<logical>_staging`. The
-        // adapter reads config usage from THIS list, never a remote probe —
-        // avoiding a lookup that fails open. One inline token per store; the
-        // adapter strips them before `fastly compute update`.
-        if let Some(loader) = manifest.as_ref()
-            && let Some(config) = loader.manifest().stores.config.as_ref()
-        {
-            for id in &config.ids {
-                passthrough.push(format!("--edgezero-staging-config={id}"));
-            }
-        }
-        // Staged deploy: clone the active version, upload the built
-        // package to a new draft, mark it staged, and emit the staged
-        // version. Never runs the manifest `deploy`
-        // command, which would activate production.
-        let outcome = adapter::execute(
-            &args.adapter,
-            adapter::Action::DeployStaging,
-            manifest.as_ref(),
-            &passthrough,
-        )?;
-        let (service_id, version) = deployed(outcome);
-        if let Some(staged) = version {
-            log::info!("version={staged}");
-        }
+        let (service_id, version) = deploy_staging(&args.adapter, manifest.as_ref(), passthrough)?;
         return Ok(result(service_id, version));
     }
 
@@ -341,11 +331,13 @@ fn deploy(args: &DeployArgs) -> Outcome<DeployResult> {
     //      the failure still carries a result (with a `null` version).
     if args.service_id.is_some() && args.adapter.eq_ignore_ascii_case("fastly") {
         return match fastly_production_deploy(&args.adapter, manifest.as_ref(), &passthrough)? {
-            Ok(version) => {
+            ProductionDeploy::Live(version) => {
                 log::info!("version={version}");
                 Ok(result(None, Some(version)))
             }
-            Err(unresolved) => Err(Failure::with_result(unresolved, result(None, None))),
+            ProductionDeploy::LiveVersionUnknown(unresolved) => {
+                Err(Failure::with_result(unresolved, result(None, None)))
+            }
         };
     }
 
@@ -359,21 +351,58 @@ fn deploy(args: &DeployArgs) -> Outcome<DeployResult> {
     Ok(result(service_id, version))
 }
 
+/// Run a staged deploy: clone the active version, upload the built package to
+/// a new draft, mark it staged, and log the staged version. Never runs the
+/// manifest `deploy` command, which would activate production.
+///
+/// Returns the service id and staged version the adapter reported.
+#[cfg(feature = "cli")]
+fn deploy_staging(
+    adapter_name: &str,
+    manifest: Option<&ManifestLoader>,
+    mut passthrough: Vec<String>,
+) -> Result<(Option<String>, Option<u64>), String> {
+    // Thread the app's declared config-store logical ids so the staged
+    // relink knows which selectors to redirect to `<logical>_staging`. The
+    // adapter reads config usage from THIS list, never a remote probe —
+    // avoiding a lookup that fails open. One inline token per store; the
+    // adapter strips them before `fastly compute update`.
+    if let Some(loader) = manifest
+        && let Some(config) = loader.manifest().stores.config.as_ref()
+    {
+        for id in &config.ids {
+            passthrough.push(format!("--edgezero-staging-config={id}"));
+        }
+    }
+    let outcome = adapter::execute(
+        adapter_name,
+        adapter::Action::DeployStaging,
+        manifest,
+        &passthrough,
+    )?;
+    let (service_id, version) = deployed(outcome);
+    if let Some(staged) = version {
+        log::info!("version={staged}");
+    }
+    Ok((service_id, version))
+}
+
 /// Run a production Fastly deploy for a known service and resolve the version
 /// it activated (see `deploy` for the resolution precedence).
 ///
-/// The outer `Err` means the deploy itself failed. The inner `Err` means the
-/// deploy went live but the activated version could not be resolved.
+/// # Errors
+///
+/// Returns an error if the deploy itself failed.
 #[cfg(feature = "cli")]
 fn fastly_production_deploy(
     adapter_name: &str,
     manifest: Option<&ManifestLoader>,
     passthrough: &[String],
-) -> Result<Result<u64, String>, String> {
+) -> Result<ProductionDeploy, String> {
     let captured =
         adapter::execute_capture(adapter_name, adapter::Action::Deploy, manifest, passthrough)?;
     if let Some(version) = captured.as_deref().and_then(parse_deploy_version) {
-        return Ok(Ok(version));
+        return Ok(ProductionDeploy::Live(version));
     }
     // Fallback: resolve the version the deploy just activated via the Fastly
     // API. `--require-active` makes EmitVersion FAIL (not emit an empty
@@ -397,10 +426,15 @@ fn fastly_production_deploy(
             manifest,
             &emit_args,
         ) {
-            Ok(outcome) => {
-                active_version(&outcome).ok_or_else(|| unresolved("no active version was reported"))
-            }
-            Err(err) => Err(unresolved(&err)),
+            Ok(outcome) => active_version(&outcome).map_or_else(
+                || {
+                    ProductionDeploy::LiveVersionUnknown(unresolved(
+                        "no active version was reported",
+                    ))
+                },
+                ProductionDeploy::Live,
+            ),
+            Err(err) => ProductionDeploy::LiveVersionUnknown(unresolved(&err)),
         },
     )
 }

@@ -19,8 +19,8 @@ use std::path::Path;
 
 use edgezero_adapter::process;
 use edgezero_adapter::registry::{
-    AuthState, GcReport, HealthcheckOutcome, ProvisionAction, ProvisionReport, ProvisionStoreRef,
-    ResolvedStoreId, RollbackOutcome, StoreKind,
+    AuthState, GcFailure, GcReport, HealthcheckOutcome, ProvisionAction, ProvisionReport,
+    ProvisionStoreRef, ResolvedStoreId, RollbackOutcome, StoreKind,
 };
 use serde::Serialize;
 
@@ -64,6 +64,10 @@ impl CommandName {
 /// Routes stdout for one command run: under `--format json`, logger `info`
 /// output and inheriting children's stdout go to stderr, and the previous
 /// routing is restored on drop. A `text` scope changes nothing.
+///
+/// The routing is process-wide. Nested scopes restore correctly, but
+/// overlapping scopes on separate threads do not: the first to drop restores
+/// routing while the other is still running. One command per process.
 #[must_use = "the routing lasts only while the scope is alive"]
 pub(crate) struct OutputScope {
     /// The routing to restore (`(child_stdout, info)`); `None` for `text`.
@@ -395,12 +399,20 @@ impl GcResult {
         older_than_secs: Option<u64>,
         report: &GcReport,
     ) -> Self {
-        let failure = report.failure.clone().unwrap_or_default();
+        let (failed, stranded, uncertain) = match &report.failure {
+            Some(GcFailure {
+                failed,
+                stranded,
+                uncertain,
+                ..
+            }) => (failed.clone(), stranded.clone(), uncertain.clone()),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
         Self {
             adapter: adapter.to_owned(),
             deleted: report.deleted,
             dry_run,
-            failed: failure.failed,
+            failed,
             kept_roots: report.kept_roots.clone(),
             older_than_secs,
             planned_deletions: report
@@ -416,7 +428,7 @@ impl GcResult {
                 logical: store.logical.clone(),
                 platform: store.platform.clone(),
             },
-            stranded: failure.stranded,
+            stranded,
             summary: GcSummaryResult {
                 entries: report.entries,
                 generations_planned: report.generations_planned,
@@ -426,7 +438,7 @@ impl GcResult {
                 roots: report.roots,
                 unprovable: report.unprovable,
             },
-            uncertain: failure.uncertain,
+            uncertain,
             warnings: report.warnings.clone(),
         }
     }
@@ -540,9 +552,14 @@ pub(crate) fn finish<R: Serialize>(
                 reason = "the JSON envelope is the one thing `--format json` writes to stdout"
             )]
             let mut stdout = io::stdout().lock();
-            writeln!(stdout, "{document}")
-                .and_then(|()| stdout.flush())
-                .map_err(|err| format!("failed to write the JSON result to stdout: {err}"))?;
+            // A failed write must not hide the command's own failure message.
+            if let Err(err) = writeln!(stdout, "{document}").and_then(|()| stdout.flush()) {
+                let message = format!("failed to write the JSON result to stdout: {err}");
+                if outcome.is_ok() {
+                    return Err(message);
+                }
+                log::error!("[edgezero] {message}");
+            }
         }
     }
     outcome.map(|_| ()).map_err(|failure| failure.message)

@@ -1373,7 +1373,7 @@ pub(crate) fn print_unified_diff_inline(
     use std::io::stdout;
     #[expect(
         clippy::disallowed_methods,
-        reason = "`config push` has no `--format`; its inline diff is text-only output"
+        reason = "`config push` and `config diff` have no `--format json` envelope; this inline diff is text-only output"
     )]
     let mut stdout = stdout().lock();
     // Silently ignore write errors — stdout may be a closed pipe (e.g.
