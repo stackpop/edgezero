@@ -31,6 +31,8 @@ use tower::Service as TowerService;
 
 #[cfg(test)]
 use crate::connection::{ConnectionExit, serve_http1};
+#[cfg(test)]
+use crate::ingress_config::AxumIngressConfig;
 use crate::outbound::AxumOutboundClient;
 use crate::request::into_core_request_parts;
 use crate::response::{AxumEgressBody, EgressConnection, prepare_egress_response};
@@ -565,6 +567,7 @@ mod tests {
                 stream,
                 state.for_connection(remote_addr, responses.clone()),
                 responses,
+                AxumIngressConfig::default(),
             )
             .await
             .expect("intentional admission abort")
@@ -784,6 +787,7 @@ mod tests {
                 stream,
                 state.for_connection(remote_addr, responses.clone()),
                 responses,
+                AxumIngressConfig::default(),
             )
             .await
             .expect("intentional detached error abort")

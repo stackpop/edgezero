@@ -119,6 +119,35 @@ separately from the portable API and must be considered when declaring required 
   `Allow`, and the effective config `Retry-After` policy after custom rendering. Applications remain
   responsible for bounding their renderer's output.
 
+### Bounded Axum HTTP/1 Ingress
+
+- Enforce finite pre-admission limits through the existing Axum server entrypoints: 256 live
+  connections, 64 KiB combined raw request heads, 100 raw fields, and a non-resetting 10-second
+  idle-plus-header deadline by default. Explicit invalid settings fail startup before application
+  configuration or listener binding. `AxumIngressConfig` publishes validated effective limits and
+  parser receive-allocation assumptions.
+- Replace per-connection spawned tasks with one bounded connection-future owner. At capacity,
+  close the single transient accepted socket without a parser, HTTP refusal response, or waiter
+  queue. Keep-alive retains its slot; disconnect, failure, timeout, cancellation, and shutdown
+  release connection state. Preserve existing application body-read and response-write deadlines.
+- Pin Hyper 1.12.0, bytes 1.12.1, and http 1.4.2 for the audited HTTP/1 resource boundary. Raw head and duplicate
+  field-count limits precede admission, but independent raw-target/header accounting and strict
+  ambiguous-framing rejection remain unsupported. HTTP/2 and socket upgrade ownership are not
+  enabled. Kernel buffers, allocator overhead, and application allocations are not RSS-certified.
+- Bound and compact response headers before Hyper reuses their map for request parsing, preserving
+  duplicates and sensitive flags. Response fields share the configured head-byte budget and a
+  derived `max(100, request_field_limit)` count cap; overflow closes the connection. Custom Hyper
+  reason phrases are removed. Oversized spare capacity/backing buffers cannot persist in the
+  parser cache.
+- **Breaking:** `AxumDevServerConfig` now requires its validated `ingress` field in complete struct
+  literals. Use `AxumIngressConfig::default()`, `from_env`, or `new`; generated entrypoints still
+  delegate to `run_app`. Axum CLI Cargo children receive selected manifest environment defaults,
+  respecting parent environment precedence and declaration order. The demo manifest and scaffold
+  document the ingress settings without duplicating runtime enforcement.
+- Recognize case-insensitive `EDGEZERO__` prefixes on Windows, where child environment-key aliases
+  retain their first spelling. Unix key identity stays unchanged, and explicit invalid limits
+  cannot be bypassed through a Windows case alias.
+
 ### Response Egress And Application Assembly
 
 - Carry every response-producing admission outcome through `ResponseEgressEnvelope` and one

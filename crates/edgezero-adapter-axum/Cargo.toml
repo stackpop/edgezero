@@ -72,4 +72,4 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 serde = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "test-util"] }

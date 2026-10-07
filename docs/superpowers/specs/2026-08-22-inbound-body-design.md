@@ -528,15 +528,15 @@ reset only the affected stream. EdgeZero does not drain an ambiguously framed bo
 not invoke the admission callback. This strict duplicate-`Content-Length` policy deliberately
 chooses one parser interpretation instead of accepting RFC-permitted identical duplicates.
 
-Axum is the first required raw-boundary implementation. Hyper 1.10.1 can discard a
+Axum is the first required strict raw-boundary implementation. Hyper can discard a
 `Content-Length` encountered after `Transfer-Encoding`, so checking the resulting
 `Request<Body>`/`HeaderMap` is insufficient and must not be described as smuggling
 protection. The Axum adapter needs an audited pinned Hyper parser patch or an upstream parser
 hook that rejects the strict policy while Hyper still has ordered `httparse` field lines.
-The current `axum::serve` boundary hands EdgeZero an already-parsed request, so this also
-requires a connection-owning accept path based on Hyper's lower-level connection builders.
-`http1::Builder::{max_headers,max_buf_size,header_read_timeout}` may provide defense in depth,
-but they do not expose exact request-target/raw-header accounting and do not preserve every
+The adapter now owns its HTTP/1 accept path and pinned Hyper 1.12.0 connection futures.
+`http1::Builder::{max_headers,max_header_size,max_buf_size,header_read_timeout}` provide bounded
+pre-admission resource controls, but they do not expose exact request-target/raw-header accounting
+and do not preserve every
 ambiguous field shape required by this contract; configuring those knobs alone cannot promote
 either raw capability.
 After that parser has rejected ambiguity, the adapter may derive `IngressFraming` from the
@@ -546,6 +546,31 @@ can disagree with Hyper and cannot safely locate subsequent pipelined request he
 also owning HTTP body framing. Raw-socket tests in §4 pin the parser behavior. Platform SDKs that expose
 only normalized requests cannot claim Native framing validation based on assumed host
 behavior; they remain Unsupported until a documented/testable raw rejection seam exists.
+
+#### Implemented Axum HTTP/1 resource boundary
+
+`AxumIngressConfig` installs finite validated connection, combined raw-head byte, raw field-count,
+and absolute idle-plus-header limits through the standard server startup path. The connection
+pool owns at most the configured number of futures plus one transient accepted socket on refusal;
+refusal creates no parser, response, task, or capacity waiter. The first deadline is stamped before
+scheduling, subsequent deadlines start when Hyper first polls the next eligible keep-alive head,
+and byte trickling does not reset them. Independent native timer wakes, I/O checks, and a completed
+head check enforce expiry before application admission without replacing application body/egress
+deadlines. Shutdown and cancellation drop all connection-owned state.
+
+The raw-head byte bound includes the request line and all field syntax together. Exact inclusive
+head and field-count limits are tested through real TCP; these are not the independent
+`IngressHeadLimits` measurements above. Hyper remains the sole HTTP/1 parser. HTTP/2 and socket
+upgrade ownership are not enabled by this server path.
+
+Receive allocation bounds are audited separately from Hyper's logical buffer threshold. Response
+heads are capped and copied into compact storage before Hyper caches them for later request parsing;
+oversized heads close the connection without another response allocation. Configuration defaults,
+ranges, precise wire definitions, trailer behavior, allocation assumptions, and exclusions are in
+the [Axum adapter guide](../../guide/adapters/axum.md#bounded-http1-ingress). Real TCP acceptance
+tests are colocated in the adapter's `connection.rs` and `dev_server.rs`. This implementation does
+not claim strict ambiguous-framing rejection, exact independent target/header totals, kernel-buffer
+bounds, or complete RSS certification. Raw capability promotion remains a future parser task.
 
 ### 1.3 Absolute body-read deadline and cancellation
 

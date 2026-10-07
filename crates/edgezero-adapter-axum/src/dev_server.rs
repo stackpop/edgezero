@@ -1,17 +1,22 @@
+use std::any::Any;
 use std::fs;
 use std::future;
 #[cfg(test)]
 use std::iter;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use futures_util::FutureExt as _;
+use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
 use tokio::sync::oneshot::{Receiver as ShutdownReceiver, Sender as ShutdownSender, channel};
-use tokio::task::{LocalSet, spawn_blocking, spawn_local};
+use tokio::task::{LocalSet, spawn_blocking};
 
 use edgezero_core::addr;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
@@ -28,7 +33,8 @@ use simple_logger::SimpleLogger;
 use std::collections::BTreeMap;
 
 use crate::config_store::AxumConfigStore;
-use crate::connection::serve_http1;
+use crate::connection::{ConnectionExit, serve_http1};
+use crate::ingress_config::AxumIngressConfig;
 use crate::key_value_store::PersistentKvStore;
 use crate::response::EgressConnection;
 use crate::secret_store::EnvSecretStore;
@@ -40,11 +46,15 @@ enum KvInitRequirement {
     Required,
 }
 
+type ConnectionResult = Result<Result<ConnectionExit, hyper::Error>, Box<dyn Any + Send>>;
+
 /// Configuration used when running the dev server embedding `EdgeZero` into Axum.
 #[derive(Clone)]
 pub struct AxumDevServerConfig {
     pub addr: SocketAddr,
     pub enable_ctrl_c: bool,
+    /// Validated listener, parser and idle-plus-header limits.
+    pub ingress: AxumIngressConfig,
 }
 
 impl Default for AxumDevServerConfig {
@@ -53,6 +63,7 @@ impl Default for AxumDevServerConfig {
         Self {
             addr: SocketAddr::from((addr::DEFAULT_HOST, addr::DEFAULT_PORT)),
             enable_ctrl_c: true,
+            ingress: AxumIngressConfig::default(),
         }
     }
 }
@@ -118,7 +129,14 @@ impl AxumDevServer {
         let listener = TokioTcpListener::from_std(std_listener)
             .context("failed to adopt std listener into tokio")?;
 
-        serve_with_stores(App::new(router), listener, config.enable_ctrl_c, stores).await
+        serve_with_stores(
+            App::new(router),
+            listener,
+            config.enable_ctrl_c,
+            config.ingress,
+            stores,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -128,7 +146,14 @@ impl AxumDevServer {
             config,
             stores,
         } = self;
-        serve_with_stores(App::new(router), listener, config.enable_ctrl_c, stores).await
+        serve_with_stores(
+            App::new(router),
+            listener,
+            config.enable_ctrl_c,
+            config.ingress,
+            stores,
+        )
+        .await
     }
 
     #[must_use]
@@ -277,6 +302,7 @@ async fn serve_with_stores(
     app: App,
     listener: TokioTcpListener,
     enable_ctrl_c: bool,
+    ingress: AxumIngressConfig,
     stores: Stores,
 ) -> anyhow::Result<()> {
     struct ShutdownOnDrop(Option<ShutdownSender<()>>);
@@ -299,6 +325,7 @@ async fn serve_with_stores(
             app,
             native_listener,
             enable_ctrl_c,
+            ingress,
             stores,
             shutdown_receiver,
         )
@@ -312,6 +339,7 @@ fn serve_local(
     app: App,
     std_listener: StdTcpListener,
     enable_ctrl_c: bool,
+    ingress: AxumIngressConfig,
     stores: Stores,
     shutdown_receiver: ShutdownReceiver<()>,
 ) -> anyhow::Result<()> {
@@ -359,26 +387,40 @@ fn serve_local(
         };
         tokio::pin!(shutdown);
         tokio::pin!(ctrl_c);
+        let mut connections = FuturesUnordered::new();
 
         loop {
             tokio::select! {
-                accepted = listener.accept() => {
-                    let (stream, remote_addr) = accepted.context("axum listener accept failed")?;
-                    let responses = EgressConnection::default();
-                    let connection_service = service.for_connection(remote_addr, responses.clone());
-                    spawn_local(async move {
-                        if let Err(error) = serve_http1(stream, connection_service, responses).await {
-                            log::debug!("axum HTTP/1 connection ended: {error}");
-                        }
-                    });
-                }
+                biased;
                 () = &mut shutdown => break,
                 () = &mut ctrl_c => break,
+                Some(result) = connections.next(), if !connections.is_empty() => {
+                    report_connection_exit(&result);
+                }
+                accepted = listener.accept() => {
+                    let (stream, remote_addr) = accepted.context("axum listener accept failed")?;
+                    // One transient accepted socket; no parser, task or waiter on refusal.
+                    if connections.len() >= ingress.max_connections() {
+                        drop(stream);
+                        continue;
+                    }
+                    let responses = EgressConnection::default();
+                    let connection_service = service.for_connection(remote_addr, responses.clone());
+                    connections.push(AssertUnwindSafe(serve_http1(stream, connection_service, responses, ingress)).catch_unwind());
+                }
             }
         }
+        // Dropping the bounded owner releases sockets, parser buffers and egress attempts.
+        drop(connections);
         Ok(())
     };
     runtime.block_on(local.run_until(serve))
+}
+
+fn report_connection_exit(result: &ConnectionResult) {
+    if !matches!(result, Ok(Ok(_))) {
+        log::debug!("axum HTTP/1 connection rejected or disconnected");
+    }
 }
 
 /// Entry point for an Axum dev-server application.
@@ -430,6 +472,8 @@ where
             .init()
             .context("failed to initialize application logger")?;
     }
+    let ingress = AxumIngressConfig::from_env(&env)?;
+    log::info!("[edgezero] axum HTTP/1 ingress limits: {ingress:?}");
     preflight()?;
     let app = build_app_for_dispatch::<A>()?;
     let stores = A::stores();
@@ -466,7 +510,7 @@ where
             secret_registry,
             ..Stores::default()
         };
-        serve_with_stores(app, listener, true, request_stores).await
+        serve_with_stores(app, listener, true, ingress, request_stores).await
     })
 }
 
@@ -704,6 +748,14 @@ mod tests {
             ])
             .env("EDGEZERO_TEST_LOGGING_SCENARIO", scenario)
             .env("EDGEZERO__LOGGING__LEVEL", level)
+            .env_remove("EDGEZERO__ADAPTER__INGRESS__MAX_CONNECTIONS")
+            .env_remove("EDGEZERO__ADAPTER__INGRESS__MAX_RAW_HEAD_BYTES")
+            .env_remove("EDGEZERO__ADAPTER__INGRESS__MAX_HEADER_COUNT")
+            .env_remove("EDGEZERO__ADAPTER__INGRESS__HEAD_READ_TIMEOUT_MS")
+            .envs(
+                (scenario == "invalid-ingress")
+                    .then_some(("EDGEZERO__ADAPTER__INGRESS__MAX_CONNECTIONS", "0")),
+            )
             .output()
             .expect("isolated logging probe");
         let stdout = String::from_utf8(output.stdout).expect("probe stdout");
@@ -722,6 +774,20 @@ mod tests {
             return;
         };
         let result = match scenario.as_str() {
+            "invalid-ingress" => {
+                let result = run_app_with_preflight::<LoggingConfiguration, _>(|| {
+                    panic!(
+                        "invalid ingress must fail before preflight or application configuration"
+                    )
+                });
+                assert_eq!(
+                    result
+                        .expect_err("invalid ingress must stop startup")
+                        .to_string(),
+                    "invalid Axum ingress setting `max_connections`"
+                );
+                return;
+            }
             "installed" => {
                 SimpleLogger::new()
                     .with_level(LevelFilter::Trace)
@@ -756,6 +822,12 @@ mod tests {
             _ => run_app::<LoggingConfiguration>(),
         };
         assert!(result.is_err(), "probe must stop before listener setup");
+    }
+
+    #[test]
+    fn invalid_ingress_stops_before_preflight_configuration_and_binding() {
+        let output = logging_probe("invalid-ingress", "info");
+        assert!(!output.contains("boot-warning-probe"), "{output}");
     }
 
     #[test]
@@ -847,6 +919,7 @@ mod tests {
         let config = AxumDevServerConfig {
             addr,
             enable_ctrl_c: false,
+            ingress: AxumIngressConfig::default(),
         };
         assert_eq!(config.addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(config.addr.port(), 3000);
@@ -871,6 +944,7 @@ mod tests {
         let config = AxumDevServerConfig {
             addr: SocketAddr::from(([127, 0, 0, 1], 9000)),
             enable_ctrl_c: false,
+            ingress: AxumIngressConfig::default(),
         };
         let server = AxumDevServer::with_config(router, config);
         assert_eq!(server.config.addr.port(), 9000);
@@ -1031,6 +1105,394 @@ mod tests {
 }
 
 #[cfg(test)]
+mod bounded_ingress_tests {
+    use std::future::pending;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use edgezero_core::app::App;
+    use edgezero_core::body::Body;
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::http::response_builder;
+    use edgezero_core::ingress::{AdmissionDecision, IngressGrant};
+    use edgezero_core::response_egress::{ResponseEgressCompletion, ResponseEgressOutcome};
+    use edgezero_core::router::RouterService;
+    use futures_util::stream::poll_fn;
+    use std::task::Poll;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::{JoinHandle, yield_now};
+    use tokio::time::{Instant, sleep, timeout};
+
+    use super::{AxumDevServer, AxumDevServerConfig};
+    use crate::ingress_config::AxumIngressConfig;
+
+    struct Server {
+        address: SocketAddr,
+        calls: Arc<AtomicUsize>,
+        panics: Arc<AtomicUsize>,
+        task: JoinHandle<anyhow::Result<()>>,
+    }
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn closed(stream: &mut TcpStream) {
+        let mut byte = [0];
+        let read = timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("connection must close");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "refusal must not send a response"
+        );
+    }
+
+    async fn healthy(stream: &mut TcpStream) {
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let read = async {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+                assert!(head.len() < 4096);
+            }
+            assert!(head.starts_with(b"HTTP/1.1 200"));
+            let mut body = [0; 2];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"ok");
+        };
+        timeout(Duration::from_secs(2), read).await.unwrap();
+    }
+
+    async fn start(connections: usize, milliseconds: u64, count: usize) -> Server {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let panics = Arc::new(AtomicUsize::new(0));
+        let observed_panics = Arc::clone(&panics);
+        let router = RouterService::builder()
+            .get("/panic", move |_| {
+                let counted = Arc::clone(&observed_panics);
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    panic!("isolated connection failure");
+                    #[expect(
+                        unreachable_code,
+                        reason = "sets the handler response type after the intentional panic"
+                    )]
+                    Ok::<_, EdgeError>("unreachable")
+                }
+            })
+            .get("/", move |_| {
+                let counted = Arc::clone(&observed);
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, EdgeError>("ok")
+                }
+            })
+            .build();
+        let server = AxumDevServer::with_config(
+            router,
+            AxumDevServerConfig {
+                addr: address,
+                enable_ctrl_c: false,
+                ingress: AxumIngressConfig::new(
+                    connections,
+                    8192,
+                    count,
+                    Duration::from_millis(milliseconds),
+                )
+                .unwrap(),
+            },
+        );
+        let task = tokio::spawn(server.run_with_listener(listener));
+        Server {
+            address,
+            calls,
+            panics,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn parser_and_unwinding_failures_release_capacity_and_leave_server_healthy() {
+        let server = start(1, 10_000, 100).await;
+        for request in [
+            &b"invalid\r\n\r\n"[..],
+            &b"GET /panic HTTP/1.1\r\nHost: localhost\r\n\r\n"[..],
+        ] {
+            let mut failed = TcpStream::connect(server.address).await.unwrap();
+            failed.write_all(request).await.unwrap();
+            let mut response = Vec::new();
+            let _read = timeout(Duration::from_secs(2), failed.read_to_end(&mut response))
+                .await
+                .unwrap();
+            assert!(!response.starts_with(b"HTTP/1.1 200"));
+            let mut recovered = TcpStream::connect(server.address).await.unwrap();
+            healthy(&mut recovered).await;
+            drop(recovered);
+        }
+        assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(server.panics.load(Ordering::SeqCst), 1);
+        assert!(!server.task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_pending_handler_stream_and_completion_resources() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let resources = Arc::new(AtomicUsize::new(0));
+        let terminals = Arc::new(AtomicUsize::new(0));
+        let handler_started = Arc::clone(&started);
+        let handler_released = Arc::clone(&released);
+        let stream_started = Arc::clone(&started);
+        let stream_released = Arc::clone(&released);
+        let router = RouterService::builder()
+            .get("/handler", move |_| {
+                let entered = Arc::clone(&handler_started);
+                let guard = DropProbe(Arc::clone(&handler_released));
+                async move {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    pending::<()>().await;
+                    drop(guard);
+                    Ok::<_, EdgeError>("unreachable")
+                }
+            })
+            .get("/stream", move |_| {
+                let entered = Arc::clone(&stream_started);
+                let guard = DropProbe(Arc::clone(&stream_released));
+                async move {
+                    let body = poll_fn(move |_cx| {
+                        let _keep_alive = &guard;
+                        entered.store(2, Ordering::SeqCst);
+                        Poll::<Option<Result<Bytes, EdgeError>>>::Pending
+                    });
+                    Ok::<_, EdgeError>(response_builder().body(Body::from_stream(body)).unwrap())
+                }
+            })
+            .build();
+        let mut app = App::new(router);
+        let completion_resources = Arc::clone(&resources);
+        let completion_terminals = Arc::clone(&terminals);
+        app.set_ingress_admission_policy(move |head| AdmissionDecision::Admit {
+            completion: ResponseEgressCompletion::new({
+                let resource = DropProbe(Arc::clone(&completion_resources));
+                let observed = Arc::clone(&completion_terminals);
+                move |report| {
+                    assert_eq!(report.outcome, ResponseEgressOutcome::TransportError);
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    drop(resource);
+                }
+            }),
+            grant: IngressGrant::empty(),
+            read_deadline: head.read_deadline_after(Duration::from_secs(10)),
+        });
+        let task = tokio::spawn(super::serve_with_stores(
+            app,
+            listener,
+            false,
+            AxumIngressConfig::new(2, 8192, 100, Duration::from_secs(10)).unwrap(),
+            super::Stores::default(),
+        ));
+        let mut handler = TcpStream::connect(address).await.unwrap();
+        handler
+            .write_all(b"GET /handler HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while started.load(Ordering::SeqCst) != 1 {
+                yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        timeout(Duration::from_secs(2), async {
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+                assert!(head.len() < 4096);
+            }
+        })
+        .await
+        .unwrap();
+        assert!(head.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        assert_eq!(resources.load(Ordering::SeqCst), 0);
+        task.abort();
+        closed(&mut handler).await;
+        closed(&mut stream).await;
+        timeout(Duration::from_secs(2), async {
+            while released.load(Ordering::SeqCst) != 2 || resources.load(Ordering::SeqCst) != 2 {
+                yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(terminals.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn saturation_refuses_without_queueing_and_disconnect_recovers() {
+        let server = start(2, 10_000, 100).await;
+        let mut first = TcpStream::connect(server.address).await.unwrap();
+        healthy(&mut first).await;
+        let mut second = TcpStream::connect(server.address).await.unwrap();
+        healthy(&mut second).await;
+        for _ in 0_usize..64 {
+            let mut refused = TcpStream::connect(server.address).await.unwrap();
+            closed(&mut refused).await;
+        }
+        assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+        drop(first);
+        // Wait for disconnect processing without depending on an arbitrary sleep.
+        let recover = async {
+            loop {
+                let mut stream = TcpStream::connect(server.address).await.unwrap();
+                let written = stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .await;
+                let mut response = Vec::new();
+                let read = stream.read_to_end(&mut response).await;
+                if written.is_ok() && read.is_ok() && response.starts_with(b"HTTP/1.1 200") {
+                    break;
+                }
+                yield_now().await;
+            }
+        };
+        timeout(Duration::from_secs(2), recover).await.unwrap();
+        healthy(&mut second).await;
+        assert_eq!(server.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn silence_and_trickling_initial_and_keepalive_heads_expire() {
+        let server = start(1, 150, 100).await;
+        let mut silent = TcpStream::connect(server.address).await.unwrap();
+        closed(&mut silent).await;
+        for keepalive in [false, true] {
+            let mut stream = TcpStream::connect(server.address).await.unwrap();
+            if keepalive {
+                healthy(&mut stream).await;
+            }
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nX-Trickle: ")
+                .await
+                .unwrap();
+            let started = Instant::now();
+            let trickle = async {
+                loop {
+                    sleep(Duration::from_millis(10)).await;
+                    if stream.write_all(b"a").await.is_err() {
+                        break;
+                    }
+                    let mut byte = [0];
+                    if let Ok(read) =
+                        timeout(Duration::from_millis(1), stream.peek(&mut byte)).await
+                        && !matches!(read, Ok(1..))
+                    {
+                        break;
+                    }
+                }
+            };
+            timeout(Duration::from_secs(2), trickle)
+                .await
+                .expect("trickle must not extend deadline");
+            assert!(started.elapsed() < Duration::from_secs(2));
+            closed(&mut stream).await;
+        }
+        let mut recovered = TcpStream::connect(server.address).await.unwrap();
+        healthy(&mut recovered).await;
+        assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn idle_keepalive_timeout_releases_capacity() {
+        let server = start(1, 100, 100).await;
+        let mut idle = TcpStream::connect(server.address).await.unwrap();
+        healthy(&mut idle).await;
+        closed(&mut idle).await;
+        let mut recovered = TcpStream::connect(server.address).await.unwrap();
+        healthy(&mut recovered).await;
+    }
+
+    #[tokio::test]
+    async fn raw_count_duplicates_and_byte_boundaries_precede_dispatch() {
+        let server = start(1, 10_000, 4).await;
+        let prefix = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-Pad: ";
+        let mut exact = prefix.to_vec();
+        exact.extend(vec![b'a'; 8192 - prefix.len() - 4]);
+        exact.extend_from_slice(b"\r\n\r\n");
+        let mut over = exact.clone();
+        over.insert(prefix.len(), b'a');
+        let count_exact = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-Dup: a\r\nX-Dup: b\r\n\r\n".to_vec();
+        let count_over = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-Dup: a\r\nX-Dup: b\r\nX-Dup: c\r\n\r\n".to_vec();
+        let mut long_line = b"GET /".to_vec();
+        long_line.extend(vec![b'a'; 8192]);
+        long_line.extend_from_slice(b" HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        for (request, expected) in [
+            (exact, b"HTTP/1.1 200"),
+            (over, b"HTTP/1.1 431"),
+            (count_exact, b"HTTP/1.1 200"),
+            (count_over, b"HTTP/1.1 431"),
+            (long_line, b"HTTP/1.1 431"),
+        ] {
+            let mut stream = TcpStream::connect(server.address).await.unwrap();
+            stream.write_all(&request).await.unwrap();
+            let mut response = Vec::new();
+            let _read = timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+                .await
+                .unwrap();
+            assert!(response.starts_with(expected), "unexpected response status");
+        }
+        assert_eq!(server.calls.load(Ordering::SeqCst), 2);
+        let mut recovered = TcpStream::connect(server.address).await.unwrap();
+        healthy(&mut recovered).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_closes_idle_and_partial_connections() {
+        let server = start(2, 10_000, 100).await;
+        let mut idle = TcpStream::connect(server.address).await.unwrap();
+        healthy(&mut idle).await;
+        let mut partial = TcpStream::connect(server.address).await.unwrap();
+        healthy(&mut partial).await;
+        partial
+            .write_all(b"GET / HTTP/1.1\r\nX-Pending:")
+            .await
+            .unwrap();
+        server.task.abort();
+        closed(&mut idle).await;
+        closed(&mut partial).await;
+    }
+}
+
+#[cfg(test)]
 mod integration_tests {
     use super::*;
     use edgezero_core::action;
@@ -1063,6 +1525,7 @@ mod integration_tests {
         let config = AxumDevServerConfig {
             addr,
             enable_ctrl_c: false,
+            ingress: AxumIngressConfig::default(),
         };
         // Use a unique temp directory for each test server
         let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -1193,6 +1656,7 @@ mod integration_tests {
         let config = AxumDevServerConfig {
             addr,
             enable_ctrl_c: false,
+            ingress: AxumIngressConfig::default(),
         };
         let server = AxumDevServer::with_config(router, config);
 
@@ -1420,6 +1884,7 @@ mod integration_tests {
         let config = super::AxumDevServerConfig {
             addr,
             enable_ctrl_c: false,
+            ingress: AxumIngressConfig::default(),
         };
         let mut server = super::AxumDevServer::with_config(router, config);
         if let Some(handle) = secret_handle {

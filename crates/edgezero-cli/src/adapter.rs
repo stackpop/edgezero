@@ -85,14 +85,7 @@ fn apply_environment(
     // `env::var_os` first and skip the explicit set when the parent
     // already has one. This mirrors the precedence the plan + the
     // typed-config env-overlay docs both promise.
-    for binding in &environment.variables {
-        if let Some(value) = &binding.value {
-            if env::var_os(&binding.env).is_some() {
-                continue;
-            }
-            command.env(&binding.env, value);
-        }
-    }
+    command.envs(resolve_environment_defaults(environment));
 
     let mut missing = Vec::new();
     for binding in &environment.secrets {
@@ -305,7 +298,28 @@ fn execute_registered_after_gate(
             )
         }
     })?;
-    adapter.execute_target(AdapterAction::from(runtime.action()), target, adapter_args)
+    let defaults = runtime.manifest().map_or_else(Vec::new, |manifest| {
+        resolve_environment_defaults(&manifest.environment_for(runtime.adapter_name()))
+    });
+    let selected = target.clone().with_environment_defaults(defaults);
+    adapter.execute_target(
+        AdapterAction::from(runtime.action()),
+        &selected,
+        adapter_args,
+    )
+}
+
+fn resolve_environment_defaults(environment: &ResolvedEnvironment) -> Vec<(String, String)> {
+    let mut defaults = Vec::new();
+    for binding in &environment.variables {
+        if let Some(value) = &binding.value
+            && env::var_os(&binding.env).is_none()
+        {
+            // Keep declaration order; Command owns platform-specific key identity.
+            defaults.push((binding.env.clone(), value.clone()));
+        }
+    }
+    defaults
 }
 
 pub(crate) fn ensure_capabilities(
@@ -650,20 +664,26 @@ mod tests {
     use crate::adapter::Action;
     use crate::manifest_source::resolve_runtime_from;
     use crate::test_support::manifest_guard;
-    use edgezero_adapter::registry::{Adapter, AdapterAction, register_adapter};
+    use edgezero_adapter::registry::{
+        Adapter, AdapterAction, AdapterExecutionTarget, register_adapter,
+    };
     use edgezero_core::manifest::{
         Capability, CapabilitySupport, ManifestContract, ManifestLoader, ResolvedEnvironmentBinding,
     };
     use edgezero_core::test_env::EnvOverride;
-    use std::ffi::OsString;
+    use std::env;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::process::Command;
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
     static BEST_EFFORT_ADAPTER: GateAdapter = GateAdapter {
         name: "gate-best-effort",
         support: CapabilitySupport::BestEffort,
     };
+    static ENVIRONMENT_ADAPTER: EnvironmentAdapter = EnvironmentAdapter;
+    static ENVIRONMENT_TARGETS: Mutex<Vec<AdapterExecutionTarget>> = Mutex::new(Vec::new());
     static BOUNDED_ADAPTER: GateAdapter = GateAdapter {
         name: "gate-bounded",
         support: CapabilitySupport::BoundedCooperative,
@@ -680,6 +700,35 @@ mod tests {
     struct GateAdapter {
         name: &'static str,
         support: CapabilitySupport,
+    }
+
+    struct EnvironmentAdapter;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "records pinned target dispatch without launching a child"
+    )]
+    impl Adapter for EnvironmentAdapter {
+        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+            Err("pinned dispatch must not rediscover the invocation project".to_owned())
+        }
+
+        fn execute_target(
+            &self,
+            _action: AdapterAction,
+            target: &AdapterExecutionTarget,
+            _args: &[String],
+        ) -> Result<(), String> {
+            ENVIRONMENT_TARGETS
+                .lock()
+                .map_err(|_poison| "fixture target lock poisoned")?
+                .push(target.clone());
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "gate-environment"
+        }
     }
 
     #[expect(
@@ -702,6 +751,82 @@ mod tests {
 
     fn capability_manifest(section: &str) -> ManifestLoader {
         ManifestLoader::load_from_str(&format!("[capabilities]\n{section}\n[adapters.gate]\n"))
+    }
+
+    #[test]
+    fn registered_dispatch_carries_only_selected_manifest_defaults_in_order() {
+        const KEY: &str = "EDGEZERO_TEST_REGISTERED_INGRESS";
+        let _lock = manifest_guard().lock().unwrap();
+        let _unset = EnvOverride::remove(KEY);
+        register_adapter(&ENVIRONMENT_ADAPTER);
+        let invocation = tempdir().unwrap();
+        let selected = tempdir().unwrap();
+        fs::write(invocation.path().join("edgezero.toml"),
+            format!("[adapters.gate-environment]\n[[environment.variables]]\nname = '{KEY}'\nvalue = 'wrong-project'\n")).unwrap();
+        let manifest_path = selected.path().join("edgezero.toml");
+        fs::write(&manifest_path, format!(
+            "[adapters.gate-environment]\n\
+             [[environment.variables]]\nname = 'first'\nenv = '{KEY}'\nvalue = 'global'\n\
+             [[environment.variables]]\nname = 'second'\nenv = '{KEY}'\nvalue = 'selected'\nadapters = ['gate-environment']\n\
+             [[environment.variables]]\nname = 'excluded'\nenv = '{KEY}'\nvalue = 'wrong-adapter'\nadapters = ['spin']\n\
+             [[environment.variables]]\nname = 'last'\nenv = '{KEY}'\nvalue = ''\n"
+        )).unwrap();
+        for action in [Action::Build, Action::Serve] {
+            let runtime = resolve_runtime_from(
+                "gate-environment",
+                action,
+                invocation.path(),
+                Some(OsString::from(&manifest_path)),
+            )
+            .unwrap();
+            execute_runtime(&runtime, &[]).unwrap();
+        }
+        let mut targets = ENVIRONMENT_TARGETS.lock().unwrap();
+        assert_eq!(targets.len(), 2);
+        for target in targets.drain(..) {
+            assert_eq!(target.app_root(), selected.path().canonicalize().unwrap());
+            assert_eq!(
+                target.environment_defaults(),
+                &[
+                    (KEY.to_owned(), "global".to_owned()),
+                    (KEY.to_owned(), "selected".to_owned()),
+                    (KEY.to_owned(), String::new())
+                ]
+            );
+            let mut child = Command::new("echo");
+            child.envs(target.environment_defaults().iter().cloned());
+            assert!(
+                child
+                    .get_envs()
+                    .any(|(key, value)| key == KEY && value.is_some_and(OsStr::is_empty))
+            );
+        }
+        assert!(env::var_os(KEY).is_none());
+    }
+
+    #[test]
+    fn environment_defaults_filter_before_collapsing_and_preserve_parent_values() {
+        const KEY: &str = "EDGEZERO_TEST_INGRESS_PROPAGATION";
+        let _lock = manifest_guard().lock().unwrap();
+        let _unset = EnvOverride::remove(KEY);
+        let loader = ManifestLoader::load_from_str(&format!(
+            "[[environment.variables]]\nname = 'first'\nenv = '{KEY}'\nvalue = 'global'\n\
+             [[environment.variables]]\nname = 'selected'\nenv = '{KEY}'\nvalue = 'selected'\nadapters = ['AxUm']\n\
+             [[environment.variables]]\nname = 'excluded'\nenv = '{KEY}'\nvalue = 'wrong'\nadapters = ['spin']\n\
+             [[environment.variables]]\nname = 'valueless'\nenv = '{KEY}'\n"
+        ));
+        let resolved = loader.manifest().environment_for("axum");
+        let defaults = super::resolve_environment_defaults(&resolved);
+        let mut child = Command::new("echo");
+        child.envs(defaults);
+        assert!(
+            child.get_envs().any(|(key, value)| key == KEY
+                && value.is_some_and(|configured| configured == "selected"))
+        );
+        for value in ["operator", ""] {
+            let _parent = EnvOverride::set(KEY, value);
+            assert!(super::resolve_environment_defaults(&resolved).is_empty());
+        }
     }
 
     #[test]

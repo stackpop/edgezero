@@ -42,7 +42,7 @@ async-trait = "0.1"
 axum = { version = "0.8", default-features = true }
 brotli = "=8.0.4"
 brotli-decompressor = "=5.0.1"
-bytes = "1"
+bytes = "=1.12.1"
 chrono = "0.4"
 compression-codecs = { version = "=0.4.38", default-features = false, features = ["brotli", "gzip", "zlib"] }
 compression-core = "=0.4.32"
@@ -63,10 +63,10 @@ flate2 = { version = "=1.1.9", default-features = false, features = ["rust_backe
 futures = { version = "0.3", features = ["std", "executor"] }
 futures-util = { version = "0.3", features = ["alloc", "io"] }
 handlebars = "6"
-http = "1"
+http = "=1.4.2"
 http-body = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "server"] }
+hyper = { version = "=1.12.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 log = "0.4"
 miniz_oxide = { version = "=0.8.9", default-features = false, features = ["simd", "with-alloc"] }

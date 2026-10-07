@@ -117,8 +117,16 @@ work, plus the Phase 2 `ResponseLimitReason` work, must be present before the to
 setup/request conversion, raw-socket integration tests.
 
 Current Axum ingress uses `IngressHeadAccounting::HostManaged` and
-`IngressFraming::HostManaged`. Every item in this task is future promotion evidence; none is a
-claim about the current adapter.
+`IngressFraming::HostManaged`. Unchecked raw-accounting/framing items in this task are future
+promotion evidence, not claims about the current adapter.
+
+The separate bounded HTTP/1 resource boundary is implemented: validated `AxumIngressConfig`, a
+finite connection-owning accept pool, pinned Hyper 1.12.0 combined raw-head/field limits, waking
+absolute idle-plus-header timers, and response-head cache compaction. TCP tests cover saturation,
+initial/subsequent trickling, idle expiry, exact/over-limit heads, disconnect recovery, and shutdown.
+See the [Axum guide](../../guide/adapters/axum.md#bounded-http1-ingress) for its effective configuration
+and allocation assumptions. This evidence does not complete the independent raw-accounting or
+strict framing items below; HTTP/2 and upgrades remain outside the current server contract.
 
 - [ ] Add red raw-socket tests for exact/over-limit request-target bytes, raw header bytes,
   and field-line count; checked accounting overflow; CL+TE in both orders; duplicate
@@ -129,14 +137,15 @@ claim about the current adapter.
   Exact limits pass and expose the exact `IngressHeadAccounting::RawValidated` totals.
 - [ ] Assert rejection is 400, closes HTTP/1 or resets only the multiplexed stream, invokes
   no admission policy, and polls no body.
-- [ ] Characterize pinned Hyper 1.10.1 first: preserve source references and tests proving a
+- [ ] Characterize pinned Hyper 1.12.0 first: preserve source references and tests proving a
   `Content-Length` after `Transfer-Encoding` is skipped and equal duplicate lengths are
   accepted. These are the red cases the patch must change.
-- [ ] Replace `axum::serve` with a connection-owning Hyper accept path while preserving
-  connect metadata, HTTP/1 keepalive and pipelining, HTTP/2 behavior, upgrades, graceful
-  shutdown, and the existing service contract. Configure `max_headers`, `max_buf_size`, and
-  `header_read_timeout` as defense in depth, but do not treat those coarse controls as exact
-  target/header accounting or framing evidence.
+- [x] Replace `axum::serve` with a bounded connection-owning Hyper HTTP/1 accept path while
+  preserving connect metadata, keep-alive, the existing service/body/egress contract, and
+  shutdown cleanup. Configure `max_headers`, `max_header_size`, `max_buf_size`, and waking
+  `header_read_timeout` as resource defense in depth, not strict raw-accounting/framing evidence.
+- [ ] Define separate resource models before enabling HTTP/2, socket upgrades, or a graceful
+  shutdown drain beyond the current bounded close-on-shutdown behavior.
 - [ ] Add the smallest audited parser patch (or consume an upstream equivalent) in Hyper's
   existing request-line/ordered `httparse` header path. Bound parser reads so the raw head is
   rejected rather than accumulated past the installed target/header policy; count duplicate

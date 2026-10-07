@@ -49,6 +49,7 @@ pub enum AdapterAction {
 pub struct AdapterExecutionTarget {
     app_root: PathBuf,
     component: Option<String>,
+    environment_defaults: Vec<(String, String)>,
     platform_manifest: Option<PathBuf>,
 }
 
@@ -67,6 +68,14 @@ impl AdapterExecutionTarget {
         self.component.as_deref()
     }
 
+    /// Selected-manifest defaults not already supplied by the parent environment.
+    /// Declaration order is retained; child commands apply the last applicable value.
+    #[must_use]
+    #[inline]
+    pub fn environment_defaults(&self) -> &[(String, String)] {
+        &self.environment_defaults
+    }
+
     /// Construct a target after the caller has canonicalized and validated it.
     #[must_use]
     #[inline]
@@ -78,6 +87,7 @@ impl AdapterExecutionTarget {
         Self {
             app_root,
             component,
+            environment_defaults: Vec::new(),
             platform_manifest,
         }
     }
@@ -87,6 +97,14 @@ impl AdapterExecutionTarget {
     #[inline]
     pub fn platform_manifest(&self) -> Option<&Path> {
         self.platform_manifest.as_deref()
+    }
+
+    /// Carry filtered runtime defaults to the adapter without mutating process state.
+    #[must_use]
+    #[inline]
+    pub fn with_environment_defaults(mut self, defaults: Vec<(String, String)>) -> Self {
+        self.environment_defaults = defaults;
+        self
     }
 }
 
@@ -979,5 +997,20 @@ mod tests {
             "should name the adapter: {local_err}"
         );
         assert!(local_err.contains("--local"), "msg: {local_err}");
+    }
+
+    #[test]
+    fn execution_target_retains_ordered_defaults_without_changing_paths() {
+        let empty = AdapterExecutionTarget::new(PathBuf::from("/tmp"), None, None);
+        assert!(empty.environment_defaults().is_empty());
+        let defaults = vec![
+            ("key".to_owned(), "first".to_owned()),
+            ("KEY".to_owned(), "last".to_owned()),
+        ];
+        let selected = empty.with_environment_defaults(defaults.clone());
+        let cloned = selected.clone();
+        assert_eq!(cloned.environment_defaults(), defaults);
+        assert_eq!(cloned.app_root(), Path::new("/tmp"));
+        assert_eq!(cloned, selected);
     }
 }

@@ -1,4 +1,6 @@
 use std::error::Error as StdError;
+use std::future::{self, Future};
+use std::io;
 
 use http_body::Body as HttpBody;
 use hyper::Request;
@@ -9,6 +11,8 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
+use crate::header_deadline::{HeaderDeadline, HeaderDeadlineExceeded, HeaderIo, HeaderService};
+use crate::ingress_config::AxumIngressConfig;
 use crate::response::AxumBodyError;
 use crate::response::EgressConnection;
 use crate::service::AxumIngressAbort;
@@ -20,53 +24,77 @@ pub(crate) enum ConnectionExit {
     DeadlineExceeded,
 }
 
-/// Owns one HTTP/1 connection until Hyper completes or an active response deadline closes it.
+/// Owns HTTP/1 parsing, idle/header expiry and the existing response deadline race.
 #[expect(
     clippy::integer_division_remainder_used,
     reason = "tokio::select! expands to internal randomized branch selection arithmetic"
 )]
-pub(crate) async fn serve_http1<ServiceType, ResponseBody>(
+pub(crate) fn serve_http1<ServiceType, ResponseBody>(
     stream: TcpStream,
     service: ServiceType,
     responses: EgressConnection,
-) -> Result<ConnectionExit, hyper::Error>
+    limits: AxumIngressConfig,
+) -> impl Future<Output = Result<ConnectionExit, hyper::Error>>
 where
     ServiceType: Service<Request<Incoming>, Response = hyper::Response<ResponseBody>>,
     ServiceType::Error: Into<Box<dyn StdError + Send + Sync>>,
+    ServiceType::Future: 'static,
     ResponseBody: HttpBody + 'static,
     ResponseBody::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    let connection_future = Http1Builder::new()
-        .keep_alive(true)
-        .serve_connection(TokioIo::new(stream), service);
-    let mut connection = Box::pin(connection_future);
+    // Stamp before scheduling the connection future, not on its first poll.
+    let head = HeaderDeadline::new(limits.head_read_timeout());
+    async move {
+        let connection_future = Http1Builder::new()
+            .keep_alive(true)
+            .max_headers(limits.max_header_count())
+            .max_header_size(limits.max_raw_head_bytes())
+            .max_buf_size(limits.parser_buffer_bytes())
+            .header_read_timeout(limits.head_read_timeout())
+            .timer(head.clone())
+            .serve_connection(
+                TokioIo::new(HeaderIo::new(stream, head.clone())),
+                HeaderService::new(service, head.clone(), limits, responses.clone()),
+            );
+        let mut connection = Box::pin(connection_future);
 
-    loop {
-        let changed = responses.changed();
-        tokio::pin!(changed);
-        if let Some(deadline) = responses.next_deadline() {
-            tokio::select! {
-                result = &mut connection => {
-                    responses.signal_transport_error();
-                    drop(connection);
-                    return classify_connection_result(result);
+        loop {
+            if head
+                .deadline()
+                .is_some_and(|deadline| TokioInstant::now() >= deadline)
+            {
+                responses.signal_elapsed_deadline(TokioInstant::now());
+                responses.signal_transport_error();
+                drop(connection);
+                return Ok(ConnectionExit::DeadlineExceeded);
+            }
+            let next_deadline = head
+                .deadline()
+                .into_iter()
+                .chain(responses.next_deadline())
+                .min();
+            let wait = async move {
+                if let Some(deadline) = next_deadline {
+                    sleep_until(deadline).await;
+                } else {
+                    future::pending::<()>().await;
                 }
-                () = sleep_until(deadline) => {
+            };
+            tokio::select! {
+                biased;
+                () = wait => {
                     if responses.signal_elapsed_deadline(TokioInstant::now()) {
                         drop(connection);
                         return Ok(ConnectionExit::DeadlineExceeded);
                     }
                 }
-                () = &mut changed => {}
-            }
-        } else {
-            tokio::select! {
                 result = &mut connection => {
                     responses.signal_transport_error();
                     drop(connection);
                     return classify_connection_result(result);
                 }
-                () = &mut changed => {}
+                () = head.changed() => {}
+                () = responses.changed() => {}
             }
         }
     }
@@ -97,6 +125,9 @@ fn error_chain_has_admission_abort(error: &hyper::Error) -> bool {
 }
 
 fn error_chain_has_deadline(error: &hyper::Error) -> bool {
+    if error.is_timeout() {
+        return true;
+    }
     let mut source = error.source();
     while let Some(current) = source {
         if current
@@ -105,9 +136,131 @@ fn error_chain_has_deadline(error: &hyper::Error) -> bool {
         {
             return true;
         }
+        if current.downcast_ref::<HeaderDeadlineExceeded>().is_some() {
+            return true;
+        }
+        if current
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::get_ref)
+            .is_some_and(<dyn StdError + Send + Sync>::is::<HeaderDeadlineExceeded>)
+        {
+            return true;
+        }
         source = current.source();
     }
     false
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use std::convert::Infallible;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use futures::future::join;
+    use hyper::Response;
+    use hyper::service::service_fn;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+
+    use super::serve_http1;
+    use crate::ingress_config::AxumIngressConfig;
+    use crate::response::EgressConnection;
+
+    async fn raw_exchange(request: &[u8]) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let service = service_fn(|_request| async {
+                Ok::<_, Infallible>(Response::new(Body::from("ok")))
+            });
+            let _result = serve_http1(
+                socket,
+                service,
+                EgressConnection::default(),
+                AxumIngressConfig::default(),
+            )
+            .await;
+        };
+        let client = async {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream.write_all(request).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            response
+        };
+        let ((), response) = timeout(Duration::from_secs(2), join(server, client))
+            .await
+            .unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn accepted_deadline_precedes_first_poll_but_not_admitted_handler_work() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::sleep;
+
+        for delayed_poll in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            let server = async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let service = service_fn(move |_request| {
+                    let counted = Arc::clone(&observed);
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        sleep(Duration::from_millis(200)).await;
+                        Ok::<_, Infallible>(Response::new(Body::from("ok")))
+                    }
+                });
+                let limits =
+                    AxumIngressConfig::new(1, 8192, 100, Duration::from_millis(100)).unwrap();
+                let connection = serve_http1(socket, service, EgressConnection::default(), limits);
+                if delayed_poll {
+                    sleep(Duration::from_millis(150)).await;
+                }
+                let _result = connection.await;
+            };
+            let client = async {
+                let mut stream = TcpStream::connect(address).await.unwrap();
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut response = Vec::new();
+                let _read = stream.read_to_end(&mut response).await;
+                response
+            };
+            let ((), response) = timeout(Duration::from_secs(2), join(server, client))
+                .await
+                .unwrap();
+            if delayed_poll {
+                assert!(response.is_empty());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            } else {
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn default_raw_head_limit_rejects_first_byte_over_before_service() {
+        let prefix = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-Pad: ";
+        let mut request = prefix.to_vec();
+        request.extend(vec![b'a'; 0x0001_0000 - prefix.len() - 4]);
+        request.extend_from_slice(b"\r\n\r\n");
+        let response = raw_exchange(&request).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        request.insert(prefix.len(), b'a');
+        let rejected = raw_exchange(&request).await;
+        assert!(rejected.starts_with(b"HTTP/1.1 431"), "unexpected status");
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +276,7 @@ mod tests {
     use edgezero_core::body::Body;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{HeaderMap, Method, StatusCode, Version, response_builder};
+    use edgezero_core::ingress::{AdmissionDecision, IngressGrant};
     use edgezero_core::response_egress::{
         ResponseEgressAttempt, ResponseEgressCompletion, ResponseEgressHead,
         ResponseEgressObserver, ResponseEgressObserverHandle, ResponseEgressOutcome,
@@ -141,6 +295,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{ConnectionExit, serve_http1};
+    use crate::ingress_config::AxumIngressConfig;
     use crate::response::{AxumEgressBody, EgressConnection};
     use crate::service::AxumServiceState;
 
@@ -239,7 +394,7 @@ mod tests {
                     let (socket, peer) = listener.accept().await.expect("accept client");
                     let responses = EgressConnection::default();
                     let service = state.for_connection(peer, responses.clone());
-                    serve_http1(socket, service, responses).await
+                    serve_http1(socket, service, responses, AxumIngressConfig::default()).await
                 });
                 let mut client = TcpStream::connect(address).await.expect("connect client");
                 client
@@ -255,6 +410,59 @@ mod tests {
                 (String::from_utf8(wire).expect("ASCII response"), exit)
             })
             .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_response_head_closes_and_completes_once_without_polling_body() {
+        let observer = RecordingObserver::default();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let resource_drops = Arc::new(AtomicUsize::new(0));
+        let observed_polls = Arc::clone(&polls);
+        let observed_drops = Arc::clone(&drops);
+        let router = RouterService::builder()
+            .get("/", move |_ctx| {
+                let source_polls = Arc::clone(&observed_polls);
+                let probe = SourceDropProbe(Arc::clone(&observed_drops));
+                async move {
+                    let source = poll_fn(move |_cx| {
+                        let _keep_alive = &probe;
+                        source_polls.fetch_add(1, Ordering::SeqCst);
+                        Poll::<Option<Result<Bytes, EdgeError>>>::Pending
+                    });
+                    Ok::<_, EdgeError>(
+                        response_builder()
+                            .header(
+                                "x-oversized",
+                                "a".repeat(AxumIngressConfig::default().max_raw_head_bytes()),
+                            )
+                            .body(Body::from_stream(source))
+                            .unwrap(),
+                    )
+                }
+            })
+            .build();
+        let mut app = App::new(router);
+        app.set_response_egress_observer(observer.clone());
+        let observed_resources = Arc::clone(&resource_drops);
+        app.set_ingress_admission_policy(move |head| AdmissionDecision::Admit {
+            completion: ResponseEgressCompletion::new({
+                let resource = SourceDropProbe(Arc::clone(&observed_resources));
+                move |_report| drop(resource)
+            }),
+            grant: IngressGrant::empty(),
+            read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+        });
+        let (wire, exit) = exchange_with_app(app).await;
+        assert!(wire.is_empty());
+        let _error = exit.expect_err("oversized response head must close the connection");
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(resource_drops.load(Ordering::SeqCst), 1);
+        let reports = observer.0.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, ResponseEgressOutcome::TransportError);
+        assert_eq!(reports[0].bytes_written, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -487,7 +695,7 @@ mod tests {
                         }
                     });
 
-                    serve_http1(stream, service, responses).await
+                    serve_http1(stream, service, responses, AxumIngressConfig::default()).await
                 });
 
                 let mut client = TcpStream::connect(address).await.expect("connect client");
@@ -556,7 +764,7 @@ mod tests {
                             Ok::<_, Infallible>(Response::new(registered_body))
                         }
                     });
-                    serve_http1(stream, service, responses).await
+                    serve_http1(stream, service, responses, AxumIngressConfig::default()).await
                 });
 
                 let mut client = TcpStream::connect(address).await.expect("connect client");

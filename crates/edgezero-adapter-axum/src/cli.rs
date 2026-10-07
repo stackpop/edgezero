@@ -428,22 +428,22 @@ fn register_ctor() {
 
 fn build(extra_args: &[String]) -> Result<(), String> {
     let project = locate_project()?;
-    run_cargo(&project, "build", extra_args)
+    run_cargo(&project, "build", extra_args, &[])
 }
 
 fn build_target(target: &AdapterExecutionTarget, extra_args: &[String]) -> Result<(), String> {
     let project = read_axum_project(&target_manifest(target, "axum.toml")?)?;
-    run_cargo(&project, "build", extra_args)
+    run_cargo(&project, "build", extra_args, target.environment_defaults())
 }
 
 fn serve(extra_args: &[String]) -> Result<(), String> {
     let project = locate_project()?;
-    run_cargo(&project, "run", extra_args)
+    run_cargo(&project, "run", extra_args, &[])
 }
 
 fn serve_target(target: &AdapterExecutionTarget, extra_args: &[String]) -> Result<(), String> {
     let project = read_axum_project(&target_manifest(target, "axum.toml")?)?;
-    run_cargo(&project, "run", extra_args)
+    run_cargo(&project, "run", extra_args, target.environment_defaults())
 }
 
 fn target_manifest(target: &AdapterExecutionTarget, name: &str) -> Result<PathBuf, String> {
@@ -469,7 +469,12 @@ fn locate_project() -> Result<AxumProject, String> {
     read_axum_project(&manifest)
 }
 
-fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> Result<(), String> {
+fn cargo_command(
+    project: &AxumProject,
+    subcommand: &str,
+    extra_args: &[String],
+    defaults: &[(String, String)],
+) -> Result<Command, String> {
     let resolution = resolve_subprocess_addr(project)?;
     for warning in &resolution.warnings {
         log::warn!("[edgezero] {warning}");
@@ -498,6 +503,17 @@ fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> 
     // no-op for the child process.
     command.env("EDGEZERO__ADAPTER__HOST", bind_addr.ip().to_string());
     command.env("EDGEZERO__ADAPTER__PORT", bind_addr.port().to_string());
+    command.envs(defaults.iter().map(|(key, value)| (key, value)));
+    Ok(command)
+}
+
+fn run_cargo(
+    project: &AxumProject,
+    subcommand: &str,
+    extra_args: &[String],
+    defaults: &[(String, String)],
+) -> Result<(), String> {
+    let mut command = cargo_command(project, subcommand, extra_args, defaults)?;
     let status = command
         .status()
         .map_err(|err| format!("failed to run cargo {subcommand}: {err}"))?;
@@ -774,6 +790,41 @@ mod tests {
     use edgezero_adapter::cli_support::find_manifest_upwards;
     use std::net::Ipv6Addr;
     use tempfile::tempdir;
+
+    #[test]
+    fn cargo_commands_preserve_ingress_defaults_and_bind_precedence() {
+        let dir = tempdir().unwrap();
+        let project = AxumProject {
+            addr: SocketAddr::from(([127, 0, 0, 1], 8787)),
+            axum_host: None,
+            axum_manifest: dir.path().join("axum.toml"),
+            axum_port: None,
+            cargo_manifest: dir.path().join("Cargo.toml"),
+            crate_dir: dir.path().to_path_buf(),
+            crate_name: "fixture".to_owned(),
+            env_host: None,
+            env_port: None,
+        };
+        let defaults = vec![
+            (
+                "EDGEZERO__ADAPTER__INGRESS__MAX_CONNECTIONS".to_owned(),
+                "3".to_owned(),
+            ),
+            ("EDGEZERO__ADAPTER__PORT".to_owned(), "9090".to_owned()),
+        ];
+        for subcommand in ["build", "run"] {
+            let command = cargo_command(&project, subcommand, &[], &defaults).unwrap();
+            assert!(command.get_envs().any(|(key, value)| key
+                == "EDGEZERO__ADAPTER__INGRESS__MAX_CONNECTIONS"
+                && value.is_some_and(|configured| configured == "3")));
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == "EDGEZERO__ADAPTER__PORT"
+                        && value.is_some_and(|configured| configured == "9090"))
+            );
+        }
+    }
 
     #[test]
     fn adapter_capability_matrix_matches_contracts() {

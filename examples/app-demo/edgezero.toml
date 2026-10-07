@@ -198,6 +198,27 @@ name = "API_BASE_URL"
 description = "Base URL for upstream API calls"
 env = "API_BASE_URL"
 
+# Native pre-admission HTTP/1 resource limits; parent environment values win.
+[[environment.variables]]
+name = "EDGEZERO__ADAPTER__INGRESS__MAX_CONNECTIONS"
+value = "256"
+adapters = ["axum"]
+
+[[environment.variables]]
+name = "EDGEZERO__ADAPTER__INGRESS__MAX_RAW_HEAD_BYTES"
+value = "65536"
+adapters = ["axum"]
+
+[[environment.variables]]
+name = "EDGEZERO__ADAPTER__INGRESS__MAX_HEADER_COUNT"
+value = "100"
+adapters = ["axum"]
+
+[[environment.variables]]
+name = "EDGEZERO__ADAPTER__INGRESS__HEAD_READ_TIMEOUT_MS"
+value = "10000"
+adapters = ["axum"]
+
 # [[environment.secrets]]
 # name = "API_TOKEN"
 # description = "Secret token used when calling the upstream API"

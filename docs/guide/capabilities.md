@@ -101,6 +101,13 @@ information they receive, but those checks do not prove parser-boundary accounti
 ambiguous HTTP/1 framing rejection. Neither raw-ingress capability is currently available on
 any adapter.
 
+Axum additionally enforces a finite adapter-owned HTTP/1 connection pool, combined raw-head
+byte and field-count limits, and absolute idle-plus-header timeouts before admission. Its
+[bounded HTTP/1 ingress configuration](/guide/adapters/axum#bounded-http1-ingress) publishes the
+effective limits, accept-loop overshoot, parser storage assumptions, and response-header cache
+safety policy. These controls do not supply independent raw-target/field-section accounting or
+the strict framing policy, so they do not promote either raw-ingress capability above.
+
 Admission is body-blind. An application may opt into `ReadBodyBeforeFallback` for pre-resolved
 404/405 requests when it needs body-limit precedence: clean EOF at or below the selected cap
 retains the canonical 404/405, the first byte over returns the application-selected buffered

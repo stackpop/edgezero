@@ -80,6 +80,135 @@ cargo build -p my-app-adapter-axum --release
 
 The binary is placed in `target/release/my-app-adapter-axum`.
 
+## Bounded HTTP/1 Ingress
+
+The standard server entrypoints own a bounded pool of HTTP/1 connections. These limits apply
+before application admission, including to sockets that never finish a request head. No custom
+listener or router is needed. HTTP/2 is not enabled, and protocol upgrades cannot transfer the
+socket out of this pool.
+
+`run_app` resolves these runtime variables once, before application configuration or binding:
+
+| Variable (`EDGEZERO__ADAPTER__INGRESS__` prefix) | Default | Supported range |
+| ------------------------------------------------ | ------- | --------------- |
+| `MAX_CONNECTIONS`                                | 256     | 1–4096          |
+| `MAX_RAW_HEAD_BYTES`                             | 65536   | 8192–1048576    |
+| `MAX_HEADER_COUNT`                               | 100     | 1–1024          |
+| `HEAD_READ_TIMEOUT_MS`                           | 10000   | 1–120000        |
+
+Only missing settings use defaults. Explicit values must be unsigned decimal integers within
+the supported ranges; empty, signed, malformed, overflowing, and zero values fail startup.
+Diagnostics identify the setting, never its supplied value. The effective validated
+`AxumIngressConfig` is logged at `Info`. Applications can resolve the same configuration with
+`AxumIngressConfig::from_env(&EnvConfig::from_env())` and inspect its getters. Programmatic
+servers install the validated value in `AxumDevServerConfig::ingress`:
+
+```rust
+use std::time::Duration;
+use edgezero_adapter_axum::{ingress_config::AxumIngressConfig, dev_server::AxumDevServerConfig};
+
+let config = AxumDevServerConfig {
+    ingress: AxumIngressConfig::new(64, 16384, 64, Duration::from_secs(5))?,
+    ..AxumDevServerConfig::default()
+};
+```
+
+Manifest defaults can be supplied through adapter-filtered `[[environment.variables]]` entries.
+The Axum CLI forwards the selected manifest's defaults to its Cargo child without mutating the
+parent environment. An existing parent variable, including an empty one, takes precedence;
+duplicate applicable defaults retain declaration order, with the last taking precedence.
+Running the binary directly requires setting the runtime variables directly.
+
+### Connection Ownership And Deadlines
+
+Let `C` be `max_connections()`. At most `C` connection futures own parser state, sockets, and
+application work, including keep-alive connections. There is no per-connection spawned task or
+permit-waiter queue. The accept loop may own **one additional transient accepted socket**; if
+capacity is exhausted it closes that socket immediately, without a parser, response, or
+background task. Completed connections are reaped before accepting more work. Disconnect,
+parser failure, timeout, cancellation, and shutdown drop the single connection owner and release
+capacity; unwinding handler failures are isolated to their connection. Shutdown closes the
+owned connections rather than waiting indefinitely for a graceful drain.
+
+The first absolute idle-plus-header deadline starts when the accepted socket enters the pool,
+before its future is first polled. Each subsequent deadline starts when Hyper first polls the
+next request head after the previous exchange permits it. Idle keep-alive time and incomplete-head
+time share this budget; a byte arriving does **not** reset it. Pipelined bytes may already be
+buffered, so this is not a deadline starting at the network arrival of each pipelined request.
+An independent timer wakes without incoming data, and ready I/O and completed heads also check
+expiry before admission. Equality is expired. Slow/trickled or idle connections close when the
+deadline expires; an HTTP timeout response is not promised.
+
+After a complete head is accepted, the header clock is disarmed for application work. Existing
+application body-read and response-write deadlines remain in force. Infrastructure timers use
+the native Tokio monotonic clock, independently of an application's injectable clock, so a
+frozen application clock cannot disable pre-admission expiry. These timers are cooperatively
+scheduled: blocking application code can delay all work on the connection executor.
+
+### Wire Limits And Parser Storage
+
+Let `H = max_raw_head_bytes()` and `N = max_header_count()`. The pinned Hyper 1.12.0 parser
+rejects a complete raw head above `H` bytes or above `N` field lines **before** constructing an
+admitted request. The byte budget includes the entire request line, field names, colons,
+whitespace, line endings, and the final empty line. Duplicate field lines count separately.
+Request-line and header bytes share one combined budget, not independent allowances. Exactly
+`H` bytes and `N` fields pass the size/count checks; other protocol, type, or application validation
+can still reject an in-budget head. Hyper additionally limits request targets to 65534 bytes
+(414). Overflow closes the connection and Hyper attempts a bounded 431 response; other malformed
+syntax may receive a bounded 400 response. Expiry or disconnect can prevent response delivery.
+Application admission and rendering hooks do not run for raw parser rejections.
+
+`parser_buffer_bytes()` is Hyper's logical threshold `H`, **not** a hard allocation ceiling.
+The receive scratch audit pins Hyper 1.12.0, bytes 1.12.1, http 1.4.2, and Rust 1.95.0:
+
+- `parser_read_allocation_bytes()` reports the conservative requested-capacity bound `R = 4H`
+  for each receive backing allocation. Adaptive reads expose spare capacity and shared-buffer
+  splits can cause a larger replacement allocation than the logical threshold.
+- `parser_trailer_allocation_bytes()` reports `T = next_power_of_two(H)` for the separate raw
+  chunked-trailer buffer. Hyper applies its byte budget separately to trailers, whose completed
+  raw field section must be **strictly smaller** than `H`; this is not a combined head-plus-trailer
+  allowance. The trailer field count remains at most `N`.
+- Conservative simultaneous receive scratch, including an outstanding channel frame, replacement
+  allocation, raw trailer growth, and copied field bytes, is `3R + 2T + H`, **plus** parser/header
+  metadata, URI/method storage, and fixed connection state. These are requested capacities, not
+  allocator-resident bytes or a complete per-request memory certificate.
+- `parser_header_map_allocation_bytes()` reports `M`, a conservative per-map requested-capacity
+  charge covering both ordinary and adversarial collision-driven growth, duplicate-value storage,
+  and capacity retained across clear/reuse. For `P = max(100, N) + 1`, raw index capacity is bounded
+  by the largest power of two at most `10P`, bucket capacity by three quarters of that number,
+  and duplicate capacity by `next_power_of_two(max(4, P - 1))`. The getter uses public header-type
+  sizes plus conservative machine-word padding for private map nodes. Charge up to `1.5M` for
+  one map's reallocating peak, or `3.5M` for overlapping request, response/cache, and trailer maps.
+  An application-retained request map or admission's temporary header clone is an additional
+  owner, not included in those three maps.
+- Raw parse workspaces additionally retain the default 100-field inline arrays and, above that,
+  bounded heap arrays. On 64-bit native builds a conservative payload charge for these two
+  workspaces is `64 * max(100, N)` bytes, plus their fixed container state. Parsed URI/method data
+  and field-name/value backing bytes are separate charges bounded by the raw input sizes.
+
+Response header maps become reusable request-parser storage in Hyper. Before handoff, EdgeZero
+therefore bounds application response fields to `max_response_header_count() = max(100, N)`
+and `max_response_header_bytes() = H`. Field-byte accounting is the sum of name bytes, value
+bytes, and four bytes per field (`: ` and CRLF), including duplicates. EdgeZero copies the map
+and field data into fresh storage, discarding application-supplied spare capacity and large
+shared backing buffers; duplicate values and sensitive flags are preserved. Custom Hyper
+reason phrases are removed in favor of canonical status phrases. Hyper's own status line,
+framing, connection, and date fields need additional fixed overhead. An oversized response head
+closes the connection and reports a transport error to any active egress attempt; it does not
+allocate a replacement error response.
+
+The pool bounds retention of receive scratch, parser-generated error responses, and parser
+metadata, not arbitrary application allocations. A budget must additionally charge parsed
+request/response metadata and copies, application-held body frames, response buffers, handler
+state, stores, outbound exchanges, and allocator overhead. Kernel socket buffers, the OS listen
+backlog, and resources outside EdgeZero are excluded. The connection bound is not a published
+platform memory ceiling or a whole-process RSS guarantee.
+
+This combined HTTP/1 resource policy does not implement the stricter independent raw-target /
+field-section accounting or raw framing-rejection policy. Admission still receives
+`IngressHeadAccounting::HostManaged` and `IngressFraming::HostManaged`; both raw-ingress
+capabilities remain `Unsupported`. See [Capabilities](/guide/capabilities).
+
 ## Outbound HTTP
 
 The Axum adapter injects `AxumOutboundClient`, backed by `reqwest`. Application handlers use the
@@ -249,7 +378,7 @@ server to authenticate against.
 Build and deploy as a standard container:
 
 ```dockerfile
-FROM rust:1.75 as builder
+FROM rust:1.95.0 as builder
 WORKDIR /app
 COPY . .
 RUN cargo build -p my-app-adapter-axum --release
@@ -287,14 +416,14 @@ A typical development workflow:
 
 ## Differences from Edge Adapters
 
-| Aspect      | Axum           | Fastly/Cloudflare |
-| ----------- | -------------- | ----------------- |
-| Compilation | Native         | Wasm              |
-| Cold start  | ~0ms           | ~0ms (Wasm)       |
-| Memory      | Unlimited      | 128MB typical     |
-| Filesystem  | Full access    | Sandboxed         |
-| Network     | Direct         | Backend/fetch     |
-| Concurrency | Multi-threaded | Single-threaded   |
+| Aspect      | Axum                            | Fastly/Cloudflare |
+| ----------- | ------------------------------- | ----------------- |
+| Compilation | Native                          | Wasm              |
+| Cold start  | ~0ms                            | ~0ms (Wasm)       |
+| Memory      | Operator configured             | Provider quota    |
+| Filesystem  | Full access                     | Sandboxed         |
+| Network     | Direct                          | Backend/fetch     |
+| Concurrency | Bounded, connection-local async | Runtime dependent |
 
 ::: tip Development Parity
 While Axum provides a convenient development environment, always test on actual edge platforms before deploying. Provider-specific behaviour such as store backends and request context differs on the real targets.
