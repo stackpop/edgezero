@@ -290,6 +290,67 @@ impl EdgeError {
         }
     }
 
+    pub(crate) fn into_response_with_message(
+        self,
+        fixed_message: Option<&'static str>,
+    ) -> Result<Response, EdgeError> {
+        let required_headers = self.required_response_headers()?;
+        let kind = self.kind();
+        // `ConfigOutOfDate { field_path: String::new(), .. }` (the missing-blob
+        // path) must OMIT the `field_path` JSON key entirely, not emit
+        // `"field_path": ""`. Per spec 6.3.1.
+        let field_path_opt: Option<&str> = match &self {
+            EdgeError::ConfigOutOfDate { field_path, .. } if !field_path.is_empty() => {
+                Some(field_path.as_str())
+            }
+            EdgeError::StoreExtraction {
+                field_path: Some(field_path),
+                ..
+            } => Some(field_path.as_str()),
+            EdgeError::PayloadTooLarge { .. }
+            | EdgeError::BadGateway { .. }
+            | EdgeError::BadRequest { .. }
+            | EdgeError::ConfigOutOfDate { .. }
+            | EdgeError::GatewayTimeout { .. }
+            | EdgeError::Internal { .. }
+            | EdgeError::MethodNotAllowed { .. }
+            | EdgeError::NotFound { .. }
+            | EdgeError::NotImplemented { .. }
+            | EdgeError::RequestHeaderFieldsTooLarge { .. }
+            | EdgeError::RequestTimeout { .. }
+            | EdgeError::ResponseTooLarge { .. }
+            | EdgeError::ServiceUnavailable { .. }
+            | EdgeError::StoreExtraction { .. }
+            | EdgeError::UriTooLong { .. }
+            | EdgeError::Validation { .. } => None,
+        };
+        let status = self.status();
+        let message = fixed_message.map_or_else(|| self.wire_message(), str::to_owned);
+
+        let mut payload = json!({
+            "error": {
+                "status": status.as_u16(),
+                "kind": kind,
+                "message": message,
+            },
+        });
+        if let Some(field_path) = field_path_opt
+            && let Some(error_obj) = payload
+                .get_mut("error")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            error_obj.insert("field_path".into(), json!(field_path));
+        }
+
+        let body = json_or_text(&payload);
+        let mut response = response_with_body(status, body)?;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        response.headers_mut().extend(required_headers);
+        Ok(response)
+    }
+
     /// Returns the stable public category without provider or application diagnostics.
     #[must_use]
     #[inline]
@@ -572,61 +633,7 @@ impl From<ConfigStoreError> for EdgeError {
 impl IntoResponse for EdgeError {
     #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
-        let required_headers = self.required_response_headers()?;
-        let kind = self.kind();
-        // `ConfigOutOfDate { field_path: String::new(), .. }` (the missing-blob
-        // path) must OMIT the `field_path` JSON key entirely, not emit
-        // `"field_path": ""`. Per spec 6.3.1.
-        let field_path_opt: Option<&str> = match &self {
-            EdgeError::ConfigOutOfDate { field_path, .. } if !field_path.is_empty() => {
-                Some(field_path.as_str())
-            }
-            EdgeError::StoreExtraction {
-                field_path: Some(field_path),
-                ..
-            } => Some(field_path.as_str()),
-            EdgeError::PayloadTooLarge { .. }
-            | EdgeError::BadGateway { .. }
-            | EdgeError::BadRequest { .. }
-            | EdgeError::ConfigOutOfDate { .. }
-            | EdgeError::GatewayTimeout { .. }
-            | EdgeError::Internal { .. }
-            | EdgeError::MethodNotAllowed { .. }
-            | EdgeError::NotFound { .. }
-            | EdgeError::NotImplemented { .. }
-            | EdgeError::RequestHeaderFieldsTooLarge { .. }
-            | EdgeError::RequestTimeout { .. }
-            | EdgeError::ResponseTooLarge { .. }
-            | EdgeError::ServiceUnavailable { .. }
-            | EdgeError::StoreExtraction { .. }
-            | EdgeError::UriTooLong { .. }
-            | EdgeError::Validation { .. } => None,
-        };
-        let status = self.status();
-        let message = self.wire_message();
-
-        let mut payload = json!({
-            "error": {
-                "status": status.as_u16(),
-                "kind": kind,
-                "message": message,
-            },
-        });
-        if let Some(field_path) = field_path_opt
-            && let Some(error_obj) = payload
-                .get_mut("error")
-                .and_then(serde_json::Value::as_object_mut)
-        {
-            error_obj.insert("field_path".into(), json!(field_path));
-        }
-
-        let body = json_or_text(&payload);
-        let mut response = response_with_body(status, body)?;
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        response.headers_mut().extend(required_headers);
-        Ok(response)
+        self.into_response_with_message(None)
     }
 }
 

@@ -50,6 +50,10 @@ export default defineConfig({
           { text: 'Cloudflare Workers', link: '/guide/adapters/cloudflare' },
           { text: 'Fermyon Spin', link: '/guide/adapters/spin' },
           { text: 'Axum (Native)', link: '/guide/adapters/axum' },
+          {
+            text: 'Axum diagnostics and trusted proxies',
+            link: '/guide/axum-diagnostics',
+          },
         ],
       },
       {

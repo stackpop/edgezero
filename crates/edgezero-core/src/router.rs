@@ -14,6 +14,30 @@ use crate::introspection::{ManifestJson, RouteTable};
 use crate::middleware::{BoxMiddleware, Middleware, Next};
 use crate::params::PathParams;
 use crate::response::IntoResponse as _;
+use crate::response_egress::{ResponseEgressFailureClassification, ResponseEgressFailureKind};
+
+pub(crate) enum RouteErrorKind {
+    MethodNotAllowed,
+    NotFound,
+}
+
+pub(crate) struct DispatchOutcome {
+    failure: Option<ResponseEgressFailureClassification>,
+    response: Result<Response, EdgeError>,
+    route_error: Option<RouteErrorKind>,
+}
+
+impl DispatchOutcome {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Result<Response, EdgeError>,
+        Option<RouteErrorKind>,
+        Option<ResponseEgressFailureClassification>,
+    ) {
+        (self.response, self.route_error, self.failure)
+    }
+}
 
 struct RouteEntry {
     handler: BoxHandler,
@@ -488,44 +512,72 @@ impl RouterService {
         request: Request,
         ingress: AdmittedIngress,
     ) -> Result<Response, EdgeError> {
-        if !Arc::ptr_eq(&self.inner, &resolved.owner) {
-            return Err(EdgeError::internal(anyhow::anyhow!(
-                "resolved dispatch token belongs to another router"
-            )));
-        }
-        if request.method() != resolved.method || request.uri().path() != resolved.path {
-            return Err(EdgeError::internal(anyhow::anyhow!(
-                "request method or path changed after ingress route resolution"
-            )));
-        }
+        self.dispatch_resolved_outcome(resolved, request, ingress)
+            .await
+            .response
+    }
 
-        match resolved.target {
-            ResolvedTarget::Found(entry, params) => {
-                if ingress.is_fallback() {
-                    return Err(EdgeError::internal(anyhow::anyhow!(
-                        "fallback body policy cannot dispatch a matched route"
-                    )));
-                }
-                self.inner
-                    .dispatch_found(request, &entry, params, Some(ingress))
-                    .await
+    pub(crate) async fn dispatch_resolved_outcome(
+        &self,
+        resolved: ResolvedDispatch,
+        request: Request,
+        ingress: AdmittedIngress,
+    ) -> DispatchOutcome {
+        let mut route_error = None;
+        let mut failure = None;
+        let response = async {
+            if !Arc::ptr_eq(&self.inner, &resolved.owner) {
+                return Err(EdgeError::internal(anyhow::anyhow!(
+                    "resolved dispatch token belongs to another router"
+                )));
             }
-            ResolvedTarget::MethodNotAllowed(allowed) => {
-                if let Some(response) = fallback_terminal_response(request, ingress).await? {
-                    return Ok(response);
-                }
-                let methods = allowed
-                    .iter()
-                    .map(|metadata| metadata.method().clone())
-                    .collect::<Vec<_>>();
-                Err(EdgeError::method_not_allowed(&resolved.method, &methods))
+            if request.method() != resolved.method || request.uri().path() != resolved.path {
+                return Err(EdgeError::internal(anyhow::anyhow!(
+                    "request method or path changed after ingress route resolution"
+                )));
             }
-            ResolvedTarget::NotFound => {
-                if let Some(response) = fallback_terminal_response(request, ingress).await? {
-                    return Ok(response);
+            match resolved.target {
+                ResolvedTarget::Found(entry, params) => {
+                    if ingress.is_fallback() {
+                        return Err(EdgeError::internal(anyhow::anyhow!(
+                            "fallback body policy cannot dispatch a matched route"
+                        )));
+                    }
+                    self.inner
+                        .dispatch_found(request, &entry, params, Some(ingress))
+                        .await
                 }
-                Err(EdgeError::not_found(resolved.path))
+                ResolvedTarget::MethodNotAllowed(allowed) => {
+                    if let Some((response, category)) =
+                        fallback_terminal_response(request, ingress).await?
+                    {
+                        failure = Some(category);
+                        return Ok(response);
+                    }
+                    let methods = allowed
+                        .iter()
+                        .map(|metadata| metadata.method().clone())
+                        .collect::<Vec<_>>();
+                    route_error = Some(RouteErrorKind::MethodNotAllowed);
+                    Err(EdgeError::method_not_allowed(&resolved.method, &methods))
+                }
+                ResolvedTarget::NotFound => {
+                    if let Some((response, category)) =
+                        fallback_terminal_response(request, ingress).await?
+                    {
+                        failure = Some(category);
+                        return Ok(response);
+                    }
+                    route_error = Some(RouteErrorKind::NotFound);
+                    Err(EdgeError::not_found(resolved.path))
+                }
             }
+        }
+        .await;
+        DispatchOutcome {
+            failure,
+            response,
+            route_error,
         }
     }
 
@@ -605,7 +657,7 @@ impl RouterService {
 async fn fallback_terminal_response(
     request: Request,
     ingress: AdmittedIngress,
-) -> Result<Option<Response>, EdgeError> {
+) -> Result<Option<(Response, ResponseEgressFailureClassification)>, EdgeError> {
     let Some(fallback) = ingress.into_fallback() else {
         return Ok(None);
     };
@@ -622,8 +674,18 @@ async fn fallback_terminal_response(
 
     match outcome? {
         FallbackDrainOutcome::Complete => Ok(None),
-        FallbackDrainOutcome::Exceeded => Ok(Some(on_exceeded.into_response())),
-        FallbackDrainOutcome::TimedOut => Ok(Some(on_timeout.into_response())),
+        FallbackDrainOutcome::Exceeded => Ok(Some((
+            on_exceeded.into_response(),
+            ResponseEgressFailureClassification::fallback(
+                ResponseEgressFailureKind::FallbackBodyExceeded,
+            ),
+        ))),
+        FallbackDrainOutcome::TimedOut => Ok(Some((
+            on_timeout.into_response(),
+            ResponseEgressFailureClassification::fallback(
+                ResponseEgressFailureKind::FallbackReadTimedOut,
+            ),
+        ))),
     }
 }
 

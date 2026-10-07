@@ -15,13 +15,16 @@ use std::future::Future;
 #[cfg(test)]
 use std::iter;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr as _;
 use std::sync::Arc;
 
+use crate::diagnostics::{NativeDiagnosticsHandle, NativeSession};
+use crate::proxy::TrustedProxyPolicy;
 pub use crate::run_options::AxumRunOptions;
-use crate::run_options::{JsonBodyLimit, failure, shutdown_grace};
+use crate::run_options::{JsonBodyLimit, failure, native_settings, shutdown_grace};
 use anyhow::Context as _;
 use edgezero_core::probe::LifecyclePhase;
 use std::time::Duration;
@@ -45,7 +48,7 @@ use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
-use log::LevelFilter;
+use log::{Level, LevelFilter};
 use simple_logger::SimpleLogger;
 
 use std::collections::BTreeMap;
@@ -136,6 +139,7 @@ struct Stores {
 pub struct AxumDevServer {
     config: AxumDevServerConfig,
     json_body_limit: JsonBodyLimit,
+    native: NativeHosting,
     router: RouterService,
     stores: Stores,
 }
@@ -147,6 +151,7 @@ impl AxumDevServer {
         Self {
             config: AxumDevServerConfig::default(),
             json_body_limit: JsonBodyLimit::DEFAULT,
+            native: NativeHosting::default(),
             router,
             stores: Stores::default(),
         }
@@ -161,14 +166,39 @@ impl AxumDevServer {
             config,
             stores,
             json_body_limit,
+            native,
         } = self;
         run_local(
             ListenerSource::Bind(config.addr),
             config.enable_ctrl_c,
             Duration::from_secs(10),
             future::pending::<()>(),
-            async move { prepare_transport(App::new(router), stores.into(), json_body_limit) },
+            async move { prepare_transport(App::new(router), stores.into(), json_body_limit, native) },
         )
+    }
+
+    /// Uses an explicit incoming-proxy policy, ignoring ambient proxy settings.
+    #[must_use]
+    #[inline]
+    pub fn with_trusted_proxy_policy(mut self, policy: TrustedProxyPolicy) -> Self {
+        self.native.policy = policy;
+        self
+    }
+
+    /// Controls only default request records, not observers or counters.
+    #[must_use]
+    #[inline]
+    pub fn with_request_records(mut self, enabled: bool) -> Self {
+        self.native.request_records = enabled;
+        self
+    }
+
+    /// Shares managed counters and the optional native observer with the runner.
+    #[must_use]
+    #[inline]
+    pub fn with_diagnostics(mut self, diagnostics: NativeDiagnosticsHandle) -> Self {
+        self.native.diagnostics = diagnostics;
+        self
     }
 
     #[cfg(test)]
@@ -178,6 +208,7 @@ impl AxumDevServer {
             config,
             stores,
             json_body_limit,
+            native,
         } = self;
         serve_with_stores(
             App::new(router),
@@ -185,6 +216,7 @@ impl AxumDevServer {
             config.enable_ctrl_c,
             stores,
             json_body_limit,
+            native,
         )
         .await
     }
@@ -195,6 +227,7 @@ impl AxumDevServer {
         Self {
             config,
             json_body_limit: JsonBodyLimit::DEFAULT,
+            native: NativeHosting::default(),
             router,
             stores: Stores::default(),
         }
@@ -379,6 +412,7 @@ async fn serve_with_stores(
     enable_ctrl_c: bool,
     stores: Stores,
     json_body_limit: JsonBodyLimit,
+    native: NativeHosting,
 ) -> anyhow::Result<()> {
     struct ShutdownOnDrop(Option<ShutdownSender<()>>);
 
@@ -402,6 +436,7 @@ async fn serve_with_stores(
             enable_ctrl_c,
             stores,
             json_body_limit,
+            native,
             shutdown_receiver,
         )
     });
@@ -417,6 +452,7 @@ fn serve_local(
     enable_ctrl_c: bool,
     stores: Stores,
     json_body_limit: JsonBodyLimit,
+    native: NativeHosting,
     shutdown_receiver: ShutdownReceiver<()>,
 ) -> anyhow::Result<()> {
     run_local(
@@ -426,11 +462,34 @@ fn serve_local(
         async move {
             let _closed = shutdown_receiver.await;
         },
-        async move { prepare_transport(app, stores.into(), json_body_limit) },
+        async move { prepare_transport(app, stores.into(), json_body_limit, native) },
     )
 }
 
-type PreparedApp = (App, PreparedStores, Arc<reqwest::Client>, JsonBodyLimit);
+#[derive(Clone, Debug)]
+struct NativeHosting {
+    diagnostics: NativeDiagnosticsHandle,
+    policy: TrustedProxyPolicy,
+    request_records: bool,
+}
+
+impl Default for NativeHosting {
+    fn default() -> Self {
+        Self {
+            diagnostics: NativeDiagnosticsHandle::new(),
+            policy: TrustedProxyPolicy::no_trust(),
+            request_records: true,
+        }
+    }
+}
+
+type PreparedApp = (
+    App,
+    PreparedStores,
+    Arc<reqwest::Client>,
+    JsonBodyLimit,
+    NativeHosting,
+);
 
 enum ListenerSource {
     Bind(SocketAddr),
@@ -463,10 +522,11 @@ fn prepare_transport(
     app: App,
     stores: PreparedStores,
     json_body_limit: JsonBodyLimit,
+    native: NativeHosting,
 ) -> anyhow::Result<PreparedApp> {
     let transport = AxumOutboundClient::try_transport()
         .map_err(|_error| failure("transport", "HTTP client", "initialization failed"))?;
-    Ok((app, stores, transport, json_body_limit))
+    Ok((app, stores, transport, json_body_limit, native))
 }
 
 struct Signals {
@@ -545,13 +605,39 @@ where
     let runtime = RuntimeBuilder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|_error| failure("runtime", "local runner", "creation failed"))?;
+        .map_err(|_error| {
+            log_native_lifecycle(
+                LifecyclePhase::Starting,
+                "runtime_creation_failed",
+                grace,
+                true,
+            );
+            failure("runtime", "local runner", "creation failed")
+        })?;
     let local = LocalSet::new();
     runtime.block_on(local.run_until(async move {
-        let mut signals = Signals::register(enable_signals)?;
+        let mut signals = Signals::register(enable_signals).inspect_err(|_error| {
+            log_native_lifecycle(
+                LifecyclePhase::Starting,
+                "signal_registration_failed",
+                grace,
+                true,
+            );
+        })?;
         let (phase, reader) = watch::channel(LifecyclePhase::Starting);
+        log_native_lifecycle(LifecyclePhase::Starting, "starting", grace, false);
         let result = run_owned(listener, grace, stop, prepare, &mut signals, &phase, reader).await;
         phase.send_replace(LifecyclePhase::Stopped);
+        log_native_lifecycle(
+            LifecyclePhase::Stopped,
+            if result.is_ok() {
+                "stopped"
+            } else {
+                "runner_failed"
+            },
+            grace,
+            result.is_err(),
+        );
         result
     }))
 }
@@ -580,17 +666,21 @@ where
         signal = next_signal(signals) => {
             signal?;
             phase.send_replace(LifecyclePhase::Draining);
+            log_native_lifecycle(LifecyclePhase::Draining, "signal_stop", grace, false);
             return Ok(());
         }
         () = &mut stop => {
             phase.send_replace(LifecyclePhase::Draining);
+            log_native_lifecycle(LifecyclePhase::Draining, "stop_requested", grace, false);
             return Ok(());
         }
-        prepared = &mut prepare => prepared?,
+        prepared = &mut prepare => prepared.inspect_err(|_error| log_native_lifecycle(LifecyclePhase::Starting, "startup_failed", grace, true))?,
     };
-    let (app, stores, transport, json_body_limit) = prepared;
-    let mut service = AxumServiceState::with_transport(app, transport, json_body_limit)
-        .with_phase(reader.clone());
+    let (app, stores, transport, json_body_limit, native) = prepared;
+    let session = NativeSession::new(native.diagnostics, native.request_records)?;
+    let mut service =
+        AxumServiceState::with_transport(app, transport, json_body_limit, session, native.policy)
+            .with_phase(reader.clone());
     if let Some(registry) = stores.config {
         service = service.with_config_registry(registry);
     }
@@ -603,12 +693,12 @@ where
     // Give stop observation another poll before bind/adoption and readiness.
     let listener = tokio::select! {
         biased;
-        signal = next_signal(signals) => { signal?; phase.send_replace(LifecyclePhase::Draining); return Ok(()); }
-        () = &mut stop => { phase.send_replace(LifecyclePhase::Draining); return Ok(()); }
+        signal = next_signal(signals) => { signal?; phase.send_replace(LifecyclePhase::Draining); log_native_lifecycle(LifecyclePhase::Draining, "signal_stop", grace, false); return Ok(()); }
+        () = &mut stop => { phase.send_replace(LifecyclePhase::Draining); log_native_lifecycle(LifecyclePhase::Draining, "stop_requested", grace, false); return Ok(()); }
         result = async { yield_now().await; adopt_listener(listener_source) } => result?,
     };
     phase.send_replace(LifecyclePhase::Ready);
-    log::info!("[edgezero] native server ready");
+    log_native_lifecycle(LifecyclePhase::Ready, "ready", grace, false);
     let mut tasks = JoinSet::new();
     let mut outcome = Ok(());
     loop {
@@ -626,9 +716,12 @@ where
                 match accepted {
                     Ok((stream, remote_addr)) => {
                         let responses = EgressConnection::default();
-                        let connection_service = service.for_connection(remote_addr, responses.clone());
+                        // Own the guard before submission, including unpolled cancellation.
+                        let (activity, connection_guard) = service.connection_activity();
+                        let connection_service = service.for_connection(remote_addr, responses.clone()).with_activity(activity);
                         let connection_phase = reader.clone();
                         tasks.spawn_local(async move {
+                            let _connection_guard = connection_guard;
                             if serve_http1_with_shutdown(stream, connection_service, responses, Some(connection_phase)).await.is_err() {
                                 log::debug!("axum HTTP/1 connection closed");
                             }
@@ -643,6 +736,16 @@ where
         }
     }
     phase.send_replace(LifecyclePhase::Draining);
+    log_native_lifecycle(
+        LifecyclePhase::Draining,
+        if outcome.is_ok() {
+            "drain_requested"
+        } else {
+            "runner_failed"
+        },
+        grace,
+        outcome.is_err(),
+    );
     drop(listener);
     let result = drain_tasks(&mut tasks, grace, signals, outcome).await;
     // Service/registry clones are dropped only after every owned connection settles.
@@ -661,6 +764,12 @@ async fn drain_tasks(
     mut outcome: anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let Some(deadline) = NativeInstant::now().checked_add(grace) else {
+        log_native_lifecycle(
+            LifecyclePhase::Draining,
+            "unusable_grace_deadline",
+            grace,
+            true,
+        );
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         return Err(failure("shutdown", "budget", "unusable deadline"));
@@ -669,10 +778,12 @@ async fn drain_tasks(
         tokio::select! {
             biased;
             signal = next_signal(signals) => {
+                log_native_lifecycle(LifecyclePhase::Draining, "forced_stop", grace, true);
                 outcome = Err(signal.err().unwrap_or_else(|| failure("shutdown", "signal", "forced stop")));
                 break;
             }
             () = sleep_until(deadline) => {
+                log_native_lifecycle(LifecyclePhase::Draining, "grace_exhausted", grace, true);
                 outcome = Err(failure("shutdown", "budget", "grace exhausted"));
                 break;
             }
@@ -686,6 +797,20 @@ async fn drain_tasks(
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     outcome
+}
+
+fn log_native_lifecycle(phase: LifecyclePhase, reason: &'static str, grace: Duration, fault: bool) {
+    // Callers are private owner branches and pass fixed categories, never returned errors.
+    let phase_name = match phase {
+        LifecyclePhase::Starting => "starting",
+        LifecyclePhase::Ready => "ready",
+        LifecyclePhase::Draining => "draining",
+        LifecyclePhase::Stopped => "stopped",
+    };
+    let level = if fault { Level::Error } else { Level::Info };
+    let _logged = catch_unwind(
+        || log::log!(target: "edgezero::native", level, "event=lifecycle phase={phase_name} reason={reason} grace_ms={}", grace.as_millis()),
+    );
 }
 
 /// Entry point for an Axum dev-server application.
@@ -709,7 +834,7 @@ fn build_app_for_dispatch<A: Hooks>() -> anyhow::Result<App> {
 /// binding, or connection serving fails.
 #[inline]
 pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
-    let (env, json_body_limit) = capture_dev_environment(vars_os())?;
+    let (env, json_body_limit, native) = capture_dev_environment(vars_os())?;
     let grace = shutdown_grace(&env)?;
     let resolution = resolve_addr(&env);
     run_local(
@@ -733,12 +858,12 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
                 config: build_config_registry(metadata.config, &env),
                 secrets: build_secret_registry(metadata.secrets, &env),
             };
-            prepare_transport(app, stores, json_body_limit)
+            prepare_transport(app, stores, json_body_limit, native)
         },
     )
 }
 
-fn capture_dev_environment<I>(vars: I) -> anyhow::Result<(EnvConfig, JsonBodyLimit)>
+fn capture_dev_environment<I>(vars: I) -> anyhow::Result<(EnvConfig, JsonBodyLimit, NativeHosting)>
 where
     I: IntoIterator<Item = (OsString, OsString)>,
 {
@@ -747,24 +872,38 @@ where
         let Some(key) = os_key.to_str() else {
             continue;
         };
-        let recognized = key
-            .strip_prefix("EDGEZERO__")
-            .is_some_and(|path| path.eq_ignore_ascii_case("ADAPTER__JSON_BODY_LIMIT_BYTES"));
-        match os_value.to_str() {
-            Some(value) => pairs.push((key.to_owned(), value.to_owned())),
-            None if recognized => {
-                return Err(failure(
-                    "settings",
-                    "JSON_BODY_LIMIT_BYTES",
-                    "non-Unicode value",
-                ));
-            }
-            None => {}
+        let recognized = key.strip_prefix("EDGEZERO__").and_then(|path| {
+            [
+                ("ADAPTER__JSON_BODY_LIMIT_BYTES", "JSON_BODY_LIMIT_BYTES"),
+                ("ADAPTER__TRUSTED_PROXY_CIDRS", "TRUSTED_PROXY_CIDRS"),
+                (
+                    "ADAPTER__FORWARDING_HEADER_FAMILY",
+                    "FORWARDING_HEADER_FAMILY",
+                ),
+                ("LOGGING__REQUEST_RECORDS", "LOGGING__REQUEST_RECORDS"),
+            ]
+            .into_iter()
+            .find(|(candidate, _)| path.eq_ignore_ascii_case(candidate))
+            .map(|(_, setting)| setting)
+        });
+        match (os_value.to_str(), recognized) {
+            (Some(value), _) => pairs.push((key.to_owned(), value.to_owned())),
+            (None, Some(setting)) => return Err(failure("settings", setting, "non-Unicode value")),
+            (None, None) => {}
         }
     }
     let env = EnvConfig::from_vars(pairs);
     let limit = JsonBodyLimit::from_config(&env)?;
-    Ok((env, limit))
+    let (policy, request_records) = native_settings(&env)?;
+    Ok((
+        env,
+        limit,
+        NativeHosting {
+            policy,
+            request_records,
+            diagnostics: NativeDiagnosticsHandle::new(),
+        },
+    ))
 }
 
 fn init_logging<A: Hooks>(level: LevelFilter) {
@@ -890,7 +1029,17 @@ where
                 );
                 failure("initializer", "application", &category)
             })?;
-            Ok((app, stores, transport, options.json_body_limit()))
+            Ok((
+                app,
+                stores,
+                transport,
+                options.json_body_limit(),
+                NativeHosting {
+                    diagnostics: options.diagnostics(),
+                    policy: options.trusted_proxy_policy(),
+                    request_records: options.request_records(),
+                },
+            ))
         },
     )
 }
@@ -1242,7 +1391,7 @@ mod tests {
 
     #[test]
     fn json_limit_development_capture_and_explicit_router_builder() {
-        let (env, selected) = capture_dev_environment([
+        let (env, selected, _native) = capture_dev_environment([
             (
                 OsString::from("EDGEZERO__ADAPTER__HOST"),
                 OsString::from("invalid-host"),
@@ -1265,6 +1414,7 @@ mod tests {
             App::new(explicit.router),
             explicit.stores.into(),
             explicit.json_body_limit,
+            explicit.native,
         )
         .expect("prepared transport");
         assert_eq!(prepared.3.get().get(), 64);
@@ -1280,7 +1430,7 @@ mod tests {
     fn development_capture_skips_unrelated_binary_settings_but_rejects_binary_json_limit() {
         use std::os::unix::ffi::OsStringExt as _;
         let binary = OsString::from_vec(vec![0xff]);
-        let (env, selected) = capture_dev_environment([
+        let (env, selected, _native) = capture_dev_environment([
             (binary.clone(), OsString::from("ignored")),
             (OsString::from("UNRELATED"), binary.clone()),
             (OsString::from("EDGEZERO__ADAPTER__HOST"), binary.clone()),
