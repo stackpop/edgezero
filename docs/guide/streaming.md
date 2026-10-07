@@ -46,6 +46,20 @@ Axum uses a connection-local Hyper body, Cloudflare a JavaScript stream writer, 
 `stream_to_client`, and Spin a WASI body writer. See [Capabilities](/guide/capabilities) for the
 exact acceptance and completion boundary on each target.
 
+Application retention does not change this ownership. Every dispatch creates
+fresh admission and response-egress state, even when the same successfully built
+`App` is reused. Keep body sources, native writers, completion resources, and
+pending work request-local rather than storing them in the app cache.
+
+Fastly's `serve_app` and `serve_app_with_hooks` retain an app through
+`lifecycle::Sandbox<App>` while the adapter owns sending and streaming. The hooks
+borrow request/response values; they do not return a native response for the SDK
+to send again. Cloudflare's `dispatch_app::<A>(&app, req, env, ctx)` returns a
+Worker response backed by its request-local coordinator. Spin's
+`dispatch_app::<A>(&app, req)` returns a raw `SpinResponse` whose body and
+transmission lifetime remain owned by the adapter coordinator. None of these
+paths collect the complete response before handoff.
+
 ## Server-Sent Events
 
 Stream events to clients with SSE:
@@ -100,7 +114,7 @@ body-mode = "buffered"  # or "stream"
 
 ## Outbound Response Decompression
 
-The outbound client decodes a single bare `gzip` or `br` content coding through shared
+The outbound client decodes a single bare `gzip`, `deflate`, or `br` content coding through shared
 `edgezero-core` decoders. Unknown, parameterized, or stacked codings pass through unchanged.
 Encoded transport bytes, decoded output, and final buffered bytes have independent limits; see
 [Capabilities](/guide/capabilities#limits-and-accounting).

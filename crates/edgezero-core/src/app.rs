@@ -970,6 +970,12 @@ mod tests {
     }
 
     #[test]
+    fn app_can_be_retained_in_a_shared_owner() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<App>();
+    }
+
+    #[test]
     fn build_app_invokes_hooks_for_routes_and_configuration() {
         let app = App::build::<TestHooks>(PlatformMetadata::default()).expect("configured app");
         assert_eq!(app.name(), "configured");

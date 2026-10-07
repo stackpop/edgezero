@@ -300,6 +300,15 @@ A typical development workflow:
 While Axum provides a convenient development environment, always test on actual edge platforms before deploying. Provider-specific behaviour such as store backends and request context differs on the real targets.
 :::
 
+## Application lifetime
+
+`dev_server::run_app` already constructs one app per server startup and serves
+clones of its router. No additional reuse option is needed. Retained application
+state must support concurrent requests; each request gets its own metadata,
+extensions, and body. Restarting the server creates a fresh app. Native Axum
+measurements are a useful ownership reference but do not establish WASM runtime
+performance or resource lifetimes.
+
 ## Next Steps
 
 - Deploy to [Fastly Compute](/guide/adapters/fastly) for production

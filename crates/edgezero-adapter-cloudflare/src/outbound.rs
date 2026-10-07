@@ -100,29 +100,23 @@ mod worker_impl {
     use async_trait::async_trait;
     use bytes::Bytes;
     use edgezero_core::body::{Body, BodyStream};
-    use edgezero_core::compression::{
-        ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_deflate_stream,
-        decode_gzip_stream,
-    };
     #[cfg(feature = "test-utils")]
     use edgezero_core::error::BudgetSource;
     use edgezero_core::error::{BadGatewayReason, EdgeError};
-    use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HOST};
+    use edgezero_core::http::header::{ACCEPT_ENCODING, HOST};
     use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
     use edgezero_core::outbound::{
-        OutboundBatch, OutboundBatchDriverEvent, OutboundCachePolicy, OutboundHttpClient,
-        OutboundRequest, OutboundRequestParts, OutboundResponse, ResponseBodyDisposition,
-        ResponseHeaderLimiter, ResponseMode, collect_response_stream,
-        enforce_payload_content_length, finish_batch_item, insert_proxy_header,
-        limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
-        normalize_response_headers, rechunk_stream, validate_for_dispatch,
+        OutboundBatch, OutboundCachePolicy, OutboundHttpClient, OutboundRequest,
+        OutboundRequestParts, OutboundResponse, ResponseBodyDisposition, ResponseBodyPolicy,
+        ResponseHeaderLimiter, ResponseMode, apply_response_body_policy, collect_response_stream,
+        insert_proxy_header, normalize_for_dispatch, normalize_response_headers,
+        validate_for_dispatch,
     };
     use edgezero_core::time::{
         Deadline, DispatchBudget, MonotonicClock, MonotonicInstant, dispatch_budget,
     };
     use futures_util::StreamExt as _;
-    use futures_util::future::{Either, FutureExt as _, LocalBoxFuture, poll_fn, select};
-    use futures_util::stream::FuturesUnordered;
+    use futures_util::future::{Either, FutureExt as _, LocalBoxFuture, select};
     use worker::js_sys::{Function, Reflect, Uint8Array, global};
     use worker::wasm_bindgen::closure::Closure;
     use worker::wasm_bindgen::{JsCast as _, JsValue};
@@ -379,7 +373,7 @@ mod worker_impl {
             }
 
             let mut completed = Vec::new();
-            let pending_slots = FuturesUnordered::<LocalBoxFuture<'static, _>>::new();
+            let mut pending_slots = Vec::<LocalBoxFuture<'static, _>>::new();
             for (index, request) in requests.into_iter().enumerate() {
                 match Self::prepare_batch(request, batch_started_at, observation_cutoff) {
                     Ok(prepared) => {
@@ -396,46 +390,13 @@ mod worker_impl {
                 }
             }
 
-            let completions = stream! {
-                let mut pending = pending_slots;
-                poll_fn(|context| {
-                    loop {
-                        match pending.poll_next_unpin(context) {
-                            Poll::Ready(Some(item)) => completed.push(item),
-                            Poll::Ready(None) | Poll::Pending => return Poll::Ready(()),
-                        }
-                    }
-                }).await;
-
-                for (index, completed_at, outcome) in completed {
-                    let Some(item) = finish_batch_item(
-                        index,
-                        batch_started_at,
-                        completed_at,
-                        observation_cutoff,
-                        outcome,
-                    ) else {
-                        yield OutboundBatchDriverEvent::Cutoff;
-                        return;
-                    };
-                    yield OutboundBatchDriverEvent::Item(item);
-                }
-
-                while let Some((index, completed_at, outcome)) = pending.next().await {
-                    let Some(item) = finish_batch_item(
-                        index,
-                        batch_started_at,
-                        completed_at,
-                        observation_cutoff,
-                        outcome,
-                    ) else {
-                        yield OutboundBatchDriverEvent::Cutoff;
-                        return;
-                    };
-                    yield OutboundBatchDriverEvent::Item(item);
-                }
-            };
-            OutboundBatch::from_driver(slot_count, completions)
+            OutboundBatch::from_futures(
+                slot_count,
+                batch_started_at,
+                observation_cutoff,
+                completed,
+                pending_slots,
+            )
         }
     }
 
@@ -528,7 +489,6 @@ mod worker_impl {
 
     #[expect(
         clippy::too_many_arguments,
-        clippy::too_many_lines,
         reason = "the adapter consumes the independent request policy fields without hiding them"
     )]
     async fn process_response(
@@ -607,44 +567,18 @@ mod worker_impl {
         }
 
         let native = response_stream(&mut response)?;
-        let encoding = classify_content_encoding(&headers);
-        let max_buffered = match response_mode {
-            ResponseMode::Buffered { max_bytes } => Some(max_bytes),
-            ResponseMode::Streamed => None,
-        };
-        enforce_payload_content_length(
-            &headers,
-            &encoding,
-            max_buffered,
-            max_decoded_response_bytes,
-            max_encoded_response_bytes,
+        let shaped = apply_response_body_policy(
+            native,
+            &mut headers,
+            ResponseBodyPolicy {
+                max_brotli_window_bits,
+                max_chunk_bytes,
+                max_decoded_response_bytes,
+                max_decoder_bytes,
+                max_encoded_response_bytes,
+                response_mode,
+            },
         )?;
-        let encoded = limit_encoded_stream(native, max_encoded_response_bytes);
-        let decoded = match &encoding {
-            ContentEncoding::Brotli => {
-                decode_brotli_stream(encoded, max_brotli_window_bits, max_decoder_bytes)
-            }
-            ContentEncoding::Deflate => decode_deflate_stream(encoded, max_decoder_bytes),
-            ContentEncoding::Gzip => decode_gzip_stream(encoded, max_decoder_bytes),
-            ContentEncoding::Identity | ContentEncoding::Passthrough(_) => encoded,
-        };
-        if matches!(
-            &encoding,
-            ContentEncoding::Brotli | ContentEncoding::Deflate | ContentEncoding::Gzip
-        ) {
-            headers.remove(CONTENT_ENCODING);
-            headers.remove(CONTENT_LENGTH);
-        }
-        let output = match &encoding {
-            ContentEncoding::Brotli
-            | ContentEncoding::Deflate
-            | ContentEncoding::Gzip
-            | ContentEncoding::Identity => {
-                limit_decoded_stream(decoded, max_decoded_response_bytes)
-            }
-            ContentEncoding::Passthrough(_) => decoded,
-        };
-        let shaped = rechunk_stream(output, max_chunk_bytes);
         let deadline_bound = deadline_stream(shaped, budget, clock, abort_guard);
         let body = match response_mode {
             ResponseMode::Buffered { max_bytes } => {

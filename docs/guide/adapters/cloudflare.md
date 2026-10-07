@@ -86,9 +86,9 @@ pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
 
 This path takes bindings verbatim and does not resolve `EDGEZERO__STORES__*`
 selectors, so prefer `run_app` unless you are mocking a backend.
-`run_app` dispatches through an internal registry-based path; unlike Fastly's
-`dispatch_with_registries`, it is not part of the Cloudflare adapter's public
-API.
+`run_app` delegates to the public `dispatch_app::<A>` registry-aware path.
+Use [application retention](#retaining-an-application) with that function when the
+caller owns a prebuilt app and wants fresh per-request store bindings.
 
 ## Building
 
@@ -330,6 +330,64 @@ Configure the Cloudflare adapter in `edgezero.toml`. See [Configuration](/guide/
 | Storage           | KV, Durable Objects, R2  | KV Store, Object Store              |
 | Logging           | `console.log`            | Log endpoints                       |
 | CLI               | Wrangler                 | Fastly CLI                          |
+
+## Retaining an application
+
+For explicit retention, keep a cache owned by one concrete application and
+select its `Hooks` type with `dispatch_app::<MyApp>` on every fetch:
+
+```rust
+use edgezero_adapter_cloudflare::CLOUDFLARE_PLATFORM;
+use edgezero_core::{app::App, EdgeError};
+use my_app_core::App as MyApp;
+use std::sync::OnceLock;
+
+static APP: OnceLock<App> = OnceLock::new();
+
+fn retained_app() -> Result<&'static App, EdgeError> {
+    if let Some(app) = APP.get() {
+        return Ok(app);
+    }
+    let app = App::build::<MyApp>(CLOUDFLARE_PLATFORM)?;
+    Ok(APP.get_or_init(|| app))
+}
+
+#[worker::event(fetch)]
+async fn fetch(req: worker::Request, env: worker::Env, ctx: worker::Context)
+    -> worker::Result<worker::Response>
+{
+    let app = retained_app().map_err(|_| {
+        worker::Error::RustError("application configuration failed".to_owned())
+    })?;
+    edgezero_adapter_cloudflare::dispatch_app::<MyApp>(app, req, env, ctx).await
+}
+```
+
+Repeated response headers such as multiple `Set-Cookie` values are preserved;
+the first application value replaces any body-generated default. This correction
+also applies to existing `run_app` users.
+
+`dispatch_app::<MyApp>` reads `MyApp::stores()` and does not initialize logging
+or construct an app. Its signature is
+`dispatch_app<A: Hooks>(&App, Request, Env, Context) -> Result<Response, worker::Error>`.
+Pass an app built from the same `Hooks` type with `CLOUDFLARE_PLATFORM`; the caller
+owns logging setup before construction. `App::build` returns `Result<App, EdgeError>`
+and invokes fallible `Hooks::configure` after installing platform metadata.
+Only a complete successful app enters the cache; an initialization error leaves it
+empty for a later attempt. Concurrent construction attempts may build separate
+successful candidates, but only one is retained.
+
+Each invocation resolves fresh configuration, runtime variables, and store
+registries, then runs fresh admission and response egress. Never retain `Env`,
+`Context`, request bodies, admission resources, or delivery coordinators in the
+app cache. Construction is synchronous and must not recursively access the cache
+or block waiting for async initialization. Apps needing async initialization or
+refresh own that state machine and publish only a complete successful snapshot.
+
+Fetch invocations may overlap. Verify isolation while two requests are actually
+in flight in the same instance. A serialized test or two separate instances does
+not establish this property. Restore the existing `run_app` entry point to remove
+explicit retention. The generated default remains unchanged.
 
 ## Next Steps
 

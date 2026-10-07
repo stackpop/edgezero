@@ -187,20 +187,15 @@ mod fastly_impl {
     use async_trait::async_trait;
     use bytes::Bytes;
     use edgezero_core::body::{Body, BodyStream};
-    use edgezero_core::compression::{
-        ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_deflate_stream,
-        decode_gzip_stream,
-    };
     use edgezero_core::error::{BadGatewayReason, EdgeError};
-    use edgezero_core::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH};
+    use edgezero_core::http::header::ACCEPT_ENCODING;
     use edgezero_core::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use edgezero_core::outbound::{
         OutboundBatch, OutboundBatchDriverEvent, OutboundCachePolicy, OutboundHttpClient,
         OutboundRequest, OutboundRequestParts, OutboundResponse, ResponseBodyDisposition,
-        ResponseHeaderLimiter, ResponseMode, collect_response_stream,
-        enforce_payload_content_length, insert_proxy_header, limit_decoded_stream,
-        limit_encoded_stream, normalize_for_dispatch, normalize_response_headers, rechunk_stream,
-        validate_for_dispatch,
+        ResponseBodyPolicy, ResponseHeaderLimiter, ResponseMode, apply_response_body_policy,
+        collect_response_stream, insert_proxy_header, normalize_for_dispatch,
+        normalize_response_headers, validate_for_dispatch,
     };
     use edgezero_core::time::{
         BATCH_DISPATCH_SLACK_MAX, Deadline, DispatchBudget, MonotonicClock, MonotonicInstant,
@@ -986,10 +981,6 @@ mod fastly_impl {
         clippy::too_many_arguments,
         reason = "the adapter consumes independent response-policy fields"
     )]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the response conversion keeps framing, coding, limits, and deadline ownership together"
-    )]
     async fn process_response(
         mut response: FastlyResponse,
         request_method: Method,
@@ -1055,44 +1046,18 @@ mod fastly_impl {
             ));
         }
 
-        let encoding = classify_content_encoding(&headers);
-        let max_buffered = match response_mode {
-            ResponseMode::Buffered { max_bytes } => Some(max_bytes),
-            ResponseMode::Streamed => None,
-        };
-        enforce_payload_content_length(
-            &headers,
-            &encoding,
-            max_buffered,
-            max_decoded_response_bytes,
-            max_encoded_response_bytes,
+        let shaped = apply_response_body_policy(
+            native,
+            &mut headers,
+            ResponseBodyPolicy {
+                max_brotli_window_bits,
+                max_chunk_bytes,
+                max_decoded_response_bytes,
+                max_decoder_bytes,
+                max_encoded_response_bytes,
+                response_mode,
+            },
         )?;
-        let encoded = limit_encoded_stream(native, max_encoded_response_bytes);
-        let decoded = match &encoding {
-            ContentEncoding::Brotli => {
-                decode_brotli_stream(encoded, max_brotli_window_bits, max_decoder_bytes)
-            }
-            ContentEncoding::Deflate => decode_deflate_stream(encoded, max_decoder_bytes),
-            ContentEncoding::Gzip => decode_gzip_stream(encoded, max_decoder_bytes),
-            ContentEncoding::Identity | ContentEncoding::Passthrough(_) => encoded,
-        };
-        if matches!(
-            &encoding,
-            ContentEncoding::Brotli | ContentEncoding::Deflate | ContentEncoding::Gzip
-        ) {
-            headers.remove(CONTENT_ENCODING);
-            headers.remove(CONTENT_LENGTH);
-        }
-        let output = match &encoding {
-            ContentEncoding::Brotli
-            | ContentEncoding::Deflate
-            | ContentEncoding::Gzip
-            | ContentEncoding::Identity => {
-                limit_decoded_stream(decoded, max_decoded_response_bytes)
-            }
-            ContentEncoding::Passthrough(_) => decoded,
-        };
-        let shaped = rechunk_stream(output, max_chunk_bytes);
         let deadline_bound = deadline_stream(shaped, budget, clock);
         let body = match response_mode {
             ResponseMode::Buffered { max_bytes } => {
@@ -1394,7 +1359,7 @@ mod fastly_impl {
         use std::thread;
 
         use edgezero_core::error::{BudgetSource, ResponseLimitReason};
-        use edgezero_core::http::header::CONNECTION;
+        use edgezero_core::http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH};
         use edgezero_core::time::Deadline;
         use flate2::{Compression, write::GzEncoder};
         use futures::executor::block_on;

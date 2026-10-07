@@ -184,9 +184,25 @@ pub async fn run_app_with_platform<A: Hooks>(
         drop(init_logger());
     }
     let app = build_app_for_dispatch::<A>(platform)?;
-    let env = EnvConfig::from_env();
+    dispatch_app::<A>(&app, req).await
+}
+
+/// Dispatch a caller-owned app through canonical admission and response egress.
+///
+/// This does not build or cache an app or install logging. The caller must pass
+/// an app built from `A` with its selected platform; `App` erases its construction type, so this pairing
+/// remains a caller precondition. Retain only application-owned values and keep
+/// native handles and pending work request-local. Shared state must support
+/// overlapping invocations.
+///
+/// # Errors
+/// Returns configuration, admission-abort, or adapter delivery errors.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[inline]
+pub async fn dispatch_app<A: Hooks>(app: &App, req: SpinRequest) -> anyhow::Result<SpinResponse> {
     let stores = A::stores();
-    request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)
+    let env = EnvConfig::from_env();
+    request::dispatch_with_registries(app, req, stores.config, stores.kv, stores.secrets, &env)
         .await
 }
 

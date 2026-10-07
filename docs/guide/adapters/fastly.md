@@ -6,7 +6,10 @@ Deploy EdgeZero applications to Fastly's Compute@Edge platform using WebAssembly
 
 - [Fastly CLI](https://developer.fastly.com/learning/compute/#install-the-fastly-cli)
 - Rust `wasm32-wasip1` target: `rustup target add wasm32-wasip1`
-- [Viceroy](https://github.com/fastly/Viceroy) for local execution and testing
+- [Viceroy](https://github.com/fastly/Viceroy) 0.21.0 for local execution and testing
+
+The adapter pins the Fastly SDK to 0.13.1. Older Viceroy releases may reject its
+host imports before application code executes; use the repository's pinned runtime.
 
 ## Project Setup
 
@@ -99,8 +102,8 @@ pub fn main() -> Result<(), fastly::Error> {
 }
 ```
 
-The request closure runs once per routed request; insert whatever typed values
-your handlers need, then read them in a handler via a custom extractor or
+The request closure runs once before admission for each request that reaches
+preparation; insert whatever typed values your handlers need, then read them via a custom extractor or
 `ctx.request().extensions().get::<Ja4>()`. The optional state returned by
 `run_app_with_hooks` is available only after EdgeZero reaches its strongest
 terminal delivery boundary. Detached admission responses skip the response
@@ -142,8 +145,10 @@ Use `run_app_with_hooks` when custom request preparation or routed-response fina
 the adapter retains response ownership and returns finalizer state only after terminal delivery.
 `run_app_with_config` and a hand-built `FastlyService` do **not** apply the env overlay, so staging
 and overridden `__NAME` / `__KEY` selectors fall back to baked-in defaults. A fully manual
-entrypoint must call `runtime_env_config` and use `send_with_registries_and_hooks` for parity with
-`run_app`. A hand-written `Hooks` implementation must also override `stores()` or pass explicit
+entrypoint must call `runtime_env_config` and use `request::send_with_registries_and_hooks` for parity
+with `run_app`. Inside a serving callback, use `request::send_request_with_registries_and_hooks`
+with the already-received request; the receiving helper would attempt to receive another request.
+A hand-written `Hooks` implementation must also override `stores()` or pass explicit
 `StoresMetadata`; the trait default declares no stores.
 
 `runtime_env_config` returns `FastlyRuntimeConfig`, not `EnvConfig`. It performs no logging:
@@ -199,7 +204,7 @@ fastly compute deploy -C crates/my-app-adapter-fastly
 
 ## Backends
 
-`FastlyOutboundClient` uses deterministic **dynamic backends** derived from the canonical target,
+Outbound HTTP uses deterministic **dynamic backends** derived from the canonical target,
 TLS identity, and provider timer budget. You do not predeclare those destinations in
 `fastly.toml`, but dynamic backends must be enabled on the deployed Fastly service. The local CLI
 cannot prove that service entitlement, so `outbound-http` is BestEffort. A disabled service
@@ -340,7 +345,7 @@ See the [Streaming guide](/guide/streaming) and
 Run contract tests for the Fastly adapter:
 
 ```bash
-cargo install viceroy --locked
+cargo install viceroy --version 0.21.0 --locked
 export CARGO_TARGET_WASM32_WASIP1_RUNNER="viceroy run"
 
 # Run tests
@@ -358,6 +363,253 @@ locally and rely on Linux CI for execution.
 ## Manifest Configuration
 
 Configure the Fastly adapter in `edgezero.toml`. See [Configuration](/guide/configuration) for the full manifest reference.
+
+## Reusing a sandbox and retaining an app
+
+Opt in with an ordinary `main` in place of the single-request `run_app` call:
+
+```rust
+use edgezero_adapter_fastly::{Serve, serve_app};
+use std::time::Duration;
+
+fn main() -> Result<(), fastly::Error> {
+    serve_app::<MyApp>(
+        Serve::new()
+            .with_max_requests(10)
+            .with_timeout(Duration::from_millis(500)),
+    ).into_result()
+}
+```
+
+`serve_app_with_hooks` additionally accepts a preparation hook
+`FnMut(&mut fastly::Request, &mut Extensions)` and a finalization hook
+`FnMut(&mut edgezero_core::Response) -> State`. Preparation runs before admission;
+finalization runs only for routed responses, before egress policy and framing.
+Detached admission responses skip finalization. The retained helper discards the
+finalizer's state after delivery; use the request-level send helper in a custom
+callback when post-send work needs that state.
+
+The first request initializes logging and builds the app through
+`App::build::<MyApp>(FASTLY_PLATFORM) -> Result<App, EdgeError>`. Each request reads
+runtime configuration and constructs new store registries. Successful app construction
+and `configure` execute once per sandbox; explicit work elsewhere still executes
+whenever the application calls it. Both hooks and their captures are retained for
+the whole serving loop; the supplied native request, extensions, and response are
+request-local. Create request-specific mutable data inside the preparation hook
+or store it in those extensions.
+
+Logging takes the first configuration snapshot, unless the app owns logging.
+An unavailable optional runtime configuration store disables logging for that
+sandbox, even if subsequent reads recover store selectors. It does not silently
+retry or reconfigure logging. The current overlay enables logging when an
+endpoint exists and uses `echo_stdout: true`. Applications requiring another
+initialization policy should use `lifecycle::serve_custom` and `setup_once`.
+`runtime_env_config` returns `FastlyRuntimeConfig` with its public `env` and deferred
+diagnostics. The standard helper emits those diagnostics after the logging setup
+decision. Custom callbacks must likewise call `emit_boot_diagnostics()` after
+installing their logger. Each configuration value consumes its pending warning at
+most once; without a backend it is not observable. Absence of a warning does not
+establish a healthy configuration read.
+
+SDK 0.13.1 exposes `with_max_requests`, `with_timeout`, `with_max_lifetime`, and
+`with_max_memory`. A value of zero disables the request-count or memory limit;
+it does not request zero callbacks or zero memory use. The lifetime limit is
+measured from `Serve` construction, including time before the first callback.
+`with_timeout` bounds only the idle wait for the next request; it does not bound
+handler or backend time. If your service is billed by memory × wall-clock time,
+idle waiting is billed too. Limits do not guarantee reuse; any request may start a
+fresh sandbox. The fixtures pin standalone Viceroy 0.21.0; any observed per-guest
+request ceiling belongs to that runtime and run, not to the SDK request limit.
+`edgezero serve` runs `fastly compute serve`, whose bundled Viceroy can differ.
+Record the executable and observed reuse rather than assuming a local ceiling
+establishes deployed behavior.
+Lifetime and memory checks occur between callbacks and cannot interrupt
+blocked application work. Before using a local memory limit, verify that the
+guest's memory-snapshot call succeeds: an unsupported snapshot conservatively
+ends the SDK loop. CPU clock observations are not reliable cross-run benchmarks.
+
+`ServeSummary::requests()` counts attempted callbacks, including a failed one;
+a crash can prevent a final summary. Handler `EdgeError`s render as responses
+and serving continues when adapter delivery succeeds. A returned setup, required-store,
+admission-abort, or terminal-delivery error ends the loop and remains in its summary.
+The lifecycle wrapper records the callback result without asking the SDK to send a
+synthetic 500, including when a response was already committed. Ingress and egress
+policies may produce their own error responses; an escaping error is not proof that
+any response was sent. Constructor panics remain sandbox failures.
+
+### Custom dispatch and streaming
+
+The standard helpers preserve core response streams without whole-body collection.
+For custom initialization or post-send work, use `lifecycle::serve_custom` with a
+configured `Serve` builder and a callback
+`FnMut(fastly::Request, &mut lifecycle::Sandbox<T>) -> Result<(), E>`. EdgeZero owns
+the retained slot and successful-only initialization; your callback chooses the
+application-owned `T`. Initialize lazily so health checks can bypass expensive
+construction.
+
+For an EdgeZero response, call `request::send_request_with_registries_and_hooks`
+with the app, store metadata, received request, `&runtime.env`, preparation hook,
+and finalization hook. It runs canonical admission, injects fresh `Kv`, `Config`,
+`Secrets`, and `AppConfig` registries, then owns framing, streaming, deadlines, and
+terminal delivery. Preparation borrows a mutable native request and extension bag;
+finalization borrows a mutable routed core response. Neither hook returns a
+response for the callback to send separately. The result is `Result<Option<State>,
+fastly::Error>`: `Some` carries routed finalizer state only after terminal delivery,
+while a delivered detached admission response returns `None`.
+
+The manual response lifetime remains adapter-owned: append every header value,
+commit once through `stream_to_client`, account accepted body bytes, and finish or
+abandon the body handle exactly once. A native response constructed directly by
+your callback, such as a health reply, must instead be explicitly sent there;
+manual native streams must be pumped, flushed, and finished before returning.
+The lifecycle wrapper never supplies an extra response. Returning `Err` terminates
+serving without a synthetic send, even after commitment. Return `Ok(())` only when
+your policy permits continued serving after cleanup. Complete pending backend and
+post-send operations before returning. Do not cache native store handles with the app.
+
+Use `Request::get_client_request_id()` for request correlation. `FASTLY_TRACE_ID`
+describes the sandbox and must not be treated as a unique request ID. If a native
+ID is unavailable, generate a request-local fallback and label its source. Do
+not retain correlation fields in app state or global logger configuration.
+
+### Custom lifecycle contract
+
+The custom path uses public APIs: `lifecycle::{Sandbox, serve_custom, run_custom}`
+and `request::send_request_with_registries_and_hooks`. EdgeZero owns the
+successful-only retained slot and delegates request reception and limits to the
+SDK. The callback owns delivery: it either explicitly sends a native response or
+calls the adapter's closed send helper. The serving wrapper passes only the
+terminal `Result<(), E>` to the SDK without a synthetic response. Applications
+own setup, state, refresh policy, hooks, and post-send work. There is no
+response-returning conversion or whole-body compatibility path.
+
+Follow this order inside a callback:
+
+1. Explicitly send lightweight health responses before expensive initialization.
+2. Read fresh `runtime_env_config(MyApp::stores())` and use `runtime.env` for logger
+   and store setup. Use `sandbox.setup_once` to guard successful logger setup independently from
+   app construction. Failed setup leaves the guard unset; partial side effects
+   are not rolled back, so retries must be safe. Emit boot diagnostics after the
+   logger is installed, not while reading configuration.
+3. Call `sandbox.initialize` with `App::build::<MyApp>(FASTLY_PLATFORM)` for a core
+   app, mapping its typed error at the adapter boundary. Success fills the slot;
+   failure leaves it empty and returns the error unchanged. Read the value
+   with `state()`. A handled failure may send a 503 and return `Ok(())` to permit
+   a later callback to retry. Propagating it with `?` ends the loop without a synthetic send.
+4. Pass the received request to `send_request_with_registries_and_hooks`. Its
+   `FnOnce` preparation hook may mutate the native request and portable extensions
+   before admission; its `FnOnce` finalizer may inspect response extensions and
+   mutate a routed response before egress. Keep bodies, extensions, registries,
+   and native handles request-local. Registered app state still overwrites
+   extensions of the same type.
+5. Wait for the send helper's terminal result before using finalizer state or
+   starting post-send work. `None` means a detached response skipped finalization.
+   Never send the core response again; a returned delivery error may follow commitment.
+6. Complete pending backend and post-send work before returning. Constructors
+   and callbacks that panic remain sandbox failures.
+
+For example, after health checks, this policy permits an in-sandbox setup retry:
+
+```rust
+if let Err(error) = sandbox.setup_once(|| install_application_logger()) {
+    eprintln!("logger setup failed: {error}");
+    fastly::Response::from_status(503).send_to_client();
+    return Ok(());
+}
+sandbox.initialize(|| App::build::<MyApp>(FASTLY_PLATFORM).map_err(fastly::Error::from))?;
+// Read sandbox.state() and call the closed send helper; do not send its response again.
+// The ? above deliberately terminates this sandbox if application construction fails.
+```
+
+A complete callback looks like this. `serve_custom` returns a `ServeSummary`
+that you inspect or convert with `into_result()`. `App::build` is fallible and
+installs `FASTLY_PLATFORM` before application configuration:
+
+```rust
+use edgezero_adapter_fastly::lifecycle::{self, Sandbox};
+use edgezero_adapter_fastly::{
+    FASTLY_PLATFORM, FastlyLogging, Serve, init_logger, request, runtime_env_config,
+};
+use edgezero_core::app::{App, Hooks};
+use my_app_core::App as MyApp;
+
+fn main() -> Result<(), fastly::Error> {
+    lifecycle::serve_custom(Serve::new().with_max_requests(10), handle).into_result()
+}
+
+fn handle(req: fastly::Request, sandbox: &mut Sandbox<App>) -> Result<(), fastly::Error> {
+    if req.get_path() == "/health" {
+        fastly::Response::from_status(200).send_to_client();
+        return Ok(());
+    }
+    let stores = MyApp::stores();
+    let mut runtime = runtime_env_config(stores);
+    sandbox.setup_once(|| {
+        let logging = FastlyLogging::from(&runtime.env);
+        if logging.use_fastly_logger && !MyApp::owns_logging() {
+            init_logger(
+                logging.endpoint.as_deref().expect("configured endpoint"),
+                logging.level,
+                logging.echo_stdout,
+            )?;
+        }
+        Ok::<(), fastly::Error>(())
+    })?;
+    runtime.emit_boot_diagnostics();
+    sandbox.initialize(|| App::build::<MyApp>(FASTLY_PLATFORM).map_err(fastly::Error::from))?;
+    let app = sandbox.state().expect("initialized above");
+    let _post_send_state = request::send_request_with_registries_and_hooks(
+        app,
+        stores,
+        req,
+        &runtime.env,
+        |_raw, _extensions| {},
+        |response| response.status(),
+    )?;
+    // Delivery is terminal here; complete any post-send work before returning.
+    Ok(())
+}
+```
+
+The fixture's [`custom_dispatch`](https://github.com/stackpop/edgezero/blob/main/tests/fixtures/reusable-app/crates/fixture-fastly/src/lib.rs)
+is a fuller reference covering logger setup, handled initialization failure,
+response finalization, adapter-owned progressive streaming and post-send work.
+
+`Sandbox::requests()` counts attempted callbacks, including early health responses
+and failed ones. `initialization_attempts()` counts only actual builder calls.
+These counters describe this sandbox and are part of the public lifecycle API.
+They do not establish client completion or provider reuse.
+
+Use `lifecycle::run_custom(Request::from_client(), callback)` for the single-request
+branch, initializing the Fastly ABI before receiving that request. It creates
+fresh state without entering `Serve` and returns the callback's `Result<(), E>`
+directly, without asking the SDK to render an error. Use an ordinary `fn main`;
+the response-returning SDK entrypoint attribute does not own this delivery lifecycle.
+
+Keep adapter, core and SDK versions aligned with the pinned checkout. Run the
+lifecycle fixtures against the checkout being adopted:
+
+```sh
+./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke
+```
+
+See the [fixture README](https://github.com/stackpop/edgezero/tree/main/tests/fixtures/reusable-app)
+for assertions, runtime requirements and evidence files. An unavailable runtime
+or missing reuse is unverified and exits 2. Local fixtures do not guarantee
+provider reuse, deployed resource lifetimes or application workload gains.
+Applications still own refresh, key rotation and bounded caches.
+
+Warning caches persist too. Their bounded recent-name sets can evict entries,
+so warnings can recur; the number of warnings logged is not a failure count.
+Dynamic-backend capacity is service-wide, and registrations may wait for capacity
+(see Fastly's [dynamic-backend limit behavior](https://www.fastly.com/documentation/reference/compute/errors)).
+A sandbox request limit alone does not bound origin diversity or request fan-out.
+
+The local fixtures are in `tests/fixtures/reusable-app`. Local reuse and streaming
+results do not establish deployed eviction frequency, endpoint-handle validity,
+resource accounting, or performance. Named endpoint delivery must be verified
+separately from echoed stdout. Roll back by restoring the original single-request
+entry point and removing retained state, not merely setting a request limit of one.
 
 ## Next Steps
 

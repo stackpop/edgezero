@@ -226,6 +226,20 @@ impl OutboundBatch {
     where
         StreamValue: Stream<Item = OutboundBatchDriverEvent> + 'static;
 
+    /// Shared future-based driver. Inputs retain original indices and terminal samples.
+    /// Drain immediately ready futures before delivering the first item; introduce no timer.
+    pub fn from_futures<F, Pending>(
+        slot_count: usize,
+        batch_started_at: MonotonicInstant,
+        observation_cutoff: Deadline,
+        completed: Vec<(usize, MonotonicInstant, Result<OutboundResponse, EdgeError>)>,
+        pending_futures: Pending,
+    ) -> Self
+    where
+        F: Future<Output = (usize, MonotonicInstant, Result<OutboundResponse, EdgeError>)>
+            + 'static,
+        Pending: IntoIterator<Item = F>;
+
     /// Returns the next observed terminal item or the explicit termination reason.
     /// Cancelling this future does not consume or lose a ready item.
     pub async fn next(&mut self) -> Result<OutboundBatchNext, EdgeError>;
@@ -919,6 +933,24 @@ impl From<Bytes> for Body {
 // Shared transport-independent response pipeline. These helpers are public because
 // adapters are separate crates. Every branch accepts and returns the same `BodyStream`,
 // preserving exact typed source errors and making the pipeline skeleton buildable.
+// All four adapters compose payload policy through `edgezero_core::outbound`:
+#[derive(Clone, Copy, Debug)]
+pub struct ResponseBodyPolicy {
+    pub max_brotli_window_bits: u8,
+    pub max_chunk_bytes: Option<NonZeroU64>,
+    pub max_decoded_response_bytes: Option<u64>,
+    pub max_decoder_bytes: u64,
+    pub max_encoded_response_bytes: Option<u64>,
+    pub response_mode: ResponseMode,
+}
+pub fn apply_response_body_policy(
+    native: BodyStream,
+    headers: &mut HeaderMap,
+    policy: ResponseBodyPolicy,
+) -> Result<BodyStream, EdgeError>;
+// Checks declared lengths without polling, then composes encoded limits, decoding and header
+// rewriting, decoded limits (not passthrough), and rechunking, in that order. Adapter-specific
+// bodyless handling, transport reads, timers, cancellation, and final collection stay outside.
 // `edgezero_core::compression` items, in module order:
 pub const BROTLI_DECODER_FIXED_CHARGE_BYTES: u64 = 16_777_216;
 pub const FLATE_DECODER_FIXED_CHARGE_BYTES: u64 = 1_048_576; // 1 MiB; see the flate memory audit

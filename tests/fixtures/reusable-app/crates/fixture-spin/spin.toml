@@ -1,0 +1,17 @@
+spin_manifest_version = 2
+[application]
+name = "reusable-app-fixture"
+version = "0.1.0"
+[variables]
+fixture_marker = { default = "fixture-only-value", secret = true }
+[[trigger.http]]
+route = "/..."
+component = "fixture"
+[component.fixture]
+source = "../../target/wasm32-wasip2/release/fixture_spin.wasm"
+allowed_outbound_hosts = ["http://127.0.0.1:*", "http://localhost:*"]
+key_value_stores = ["fixture_config", "fixture_kv"]
+[component.fixture.variables]
+fixture_marker = "{{ fixture_marker }}"
+[component.fixture.environment]
+FIXTURE_MODE = "retained"

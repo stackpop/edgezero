@@ -327,6 +327,64 @@ The tests execute the adapter's real `wasm32-wasip2` request path under Wasmtime
 Configure the Spin adapter in `edgezero.toml`. See
 [Configuration](/guide/configuration) for the full manifest reference.
 
+## Retaining an application
+
+Use a concrete application-owned `OnceLock<App>` and call
+`edgezero_adapter_spin::dispatch_app::<MyApp>(app, req).await` on each
+invocation. This resolves fresh request resources from `MyApp::stores()` and does
+not install logging, construct an app, or cache native resources. Initialize any
+application logging before the cache's synchronous app constructor. Do not use a
+generic unkeyed static or hold a lock across an await.
+
+```rust
+use edgezero_adapter_spin::{SPIN_PLATFORM, SpinResponse};
+use edgezero_core::{app::App, EdgeError};
+use my_app_core::App as MyApp;
+use spin_sdk::{http::Request, http_service};
+use std::sync::OnceLock;
+
+static APP: OnceLock<App> = OnceLock::new();
+
+fn retained_app() -> Result<&'static App, EdgeError> {
+    if let Some(app) = APP.get() {
+        return Ok(app);
+    }
+    let app = App::build::<MyApp>(SPIN_PLATFORM)?;
+    Ok(APP.get_or_init(|| app))
+}
+
+#[http_service]
+async fn handle(req: Request) -> anyhow::Result<SpinResponse> {
+    let app = retained_app()?;
+    edgezero_adapter_spin::dispatch_app::<MyApp>(app, req).await
+}
+```
+
+`App::build::<MyApp>(SPIN_PLATFORM)` returns `Result<App, EdgeError>` and invokes
+fallible `Hooks::configure` after installing platform metadata. For Akamai Functions,
+select `AKAMAI_FUNCTIONS_PLATFORM`; other hosts can supply metadata matching their
+configured limits. Only a successful app is cached, so a failed build can be retried.
+Concurrent construction attempts may build multiple candidates; only one is retained.
+The app must be built from the same `Hooks` type used by dispatch.
+
+`dispatch_app<A: Hooks>(&App, SpinRequest) -> anyhow::Result<SpinResponse>` returns
+the raw WASI response, not a collected SDK response. Each invocation resolves fresh
+registries and runs admission and response egress; the adapter's coordinator owns
+the body writer and transmission-result observation through terminal delivery.
+
+The pinned SDK 7 macro exports a P3 HTTP interface. The `wasm32-wasip2` Rust target
+name does not establish the component's HTTP lifecycle. Verify the emitted
+interface and host together. See Spin's
+[instance-reuse documentation](https://spinframework.dev/v4/http-trigger#controlling-instance-reuse)
+for the reuse and concurrency controls your host version supports.
+
+Test both sequential reuse and overlapping invocations in the same instance.
+Different guest instances are not evidence of concurrent isolation. Keep
+request/response bodies, admission resources, delivery coordinators, and pending
+operations invocation-local. Standard response delivery remains lazy under host
+backpressure; retention adds no whole-response buffer or collection cap. Restore `run_app`
+and remove the cache to roll back; default generated entry points are unchanged.
+
 ## Next Steps
 
 - [Migration guide](/guide/manifest-store-migration) — moving from the

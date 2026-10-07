@@ -5,6 +5,11 @@
 > **Status:** Deterministic implementation is complete on PR 275. Protected deployed-provider evidence remains an external promotion gate, so the affected capability cells remain `BestEffort`. The unchecked steps below are retained as the original implementation record.
 > **Superseded batch/lifecycle API:** The 2026-09-15 consumer-alignment plan replaces this
 > plan's `send_all` API and test sentinels. Retain the text only as implementation history.
+> **Shared implementation follow-up (R5/R6):** Axum, Cloudflare, and Spin now use
+> `OutboundBatch::from_futures`. All four adapters use `ResponseBodyPolicy` /
+> `apply_response_body_policy` for the payload-limit/decoding/rechunking composition.
+> Transport reads, clocks, timers, cancellation, bodyless handling, and final collection remain
+> adapter-owned. These extractions do not change the normative outbound contract.
 
 **Goal:** Implement the full outbound contract for Axum and Cloudflare, including batch behavior, typed cleanup, adapter scheduling, and executable native/WASM/host contracts.
 

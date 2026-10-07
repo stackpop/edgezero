@@ -1,21 +1,27 @@
+use std::future::Future;
 use std::iter;
 use std::net::IpAddr;
 use std::num::NonZeroU64;
 use std::str;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt as _;
-use futures_util::stream::{LocalBoxStream, Stream, iter};
+use futures_util::future::poll_fn;
+use futures_util::stream::{FuturesUnordered, LocalBoxStream, Stream, iter};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::Url;
 
 use crate::body::{Body, BodyStream};
-use crate::compression::ContentEncoding;
+use crate::compression::{
+    ContentEncoding, classify_content_encoding, decode_brotli_stream, decode_deflate_stream,
+    decode_gzip_stream,
+};
 use crate::error::{BadGatewayDecodeReason, BadGatewayReason, EdgeError, ResponseLimitReason};
 use crate::http::header::{
     CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST, PROXY_AUTHENTICATE,
@@ -86,6 +92,18 @@ pub struct OutboundRequestParts {
 pub enum ResponseMode {
     Buffered { max_bytes: u64 },
     Streamed,
+}
+
+/// Shared response-body limits and decoding policy applied after adapter header normalization.
+/// Transport reads, deadlines, cancellation, and final buffered collection remain adapter-owned.
+#[derive(Clone, Copy, Debug)]
+pub struct ResponseBodyPolicy {
+    pub max_brotli_window_bits: u8,
+    pub max_chunk_bytes: Option<NonZeroU64>,
+    pub max_decoded_response_bytes: Option<u64>,
+    pub max_decoder_bytes: u64,
+    pub max_encoded_response_bytes: Option<u64>,
+    pub response_mode: ResponseMode,
 }
 
 /// Controls use of an adapter-managed intermediary cache for one request.
@@ -267,6 +285,51 @@ impl OutboundBatch {
             termination: None,
             unresolved: vec![true; slot_count],
         }
+    }
+
+    /// Builds a batch from preflight outcomes and adapter-owned exchange futures.
+    ///
+    /// Every outcome carries its original index and already-sampled terminal instant. Ready
+    /// futures are drained before the first item is delivered, retaining on-time observations
+    /// across consumer delays. No transport timer or clock sampling is introduced here.
+    /// The same driver-index, cutoff, and EOF invariants as [`Self::from_driver`] apply.
+    #[must_use]
+    #[inline]
+    pub fn from_futures<F, Pending>(
+        slot_count: usize,
+        batch_started_at: MonotonicInstant,
+        observation_cutoff: Deadline,
+        mut completed: Vec<(usize, MonotonicInstant, Result<OutboundResponse, EdgeError>)>,
+        pending_futures: Pending,
+    ) -> Self
+    where
+        F: Future<Output = (usize, MonotonicInstant, Result<OutboundResponse, EdgeError>)>
+            + 'static,
+        Pending: IntoIterator<Item = F>,
+    {
+        let mut pending = pending_futures.into_iter().collect::<FuturesUnordered<_>>();
+        let completions = stream! {
+            poll_fn(|context| {
+                loop {
+                    match pending.poll_next_unpin(context) {
+                        Poll::Ready(Some(item)) => completed.push(item),
+                        Poll::Ready(None) | Poll::Pending => return Poll::Ready(()),
+                    }
+                }
+            }).await;
+            let mut outcomes = iter(completed).chain(pending);
+            while let Some((index, completed_at, outcome)) = outcomes.next().await {
+                let Some(item) = finish_batch_item(
+                    index, batch_started_at, completed_at, observation_cutoff, outcome,
+                ) else {
+                    drop(outcomes);
+                    yield OutboundBatchDriverEvent::Cutoff;
+                    return;
+                };
+                yield OutboundBatchDriverEvent::Item(item);
+            }
+        };
+        Self::from_driver(slot_count, completions)
     }
 
     /// Returns the next newly terminal slot or the typed batch termination reason.
@@ -1103,6 +1166,62 @@ impl OutboundRequest {
     }
 }
 
+/// Applies the shared payload policy without polling the native body.
+///
+/// Declared lengths are checked first, then streaming encoded limits, recognized decoding,
+/// decoded limits, and rechunking. Raw passthrough keeps its encoding/length headers and bypasses
+/// only the decoded limit. Adapters must handle bodyless responses before calling this helper.
+///
+/// # Errors
+/// Returns malformed content-length or declared payload-limit errors before rewriting headers.
+#[inline]
+pub fn apply_response_body_policy(
+    native: BodyStream,
+    headers: &mut HeaderMap,
+    policy: ResponseBodyPolicy,
+) -> Result<BodyStream, EdgeError> {
+    let encoding = classify_content_encoding(headers);
+    let max_buffered = match policy.response_mode {
+        ResponseMode::Buffered { max_bytes } => Some(max_bytes),
+        ResponseMode::Streamed => None,
+    };
+    enforce_payload_content_length(
+        headers,
+        &encoding,
+        max_buffered,
+        policy.max_decoded_response_bytes,
+        policy.max_encoded_response_bytes,
+    )?;
+    let encoded = limit_encoded_stream(native, policy.max_encoded_response_bytes);
+    let decoded = match &encoding {
+        ContentEncoding::Brotli => decode_brotli_stream(
+            encoded,
+            policy.max_brotli_window_bits,
+            policy.max_decoder_bytes,
+        ),
+        ContentEncoding::Deflate => decode_deflate_stream(encoded, policy.max_decoder_bytes),
+        ContentEncoding::Gzip => decode_gzip_stream(encoded, policy.max_decoder_bytes),
+        ContentEncoding::Identity | ContentEncoding::Passthrough(_) => encoded,
+    };
+    if matches!(
+        &encoding,
+        ContentEncoding::Brotli | ContentEncoding::Deflate | ContentEncoding::Gzip
+    ) {
+        headers.remove(CONTENT_ENCODING);
+        headers.remove(CONTENT_LENGTH);
+    }
+    let output = match &encoding {
+        ContentEncoding::Brotli
+        | ContentEncoding::Deflate
+        | ContentEncoding::Gzip
+        | ContentEncoding::Identity => {
+            limit_decoded_stream(decoded, policy.max_decoded_response_bytes)
+        }
+        ContentEncoding::Passthrough(_) => decoded,
+    };
+    Ok(rechunk_stream(output, policy.max_chunk_bytes))
+}
+
 /// Converts one adapter-observed terminal batch outcome into its indexed public result.
 ///
 /// Adapters must pass samples from the batch's shared monotonic clock. `None` means the terminal
@@ -1699,6 +1818,7 @@ mod tests {
 
     use std::cell::Cell;
     use std::future::Future as _;
+    use std::io::Write as _;
     use std::num::NonZeroU64;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1708,8 +1828,11 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
+    use flate2::write::{GzEncoder, ZlibEncoder};
     use futures::FutureExt as _;
+    use futures::channel::oneshot;
     use futures::executor::block_on;
+    use futures::future::{Ready, pending, ready};
     use futures::pin_mut;
     use futures::task::noop_waker_ref;
     use futures_util::{StreamExt as _, stream};
@@ -1731,9 +1854,9 @@ mod tests {
         HttpClient, OutboundBatch, OutboundBatchDriverEvent, OutboundBatchItem, OutboundBatchNext,
         OutboundBatchTermination, OutboundCachePolicy, OutboundHttpClient, OutboundRequest,
         OutboundResponse, OutboundSlotResult, PROXY_HEADER, ResponseBodyDisposition,
-        ResponseHeaderLimiter, ResponseMode, collect_response_stream,
-        enforce_payload_content_length, finish_batch_item, insert_proxy_header,
-        limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
+        ResponseBodyPolicy, ResponseHeaderLimiter, ResponseMode, apply_response_body_policy,
+        collect_response_stream, enforce_payload_content_length, finish_batch_item,
+        insert_proxy_header, limit_decoded_stream, limit_encoded_stream, normalize_for_dispatch,
         normalize_response_headers, rechunk_stream, validate_for_dispatch,
     };
 
@@ -1812,6 +1935,340 @@ mod tests {
                 Ok(response_with_body(Body::empty())),
             ),
         )
+    }
+
+    #[test]
+    fn future_batch_retains_ready_timestamps_before_delivering_preflight_failures() {
+        let start = MonotonicInstant::now();
+        let observation_cutoff = Deadline::at_instant(start + Duration::from_secs(1));
+        let current = Rc::new(Cell::new(start + Duration::from_millis(5)));
+        let sampled = Rc::clone(&current);
+        let pending = async move { (1, sampled.get(), Err(EdgeError::bad_request("ready slot"))) };
+        let mut batch = OutboundBatch::from_futures(
+            2,
+            start,
+            observation_cutoff,
+            vec![(
+                0,
+                start + Duration::from_millis(2),
+                Err(EdgeError::bad_request("preflight")),
+            )],
+            [pending],
+        );
+        let OutboundBatchNext::Item(first) = block_on(batch.next()).expect("preflight") else {
+            panic!("expected preflight item");
+        };
+        assert_eq!(first.index, 0);
+        assert_eq!(first.result.elapsed, Duration::from_millis(2));
+        current.set(start + Duration::from_secs(2));
+        let OutboundBatchNext::Item(second) = block_on(batch.next()).expect("retained result")
+        else {
+            panic!("expected retained result");
+        };
+        assert_eq!(second.index, 1);
+        assert_eq!(second.result.elapsed, Duration::from_millis(5));
+        assert!(matches!(
+            block_on(batch.next()).expect("EOF"),
+            OutboundBatchNext::Finished(OutboundBatchTermination::Completed)
+        ));
+    }
+
+    #[test]
+    fn future_batch_cutoff_depends_on_observation_not_timeout_attribution() {
+        let start = MonotonicInstant::now();
+        let observation_cutoff = Deadline::at_instant(start + Duration::from_secs(1));
+        let early = ready((
+            1,
+            start + Duration::from_millis(5),
+            Err(EdgeError::gateway_timeout_caused(
+                "phase timeout",
+                BudgetSource::BatchCutoff,
+            )),
+        ));
+        let at_cutoff = ready((
+            0,
+            observation_cutoff.instant(),
+            Err(EdgeError::bad_request("late")),
+        ));
+        let batch = OutboundBatch::from_futures(
+            2,
+            start,
+            observation_cutoff,
+            Vec::new(),
+            [early, at_cutoff],
+        );
+        let result = block_on(batch.collect()).expect("observation_cutoff");
+        assert_eq!(result.termination, OutboundBatchTermination::Cutoff);
+        assert!(matches!(result.slots.first(), Some(None)));
+        let early_result = result
+            .slots
+            .get(1)
+            .and_then(Option::as_ref)
+            .expect("early slot retained");
+        assert!(matches!(
+            early_result.outcome,
+            Err(EdgeError::GatewayTimeout {
+                cause: BudgetSource::BatchCutoff,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn future_batch_orders_controlled_completions_and_drops_cancelled_work() {
+        let start = MonotonicInstant::now();
+        let observation_cutoff = Deadline::at_instant(start + Duration::from_secs(1));
+        let drops = Rc::new(Cell::new(0));
+        let signal = BodyDropSignal(Rc::clone(&drops));
+        let (send_first, receive_first) = oneshot::channel::<()>();
+        let (send_second, receive_second) = oneshot::channel::<()>();
+        let first = async move {
+            let _signal = signal;
+            receive_first.await.expect("first completion");
+            (
+                0,
+                start + Duration::from_millis(8),
+                Err(EdgeError::bad_request("first")),
+            )
+        }
+        .boxed_local();
+        let second = async move {
+            receive_second.await.expect("second completion");
+            (
+                1,
+                start + Duration::from_millis(3),
+                Err(EdgeError::bad_request("second")),
+            )
+        }
+        .boxed_local();
+        let mut batch =
+            OutboundBatch::from_futures(2, start, observation_cutoff, Vec::new(), [first, second]);
+        send_second.send(()).expect("second ready");
+        let OutboundBatchNext::Item(item) = block_on(batch.next()).expect("second completes first")
+        else {
+            panic!("expected completion");
+        };
+        assert_eq!(item.index, 1);
+        assert_eq!(batch.cancel(), vec![0]);
+        assert_eq!(drops.get(), 1);
+        assert!(send_first.send(()).is_err());
+    }
+
+    #[test]
+    fn future_batch_validates_empty_and_premature_drivers() {
+        let start = MonotonicInstant::now();
+        let observation_cutoff = Deadline::at_instant(start + Duration::from_secs(1));
+        let empty =
+            Vec::<Ready<(usize, MonotonicInstant, Result<OutboundResponse, EdgeError>)>>::new();
+        let completed = block_on(
+            OutboundBatch::from_futures(0, start, observation_cutoff, Vec::new(), empty).collect(),
+        )
+        .expect("empty completion");
+        assert_eq!(completed.termination, OutboundBatchTermination::Completed);
+        let empty =
+            Vec::<Ready<(usize, MonotonicInstant, Result<OutboundResponse, EdgeError>)>>::new();
+        let failure = block_on(
+            OutboundBatch::from_futures(
+                2,
+                start,
+                observation_cutoff,
+                vec![(1, start, Err(EdgeError::bad_request("preflight")))],
+                empty,
+            )
+            .collect(),
+        )
+        .expect_err("missing future");
+        assert!(matches!(failure.error, EdgeError::Internal { .. }));
+        assert!(failure.slots.get(1).is_some_and(Option::is_some));
+    }
+
+    #[test]
+    fn future_batch_cutoff_releases_pending_work_before_reporting_finished() {
+        let start = MonotonicInstant::now();
+        let observation_cutoff = Deadline::at_instant(start + Duration::from_secs(1));
+        let drops = Rc::new(Cell::new(0));
+        let signal = BodyDropSignal(Rc::clone(&drops));
+        let pending = async move {
+            let _signal = signal;
+            pending::<()>().await;
+            (
+                1,
+                start,
+                Err(EdgeError::bad_request("unreachable completion")),
+            )
+        };
+        let mut batch = OutboundBatch::from_futures(
+            2,
+            start,
+            observation_cutoff,
+            vec![(
+                0,
+                observation_cutoff.instant(),
+                Err(EdgeError::bad_request("late completion")),
+            )],
+            [pending],
+        );
+        assert!(matches!(
+            block_on(batch.next()).expect("cutoff"),
+            OutboundBatchNext::Finished(OutboundBatchTermination::Cutoff)
+        ));
+        assert_eq!(
+            drops.get(),
+            1,
+            "finished cutoff must release pending work even while batch remains owned"
+        );
+        assert_eq!(batch.cancel(), vec![0, 1]);
+        assert_eq!(drops.get(), 1);
+    }
+
+    fn body_policy() -> ResponseBodyPolicy {
+        ResponseBodyPolicy {
+            max_brotli_window_bits: 24,
+            max_chunk_bytes: None,
+            max_decoded_response_bytes: Some(32),
+            max_decoder_bytes: super::DEFAULT_MAX_DECODER_BYTES,
+            max_encoded_response_bytes: Some(256),
+            response_mode: ResponseMode::Buffered { max_bytes: 32 },
+        }
+    }
+
+    #[test]
+    fn body_policy_rejects_declared_limits_without_polling_or_rewriting_headers() {
+        let polls = Rc::new(Cell::new(0_usize));
+        let counted = Rc::clone(&polls);
+        let source = stream::poll_fn(move |_context| {
+            counted.set(counted.get() + 1);
+            Poll::Ready(None)
+        })
+        .boxed_local();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+        headers.insert("content-length", HeaderValue::from_static("257"));
+        let error = apply_response_body_policy(source, &mut headers, body_policy())
+            .err()
+            .expect("encoded preflight");
+        assert!(matches!(
+            error,
+            EdgeError::ResponseTooLarge {
+                reason: ResponseLimitReason::EncodedBody,
+                ..
+            }
+        ));
+        assert_eq!(polls.get(), 0);
+        assert!(headers.contains_key("content-encoding"));
+        assert!(headers.contains_key("content-length"));
+    }
+
+    #[test]
+    fn body_policy_decodes_recognized_codings_before_rechunking() {
+        let plain = b"decoded body";
+        let mut gzip = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(plain).expect("gzip");
+        let mut deflate = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        deflate.write_all(plain).expect("deflate");
+        let mut brotli = Vec::new();
+        let mut compressor = brotli::CompressorWriter::new(&mut brotli, 4096, 5, 21);
+        compressor.write_all(plain).expect("brotli");
+        drop(compressor);
+        for (coding, encoded) in [
+            ("gzip", gzip.finish().expect("gzip finish")),
+            ("deflate", deflate.finish().expect("deflate finish")),
+            ("br", brotli),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-encoding", HeaderValue::from_static(coding));
+            headers.insert(
+                "content-length",
+                HeaderValue::from_str(&encoded.len().to_string()).expect("length"),
+            );
+            let source = stream::iter([Ok(Bytes::from(encoded))]).boxed_local();
+            let mut policy = body_policy();
+            policy.max_chunk_bytes = NonZeroU64::new(2);
+            let output = apply_response_body_policy(source, &mut headers, policy).expect("policy");
+            assert!(!headers.contains_key("content-encoding"));
+            assert!(!headers.contains_key("content-length"));
+            let chunks = block_on(output.collect::<Vec<_>>());
+            let mut collected = Vec::new();
+            for chunk in chunks {
+                let bytes = chunk.expect("decoded chunk");
+                assert!(bytes.len() <= 2);
+                collected.extend_from_slice(&bytes);
+            }
+            assert_eq!(collected, plain);
+        }
+    }
+
+    #[test]
+    fn body_policy_passthrough_preserves_headers_and_bypasses_decoded_limit_only() {
+        for coding in ["unknown", "gzip, br", "gzip;"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-encoding", HeaderValue::from_static(coding));
+            headers.insert("content-length", HeaderValue::from_static("4"));
+            let source = stream::iter([Ok(Bytes::from_static(b"abcd"))]).boxed_local();
+            let mut policy = body_policy();
+            policy.max_decoded_response_bytes = Some(1);
+            let output = apply_response_body_policy(source, &mut headers, policy)
+                .expect("passthrough policy");
+            assert_eq!(
+                headers.get("content-encoding"),
+                Some(&HeaderValue::from_static(coding))
+            );
+            assert!(headers.contains_key("content-length"));
+            assert_eq!(
+                block_on(collect_response_stream(output, 4)).expect("passthrough"),
+                Bytes::from_static(b"abcd")
+            );
+        }
+        let mut headers = HeaderMap::new();
+        let mut policy = body_policy();
+        policy.max_decoded_response_bytes = Some(1);
+        policy.max_chunk_bytes = NonZeroU64::new(1);
+        let source = stream::iter([Ok(Bytes::from_static(b"ab"))]).boxed_local();
+        let mut output =
+            apply_response_body_policy(source, &mut headers, policy).expect("identity");
+        assert!(matches!(
+            block_on(output.next()),
+            Some(Err(EdgeError::ResponseTooLarge {
+                reason: ResponseLimitReason::DecodedBody,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn body_policy_encoded_limit_precedes_decoder_and_preserves_source_errors() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+        let mut policy = body_policy();
+        policy.max_encoded_response_bytes = Some(1);
+        let source = stream::iter([Ok(Bytes::from_static(b"invalid gzip"))]).boxed_local();
+        let output = apply_response_body_policy(source, &mut headers, policy).expect("policy");
+        assert!(matches!(
+            block_on(collect_response_stream(output, 32)),
+            Err(EdgeError::ResponseTooLarge {
+                reason: ResponseLimitReason::EncodedBody,
+                ..
+            })
+        ));
+
+        for coding in ["identity", "gzip", "deflate", "br", "unknown"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-encoding", HeaderValue::from_static(coding));
+            let source = stream::iter([Err(EdgeError::gateway_timeout_caused(
+                "source timeout",
+                BudgetSource::RequestDeadline,
+            ))])
+            .boxed_local();
+            let output =
+                apply_response_body_policy(source, &mut headers, body_policy()).expect("policy");
+            assert!(matches!(
+                block_on(collect_response_stream(output, 32)),
+                Err(EdgeError::GatewayTimeout {
+                    cause: BudgetSource::RequestDeadline,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

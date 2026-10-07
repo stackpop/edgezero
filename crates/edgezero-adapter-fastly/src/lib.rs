@@ -1,6 +1,14 @@
 //! Utilities for bridging Fastly Compute@Edge requests into the
 //! `edgezero-core` service abstractions.
 
+#![cfg_attr(
+    feature = "fastly",
+    expect(
+        clippy::pub_use,
+        reason = "reuse the platform serving limits and summary"
+    )
+)]
+
 #[cfg(feature = "fastly")]
 use anyhow::Context as _;
 
@@ -20,6 +28,7 @@ pub mod config_store;
 pub mod context;
 #[cfg(feature = "fastly")]
 pub mod key_value_store;
+pub mod lifecycle;
 #[cfg(any(feature = "fastly", all(test, not(target_arch = "wasm32"))))]
 pub mod logger;
 #[cfg(any(test, feature = "test-utils", feature = "fastly"))]
@@ -45,6 +54,8 @@ use edgezero_core::http::{Extensions, Response};
 use edgezero_core::manifest::ResolvedLoggingConfig;
 #[cfg(feature = "fastly")]
 use fastly::compute_runtime::service_id;
+#[cfg(feature = "fastly")]
+pub use fastly::http::serve::{Serve, ServeSummary};
 #[cfg(any(feature = "fastly", test))]
 use std::mem;
 use std::num::NonZeroU32;
@@ -281,6 +292,67 @@ where
     let app = build_app_for_dispatch::<A>();
     config.emit_boot_diagnostics();
     request::send_with_registries_and_hooks(&app?, stores, &config.env, prepare, finalize)
+}
+
+/// Retain a successfully built app while the SDK serves sequential requests.
+///
+/// Each callback resolves fresh runtime configuration and store registries. Logging
+/// uses the first snapshot, and the adapter owns response delivery without SDK resends.
+#[cfg(feature = "fastly")]
+#[must_use = "inspect the summary or handle its terminal error with into_result()"]
+#[inline]
+pub fn serve_app<A: Hooks>(serve: Serve) -> ServeSummary<fastly::Error> {
+    serve_app_with_hooks::<A, _, _, _>(serve, |_request, _extensions| {}, |_response| ())
+}
+
+/// Retained serving with request-local preparation and routed response finalization.
+///
+/// The hooks follow [`run_app_with_hooks`]. Preparation runs before admission;
+/// finalization runs only for routed responses, before adapter-owned delivery.
+/// Captures persist across callbacks and must not accidentally retain request resources.
+#[cfg(feature = "fastly")]
+#[must_use = "inspect the summary or handle its terminal error with into_result()"]
+#[inline]
+pub fn serve_app_with_hooks<A, Prepare, Finalize, State>(
+    serve: Serve,
+    mut prepare: Prepare,
+    mut finalize: Finalize,
+) -> ServeSummary<fastly::Error>
+where
+    A: Hooks,
+    Prepare: FnMut(&mut fastly::Request, &mut Extensions),
+    Finalize: FnMut(&mut Response) -> State,
+{
+    init_fastly_abi();
+    let stores = A::stores();
+    lifecycle::serve_custom(serve, move |req, retained: &mut lifecycle::Sandbox<App>| {
+        let mut runtime = runtime_env_config(stores);
+        retained.setup_once(|| {
+            let logging = FastlyLogging::from(&runtime.env);
+            if logging.use_fastly_logger && !A::owns_logging() {
+                init_logger(
+                    logging.endpoint.as_deref().unwrap_or("stdout"),
+                    logging.level,
+                    logging.echo_stdout,
+                )?;
+            }
+            Ok::<(), fastly::Error>(())
+        })?;
+        runtime.emit_boot_diagnostics();
+        retained.initialize(build_app_for_dispatch::<A>)?;
+        let app = retained.state().ok_or_else(|| {
+            fastly::Error::msg("application initialization did not retain an app")
+        })?;
+        request::send_request_with_registries_and_hooks(
+            app,
+            stores,
+            req,
+            &runtime.env,
+            &mut prepare,
+            &mut finalize,
+        )
+        .map(|_state| ())
+    })
 }
 
 /// Build an [`EnvConfig`] from the optional `edgezero_runtime_env`

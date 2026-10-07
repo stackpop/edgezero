@@ -49,6 +49,9 @@ separately from the portable API and must be considered when declaring required 
   uses deterministic dynamic-backend identities that include exact timer budgets. An early
   `BatchCutoff`-attributed provider phase timeout terminates only its slot unless the actual
   observation cutoff has expired.
+- Share the future-based batch driver through `OutboundBatch::from_futures` on Axum, Cloudflare,
+  and Spin. Preserve recorded terminal timestamps, ready-result retention, index validation,
+  and clean-EOF completion; Fastly retains its provider-handle driver.
 
 ### Encoding, Limits, And Error Classification
 
@@ -56,6 +59,9 @@ separately from the portable API and must be considered when declaring required 
   Decoded caps apply to identity and EdgeZero-decoded bodies, not raw passthrough encodings.
   Checks occur incrementally before appending excess output; response collection retains the
   configured bounds and original absolute deadline.
+- Share the response-body policy through `ResponseBodyPolicy` and `apply_response_body_policy`
+  across all four adapters. Declared lengths, encoded limits, decoding/header rewriting, decoded
+  limits, and rechunking retain their order; transport lifetimes remain adapter-owned.
 - Add `into_bytes_bounded`, `into_bytes_bounded_until`, `json_bounded`, and `json_bounded_until`
   for explicit response consumption. The `_until` helpers check the retained application clock
   cooperatively; pending-stream cancellation still depends on the adapter's deadline wrapper.
@@ -149,6 +155,11 @@ separately from the portable API and must be considered when declaring required 
 - Add Fastly's closed `run_app_with_hooks` lifecycle for raw-request preparation and routed-response
   finalization while retaining adapter-owned delivery and returning routed hook state only after
   terminal delivery.
+- Integrate opt-in reusable application lifecycles with fallible assembly and canonical admission/
+  egress. Cloudflare and Spin expose prebuilt `dispatch_app`; Fastly exposes `serve_app`,
+  `serve_app_with_hooks`, and successful-only `lifecycle::Sandbox` retention. Fastly custom serving
+  callbacks own delivery and return `Result<(), E>` without an SDK-generated second response.
+  Reuse no request handles, bodies, extensions, registries, or pending transport work.
 
 ### Bounded Config And Secret Extraction
 

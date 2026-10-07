@@ -536,6 +536,30 @@ where
 {
     init_fastly_abi();
     let req = FastlyRequest::from_client();
+    send_request_with_registries_and_hooks(app, stores, req, env, prepare, finalize)
+}
+
+/// Deliver an already-received request through canonical admission and owned egress.
+///
+/// Use this inside a retained serving loop; it never receives another client request.
+/// Request registries, preparation, finalization, and body handles remain request-local.
+///
+/// # Errors
+/// Returns store setup, admission-abort, or terminal delivery errors without sending a second response.
+#[inline]
+pub fn send_request_with_registries_and_hooks<State, Prepare, Finalize>(
+    app: &App,
+    stores: StoresMetadata,
+    req: FastlyRequest,
+    env: &EnvConfig,
+    prepare: Prepare,
+    finalize: Finalize,
+) -> Result<Option<State>, FastlyError>
+where
+    Prepare: FnOnce(&mut FastlyRequest, &mut Extensions),
+    Finalize: FnOnce(&mut Response) -> State,
+{
+    init_fastly_abi();
     let request_start = app.monotonic_now();
     let kv_registry = build_kv_registry(stores.kv, env)?;
     let config_registry = build_config_registry(stores.config, env);

@@ -171,6 +171,25 @@ pub async fn run_app<A: Hooks>(
         drop(init_logger());
     }
     let app = build_app_for_dispatch::<A>()?;
+    dispatch_app::<A>(&app, req, env, ctx).await
+}
+
+/// Dispatch a caller-owned app through canonical admission and response egress.
+///
+/// The app must be built from `A` with [`CLOUDFLARE_PLATFORM`]. This function does not
+/// initialize logging or retain an app. Bindings and runtime variables are resolved
+/// for every request; only application-owned, concurrency-safe state may be retained.
+///
+/// # Errors
+/// Returns category-safe configuration, admission-abort, or adapter delivery errors.
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+#[inline]
+pub async fn dispatch_app<A: Hooks>(
+    app: &App,
+    req: Request,
+    env: Env,
+    ctx: Context,
+) -> Result<Response, WorkerError> {
     let stores = A::stores();
     let env_config = env_config_from_worker(&env, stores);
     let runtime_variables = match A::manifest() {
@@ -188,7 +207,7 @@ pub async fn run_app<A: Hooks>(
         }
     };
     request::dispatch_with_registries(
-        &app,
+        app,
         req,
         env,
         ctx,

@@ -4,7 +4,7 @@
 
 **Goal:** Make normal completion, method-cutoff termination, and malformed adapter-driver termination unambiguous in the public outbound batch API.
 
-**Architecture:** Replace the stream-like `Option` terminal signal with an explicit `OutboundBatchNext::{Item, Finished}` result and add `OutboundBatchTermination::{Completed, Cutoff}` to ordered results. Adapter streams emit private-contract driver events for slots, cutoff, or failure; core validates index range, uniqueness, and premature EOF and returns `OutboundBatchFailure` with the precise `EdgeError::Internal` and previously collected slots instead of silently converting invariant violations into unresolved slots.
+**Architecture:** Replace the stream-like `Option` terminal signal with an explicit `OutboundBatchNext::{Item, Finished}` result and add `OutboundBatchTermination::{Completed, Cutoff}` to ordered results. Adapter streams emit public driver events for slots, cutoff, or failure; core validates index range, uniqueness, and premature EOF and returns `OutboundBatchFailure` with the precise `EdgeError::Internal` and previously collected slots instead of silently converting invariant violations into unresolved slots.
 
 **Tech Stack:** Rust 2024, `futures`, `async-stream`, EdgeZero `EdgeError`, provider adapter contract tests, VitePress documentation checks.
 
@@ -217,3 +217,20 @@ The full workspace suite passes, including 720 core unit tests. Explicit nonzero
 contract runs pass for Axum (13), Cloudflare (3), Fastly (1), and Spin (2); strict WASM clippy
 passes for all three provider targets. Specs/guides and the documentation checker reflect the
 EOF requirement. This follow-up does not claim new deployed-host evidence.
+
+### Review Follow-Up: Shared Future Driver (R5)
+
+- [x] Extract `OutboundBatch::from_futures` for Axum, Cloudflare, and Spin, preserving original
+  indices and preflight/terminal timestamps. Keep Fastly's provider-handle driver separate.
+- [x] Drain ready exchange futures before the first yield, retain clean-EOF validation, and
+  introduce no core clock sampling or timer. Keep transport cancellation inside each adapter.
+- [x] Add deterministic timestamp-retention, cutoff-attribution, cancellation, empty/premature
+  driver, and cutoff-release tests. Release pending futures before delivering `Finished(Cutoff)`.
+- [x] Complete merge-wide native/WASM, reusable-fixture, demo/generator, and documentation gates.
+
+Verified during the main merge: 733 core unit tests and the full workspace suite pass; strict
+native and provider-WASM Clippy pass; Cloudflare, Fastly, and Spin runtime contract suites pass.
+The reusable fixture suite (5 core and 26 harness tests), Fastly owned-finalization test and
+Viceroy 0.21.0 HTTP smoke pass. Demo host tests/lint and all three provider WASM builds pass,
+as does a fresh generated workspace. Documentation format/lint/build, dependency contracts,
+and the expanded legacy guard pass. This is local evidence, not deployed-provider promotion.

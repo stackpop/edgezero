@@ -326,8 +326,11 @@ app-state struct and register that.
 
 > **Make `app_state()` cheap.** The macro emits the `state` expression inside the
 > generated `build_router()`, which each adapter's `run_app` calls through
-> `EdgeZeroApp::build::<A>(platform)` — **once at startup** for long-lived runtimes (Axum), but
-> **once per request** on Fastly Compute (each request is a fresh Wasm instance).
+> `App::build::<A>(platform)` — **once at startup** for Axum, but **once per
+> invocation** for the default Fastly, Cloudflare, and Spin entry points.
+> Opt-in retained paths build only until an app is successfully retained; host
+> eviction can require fresh initialization on any request. A reused Fastly
+> sandbox does not imply that the app is retained unless the entry point chooses it.
 > So the `state` expression runs on that cadence: build heavy state **once** and
 > hand out clones (e.g. a `OnceLock<Arc<AppState>>` as above, or a `static`), and
 > let `T = Arc<AppState>` so each call is just a refcount bump. Do **not** `Arc::new(HeavyThing::build())` directly in the `state` expression.
@@ -370,6 +373,14 @@ the monotonic clock, an error-response renderer, and response-egress policy or o
 callback cheap for the same adapter-lifecycle reasons as `state = <expr>` above. A configuration
 error prevents EdgeZero request conversion, body polling, and dispatch; Axum also fails before
 binding its listener.
+
+`App::build::<A>(PLATFORM) -> Result<App, EdgeError>` is the canonical assembly
+path. It installs the selected platform before calling `Hooks::configure` and
+rejects a successful configuration that replaces that metadata. Publish or retain
+only the completed successful app, never an initialization error. Retaining the app
+does not retain request admission grants, registries, bodies, or response-egress
+resources; those are fresh for every dispatch. See
+[application retention](/guide/adapters/overview#opt-in-application-retention).
 
 Use the synchronous error renderer when framework and handler errors must use an application-owned,
 fixed-size wire body:

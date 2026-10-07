@@ -277,10 +277,11 @@ fn response_lifecycle(
 /// `build_router()`, which every adapter's `run_app` invokes via
 /// `EdgeZeroApp::build::<A>(platform)`
 /// — once at startup for long-lived runtimes (Axum), but **once per request** on
-/// Fastly Compute (each request is a fresh Wasm instance). So `app_state()` must
-/// be **cheap**: build the heavy state once and hand out clones. Here a
-/// `OnceLock<Arc<DemoState>>` builds it lazily and every call just bumps the
-/// `Arc` refcount — do NOT `Arc::new(..)` a heavy object on each call.
+/// default Fastly, Cloudflare and Spin entry points. Fastly starts a fresh Wasm
+/// instance by default; Cloudflare and Spin also rebuild the app per request.
+/// So `app_state()` must be **cheap**: build the heavy state once and hand out
+/// clones. Here a `OnceLock<Arc<DemoState>>` builds it lazily and every call just
+/// bumps the `Arc` refcount — do NOT `Arc::new(..)` a heavy object on each call.
 #[must_use]
 #[inline]
 pub fn app_state() -> Arc<DemoState> {
