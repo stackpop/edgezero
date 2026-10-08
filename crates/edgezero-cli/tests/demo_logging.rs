@@ -7,10 +7,12 @@ mod tests {
     use std::process::Command;
 
     fn demo_startup(level: &str, host: &str) -> (String, String) {
+        let directory = tempfile::tempdir().expect("isolated demo state");
         let listener = TcpListener::bind("127.0.0.1:0").expect("reserve demo port");
         let port = listener.local_addr().expect("reserved address").port();
         let output = Command::new(env!("CARGO_BIN_EXE_edgezero"))
             .arg("demo")
+            .current_dir(directory.path())
             .env("EDGEZERO__LOGGING__LEVEL", level)
             .env("EDGEZERO__ADAPTER__HOST", host)
             .env("EDGEZERO__ADAPTER__PORT", port.to_string())
