@@ -1,0 +1,64 @@
+# Build from the workspace root after preparing portable dependencies and Cargo.lock.
+# Keep this pin aligned with .tool-versions when updating the application toolchain.
+ARG RUST_VERSION={{rust_version}}
+FROM rust:${RUST_VERSION}-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
+ARG RUST_VERSION
+ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}
+WORKDIR /build
+COPY . .
+
+# Support exact release pins and the conventional [toolchain] channel declaration.
+# Validate before invoking rustup, which could otherwise download a directory override.
+RUN <<'SH'
+set -eu
+fail() { echo "container toolchain: $*" >&2; exit 1; }
+test -f Cargo.lock || fail 'prepare and commit the application Cargo.lock first'
+pin=$(awk '$1 == "rust" { if (NF != 2 || ++count != 1) exit 1; pin = $2 }
+    END { if (count != 1) exit 1; print pin }' .tool-versions) \
+    || fail 'expected one rust X.Y.Z entry in .tool-versions'
+printf '%s\n' "$pin" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+    || fail 'Rust must be an exact X.Y.Z release'
+test "$pin" = "$RUST_VERSION" || fail 'update the Docker Rust pin to match .tool-versions'
+test ! -e rust-toolchain || fail 'use rust-toolchain.toml with an exact channel instead of rust-toolchain'
+if test -f rust-toolchain.toml; then
+    channel=$(awk '
+        { sub(/#.*/, ""); gsub(/^[ \t]+|[ \t]+$/, "") }
+        /^\[/ { section = $0; next }
+        section == "[toolchain]" && /^channel[ \t]*=/ {
+            if (++count != 1 || $0 !~ /^channel[ \t]*=[ \t]*"[0-9]+\.[0-9]+\.[0-9]+"$/) exit 1
+            sub(/^channel[ \t]*=[ \t]*"/, ""); sub(/"$/, ""); channel = $0
+        }
+        END { if (count != 1) exit 1; print channel }
+    ' rust-toolchain.toml) || fail 'expected one quoted X.Y.Z channel under [toolchain]'
+    test "$channel" = "$pin" || fail 'rust-toolchain.toml conflicts with .tool-versions'
+fi
+actual=$(rustup run "$RUST_VERSION" rustc --version | awk '{print $2}')
+test "$actual" = "$pin" || fail 'the installed builder compiler does not match the application pin'
+SH
+
+# AWS-LC may build bundled native sources. These tools stay in the builder.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
+RUN <<'SH'
+set -eu
+host=$(rustc -vV | awk '$1 == "host:" {print $2}')
+cargo build -p {{proj_axum}} --bin {{proj_axum}} --release --locked --target "$host"
+mkdir /out
+cp "target/$host/release/{{proj_axum}}" /out/app
+strip --strip-debug /out/app
+SH
+
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
+# Apply available Bookworm fixes to packages inherited from the pinned base too.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /out/app /usr/local/bin/app
+ENV EDGEZERO__ADAPTER__HOST=0.0.0.0 \
+    EDGEZERO__ADAPTER__PORT=8787
+USER 10001:10001
+EXPOSE 8787
+ENTRYPOINT ["/usr/local/bin/app"]
