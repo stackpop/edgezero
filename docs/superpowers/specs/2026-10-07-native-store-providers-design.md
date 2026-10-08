@@ -1,6 +1,6 @@
 # Native store providers independent of HTTP adapters
 
-- Status: Implementation and draft publication via `gh stack` authorized, including rebasing onto open prerequisites. Real AWS service acceptance is declined and excluded.
+- Status: Offline implementation verified and published as draft [PR #414](https://github.com/stackpop/edgezero/pull/414) via `gh stack`, based on open #275 with the compatible #406 lifecycle bridge. Real AWS service acceptance is declined and excluded.
 - Date: 2026-10-07
 - Owning issue: [EdgeZero #410](https://github.com/stackpop/edgezero/issues/410).
 - Audited main: `683202c66948146ec360f490126f1d60f920288b`.

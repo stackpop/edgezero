@@ -1,6 +1,6 @@
 # Native store providers implementation plan
 
-- Status: Implementation complete through offline Stages 1-8. Native provider combinations, generated-consumer startup, workspace/native/WASM gates and documentation checks passed. Draft publication via `gh stack` is authorized and pending rebase/publication. Provider availability validation deliberately remains structural-only/unknown. Real AWS acceptance is declined and excluded.
+- Status: Implementation complete through offline Stages 1-8. Native provider combinations, generated-consumer startup, workspace/native/WASM gates and documentation checks passed. Draft [PR #414](https://github.com/stackpop/edgezero/pull/414) was published via `gh stack` after rebasing and rerunning gates. Provider availability validation deliberately remains structural-only/unknown. Real AWS acceptance is declined and excluded.
 - Date: 2026-10-07.
 - Owning issue: [EdgeZero #410](https://github.com/stackpop/edgezero/issues/410).
 - Governing design: [Native store providers independent of HTTP adapters](../specs/2026-10-07-native-store-providers-design.md), including the R1 Cargo feature-resolution correction.
@@ -603,7 +603,7 @@ A machine-local `/tmp` quota caused one interrupted test run. Checks use a disk-
 
 Read-only final provider and CLI reviews found no confirmed boundary defects (`/tmp/native-store-final-review-{provider,cli}.md`). These reviews did not execute Cargo and do not replace coordinator gates. Generated `serve` CLI end-to-end behavior is not separately demonstrated; shared argument selection/action gating is source/unit-tested, and generated build plus production startup is executed. Remaining review items are dependency DEBUG/TRACE disclosure, operator-reviewed Agent release/digest and explicitly excluded real AWS acceptance.
 
-Publication will rebase the compatible lifecycle bridge plus #410 onto latest #275 and create one draft stack member. Existing prerequisite PRs must remain unchanged. Re-run affected gates after that rebase and record final PR/base/head separately.
+Publication completed with one draft stack member, [PR #414](https://github.com/stackpop/edgezero/pull/414), assigned to ChristianPavilonis. Trunk is `docs/outbound-http-spec` / #275 at `ea66eff045512cccc60646d6ec339e83ff44fed7`. The compatible lifecycle bridge is `a08f54c`; tested implementation checkpoint is `ab402f4fbdaa5c7c244ec16c11cfacec65123064`, tree `d6097c9c8947e8828338b3340287d6df0650380e`. Existing #275/#406 were not modified. The clean rebase required one lockfile dependency disambiguation (`wasm-streams 0.6.0`), followed by all 24 gates passing again and a successful existing generated workspace/WASM test. Exact commands, fingerprints and logs remain under `final-checks/`; `generated-full-rebased.log` records the additional consumer gate. The subsequent publication-record commit changes only documentation. No merge or deployment was performed.
 
 ## Links
 
