@@ -2,16 +2,22 @@
 
 > Historical implementation plan. The private-helper design and custom callback
 > choices are superseded by [the custom serving lifecycle plan](2026-09-17-custom-serving-lifecycle.md).
-> The implemented public `Sandbox` and `Hooks`-typed Cloudflare/Spin dispatch APIs
-> are described in the updated [spec](../specs/2026-09-15-reusable-app-lifecycle-design.md).
+> PR #275's outbound hard-cut also supersedes the original infallible assembly,
+> public raw conversion, response-returning dispatch, and buffering choices.
+> Current APIs are reconciled below; the [outbound HTTP design](../specs/2026-05-21-outbound-http-design.md)
+> remains authoritative for admission, outbound execution, response egress, and
+> capabilities. The updated [lifecycle spec](../specs/2026-09-15-reusable-app-lifecycle-design.md)
+> documents successful-only retention. Historical checkmarks and verification
+> counts do not verify the reconciled implementation.
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkboxes for tracking; exceptions and evidence limits are recorded in the execution checkpoint.
+> This is a historical decision record, not authorization to restore superseded
+> APIs. Any new implementation requires a current approved plan.
 
 **Goal:** Add explicit application retention for Fastly, Cloudflare, and Spin while preserving existing defaults and Axum's retained-router behavior.
 
-**Architecture:** Keep ownership in the existing core `App`. Add a private, host-testable initialization helper behind Fastly's new `Serve` conveniences and explicit-metadata dispatch wrappers for Cloudflare/Spin. Concrete application caches and provider HTTP fixtures demonstrate retention without introducing a common scheduler or generic singleton.
+**Architecture:** Keep ownership in core `App`, built through fallible `App::build::<A>(PLATFORM)`. Fastly uses public, host-testable `Sandbox` state with `serve_app` / `serve_app_with_hooks`; Cloudflare/Spin use `Hooks`-typed prebuilt dispatch. Retain successful apps only and create fresh registries, admission, and response-egress resources per request. No common scheduler or generic singleton is introduced.
 
-**Tech Stack:** Rust, Fastly SDK 0.12.1/Viceroy, worker 0.8/worker-build/Wrangler, Spin SDK 6/P3, Axum, shell, VitePress/Prettier.
+**Tech Stack:** Rust, Fastly SDK 0.13.1/Viceroy 0.21.0, worker 0.8.5/worker-build/Wrangler, Spin SDK 7/P3, Axum, shell, VitePress/Prettier.
 
 ---
 
@@ -19,8 +25,8 @@
 
 - Source baseline: `593fc9282a1c56e12bae15f91eef2162f4b6a1b7`.
 - Governing design: [Reusable application lifecycle spec](../specs/2026-09-15-reusable-app-lifecycle-design.md), including the host/WASM test split and attempted-request accounting added during review.
-- This document plans implementation. Before executing code changes, obtain plan approval as required by `CLAUDE.md`. Planning does not authorize deployment, publishing, external comments, or committing unrelated work.
-- Preserve existing entry points, generated templates, macro grammar, logging ownership, error translation, buffering, stream caps, and defaults. No new Tokio dependency in core/WASM adapters, no provider-independent scheduler, and no external consumer identifiers in documents or fixtures.
+- This document records historical implementation. New code work requires approval under `CLAUDE.md`; this record does not authorize deployment, publishing, external comments, or unrelated commits.
+- Preserve lifecycle defaults, macro grammar, and logging ownership while following PR #275's canonical fallible assembly and lazy delivery. Do not restore historical response buffering, collection caps, or removed APIs through compatibility aliases. No new Tokio dependency in core/WASM adapters, provider-independent scheduler, or external consumer identifiers.
 - Re-read current `CLAUDE.md` and compare source with the baseline before execution. Use `superpowers:using-git-worktrees` when starting approved code work. This planning-only document remains in the current workspace.
 - Run scoped `cargo test` after each code increment. Provider fixture changes also need the real-target check/build. No host stub proves provider behavior.
 - The commit messages below are implementation checkpoints, not commands to commit during planning. Commit only focused, verified changes within the approved execution scope.
@@ -44,7 +50,7 @@ Production and existing tests:
 - `crates/edgezero-core/src/router.rs`: forced interleaving/isolation test.
 - `crates/edgezero-core/src/app_config.rs`: audit recursion-guard cleanup and extend colocated tests only where coverage is missing.
 - `crates/edgezero-adapter-fastly/src/request.rs`: audit bounded warning-cache behavior; preserve production behavior.
-- `crates/edgezero-adapter-fastly/src/lib.rs`: private retained state, colocated host tests, two public serving helpers, SDK exports.
+- `crates/edgezero-adapter-fastly/src/lib.rs` and `src/lifecycle.rs`: successful-only `Sandbox`, host tests, `serve_app` / `serve_app_with_hooks`, and SDK exports.
 - `crates/edgezero-adapter-cloudflare/src/lib.rs`: additive `dispatch_app`.
 - `crates/edgezero-adapter-spin/src/lib.rs`: additive `dispatch_app`.
 - `.github/workflows/test.yml`: native harness tests and Fastly HTTP smoke using existing Viceroy setup.
@@ -79,7 +85,10 @@ tests/fixtures/reusable-app/
 
 Documentation: `docs/guide/adapters/{overview,fastly,cloudflare,spin,axum}.md`, fixture README, and the fresh-Fastly-instance comment in `examples/app-demo/crates/app-demo-core/src/lib.rs`.
 
-No production request/response module changes are expected. Reuse their dispatchers; add no core lifecycle module or manifest setting.
+The original retention work minimized request/response changes. PR #275 now owns
+canonical admission and response egress in those modules; do not restore the
+historical conversion or collection paths. No core lifecycle module or reuse
+manifest setting is introduced.
 
 ## Task 1: Protect retained ownership and request separation
 
@@ -106,78 +115,32 @@ fn app_can_be_retained_in_a_shared_owner() {
 
 ## Task 2: Host-testable Fastly production initialization
 
-**File:** `crates/edgezero-adapter-fastly/src/lib.rs`.
+**Files:** `crates/edgezero-adapter-fastly/src/lib.rs`, `src/lifecycle.rs`.
+
+The original private, infallible initialization sketch is superseded by the
+custom lifecycle work and PR #275. Current production uses `Sandbox<App>` with
+independent successful setup and fallible construction guards.
 
 Native `cargo test --features fastly` has a reproduced pre-existing unresolved-hostcall linker failure. Compile shared initialization logic under `cfg(any(feature = "fastly", test))`, as this file already does for `FastlyLogging`/`EnvConfig`. Do not introduce fake hostcalls.
 
-- [x] **2.1 Write tests referring to private `RetainedApp` first.** Use counted closures and real core `App` values. Run `cargo test -p edgezero-adapter-fastly --lib retained_app`; expected initial failure: missing helper.
-- [x] **2.2 Add this private production state** adjacent to the entry points:
+- [x] **2.1 Protect successful-only retention.** Use the production `Sandbox` state with counted closures and real core app construction. Initialization failure leaves the slot empty; setup succeeds independently of app construction.
+- [x] **2.2 Use the current production lifecycle:**
 
 ```rust
-#[cfg(any(feature = "fastly", test))]
-#[derive(Default)]
-struct RetainedApp {
-    app: Option<edgezero_core::app::App>,
-}
+use edgezero_adapter_fastly::{FASTLY_PLATFORM, lifecycle::Sandbox};
+use edgezero_core::app::App;
 
-#[cfg(any(feature = "fastly", test))]
-impl RetainedApp {
-    fn get_or_init<E>(
-        &mut self,
-        env: &edgezero_core::env_config::EnvConfig,
-        owns_logging: impl FnOnce() -> bool,
-        install_logger: impl FnOnce(&str, log::LevelFilter, bool) -> Result<(), E>,
-        build: impl FnOnce() -> edgezero_core::app::App,
-    ) -> Result<&edgezero_core::app::App, E> {
-        if self.app.is_none() {
-            let logging = FastlyLogging::from(env);
-            if logging.use_fastly_logger && !owns_logging() {
-                install_logger(
-                    logging.endpoint.as_deref().unwrap_or("stdout"),
-                    logging.level,
-                    logging.echo_stdout,
-                )?;
-            }
-        }
-        Ok(self.app.get_or_insert_with(build))
-    }
-}
+let mut retained = Sandbox::<App>::default();
+retained.initialize(|| App::build::<MyApp>(FASTLY_PLATFORM))?;
+let app = retained.state().expect("successful initialization");
 ```
 
-Apply existing documentation/lint conventions. The helper stores successful initialization only; it does not cache errors or emulate SDK termination. Task 3 uses this exact state in production.
+`Hooks::configure` returns `Result<(), EdgeError>`; `App::build` installs and
+validates platform metadata. No partial app or initialization error is retained.
+Custom callbacks decide whether a failure is recoverable; standard serving
+propagates it and stops without another send.
 
-- [x] **2.3 Add this degraded-snapshot regression**, importing `App`, `RouterService`, and `EnvConfig` from core in the colocated module:
-
-```rust
-#[test]
-fn retained_app_keeps_degraded_first_logging_decision() {
-    let mut retained = RetainedApp::default();
-    let installs = std::cell::Cell::new(0);
-    let builds = std::cell::Cell::new(0);
-    let first = EnvConfig::from_vars(std::iter::empty::<(String, String)>());
-    let later = EnvConfig::from_vars([
-        ("EDGEZERO__LOGGING__ENDPOINT", "fixture-logs"),
-        ("EDGEZERO__LOGGING__LEVEL", "debug"),
-    ]);
-    for env in [&first, &later] {
-        let app = retained.get_or_init(
-            env,
-            || false,
-            |_, _, _| {
-                installs.set(installs.get() + 1);
-                Ok::<(), &'static str>(())
-            },
-            || {
-                builds.set(builds.get() + 1);
-                App::with_name(RouterService::builder().build(), "retained")
-            },
-        ).expect("initialization");
-        assert_eq!(app.name(), "retained");
-    }
-    assert_eq!(builds.get(), 1);
-    assert_eq!(installs.get(), 0);
-}
-```
+- [x] **2.3 Preserve the degraded first logging snapshot.** Exercise production `setup_once` with an empty initial environment and later successful selector reads. Logging is not reconfigured after successful setup, while runtime/store resolution remains per request. The earlier private-helper test sketch is superseded.
 
 - [x] **2.4 Complete these cases:**
 
@@ -185,7 +148,7 @@ fn retained_app_keeps_degraded_first_logging_decision() {
 | ------------------ | ---------------------------------------------------------------------------------------------- |
 | Configured logging | `logger`, then `build`, once across two calls; endpoint/level from first env; stdout true      |
 | Owned logging      | Zero adapter installs, one build                                                               |
-| Logger error       | Exact injected error, zero builds, no stored app; do not present same-owner retry as supported |
+| Logger error       | Exact injected error, zero builds, no stored app; custom retries require safe setup side effects |
 | Fresh owner        | Two state values initialize independently, no shared static                                    |
 | Retained app       | Two dispatches use the same configured router/state                                            |
 
@@ -203,31 +166,22 @@ pub use fastly::http::serve::{Serve, ServeSummary};
 
 #[cfg(feature = "fastly")]
 #[inline]
-pub fn serve_app<A: Hooks>(serve: Serve) -> ServeSummary<fastly::Error> {
-    serve_app_with_request_extensions::<A, _>(serve, |_request, _extensions| {})
-}
+pub fn serve_app<A: Hooks>(serve: Serve) -> ServeSummary<fastly::Error>;
 
 #[cfg(feature = "fastly")]
 #[inline]
-pub fn serve_app_with_request_extensions<A, F>(
+pub fn serve_app_with_hooks<A, Prepare, Finalize, State>(
     serve: Serve,
-    mut extend: F,
+    prepare: Prepare,
+    finalize: Finalize,
 ) -> ServeSummary<fastly::Error>
 where
     A: Hooks,
-    F: FnMut(&fastly::Request, &mut Extensions),
-{
-    let stores = A::stores();
-    let mut retained = RetainedApp::default();
-    serve.run(move |req| -> Result<fastly::Response, fastly::Error> {
-        let env = runtime_env_config(stores);
-        let app = retained.get_or_init(&env, A::owns_logging, init_logger, A::build_app)?;
-        request::dispatch_with_registries(app, req, stores, &env, &mut extend)
-    })
-}
+    Prepare: FnMut(&mut fastly::Request, &mut Extensions),
+    Finalize: FnMut(&mut edgezero_core::Response) -> State;
 ```
 
-- [x] **3.2 Add API docs** for ordinary `main`, first-callback initialization, degraded logging snapshot, fresh registries/extensions, `owns_logging`, limits, terminal SDK callback errors, attempted counts, and `.into_result()`. Do not promise progressive streaming on this standard path.
+- [x] **3.2 Add API docs** for ordinary `main`, successful-only `Sandbox<App>` retention, degraded logging snapshot, fresh registries/admission/egress, `owns_logging`, limits, terminal errors, attempted counts, and `.into_result()`. Preparation borrows the request before admission; finalization borrows only routed responses before policy/framing. The adapter owns lazy delivery; no native response is returned to the SDK for another send.
 - [x] **3.3 Verify:**
 
 ```sh
@@ -238,7 +192,7 @@ cargo check -p edgezero-adapter-fastly --features fastly --all-targets
 
 Expected: host logic passes and SDK wrappers type-check. HTTP execution remains Task 7.
 
-- [x] **3.4 Confirm all existing helpers/logger/templates are unchanged.** Checkpoint: `feat(fastly): add opt-in retained app serving`.
+- [x] **3.4 Preserve lifecycle defaults and logging ownership.** PR #275 supersedes the earlier unchanged-helper guarantee; do not restore removed APIs or buffering. Checkpoint: `feat(fastly): add opt-in retained app serving`.
 
 ## Task 4: Cloudflare and Spin prebuilt dispatch
 
@@ -249,24 +203,12 @@ Expected: host logic passes and SDK wrappers type-check. HTTP execution remains 
 ```rust
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 #[inline]
-pub async fn dispatch_app(
+pub async fn dispatch_app<A: Hooks>(
     app: &edgezero_core::app::App,
-    stores: StoresMetadata,
     req: Request,
     env: Env,
     ctx: Context,
-) -> Result<Response, WorkerError> {
-    let env_config = env_config_from_worker(&env, stores);
-    request::dispatch_with_registries(
-        app, req, env, ctx,
-        request::RegistryInputs {
-            config_meta: stores.config,
-            kv_meta: stores.kv,
-            secret_meta: stores.secrets,
-            env_config: &env_config,
-        },
-    ).await
-}
+) -> Result<Response, WorkerError>;
 ```
 
 - [x] **4.2 Run `cargo test -p edgezero-adapter-cloudflare` and `cargo check -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown`.** Binding/runtime assertions come in Task 8.
@@ -275,31 +217,25 @@ pub async fn dispatch_app(
 ```rust
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[inline]
-pub async fn dispatch_app(
+pub async fn dispatch_app<A: Hooks>(
     app: &App,
-    stores: edgezero_core::app::StoresMetadata,
     req: SpinRequest,
-) -> anyhow::Result<SpinFullResponse> {
-    let env = EnvConfig::from_env();
-    request::dispatch_with_registries(
-        app, req, stores.config, stores.kv, stores.secrets, &env,
-    ).await
-}
+) -> anyhow::Result<edgezero_adapter_spin::SpinResponse>;
 ```
 
-- [x] **4.4 Run `cargo test -p edgezero-adapter-spin` and `cargo check -p edgezero-adapter-spin --features spin --target wasm32-wasip2`.** Add public docs for explicit metadata, caller-owned app/logging, fresh request setup, and overlapping invocations.
-- [x] **4.5 Leave both `run_app` bodies unchanged.** Delegating them directly would move configuration reads after app construction. Small additive wrappers preserve exact ordering without extra plumbing. Checkpoint: `feat(adapters): dispatch prebuilt Cloudflare and Spin apps`.
+- [x] **4.4 Run `cargo test -p edgezero-adapter-spin` and `cargo check -p edgezero-adapter-spin --features spin --target wasm32-wasip2`.** Document `A::stores()` selection, caller-owned successful app/logging, fresh registries/admission/egress, raw Spin response ownership, and overlapping invocations.
+- [x] **4.5 Current `run_app` delegates to `dispatch_app::<A>`.** Logging precedes fallible `App::build::<A>(PLATFORM)`; configuration, runtime variables, and registries are resolved for every dispatch. The original nondelegating wrapper choice is superseded by PR #275. Callers pair retained apps with their construction `Hooks` type and selected platform. Checkpoint: `feat(adapters): dispatch prebuilt Cloudflare and Spin apps`.
 
 ## Task 5: Build the portable probe fixture
 
 **Files:** `tests/fixtures/reusable-app/{Cargo.toml,Cargo.lock,.gitignore}` and `crates/fixture-core/{Cargo.toml,src/lib.rs}` beneath that directory.
 
 - [x] **5.1 Create an isolated workspace.** Use resolver 2, edition 2024, `publish = false`, and `default-members = ["crates/fixture-core"]`. Workspace EdgeZero paths are `../../../crates/<crate>`. Provider packages enable their own features; core uses `default-features = false`. Match the repository's SDK versions. Keep Tokio confined to the native Axum fixture. Ignore `target`, `.runs`, `.wrangler`, `.spin`, and generated worker output. Generate and commit the fixture lockfile; all subsequent builds use `--locked`.
-- [x] **5.2 Add counted `FixtureApp` and a distinct `OtherApp`.** Count `build_app` and `configure` independently. Supply explicit config/KV/secret metadata with fixture-only names. Issue a fresh unique synthetic candidate boot token on every incoming request; each guest latches only its first candidate as its instance marker and increments a guest-local request ordinal. Never share a candidate token across a run or runtime process: fresh guests must report different markers. This test marker must never contain real request data or appear as a production caching example.
+- [x] **5.2 Add counted `FixtureApp` and a distinct `OtherApp`.** Count route construction and fallible `configure` independently through `App::build::<A>(PLATFORM)`. Supply explicit config/KV/secret metadata with fixture-only names. Issue a fresh unique synthetic candidate boot token on every incoming request; each guest latches only its first candidate as its instance marker and increments a guest-local request ordinal. Never share a candidate token across a run or runtime process: fresh guests must report different markers. This test marker must never contain real request data or appear as a production caching example.
 - [x] **5.3 Add a failing probe contract test.** Two requests must return their own path, header, body, and request-extension tokens; an intentionally shared `Arc` counter must increment. Run `cargo test --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-core`; expect the missing probe behavior to fail.
 - [x] **5.4 Implement the probe with `#[action]` handlers and core HTTP imports.** Keep shared state limited to counters and the controlled fixture identity. Return JSON records containing instance, ordinal, build/configure counts, and echoed synthetic request fields.
 - [x] **5.5 Add `/cookies` and `/rendered-error`.** Append two distinct `Set-Cookie` values; return an ordinary renderable application error on the latter route. Add assertions for both and rerun the scoped tests.
-- [x] **5.6 Add `/stream`, `/stream-error`, and `/overlap/{id}`.** Use a controlled loopback backend through the injected proxy. The overlap route captures request values before awaiting a barrier and returns them afterward. An in-flight guard increments/decrements atomics without keeping a mutex guard across an await. Return the observed maximum in-flight count.
+- [x] **5.6 Add `/stream`, `/stream-error`, and `/overlap/{id}`.** Use a controlled loopback backend through the injected outbound HTTP interface. The overlap route captures request values before awaiting a barrier and returns them afterward. An in-flight guard increments/decrements atomics without keeping a mutex guard across an await. Return the observed maximum in-flight count.
 - [x] **5.7 Add `/bindings` and `/origin/{id}`.** Report only binding presence and nonsecret fixture markers. Origins come from a finite harness-owned allowlist. Test unknown-origin rejection and both concrete apps' different route identities.
 - [x] **5.8 Run the locked core fixture tests.** Expected: all portable assertions pass without provider calls. Checkpoint: `test(lifecycle): add portable retained-app probes`.
 
@@ -321,27 +257,27 @@ pub async fn dispatch_app(
 **Files:** `tests/fixtures/reusable-app/crates/fixture-fastly/{Cargo.toml,fastly.toml,src/lib.rs,src/bin/single_request.rs,src/bin/rebuild_per_request.rs,src/bin/retained_app.rs,src/bin/custom_single_request.rs,src/bin/custom_rebuild_per_request.rs,src/bin/custom_retained_app.rs,src/bin/logger_negative.rs}`; extend harness Fastly orchestration.
 
 - [x] **7.1 Declare explicit binary names.** Use `fixture-fastly-a`, `fixture-fastly-b`, `fixture-fastly-c`, `fixture-fastly-custom-a`, `fixture-fastly-custom-b`, `fixture-fastly-custom-c`, and `fixture-fastly-logger-negative`. Pin SDK 0.12.1 and build on `wasm32-wasip1`.
-- [x] **7.2 Implement standard A with the existing single-request macro entry point.** Call `run_app_with_request_extensions`, adding only fixture observations. Preserve its current logging and construction behavior.
-- [x] **7.3 Implement standard B using raw `Serve::run`.** Read runtime configuration each callback, make the logging decision once from the first snapshot, build the app each callback, and call `dispatch_with_registries`. Use the same logging policy as C, including a degraded first snapshot. Do not call retaining `serve_app` for B.
-- [x] **7.4 Implement standard C with `serve_app_with_request_extensions`.** Start with a finite request limit of 10 and a bounded idle wait. Record SDK attempted-request summaries separately from client success. Compare A/B/C with identical payloads, dispatch, and instrumentation.
-- [x] **7.5 Implement custom A/B/C around a shared raw dispatch function.** A owns one native request; B builds each callback; C captures an ordinary `Option<App>` and initializes it lazily. Mutate a synthetic native header, record native metadata, convert into core, route, recover response extensions, and apply a fixture finalizer. A health request before C's first application request must leave its build count at zero.
+- [x] **7.2 Implement standard A with the single-request entry point.** Use `run_app_with_hooks`, adding fixture observations through preparation and routed-response finalization. Preserve per-invocation construction and canonical adapter-owned delivery.
+- [x] **7.3 Implement standard B using `lifecycle::serve_custom`.** Read runtime configuration each callback, complete logging setup once from the first snapshot, call `App::build::<A>(FASTLY_PLATFORM)` each callback, and use `request::send_request_with_registries_and_hooks`. Use the same logging policy as C, including a degraded first snapshot. Do not call retaining `serve_app` for B.
+- [x] **7.4 Implement standard C with `serve_app_with_hooks`.** Start with a finite request limit of 10 and a bounded idle wait. Record SDK attempted-request summaries separately from completed delivery. Compare A/B/C with identical payloads, canonical dispatch, and instrumentation.
+- [x] **7.5 Implement custom A/B/C through the canonical send-owning path.** A uses `run_custom` for one native request; B builds each callback; C initializes a `Sandbox<App>` lazily and retains only success. Use request preparation for synthetic native metadata and routed-response finalization for extension observations. A health callback before C's first application request must leave its initialization count at zero. The original manual-conversion design is superseded by PR #275.
 - [x] **7.5a Verify request correlation independently of sandbox identity.** Capture `Request::get_client_request_id()` on each callback and record `FASTLY_TRACE_ID` only as sandbox metadata. Never use the latter as a unique request ID. When the native ID is unavailable, use the harness-issued unique per-request token as an explicitly labeled fixture fallback; record availability and do not present fallback evidence as native-ID support. Across callbacks in the same observed guest, verify that correlation is derived afresh from each request and does not persist in the global logger or retained app. Keep correlation in request-local extensions or explicit per-event log fields. Exercise the fallback through a supported runtime case or a labeled injected accessor result.
-- [x] **7.6 Implement manual progressive response sending in the custom function.** Append every header value. For a core stream, create the native response, commit using `stream_to_client`, pump chunks, and finish the writable body before callback return. Handle errors after commitment locally with explicit logging/cleanup; do not return an error that causes the SDK to attempt another response. Complete instrumented post-send backend work within the callback and prove the next callback starts afterward.
+- [x] **7.6 Verify canonical progressive response delivery.** Preserve every header value and delayed-chunk production through the adapter's owned stream writer. Terminal failure after commitment cleans up without replacing the response. Lifecycle wrappers record escaping errors without an SDK resend. Complete request-owned post-delivery work before the next callback; do not duplicate transport ownership in a fixture.
 - [x] **7.7 Configure local backends and stores.** Derive runtime configuration's service-scoped keys from the guest's actual service ID, following `scripts/smoke_test_config_key_override.sh`. Keep config, KV, and secret fixtures isolated. Capture a named logging endpoint distinctly from echoed stdout; if the selected runtime cannot expose endpoint-specific evidence, report that assertion unavailable.
-- [x] **7.8 Add terminal and continuing cases.** Rendered handler errors should allow later callbacks in the same instance. Required-KV open errors, inbound conversion errors, response collection errors, and error-rendering failure are separate escaping paths. Test controlled reachable failures; label injected/unavailable cases honestly. Add constructor panic, pre-commit failure, post-commit stream failure, and a later fresh-owner initialization case.
+- [x] **7.8 Add terminal and continuing cases.** Separate rendered handler errors, admission refusals/aborts, bounded precommit fallbacks, and escaping delivery failures according to the outbound design. Test controlled reachable failures; label injected/unavailable cases honestly. Add configuration failure without caching, constructor panic, post-commit stream failure, and a fresh-owner initialization case. Historical collection-error behavior is superseded.
 - [x] **7.9 Add the logger negative control.** Naively wrapping enabled-logger `run_app` in `Serve` should expose the second-installation failure. Keep this out of B's performance samples. Add the degraded-first-read/recovered-selector case where runtime controls permit; otherwise retain host injection evidence and mark the provider scenario unverified.
 - [x] **7.10 Build and run the fixtures.** From the fixture workspace run `cargo build --locked --release -p fixture-fastly --bins --target wasm32-wasip1`. Launch the selected executable with `viceroy serve --addr 127.0.0.1:<port> --config <run-config> <absolute-wasm-path>`. Account for readiness callbacks or restart before measuring. Run `./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke`.
-- [x] **7.11 Assert actual reuse before accepting comparisons.** Stable guest marker plus increasing ordinal is required. A builds once per fresh invocation; B builds each reused callback; C builds once per retained owner. Check cookies, buffering versus progressive streaming, request isolation, limit 1/10, idle exit, and restart. Compare standard A/B/C and custom A/B/C separately.
+- [x] **7.11 Assert actual reuse before accepting comparisons.** Stable guest marker plus increasing ordinal is required. A builds once per fresh invocation; B builds each reused callback; C retains the first successful app. Check cookies, canonical progressive streaming, request isolation, limit 1/10, idle exit, and restart. Historical buffered comparisons must be rerun against matched lazy delivery.
 - [x] **7.12 Run existing Fastly tests on their proper runners.** Run default host `cargo test -p edgezero-adapter-fastly --lib`. With the selected Viceroy on PATH, run `CARGO_TARGET_WASM32_WASIP1_RUNNER="viceroy run" cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --test contract`, and repeat with `--lib`. Native feature-enabled linking is not a required test route. Checkpoint: `test(fastly): verify reusable sandbox lifecycle over HTTP`.
 
 ## Task 8: Exercise Cloudflare and Spin retained ownership
 
 **Files:** fixture Cloudflare and Spin package files listed in the file map; provider sections of the harness.
 
-- [x] **8.1 Add the Cloudflare fetch fixture.** Use a `cdylib`/`rlib` and `#[event(fetch)]`. A launch-time fixture mode selects unchanged `run_app` or a concrete `static APP: OnceLock<App>` with `dispatch_app` and full metadata. Add a separate concrete `OTHER_APP`; never place an unkeyed static inside a generic function. Do not retain `Env`, `Context`, bodies, or binding handles.
+- [x] **8.1 Add the Cloudflare fetch fixture.** Use a `cdylib`/`rlib` and `#[event(fetch)]`. A launch-time fixture mode selects `run_app` or a concrete `OnceLock<App>` populated only after `App::build::<A>(CLOUDFLARE_PLATFORM)` succeeds, with `dispatch_app::<A>(&app, req, env, ctx)`. Add a separate concrete `OTHER_APP`; never place an unkeyed static inside a generic function. Do not retain initialization errors, `Env`, `Context`, bodies, bindings, admission, or egress resources.
 - [x] **8.2 Configure local Worker builds and bindings.** Use `main = "build/worker/shim.mjs"`, record a fixed compatibility date, and build with `worker-build --release . -- --locked` from the package. Seed only local KV using the same persistence directory supplied to Wrangler. No remote commands or account credentials are needed.
-- [x] **8.3 Add the Spin HTTP fixture.** Use SDK 6's `#[http_service]`, concrete app statics, and explicit store metadata. Configure component permissions, fixture config/secret variables, and a local KV store in `runtime-config.toml`. Keep incoming/outgoing bodies and pending futures request-owned.
-- [x] **8.4 Build and boot Spin.** Run `cargo build --locked --release -p fixture-spin --target wasm32-wasip2` from the fixture workspace. The original manifest component source is `../../target/wasm32-wasip2/release/fixture_spin.wasm`; resolve it to an absolute path in copied run manifests. Use the selected `spin up --listen <address> --runtime-config-file <config> --from <manifest>`. Verify the emitted interface by successful SDK6/P3 host boot; record independent component inspection as unavailable if no inspection tool is installed. The target name alone is insufficient.
+- [x] **8.3 Add the Spin HTTP fixture.** Use the pinned SDK 7's `#[http_service]`, successful-only concrete app statics built with the selected platform, and `dispatch_app::<A>(&app, req) -> anyhow::Result<SpinResponse>`. This is a raw response, not a collected SDK response. Configure component permissions, fixture variables, and a local KV store in `runtime-config.toml`. Keep bodies, admission/egress, and pending futures request-owned.
+- [x] **8.4 Build and boot Spin.** Run `cargo build --locked --release -p fixture-spin --target wasm32-wasip2` from the fixture workspace. Resolve the component source to an absolute path in copied run manifests. Use the selected `spin up --listen <address> --runtime-config-file <config> --from <manifest>`. Reverify the current SDK7/P3 interface and host together; historical host boot does not establish current compatibility. Record independent inspection as unavailable if no inspection tool is installed. The target name alone is insufficient.
 - [x] **8.5 Detect Spin controls from the selected runtime.** The investigated Spin 4.0 help does not expose newer reuse/concurrency controls. Exercise controls only when advertised, record their values, and otherwise observe default behavior while marking those controls unavailable. Never blindly pass flags copied from newer documentation.
 - [x] **8.6 Run sequential ownership and binding assertions on both providers.** Compare per-request versus retained builds, verify different concrete apps return different routes, and check named/default metadata, cookies, bodies, and rendered errors. Restart to prove cold initialization remains correct.
 - [ ] **8.7 Force overlapping requests on the same guest.** Hold two distinct requests at the backend barrier, verify both arrivals, release them, and assert stable guest identity, maximum in-flight count at least two, and unchanged per-request fields after awaiting. Different instances or serialized delivery are incomplete evidence, not a pass; retry only within a bounded deadline. Retained Spin and both Cloudflare modes passed; the latest Spin per-request control selected separate guests in all three attempts, so this full matrix criterion remains unverified.
@@ -365,7 +301,7 @@ pub async fn dispatch_app(
 - [x] **10.1 Add measurement validation tests.** Reject missing metrics represented as zero, negative phase deltas, mismatched tool/build identities, and SDK wall time mislabeled as CPU. Run the Rust harness tests before and after implementing the report functions.
 - [x] **10.2 Preflight guest CPU and memory capabilities.** Before enabling `with_max_memory`, require a successful guest heap snapshot. If unsupported, omit that optional limit in the comparison and report the metric unsupported. Separately test conservative SDK termination only if the selected host can produce the unsupported-snapshot failure naturally or exposes a documented hostcall fault-injection facility. Record that mechanism and label injected evidence. Otherwise mark this runtime case unsupported/unverified; do not patch the SDK or substitute a decision-model test as provider evidence. Record precision and source for every memory/CPU observation.
 - [x] **10.2a Exercise all four independent SDK limits.** Test `with_max_requests` with 1 and 10, `with_timeout` with a controlled idle gap, `with_max_lifetime` by crossing a positive elapsed deadline during controlled initialization before the next callback, and `with_max_memory` after successful heap preflight with a threshold below the measured fixture baseline. Check summary/next-instance behavior without assuming exact eviction timing or guaranteed reuse. Keep limit-boundary tests separate from performance runs so one limit cannot mask another.
-- [x] **10.3 Instrument phases.** Capture before/after initialization and request cleanup memory; build/configure counts; initialization and handler wall time; supported SDK CPU phase deltas; request commitment, guest completion, and client completion. Returned-response sending may occur outside callback timing. Keep SDK attempted counts separate from completions.
+- [x] **10.3 Instrument phases.** Capture before/after initialization and request cleanup memory; construction/configure counts; initialization and handler wall time; supported SDK CPU phase deltas; commitment, guest completion, and peer completion. Current Fastly callbacks include adapter-owned terminal delivery, not a returned-response sender outside the callback. Keep SDK attempted counts separate from completions.
 - [x] **10.4 Run repeated matched A/B/C workloads.** Default to three repetitions of 100 sequential requests per variant, finite limit 10, randomized variant order, release builds, and identical instrumentation/backend/payloads. Record configurable sample counts and seeds. Include cheap and deliberately expensive construction, delayed/large streams, failures, idle gaps, and a longer bounded run with a larger finite limit for memory growth.
 - [x] **10.5 Exercise finite proxy-origin pressure.** Compare one repeated origin with many distinct loopback origins owned by the harness. Bound count and deadlines, and record waits/failures/completions. Local behavior cannot establish the deployed service-wide dynamic-backend capacity limit, which may block registrations pending capacity.
 - [x] **10.6 Exercise malformed input and interrupted bodies.** Distinguish host rejection before dispatch from observed adapter conversion errors; label fault injection explicitly. Do not infer a demonstrated exploit from a hypothetical request.
@@ -389,7 +325,7 @@ pub async fn dispatch_app(
 
 **Files:** no planned new implementation files; fix only findings in the files above.
 
-- [x] **12.1 Review the final diff against the spec.** Confirm unchanged default entry points and generation, core traits and macro grammar, request/response conversion semantics (with the documented Cloudflare duplicate-header correction), header duplication, existing stream caps, and error policy. Production changes include adapter entry points, the public Fastly lifecycle module and registry-aware request conversion, Cloudflare response headers, selected-adapter CLI validation and Spin CLI diagnostic redaction; the updated spec records these scope exceptions.
+- [x] **12.1 Review the final diff against current authority.** Preserve lifecycle defaults, macro grammar, and header duplication while using fallible platform-aware assembly, canonical admission, and lazy owned egress. PR #275 supersedes the original unchanged-conversion/stream-cap claims. Production surfaces include the public Fastly lifecycle and borrowing hooks, `Hooks`-typed retained dispatch, and request-local resources; no compatibility alias restores removed paths.
 - [x] **12.2 Run all repository gates.** Expected: each command exits successfully; record unavailable targets/tools separately rather than claiming success.
 
 ```sh
@@ -428,7 +364,12 @@ The planning review compared two focused proposals: a private Fastly state helpe
 
 A subsequent independent alignment review found two verification omissions from spec §6.3. Tasks 1.6a–1.6b now schedule the persistent-state audit and supported cleanup checks; Tasks 7.5a and 11.2 explicitly cover request correlation and its fallback. These are verification/documentation additions, not evidence of a production defect or a change to lifecycle ownership.
 
-## Execution checkpoint
+## Historical execution checkpoint
+
+The results in this section predate reconciliation with PR #275. They record the
+original lifecycle implementation, not current API compatibility or a rerun of
+the authoritative outbound contracts. Reverify the current fixtures and gates
+before making a new passing claim.
 
 Implementation is on `feat/reusable-app-lifecycle` in the original checkout.
 The implementation is committed on this branch. Existing default entry points, generated templates,
@@ -460,10 +401,10 @@ Remaining evidence is environmental or outside this implementation:
   binding recovery are separate, labeled checks.
 - No reachable public input triggers an error in the current error renderer.
   A trap is not evidence of a returned rendering error.
-- No component-inspection executable is installed; successful Spin SDK6 component
-  boot supplies runtime compatibility evidence.
-- Standard returned-response helpers expose conversion observations, not a
-  post-send callback; unavailable CPU/cleanup phases remain unknown.
+- No component-inspection executable was installed; the historical Spin component
+  boot supplies evidence only for that tested SDK/host combination.
+- Historical conversion-only phase observations do not measure the current
+  adapter-owned delivery path. Unavailable CPU/cleanup phases remain unknown.
 - Deployed reuse frequency, resource accounting, capacity, and application workload
   benefit require separately authorized deployment and application-owned adoption.
 - The 300-probe run with limit 100 still observed at most six requests per guest.
@@ -490,3 +431,21 @@ now gives concrete mitigations for stale snapshots, cache growth, concurrent
 mutation, logging ownership, failures, and partial streams. These protect and
 explain existing behavior; application refresh policies and provider lifecycle
 limits remain outside the framework's ownership.
+
+## PR #275 Reconciliation Evidence
+
+The main merge retains opt-in successful application reuse but hard-cuts historical assembly
+and conversion paths to the authoritative outbound contract. Prebuilt Cloudflare/Spin dispatch
+and Fastly retained/custom serving use canonical admission and adapter-owned lazy egress.
+Every request resolves fresh registries and lifecycle resources. Custom Fastly callbacks return
+terminal `Result<(), E>` without allowing the SDK to send a replacement response.
+
+Verified locally with the current pins: 733 core tests and the full workspace suite; native
+and all provider-WASM lint; provider runtime contracts; 5 fixture-core and 26 harness tests;
+Fastly fixture finalization and Viceroy 0.21.0 HTTP smoke; demo host tests/lint/WASM builds;
+fresh generated-project tests/provider builds; docs format/lint/build and contract guards.
+The truncated-upstream proof gates its abort on client observation of the partial body.
+The immediate zero-byte source-failure proof requires one correlated terminal completion,
+no fallback, and terminal guest eviction; only EOF/reset before a status is accepted, never
+a timeout or malformed response. Deployed reuse, teardown, and resource guarantees remain
+outside this local evidence.

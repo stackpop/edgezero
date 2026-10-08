@@ -706,16 +706,12 @@ where
             }
         },
         ReadConfigEntry::MissingKey => {
-            let leaf_count = collect_changes(
-                &serde_json::Value::Object(serde_json::Map::default()),
-                &local_envelope.data,
-            )
-            .len();
+            let leaf_count = collect_changes(&serde_json::json!({}), &local_envelope.data).len();
             diff_info(&format!(
                 "# no remote at key `{key}`; all {leaf_count} leaves added"
             ));
             dispatch_diff_format(
-                &serde_json::Value::Object(serde_json::Map::default()),
+                &serde_json::json!({}),
                 &local_envelope.data,
                 "(none)",
                 &local_sha,
@@ -724,18 +720,14 @@ where
             DiffOutcome::RemoteAbsent
         }
         ReadConfigEntry::MissingStore => {
-            let leaf_count = collect_changes(
-                &serde_json::Value::Object(serde_json::Map::default()),
-                &local_envelope.data,
-            )
-            .len();
+            let leaf_count = collect_changes(&serde_json::json!({}), &local_envelope.data).len();
             diff_info(&format!(
                 "# store has no matching backend yet \u{2014} run `edgezero provision \
                  --adapter {}` first if this is the live remote; all {leaf_count} leaves added",
                 args.adapter
             ));
             dispatch_diff_format(
-                &serde_json::Value::Object(serde_json::Map::default()),
+                &serde_json::json!({}),
                 &local_envelope.data,
                 "(none)",
                 &local_sha,
@@ -1060,7 +1052,7 @@ fn render_first_read_diff(
         ReadConfigEntry::MissingKey if !no_diff => {
             push_info(&format!("# no remote at key `{key}`; all leaves added"));
             print_unified_diff_inline(
-                &serde_json::Value::Object(serde_json::Map::default()),
+                &serde_json::json!({}),
                 &local_envelope.data,
                 "(none)",
                 local_sha,
@@ -1074,7 +1066,7 @@ fn render_first_read_diff(
             );
             push_info("# no remote store; all leaves added");
             print_unified_diff_inline(
-                &serde_json::Value::Object(serde_json::Map::default()),
+                &serde_json::json!({}),
                 &local_envelope.data,
                 "(none)",
                 local_sha,
@@ -2175,7 +2167,11 @@ ids = ["app_config"]
         ])
         .to_string();
         let oplog = dir.path().join("fastly-ops.log");
-        let fake = fake_fastly_gc_list(r#"[{"name":"app_config","id":"store-1"}]"#, &list, &oplog);
+        let fake = fake_fastly_gc_list(
+            &serde_json::json!([{"name": "app_config", "id": "store-1"}]).to_string(),
+            &list,
+            &oplog,
+        );
         let _prepend = PathPrepend::new(fake.path());
 
         let args = ConfigGcArgs {
@@ -2211,13 +2207,17 @@ ids = ["app_config"]
         let list = json!([
             {
                 "item_key": "app_config",
-                "item_value": r#"{"edgezero_kind":"fastly_config_chunks_v2","data":{}}"#,
+                "item_value": &serde_json::json!({"edgezero_kind": "fastly_config_chunks_v2", "data": {}}).to_string(),
                 "created_at": "2026-07-01T00:00:00Z"
             },
         ])
         .to_string();
         let oplog = dir.path().join("fastly-ops.log");
-        let fake = fake_fastly_gc_list(r#"[{"name":"app_config","id":"store-1"}]"#, &list, &oplog);
+        let fake = fake_fastly_gc_list(
+            &serde_json::json!([{"name": "app_config", "id": "store-1"}]).to_string(),
+            &list,
+            &oplog,
+        );
         let _prepend = PathPrepend::new(fake.path());
 
         let args = ConfigGcArgs {
@@ -2272,7 +2272,7 @@ ids = ["app_config"]
         .to_string();
         // The store list is keyed ONLY on the ENV name -> a specific id. If the
         // overlay were ignored (logical "app_config" looked up), resolution fails.
-        let stores = r#"[{"name":"shared_config","id":"store-42"}]"#;
+        let stores = &serde_json::json!([{"name": "shared_config", "id": "store-42"}]).to_string();
         let oplog = dir.path().join("fastly-ops.log");
         let fake = fake_fastly_gc_list(stores, &entries, &oplog);
         let _prepend = PathPrepend::new(fake.path());
@@ -3508,12 +3508,17 @@ ids = ["default"]
         // Every kind of unreadable prior STATE must let a local dry-run reach the
         // writer's degrading count rather than hitting the Spin-Cloud rejection:
         // a corrupt-but-parsing pointer, malformed TOML, and a non-string root.
+        let sha = "a".repeat(64);
         let corrupt_pointer = format!(
             "app_config = {}",
-            toml_string_literal(&format!(
-                "{{\"edgezero_kind\":\"fastly_config_chunks\",\"version\":1,\"chunks\":[{{\"key\":\"app_config.__edgezero_chunks.{sha}.0\",\"len\":10,\"sha256\":\"x\"}}],\"data_sha256\":\"\",\"envelope_len\":10,\"envelope_sha256\":\"{sha}\"}}",
-                sha = "a".repeat(64),
-            )),
+            toml_string_literal(&serde_json::json!({
+                "edgezero_kind": "fastly_config_chunks",
+                "version": 1_u32,
+                "chunks": [{"key": format!("app_config.__edgezero_chunks.{sha}.0"), "len": 10_u32, "sha256": "x"}],
+                "data_sha256": "",
+                "envelope_len": 10_u32,
+                "envelope_sha256": sha,
+            }).to_string()),
         );
         let cases = [
             (

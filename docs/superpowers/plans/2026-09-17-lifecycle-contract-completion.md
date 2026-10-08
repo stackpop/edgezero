@@ -1,13 +1,26 @@
 # Lifecycle contract completion
 
+> Historical implementation record, reconciled with PR #275's outbound hard-cut.
+> Raw conversion, response-returning dispatch, and collected response paths are
+> superseded by canonical admission and adapter-owned lazy egress. The
+> [outbound HTTP design](../specs/2026-05-21-outbound-http-design.md) is authoritative;
+> no compatibility aliases restore removed APIs. Recorded checkmarks and test
+> counts below predate reconciliation and require current verification.
+
 **Goal:** Make the supported custom lifecycle executable and keep target-specific
 configuration validation scoped to its destination without disclosing secret references.
 
-**Architecture:** Keep the existing SDK serving loop, raw request conversion, and
-retained router interfaces. Applications own initialization failure policy and
-response finalization. Extend the existing Rust fixtures instead of adding another
-serving abstraction. Standalone config validation remains the portability check;
-push and diff validate only their selected adapter.
+**Architecture:** Keep provider scheduling separate from successful-only app
+retention. Assemble with `App::build::<A>(PLATFORM) -> Result<App, EdgeError>` and
+fallible `Hooks::configure`. Fastly uses `Sandbox`, `serve_app`, and
+`serve_app_with_hooks` with borrowing preparation/finalization and owned sending;
+no raw conversion or response-returning helper bypasses admission or egress.
+Cloudflare dispatch takes `(&App, Request, Env, Context)` and returns a Worker
+response; Spin takes `(&App, SpinRequest)` and returns raw `SpinResponse`. Both
+select `A::stores()` and resolve fresh registries/admission/egress per invocation,
+without building an app or installing logging. Applications own retry policy and
+never cache initialization errors. Standalone config validation remains the
+portability check; push and diff validate only their selected adapter.
 
 ## Lifecycle acceptance
 
@@ -30,7 +43,7 @@ push and diff validate only their selected adapter.
       adapter for push/diff, retaining global schema and handler checks.
 - [x] Keep field paths and naming rules in errors; omit raw and normalized values.
 
-## Verification
+## Historical verification
 
 - [x] Run scoped tests after code changes, then workspace tests, format, Clippy,
       all-adapter feature checks, and Spin WASM compilation.

@@ -480,13 +480,15 @@ fn custom_stream_checks(
         large,
         json!({"variant":variant,"repetition":repetition,"assertion":"large_progressive_stream"}),
     ))?;
+    // Trigger truncation only after the downstream client has observed the partial body.
+    *backend.release.0.lock().unwrap() = false;
     let failure_token = crate::token();
     let failure = net::request(
         port,
         "/stream-error",
         &failure_token,
-        Some(&backend.url(&format!("/abort?token={failure_token}"))),
-        None,
+        Some(&backend.url(&format!("/abort?gated=1&token={failure_token}"))),
+        Some(&backend.release),
     );
     let failure = match failure {
         Ok(reply) => {
@@ -1018,10 +1020,39 @@ fn faults(exe: &Path, run: &Path, records: &mut Records) -> Result<()> {
             )?;
             records.push(json!({"status":"pass","assertion":"malformed_rejected_before_dispatch","token":malformed_token,"status_line":rejected}))?;
             let failed_token = token();
-            let reply = net::request(port, path, &failed_token, None, None)?;
+            let reply = if *path == "/collect-error" {
+                let failure = net::request(port, path, &failed_token, None, None)
+                    .err()
+                    .ok_or("owned egress must abandon the failed response stream")?;
+                if let Some(partial) = failure.downcast_ref::<net::InterruptedResponse>() {
+                    require(
+                        partial.status == 200 && partial.body.is_empty(),
+                        "egress source failure sent a replacement response",
+                    )?;
+                    json!({"status":partial.status,"body":"","interrupted":true})
+                } else {
+                    // An immediate source error can reset delivery before the head is observed.
+                    require(
+                        failure.downcast_ref::<net::ResponseHeadAborted>().is_some(),
+                        format!("unexpected response-head failure: {failure}"),
+                    )?;
+                    json!({"no_response_head":true,"interrupted":true,"error":failure.to_string()})
+                }
+            } else {
+                net::request(port, path, &failed_token, None, None)?
+            };
             let recoverable = *path == "/recoverable-store-error";
+            let rendered_ingress = *path == "/inbound-error";
             require(
-                reply["status"] == if recoverable { 503 } else { 500 },
+                (*path == "/collect-error" && reply["no_response_head"] == true)
+                    || reply["status"]
+                        == if *path == "/collect-error" {
+                            200
+                        } else if recoverable {
+                            503
+                        } else {
+                            500
+                        },
                 format!("fault not observed: {path}: {reply}"),
             )?;
             let following = req(port, "/probe/recovered")?;
@@ -1036,6 +1067,8 @@ fn faults(exe: &Path, run: &Path, records: &mut Records) -> Result<()> {
                     .ok_or("missing fault attempt")?;
                 let event = if *path == "/constructor-panic" {
                     "constructor_panic"
+                } else if rendered_ingress {
+                    "ingress_error_response"
                 } else {
                     "adapter_error"
                 };
@@ -1046,7 +1079,23 @@ fn faults(exe: &Path, run: &Path, records: &mut Records) -> Result<()> {
                     "missing actual failure boundary",
                 )
             })?;
-            if recoverable {
+            if *path == "/collect-error" {
+                let terminal = logs(&log)
+                    .into_iter()
+                    .filter(|event| {
+                        event["event"] == "egress_terminal" && event["token"] == failed_token
+                    })
+                    .collect::<Vec<_>>();
+                require(
+                    terminal.len() == 1
+                        && terminal[0]["outcome"] == "SourceError"
+                        && terminal[0]["body_kind"] == "Application"
+                        && terminal[0]["bytes_written"] == 0
+                        && terminal[0]["fallback"].is_null(),
+                    "immediate source failure must terminate once without fallback delivery",
+                )?;
+            }
+            if recoverable || rendered_ingress {
                 let status = if value["instance"] == failed_guest {
                     "pass"
                 } else {
@@ -1054,14 +1103,18 @@ fn faults(exe: &Path, run: &Path, records: &mut Records) -> Result<()> {
                 };
                 require(
                     value["builds"] == 1,
-                    "retained app rebuilt after handled store failure",
+                    "retained app rebuilt after handled failure",
                 )?;
                 require(
                     guest(&req(port, "/bindings")?)?
                         == json!({"config":true,"kv":true,"secrets":true,"unknown":false}),
                     "bindings failed to recover",
                 )?;
-                records.push(json!({"status":status,"assertion":"injected_selector_failure_recovery","instance":failed_guest,"source":"custom_callback_handles_real_registry_error"}))?;
+                if rendered_ingress {
+                    records.push(json!({"status":status,"assertion":"admitted_body_failure_rendered","instance":failed_guest,"source":"canonical_admitted_request_dispatch"}))?;
+                } else {
+                    records.push(json!({"status":status,"assertion":"injected_selector_failure_recovery","instance":failed_guest,"source":"custom_callback_handles_real_registry_error"}))?;
+                }
             } else {
                 require(
                     value["instance"] != failed_guest,

@@ -62,6 +62,29 @@ Each item must be:
 - Either a unit struct or zero-argument constructor
 - Implementing `edgezero_core::middleware::Middleware`
 
+## Capabilities Section
+
+Use `[capabilities]` to declare portable runtime behavior that the application requires or
+explicitly treats as optional:
+
+```toml
+[capabilities]
+required = ["outbound-deadlines"]
+optional = ["outbound-http"]
+
+[capabilities.outbound]
+hosts = ["https://api.example.com", "https://*.example.net:*"]
+```
+
+Required capabilities accept `Native` or `BoundedCooperative` support and fail before adapter
+execution for `BestEffort` or `Unsupported`. Optional capabilities log degradation and proceed.
+Unknown names, duplicates, and required/optional overlap are validation errors.
+
+Outbound hosts configure adapter plumbing rather than application authorization. Omitting
+`hosts` defaults to `https://*:*`; `hosts = ["*"]` is an explicit grant for both HTTP and HTTPS.
+See [Capabilities](/guide/capabilities) for the exact grammar, support matrix, and platform
+limitations.
+
 ## HTTP Triggers
 
 The `[[triggers.http]]` array defines routes:
@@ -75,6 +98,7 @@ handler = "my_app_core::handlers::root"
 
 [[triggers.http]]
 id = "echo"
+class = "interactive"
 path = "/echo/{name}"
 methods = ["GET", "POST"]
 handler = "my_app_core::handlers::echo"
@@ -91,6 +115,11 @@ body-mode = "buffered"
 | `adapters`    | No       | Intended adapter filter (metadata; `app!` currently ignores) |
 | `description` | No       | Human-readable description for docs or tooling               |
 | `body-mode`   | No       | `buffered` or `stream`                                       |
+| `class`       | No       | Opaque route class exposed to ingress admission policy       |
+
+`class` is application-defined metadata. It is available on matched and
+method-not-allowed route metadata, but it is not interpreted by EdgeZero and does not change the
+route's stable method-plus-pattern identity.
 
 ::: tip Adapter filters
 The `adapters` field is currently metadata for tooling; `app!` wires all triggers regardless of adapter.
@@ -223,6 +252,13 @@ handlers can call `ctx.config_store("app_config")` (or
 
 Treat config-store keys like API surface: validate or allowlist any user-controlled lookup before
 calling `ctx.config_store_default()?.get(...)`.
+
+Raw `ConfigStore::get` and `get_bounded` return shared `ConfigValue` UTF-8 payloads,
+not `String`. Cloning shares one value's allocation; borrow with `as_str()` or
+`as_ref()`, or explicitly allocate with `to_string()` at an ownership boundary.
+`Debug` output is redacted. Typed `AppConfig<C>` fields are unchanged. Axum loads
+[bounded immutable snapshots](/guide/adapters/axum#snapshot-allocation-limits)
+before listener bind; push updated local config before startup or restart afterward.
 
 ## Application config
 
@@ -504,7 +540,15 @@ Logging can be configured per adapter under `[adapters.<name>.logging]` or via a
 | `level`       | All          | Log level: `trace`, `debug`, `info`, `warn`, `error`, `off` |
 | `echo_stdout` | Fastly, Axum | Mirror logs to stdout                                       |
 
-Note: Cloudflare logging is not wired to a built-in logger yet.
+Manifest logging settings and runtime `EDGEZERO__LOGGING__*` overrides are separate; consult
+the adapter guide for which source its runner consumes. Cloudflare and Spin do not install a
+Rust `log` backend. `owns_logging = true` transfers installation **and filter configuration**
+to the application, before entering the runner. The pure
+`edgezero_core::resolve_logging_level(&EnvConfig)` helper resolves runtime levels without
+implicitly applying manifest defaults or changing global state.
+
+Managed Fastly/Axum loggers retain `edgezero::boot` errors and warnings at `Warn` even when
+ordinary runtime logging is `Off`. See [Logging Initialisation](/guide/adapters/overview#logging-initialisation).
 
 ## Full Example
 
@@ -516,6 +560,12 @@ middleware = [
   "edgezero_core::middleware::RequestLogger",
   "my_app_core::middleware::Cors"
 ]
+
+[capabilities]
+optional = ["outbound-http"]
+
+[capabilities.outbound]
+hosts = ["https://api.example.com"]
 
 [[triggers.http]]
 id = "root"
@@ -634,7 +684,8 @@ The macro:
 - Generates route registration
 - Wires middleware from the manifest
 - Bakes portable store metadata (`Hooks::stores()`) from `[stores.kv]`, `[stores.config]`, and `[stores.secrets]` when present
-- Creates the `App` struct that implements `Hooks` (use `App::build_app()`)
+- Creates the application hook struct consumed by the fallible, core-owned
+  `edgezero_core::app::App::build::<YourApp>(platform)` constructor
 
 Arguments:
 

@@ -1,5 +1,16 @@
+#![cfg(target_arch = "wasm32")]
+#![allow(
+    unsafe_code,
+    reason = "spin's #[http_service] macro generates the unsafe wasm export"
+)]
+
+use anyhow::Context as _;
 use edgezero_core::app::{App, Hooks};
-use fixture_core::{FixtureApp, MissingBindingApp, OtherApp};
+#[cfg(not(feature = "qualification"))]
+use fixture_core::FixtureApp;
+#[cfg(feature = "qualification")]
+use fixture_core::qualification::QualificationApp as FixtureApp;
+use fixture_core::{MissingBindingApp, OtherApp, retained_app};
 use spin_sdk::{
     http::{IntoResponse, Request},
     http_service,
@@ -8,30 +19,32 @@ use std::sync::OnceLock;
 static APP: OnceLock<App> = OnceLock::new();
 static OTHER_APP: OnceLock<App> = OnceLock::new();
 
+fn retained_app_for_dispatch<A: Hooks>(cell: &OnceLock<App>) -> anyhow::Result<&App> {
+    retained_app::<A>(cell, edgezero_adapter_spin::SPIN_PLATFORM)
+        .context("application configuration failed")
+}
+
 #[http_service]
-async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
+async fn handle(req: Request) -> anyhow::Result<edgezero_adapter_spin::SpinResponse> {
     if !FixtureApp::owns_logging() {
         drop(edgezero_adapter_spin::init_logger());
     }
     let retained = std::env::var("FIXTURE_MODE").as_deref() == Ok("retained");
     if retained && req.uri().path() == "/binding-failure" {
-        // Pairs MissingBindingApp with FixtureApp's router; valid only while
-        // dispatch_app reads nothing but A::stores() (see MissingBindingApp).
-        let result = edgezero_adapter_spin::dispatch_app::<MissingBindingApp>(
-            APP.get_or_init(FixtureApp::build_app),
-            req,
-        )
-        .await;
+        let app = App::build::<MissingBindingApp>(edgezero_adapter_spin::SPIN_PLATFORM)
+            .context("application configuration failed")?;
+        let result = edgezero_adapter_spin::dispatch_app::<MissingBindingApp>(&app, req).await;
         return match result {
             Err(error) => {
                 let body = serde_json::json!({"instance":fixture_core::instance_id(),"source":"injected_required_binding","error":format!("{error:#}")}).to_string();
-                Ok(edgezero_adapter_spin::response::from_core_response(
-                    edgezero_core::http::response_builder()
-                        .status(503)
-                        .body(edgezero_core::body::Body::from(body))
-                        .unwrap(),
-                )
-                .await?)
+                edgezero_core::http::response_builder()
+                    .status(503)
+                    .header("content-type", "application/json")
+                    .body(body)?
+                    .into_response()
+                    .map_err(|error| {
+                        anyhow::anyhow!("fixture response conversion failed: {error:?}")
+                    })
             }
             Ok(response) => Ok(response),
         };
@@ -45,14 +58,14 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
             return edgezero_adapter_spin::run_app::<OtherApp>(req).await;
         }
         return edgezero_adapter_spin::dispatch_app::<OtherApp>(
-            OTHER_APP.get_or_init(OtherApp::build_app),
+            retained_app_for_dispatch::<OtherApp>(&OTHER_APP)?,
             req,
         )
         .await;
     }
     if retained {
         edgezero_adapter_spin::dispatch_app::<FixtureApp>(
-            APP.get_or_init(FixtureApp::build_app),
+            retained_app_for_dispatch::<FixtureApp>(&APP)?,
             req,
         )
         .await

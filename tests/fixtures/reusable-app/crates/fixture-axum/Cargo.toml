@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+qualification = ["fixture-core/qualification"]
+
 [dependencies]
 fixture-core.workspace = true
 edgezero-core.workspace = true

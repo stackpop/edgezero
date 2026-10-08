@@ -27,13 +27,14 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
-    register_adapter,
+    Adapter, AdapterAction, AdapterExecutionTarget, AdapterPushContext, ProvisionStores,
+    ReadConfigEntry, ResolvedStoreId, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
     ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
+use edgezero_core::{Capability, CapabilitySupport, PlatformMetadata};
 use walkdir::WalkDir;
 
 static FASTLY_ADAPTER: FastlyCliAdapter = FastlyCliAdapter;
@@ -389,6 +390,35 @@ struct RuntimeStoreNameReconciliation {
     reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`)."
 )]
 impl Adapter for FastlyCliAdapter {
+    fn capability(&self, capability: Capability) -> CapabilitySupport {
+        match capability {
+            Capability::IngressAdmission
+            | Capability::OutboundAuthorityOverride
+            | Capability::OutboundCacheBypass
+            | Capability::OutboundHeaderFidelity => CapabilitySupport::Native,
+            Capability::ConfigReadDeadlines
+            | Capability::InboundReadDeadlines
+            | Capability::IngressAdmissionAbort
+            | Capability::LazyStreamedResponsePassthrough
+            | Capability::OutboundBatchCancellation
+            | Capability::OutboundBatchCompletionOrder
+            | Capability::OutboundBatchSlotIsolation
+            | Capability::OutboundDeadlines
+            | Capability::OutboundFlexiblePhaseBudget
+            | Capability::OutboundHttp
+            | Capability::ResponseEgressAbort
+            | Capability::ResponseEgressBackpressure
+            | Capability::ResponseEgressCompletion
+            | Capability::ResponseWriteDeadlines
+            | Capability::StreamedUploadDeadlines => CapabilitySupport::BestEffort,
+            Capability::ConfigReadAllocationBounds
+            | Capability::OutboundCompleteResourceAccounting
+            | Capability::RawIngressFramingValidation
+            | Capability::RawIngressHeadLimits
+            | _ => CapabilitySupport::Unsupported,
+        }
+    }
+
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             // `fastly profile {create|delete|list}` is the native
@@ -419,6 +449,37 @@ impl Adapter for FastlyCliAdapter {
         }
     }
 
+    fn execute_target(
+        &self,
+        action: AdapterAction,
+        target: &AdapterExecutionTarget,
+        args: &[String],
+    ) -> Result<(), String> {
+        let manifest = target_manifest(target)?;
+        let manifest_dir = manifest
+            .parent()
+            .ok_or_else(|| "pinned fastly manifest has no parent directory".to_owned())?;
+        match action {
+            AdapterAction::Build => {
+                let artifact = build_from_manifest(&manifest, args)?;
+                log::info!("[edgezero] Fastly build complete -> {}", artifact.display());
+                Ok(())
+            }
+            AdapterAction::Deploy => deploy_from_dir(manifest_dir, args),
+            AdapterAction::DeployStaging => deploy_staging_from_dir(args, manifest_dir),
+            AdapterAction::Serve => serve_from_dir(manifest_dir, args),
+            AdapterAction::AuthLogin
+            | AdapterAction::AuthLogout
+            | AdapterAction::AuthStatus
+            | AdapterAction::EmitVersion
+            | AdapterAction::Healthcheck
+            | AdapterAction::Rollback
+            | _ => Err(format!(
+                "fastly adapter cannot execute operational action {action:?} against a pinned runtime target"
+            )),
+        }
+    }
+
     fn gc_config_entries(
         &self,
         _manifest_root: &Path,
@@ -434,6 +495,10 @@ impl Adapter for FastlyCliAdapter {
 
     fn name(&self) -> &'static str {
         "fastly"
+    }
+
+    fn platform_metadata(&self) -> PlatformMetadata {
+        crate::FASTLY_PLATFORM
     }
 
     fn preflight_config_write(&self, key: &str, body: &str) -> Result<(), String> {
@@ -4115,6 +4180,10 @@ fn no_matching_store_error(name: &str) -> String {
 pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let manifest =
         find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    build_from_manifest(&manifest, extra_args)
+}
+
+fn build_from_manifest(manifest: &Path, extra_args: &[String]) -> Result<PathBuf, String> {
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
@@ -4176,20 +4245,18 @@ fn build_compute_deploy_args(extra_args: &[String]) -> Vec<String> {
 /// # Errors
 /// Returns an error if the Fastly CLI deploy command fails.
 ///
-/// Honours a CLI-threaded `--manifest-path <abs fastly.toml>` (see
-/// [`resolve_manifest_dir`]) so a monorepo with several Fastly apps
-/// deploys the one the operator's `edgezero.toml` selected, rather than
-/// whichever `fastly.toml` a bare working-directory search finds first.
-/// The flag is EdgeZero-internal — `fastly compute deploy` has no such
-/// flag — so it is stripped from the forwarded argv.
 #[inline]
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     let manifest_dir = resolve_manifest_dir(extra_args)?;
+    deploy_from_dir(&manifest_dir, extra_args)
+}
+
+fn deploy_from_dir(manifest_dir: &Path, extra_args: &[String]) -> Result<(), String> {
     let forwarded = args_without_flag_value(extra_args, "--manifest-path");
 
     let status = Command::new("fastly")
         .args(build_compute_deploy_args(&forwarded))
-        .current_dir(&manifest_dir)
+        .current_dir(manifest_dir)
         .status()
         .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
     if !status.success() {
@@ -4293,7 +4360,10 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
+    serve_from_dir(manifest_dir, extra_args)
+}
 
+fn serve_from_dir(manifest_dir: &Path, extra_args: &[String]) -> Result<(), String> {
     let status = Command::new("fastly")
         .args(["compute", "serve"])
         .args(extra_args)
@@ -5010,18 +5080,25 @@ fn fastly_api_put(path: &str, token: &str) -> Result<u16, String> {
     }
 }
 
-/// Resolve the directory containing the Fastly manifest for a deploy
-/// (production [`deploy`] or [`deploy_staging`]).
+fn target_manifest(target: &AdapterExecutionTarget) -> Result<PathBuf, String> {
+    let manifest = target
+        .platform_manifest()
+        .map_or_else(|| target.app_root().join("fastly.toml"), Path::to_path_buf);
+    if !manifest.is_file() {
+        return Err(format!(
+            "pinned fastly manifest {} is not a regular file",
+            manifest.display()
+        ));
+    }
+    Ok(manifest)
+}
+
+/// Resolve the directory containing the Fastly manifest for a legacy
+/// direct staging-deploy call.
 ///
-/// The CLI (`edgezero_cli::run_deploy`) resolves the `edgezero.toml`
-/// manifest — honouring `EDGEZERO_MANIFEST` — and threads the
-/// manifest-configured `[adapters.fastly.adapter].manifest` path in as
-/// `--manifest-path <abs fastly.toml>`. Prefer that so a monorepo with
-/// multiple Fastly apps deploys/stages the app the operator actually
-/// selected, rather than whichever `fastly.toml` a bare working-directory
-/// search happens to find first. Only when no `--manifest-path` is
-/// threaded (e.g. a manifest that declares Fastly commands but no adapter
-/// `manifest` key) do we fall back to the working-directory search.
+/// Runtime-producing CLI actions use [`Adapter::execute_target`] and never
+/// enter this discovery path. The `--manifest-path` token remains accepted for
+/// compatibility with callers of this crate-level function.
 fn resolve_manifest_dir(args: &[String]) -> Result<PathBuf, String> {
     if let Some(raw) = arg_value(args, "--manifest-path") {
         let path = PathBuf::from(raw);
@@ -5043,6 +5120,11 @@ fn resolve_manifest_dir(args: &[String]) -> Result<PathBuf, String> {
 /// build, upload to a new draft version (no activation), stage it, and
 /// emit `version=<N>`.
 fn deploy_staging(args: &[String]) -> Result<(), String> {
+    let manifest_dir = resolve_manifest_dir(args)?;
+    deploy_staging_from_dir(args, &manifest_dir)
+}
+
+fn deploy_staging_from_dir(args: &[String], manifest_dir: &Path) -> Result<(), String> {
     let service_id = resolve_service_id(args)?;
     validate_service_id(&service_id)?;
     // The Fastly CLI reads FASTLY_API_TOKEN from the env; fail fast
@@ -5050,8 +5132,6 @@ fn deploy_staging(args: &[String]) -> Result<(), String> {
     // `fastly compute update` error.
     require_token()?;
 
-    let manifest_dir_buf = resolve_manifest_dir(args)?;
-    let manifest_dir = manifest_dir_buf.as_path();
     // The CLI threads the app's declared config-store logical ids as
     // `--edgezero-staging-config=<logical>` (one per store) so the staging relink
     // knows which selectors to redirect — read from the app manifest, never a
@@ -5574,20 +5654,157 @@ mod tests {
     #[cfg(unix)]
     use edgezero_core::test_env::{EnvOverride, PathPrepend};
     use std::collections::{BTreeMap, HashSet};
+    use std::num::NonZeroU32;
 
     #[cfg(unix)]
     use std::sync::Mutex;
     use tempfile::tempdir;
 
-    // Shared fixture names. Pinning these as consts (instead of
-    // inline `"sessions"` / `"app_config"` per call site) keeps the
-    // setup-vs-assertion pair in sync -- a typo in one place no
-    // longer silently divorces from the other, because both reference
-    // the same const. Also names the intent: these are the LOGICAL
-    // store ids the fastly adapter operates on, not arbitrary strings.
-    const TEST_KV_ID: &str = "sessions";
+    // Logical store ids shared by setup and assertions.
     const TEST_CONFIG_ID: &str = "app_config";
+    const TEST_KV_ID: &str = "sessions";
     const TEST_SECRET_ID: &str = "default";
+
+    #[test]
+    fn adapter_capability_matrix_matches_contracts() {
+        adapter_capability_matrix_matches_outbound_spec();
+    }
+
+    #[test]
+    fn adapter_capability_matrix_matches_outbound_spec() {
+        let expected = [
+            (
+                Capability::ConfigReadAllocationBounds,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ConfigReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::InboundReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::IngressAdmission, CapabilitySupport::Native),
+            (
+                Capability::IngressAdmissionAbort,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::RawIngressFramingValidation,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::RawIngressHeadLimits,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressAbort,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::ResponseEgressBackpressure,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::ResponseEgressCompletion,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::ResponseWriteDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::OutboundHttp, CapabilitySupport::BestEffort),
+            (
+                Capability::OutboundCompleteResourceAccounting,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::OutboundHeaderFidelity,
+                CapabilitySupport::Native,
+            ),
+            (Capability::OutboundDeadlines, CapabilitySupport::BestEffort),
+            (
+                Capability::OutboundFlexiblePhaseBudget,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::OutboundAuthorityOverride,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::OutboundBatchCancellation,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::OutboundBatchCompletionOrder,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::OutboundBatchSlotIsolation,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::OutboundCacheBypass, CapabilitySupport::Native),
+            (
+                Capability::StreamedUploadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::LazyStreamedResponsePassthrough,
+                CapabilitySupport::BestEffort,
+            ),
+        ];
+
+        for (capability, support) in expected {
+            assert_eq!(
+                FASTLY_ADAPTER.capability(capability),
+                support,
+                "{capability:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adapter_platform_metadata_matches_runtime_metadata() {
+        let metadata = FASTLY_ADAPTER.platform_metadata();
+        let source = edgezero_core::PlatformResourceSource::PlatformLimit {
+            provider: "Fastly Compute",
+        };
+
+        assert_eq!(metadata, crate::FASTLY_PLATFORM);
+        assert_eq!(
+            metadata.memory_ceiling(),
+            edgezero_core::PlatformFact::known(
+                edgezero_core::MemoryCeiling::new(
+                    128_000_000,
+                    edgezero_core::MemoryCeilingScope::PerExecution,
+                    Some(1_000_000),
+                ),
+                source,
+            )
+        );
+        assert_eq!(
+            metadata.inbound_request_population_bound(),
+            edgezero_core::PlatformFact::known(
+                edgezero_core::InboundRequestPopulationBound::new(NonZeroU32::MIN),
+                source,
+            )
+        );
+        assert_eq!(
+            metadata
+                .inbound_request_population_bound()
+                .value()
+                .expect("Fastly publishes the per-execution population")
+                .max_live_requests(),
+            NonZeroU32::MIN
+        );
+        assert_eq!(
+            metadata.host_ingress_memory_accounting(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::ProviderUnpublished
+            )
+        );
+    }
 
     // `PathPrepend` (RAII $PATH guard) is the shared helper imported above from
     // `edgezero_core::test_env`; the merge with edition-2024 main replaced our
@@ -6033,11 +6250,7 @@ mod tests {
 
     #[test]
     fn parse_active_version_finds_active_entry() {
-        let json = r#"[
-            {"number": 1, "active": false},
-            {"number": 2, "active": true},
-            {"number": 3, "active": false}
-        ]"#;
+        let json = &serde_json::json!([{"number": 1_u64, "active": false}, {"number": 2_u64, "active": true}, {"number": 3_u64, "active": false}]).to_string();
         assert_eq!(resolve_active_version(json), Ok(Some(2)));
     }
 
@@ -6045,7 +6258,7 @@ mod tests {
     fn parse_active_version_none_when_no_active() {
         // A parsed list with no active version is `Ok(None)` — confirmed
         // no active version (first deploy), NOT an operational failure.
-        let json = r#"[{"number": 1, "active": false}]"#;
+        let json = &serde_json::json!([{"number": 1_u64, "active": false}]).to_string();
         assert_eq!(resolve_active_version(json), Ok(None));
     }
 
@@ -6054,7 +6267,7 @@ mod tests {
         // A truncated / non-array body is an operational failure, distinct from
         // "no active version" — the caller must fail closed, not record empty.
         resolve_active_version("not json").expect_err("non-JSON must be an operational error");
-        resolve_active_version(r#"{"error":"unauthorized"}"#)
+        resolve_active_version(&serde_json::json!({"error": "unauthorized"}).to_string())
             .expect_err("a non-array body must be an operational error");
     }
 
@@ -6063,35 +6276,48 @@ mod tests {
         // A garbled ACTIVE entry must fail closed, not read as "no active
         // version" — otherwise a production deploy proceeds with no rollback
         // target. Each of these is malformed and must be an operational error.
-        resolve_active_version(r#"[{"active":true}]"#)
+        resolve_active_version(&serde_json::json!([{"active": true}]).to_string())
             .expect_err("active entry with no `number` must error");
-        resolve_active_version(r#"[{"active":true,"number":"7"}]"#)
+        resolve_active_version(&serde_json::json!([{"active": true, "number": "7"}]).to_string())
             .expect_err("active entry with a string `number` must error");
-        resolve_active_version(r#"[{"active":"true","number":7}]"#)
-            .expect_err("a non-boolean `active` must error");
+        resolve_active_version(
+            &serde_json::json!([{"active": "true", "number": 7_u64}]).to_string(),
+        )
+        .expect_err("a non-boolean `active` must error");
         // A non-boolean `active` ANYWHERE is schema drift — the whole list is
         // scanned, so it is caught even AFTER a valid active entry (a naive
         // first-match parser would miss this one).
-        resolve_active_version(r#"[{"active":"false"},{"active":true,"number":9}]"#)
-            .expect_err("a non-boolean `active` before the active entry is schema drift");
-        resolve_active_version(r#"[{"active":true,"number":9},{"active":"nope"}]"#)
-            .expect_err("a non-boolean `active` AFTER the active entry is still schema drift");
+        resolve_active_version(
+            &serde_json::json!([{"active": "false"}, {"active": true, "number": 9_u64}])
+                .to_string(),
+        )
+        .expect_err("a non-boolean `active` before the active entry is schema drift");
+        resolve_active_version(
+            &serde_json::json!([{"active": true, "number": 9_u64}, {"active": "nope"}]).to_string(),
+        )
+        .expect_err("a non-boolean `active` AFTER the active entry is still schema drift");
         // More than one active version is ambiguous — refuse rather than pick one.
-        resolve_active_version(r#"[{"active":true,"number":9},{"active":true,"number":10}]"#)
+        resolve_active_version(&serde_json::json!([{"active": true, "number": 9_u64}, {"active": true, "number": 10_u64}]).to_string())
             .expect_err("two active versions must error as ambiguous");
         // EVERY element must be a version object with a numeric `number` — a
         // garbled entry must fail closed, not be skipped as "not active".
-        resolve_active_version("[]").expect_err("an empty version list is an invalid response");
-        resolve_active_version("[null]").expect_err("a null element must error");
-        resolve_active_version("[{}]").expect_err("an entry with no `number` must error");
-        resolve_active_version(r#"[{"number":"invalid"}]"#)
+        resolve_active_version(&serde_json::json!([]).to_string())
+            .expect_err("an empty version list is an invalid response");
+        resolve_active_version(&serde_json::json!([null]).to_string())
+            .expect_err("a null element must error");
+        resolve_active_version(&serde_json::json!([{}]).to_string())
+            .expect_err("an entry with no `number` must error");
+        resolve_active_version(&serde_json::json!([{"number": "invalid"}]).to_string())
             .expect_err("a non-numeric `number` must error");
         // An omitted `active` field means "not active" (not an error), as long
         // as the entry is otherwise a well-formed version object.
-        assert_eq!(resolve_active_version(r#"[{"number":42}]"#), Ok(None));
+        assert_eq!(
+            resolve_active_version(&serde_json::json!([{"number": 42_u64}]).to_string()),
+            Ok(None)
+        );
         // Sanity: a well-formed list still resolves.
         assert_eq!(
-            resolve_active_version(r#"[{"active":false,"number":1},{"active":true,"number":2}]"#),
+            resolve_active_version(&serde_json::json!([{"active": false, "number": 1_u64}, {"active": true, "number": 2_u64}]).to_string()),
             Ok(Some(2))
         );
     }
@@ -6111,8 +6337,8 @@ mod tests {
 
     #[test]
     fn active_version_or_require_enforces_require_active() {
-        let active = r#"[{"active":true,"number":5}]"#;
-        let none = r#"[{"active":false,"number":5}]"#;
+        let active = &serde_json::json!([{"active": true, "number": 5_u64}]).to_string();
+        let none = &serde_json::json!([{"active": false, "number": 5_u64}]).to_string();
 
         // A resolvable active version is returned regardless of the flag.
         assert_eq!(active_version_or_require(active, false, "svc"), Ok(Some(5)));
@@ -6156,16 +6382,22 @@ mod tests {
 
     #[test]
     fn parse_staging_ip_tolerates_a_plural_array_shape() {
-        let json = r#"[{"name": "example.com", "staging_ips": ["151.101.2.10"]}]"#;
+        let json = &serde_json::json!([{"name": "example.com", "staging_ips": ["151.101.2.10"]}])
+            .to_string();
         assert_eq!(parse_staging_ip(json).as_deref(), Some("151.101.2.10"));
     }
 
     #[test]
     fn parse_staging_ip_none_when_absent_or_null() {
-        assert_eq!(parse_staging_ip(r#"[{"name": "example.com"}]"#), None);
+        assert_eq!(
+            parse_staging_ip(&serde_json::json!([{"name": "example.com"}]).to_string()),
+            None
+        );
         // `staging_ip` is nullable for services without staging enabled.
         assert_eq!(
-            parse_staging_ip(r#"[{"name": "example.com", "staging_ip": null}]"#),
+            parse_staging_ip(
+                &serde_json::json!([{"name": "example.com", "staging_ip": null}]).to_string()
+            ),
             None
         );
     }
@@ -6173,7 +6405,7 @@ mod tests {
     #[test]
     fn parse_config_store_entries_reads_key_value_pairs() {
         let entries = parse_config_store_entries(
-            r#"[{"item_key":"A","item_value":"1"},{"item_key":"B","item_value":"2"}]"#,
+            &serde_json::json!([{"item_key": "A", "item_value": "1"}, {"item_key": "B", "item_value": "2"}]).to_string(),
         )
         .expect("well-formed listing parses");
         assert_eq!(
@@ -6202,8 +6434,9 @@ mod tests {
 
         // 2. Schema drift: valid JSON that is neither a bare array nor an `items`
         //    envelope (here an object whose VALUE is the secret).
-        let drift = parse_config_store_entries(&format!(r#"{{"unexpected":"{SECRET}"}}"#))
-            .expect_err("schema drift must error");
+        let drift =
+            parse_config_store_entries(&serde_json::json!({"unexpected": SECRET}).to_string())
+                .expect_err("schema drift must error");
         assert!(
             !drift.contains(SECRET),
             "schema-drift error leaked the value: {drift}"
@@ -6211,9 +6444,13 @@ mod tests {
 
         // 3. Malformed entry: a valid array where an entry lacks item_key/item_value,
         //    while a SIBLING entry carries the secret in its value.
-        let bad_entry = parse_config_store_entries(&format!(
-            r#"[{{"item_key":"ok","item_value":"{SECRET}"}},{{"item_key":"bad"}}]"#
-        ))
+        let bad_entry = parse_config_store_entries(
+            &serde_json::json!([
+                {"item_key": "ok", "item_value": SECRET},
+                {"item_key": "bad"},
+            ])
+            .to_string(),
+        )
         .expect_err("a malformed entry must error");
         assert!(
             !bad_entry.contains(SECRET),
@@ -7527,12 +7764,11 @@ build = \"cargo build --release\"
 
     #[test]
     fn find_config_store_id_matches_bare_array_by_name() {
-        let stdout = format!(
-            r#"[
-                {{"id": "abc123", "name": "{TEST_CONFIG_ID}"}},
-                {{"id": "def456", "name": "other_store"}}
-            ]"#
-        );
+        let stdout = serde_json::json!([
+            {"id": "abc123", "name": TEST_CONFIG_ID},
+            {"id": "def456", "name": "other_store"},
+        ])
+        .to_string();
         match find_config_store_id(&stdout, TEST_CONFIG_ID) {
             ConfigStoreLookup::Found(id) => assert_eq!(id, "abc123"),
             ConfigStoreLookup::NotFound => panic!("expected Found, got NotFound"),
@@ -7544,11 +7780,8 @@ build = \"cargo build --release\"
 
     #[test]
     fn find_config_store_id_tolerates_items_envelope() {
-        let stdout = format!(
-            r#"{{"items": [
-                {{"id": "xyz789", "name": "{TEST_CONFIG_ID}"}}
-            ]}}"#
-        );
+        let stdout =
+            serde_json::json!({"items": [{"id": "xyz789", "name": TEST_CONFIG_ID}]}).to_string();
         match find_config_store_id(&stdout, TEST_CONFIG_ID) {
             ConfigStoreLookup::Found(id) => assert_eq!(id, "xyz789"),
             ConfigStoreLookup::NotFound => panic!("expected Found, got NotFound"),
@@ -7563,7 +7796,7 @@ build = \"cargo build --release\"
         // JSON parses cleanly, entries are well-formed
         // (`name` + `id` strings present), but no entry matches
         // → NotFound. Operator likely needs to run `provision`.
-        let stdout = r#"[{"id": "abc", "name": "other"}]"#;
+        let stdout = &serde_json::json!([{"id": "abc", "name": "other"}]).to_string();
         assert!(matches!(
             find_config_store_id(stdout, "missing"),
             ConfigStoreLookup::NotFound
@@ -7592,7 +7825,7 @@ build = \"cargo build --release\"
     fn find_config_store_id_flags_schema_drift_when_shape_unexpected() {
         // JSON parses but the top-level is neither a bare array
         // nor an `{items: [...]}` envelope.
-        let stdout = r#"{"namespace": "fastly", "list": []}"#;
+        let stdout = &serde_json::json!({"namespace": "fastly", "list": []}).to_string();
         match find_config_store_id(stdout, "any") {
             ConfigStoreLookup::SchemaDrift(detail) => {
                 assert!(
@@ -7610,7 +7843,7 @@ build = \"cargo build --release\"
         // Array of objects but none have BOTH string `name` and
         // string `id` fields — suggests schema rename (e.g.
         // fastly renamed `name` → `title`).
-        let stdout = format!(r#"[{{"title": "{TEST_CONFIG_ID}", "uid": "abc"}}]"#);
+        let stdout = serde_json::json!([{"title": TEST_CONFIG_ID, "uid": "abc"}]).to_string();
         let drift = find_config_store_id(&stdout, TEST_CONFIG_ID);
         assert!(
             matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
@@ -7625,9 +7858,11 @@ build = \"cargo build --release\"
         // definite NotFound would authorise an overwrite of a store that exists,
         // so a malformed row must be SchemaDrift (a hard error), not NotFound --
         // even when another row is well-formed.
-        let stdout = format!(
-            r#"[{{"name": "", "id": "abc"}}, {{"name": "{TEST_CONFIG_ID}", "id": "store-1"}}]"#
-        );
+        let stdout = serde_json::json!([
+            {"name": "", "id": "abc"},
+            {"name": TEST_CONFIG_ID, "id": "store-1"},
+        ])
+        .to_string();
         let drift = find_config_store_id(&stdout, "some-other-store");
         assert!(
             matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
@@ -7639,9 +7874,11 @@ build = \"cargo build --release\"
     fn find_config_store_id_rejects_duplicate_names() {
         // A duplicate name means we are not reading one consistent view of the
         // store, so resolving an id off it is ambiguous -> fail closed.
-        let stdout = format!(
-            r#"[{{"name": "{TEST_CONFIG_ID}", "id": "a"}}, {{"name": "{TEST_CONFIG_ID}", "id": "b"}}]"#
-        );
+        let stdout = serde_json::json!([
+            {"name": TEST_CONFIG_ID, "id": "a"},
+            {"name": TEST_CONFIG_ID, "id": "b"},
+        ])
+        .to_string();
         let drift = find_config_store_id(&stdout, TEST_CONFIG_ID);
         assert!(
             matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
@@ -7654,7 +7891,7 @@ build = \"cargo build --release\"
         // Empty array IS a valid "store doesn't exist yet" signal,
         // not schema drift — fastly CLI legitimately returns `[]`
         // when no config-stores exist.
-        let drift = find_config_store_id("[]", "any");
+        let drift = find_config_store_id(&serde_json::json!([]).to_string(), "any");
         assert!(
             matches!(drift, ConfigStoreLookup::NotFound),
             "empty array must be NotFound, got {drift:?}"
@@ -7667,10 +7904,9 @@ build = \"cargo build --release\"
         // malformed entry could be the store we're looking for (hidden behind a
         // missing name/id). Deciding NotFound here would fail OPEN — staging
         // would then mirror no production overrides. Any malformed entry is drift.
-        let stdout = r#"[
-            {"id": "abc123", "name": "some_other_store"},
-            {"id": "def456"}
-        ]"#;
+        let stdout =
+            &serde_json::json!([{"id": "abc123", "name": "some_other_store"}, {"id": "def456"}])
+                .to_string();
         let drift = find_config_store_id(stdout, "edgezero_runtime_env");
         assert!(
             matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
@@ -7682,10 +7918,7 @@ build = \"cargo build --release\"
     fn find_config_store_id_scans_past_a_match() {
         // The full list is scanned: a malformed entry AFTER the match must still
         // be caught (no short-circuit on the first Found).
-        let stdout = r#"[
-            {"id": "abc123", "name": "edgezero_runtime_env"},
-            {"name": "broken"}
-        ]"#;
+        let stdout = &serde_json::json!([{"id": "abc123", "name": "edgezero_runtime_env"}, {"name": "broken"}]).to_string();
         let drift = find_config_store_id(stdout, "edgezero_runtime_env");
         assert!(
             matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
@@ -7695,10 +7928,7 @@ build = \"cargo build --release\"
 
     #[test]
     fn find_config_store_id_flags_duplicate_names_as_ambiguous() {
-        let stdout = r#"[
-            {"id": "abc123", "name": "edgezero_runtime_env"},
-            {"id": "def456", "name": "edgezero_runtime_env"}
-        ]"#;
+        let stdout = &serde_json::json!([{"id": "abc123", "name": "edgezero_runtime_env"}, {"id": "def456", "name": "edgezero_runtime_env"}]).to_string();
         let drift = find_config_store_id(stdout, "edgezero_runtime_env");
         assert!(
             matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
@@ -8006,7 +8236,8 @@ build = \"cargo build --release\"
         let entry_list = dir.path().join("entries.json");
         fs::write(
             &store_list,
-            format!(r#"[{{"name":"{RUNTIME_ENV_STORE_NAME}","id":"runtime-env-123"}}]"#),
+            serde_json::json!([{"name": RUNTIME_ENV_STORE_NAME, "id": "runtime-env-123"}])
+                .to_string(),
         )
         .expect("store list");
         let entries = current
@@ -8086,13 +8317,14 @@ exit 1
         let list_file = dir.path().join("list_payload.txt");
         let entry_list_file = dir.path().join("entry_list_payload.txt");
         // Store-list JSON: bare array with one entry matching TEST_CONFIG_ID.
-        let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
+        let list_json =
+            serde_json::json!([{"name": TEST_CONFIG_ID, "id": "store-abc123"}]).to_string();
         let entry_list_json = {
-            let items: Vec<String> = entry_list_keys
+            let items: Vec<_> = entry_list_keys
                 .iter()
-                .map(|key| format!(r#"{{"item_key":{}}}"#, serde_json::to_string(key).unwrap()))
+                .map(|key| serde_json::json!({"item_key": key}))
                 .collect();
-            format!("[{}]", items.join(","))
+            serde_json::json!(items).to_string()
         };
         fs::write(&stdout_file, stdout_body).expect("write stdout payload");
         fs::write(&stderr_file, stderr_body).expect("write stderr payload");
@@ -8123,17 +8355,16 @@ exit 1
         let script_path = dir.path().join("fastly");
         let list_file = dir.path().join("list_payload.txt");
         let entry_file = dir.path().join("entry_payload.txt");
-        let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
+        let list_json =
+            serde_json::json!([{"name": TEST_CONFIG_ID, "id": "store-abc123"}]).to_string();
         // item_value must be a valid BlobEnvelope JSON so the resolver accepts it.
         let envelope_json = serde_json::to_string(&BlobEnvelope::new(
             json!({"v": "logged"}),
             "2026-06-22T00:00:00Z".into(),
         ))
         .expect("serialize");
-        let entry_json = format!(
-            r#"{{"item_value":{},"store_id":"store-abc123"}}"#,
-            serde_json::to_string(&envelope_json).expect("escape")
-        );
+        let entry_json =
+            json!({"item_value": envelope_json, "store_id": "store-abc123"}).to_string();
         fs::write(&list_file, list_json).expect("write list payload");
         fs::write(&entry_file, &entry_json).expect("write entry payload");
         let script = format!(
@@ -8173,10 +8404,7 @@ exit 1
             "2026-06-22T00:00:00Z".into(),
         ))
         .expect("serialize");
-        let entry_json = format!(
-            r#"{{"item_value":{},"store_id":"store-abc123"}}"#,
-            serde_json::to_string(&envelope).expect("escape")
-        );
+        let entry_json = json!({"item_value": envelope, "store_id": "store-abc123"}).to_string();
         let fake = fake_fastly_returning(&entry_json, "", 0);
         let _path = PathPrepend::new(fake.path());
         let result = FastlyCliAdapter
@@ -8376,7 +8604,8 @@ exit 1
         use std::os::unix::fs::PermissionsExt as _;
         let fake_dir = tempdir().expect("tempdir");
         let list_file = fake_dir.path().join("list.json");
-        let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
+        let list_json =
+            serde_json::json!([{"name": TEST_CONFIG_ID, "id": "store-abc123"}]).to_string();
         fs::write(&list_file, list_json).expect("write list");
         // The `config-store-entry list` response: a bare array of the keys present
         // in `key_responses`. Absence confirmation lists the store and checks
@@ -8384,13 +8613,11 @@ exit 1
         // `item_key` is needed (the keys-only listing is value-tolerant).
         let entry_list_file = fake_dir.path().join("entry_list.json");
         let entries_json = {
-            let items: Vec<String> = key_responses
+            let items: Vec<_> = key_responses
                 .iter()
-                .map(|(key, _)| {
-                    format!(r#"{{"item_key":{}}}"#, serde_json::to_string(key).unwrap())
-                })
+                .map(|(key, _)| serde_json::json!({"item_key": key}))
                 .collect();
-            format!("[{}]", items.join(","))
+            serde_json::json!(items).to_string()
         };
         fs::write(&entry_list_file, entries_json).expect("write entry list");
         // Write each key response to a named file.
@@ -8471,16 +8698,13 @@ echo 'unexpected' >&2; exit 1
         let list_file = dir.path().join("list.json");
         fs::write(
             &list_file,
-            format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#),
+            serde_json::json!([{"name": TEST_CONFIG_ID, "id": "store-abc123"}]).to_string(),
         )
         .expect("list");
         let entries_file = dir.path().join("entries.json");
         fs::write(&entries_file, entry_list_json(entry_list)).expect("entries");
         for (index, value) in root_describe_seq.iter().enumerate() {
-            let wrapped = format!(
-                r#"{{"item_value":{}}}"#,
-                serde_json::to_string(value).expect("escape")
-            );
+            let wrapped = serde_json::json!({"item_value": value}).to_string();
             let nth = index.saturating_add(1);
             fs::write(
                 dir.path().join(format!("resp_{root_key}_{nth}.json")),
@@ -8656,7 +8880,7 @@ echo 'unexpected' >&2; exit 1
         let dir = tempdir().expect("tempdir");
         // The sentinel is an OBJECT KEY (not a value): the earlier redactor joined
         // keys into the diagnostic, so this is what pins the key-disclosure fix.
-        let drift = format!(r#"{{"{SENTINEL}":"x"}}"#);
+        let drift = serde_json::json!({(SENTINEL): "x"}).to_string();
         let fake = fake_fastly_returning(&drift, "", 0);
         let _path = PathPrepend::new(fake.path());
 
@@ -9066,10 +9290,7 @@ echo 'unexpected' >&2; exit 1
 
         let envelope = BlobEnvelope::new(json!({"hello": "world"}), "2026-06-22T00:00:00Z".into());
         let json_str = serde_json::to_string(&envelope).unwrap();
-        let item_json = format!(
-            r#"{{"item_value":{}}}"#,
-            serde_json::to_string(&json_str).unwrap()
-        );
+        let item_json = json!({"item_value": json_str}).to_string();
         let fake = fake_fastly_returning(&item_json, "", 0);
         let _path = PathPrepend::new(fake.path());
 
@@ -9102,14 +9323,11 @@ echo 'unexpected' >&2; exit 1
         // Build a key→response map for every physical entry.
         let mut key_responses: Vec<(String, String)> = Vec::new();
         for (pk, pv) in &physical {
-            let resp = format!(r#"{{"item_value":{}}}"#, serde_json::to_string(pv).unwrap());
+            let resp = serde_json::json!({"item_value": pv}).to_string();
             key_responses.push((pk.clone(), resp));
         }
         // The root key should return the pointer.
-        let ptr_resp = format!(
-            r#"{{"item_value":{}}}"#,
-            serde_json::to_string(pointer_json).unwrap()
-        );
+        let ptr_resp = serde_json::json!({"item_value": pointer_json}).to_string();
         key_responses.push((TEST_CONFIG_ID.to_owned(), ptr_resp));
 
         let fake = fake_fastly_with_key_dispatch(dir.path(), &key_responses);
@@ -9146,10 +9364,7 @@ echo 'unexpected' >&2; exit 1
         let (_, pointer_json) = physical.last().unwrap();
         // Only provide the root pointer; omit chunk responses so the chunk fetch
         // gets a CLEAN not-found (`Error: item not found`, no operational marker).
-        let ptr_resp = format!(
-            r#"{{"item_value":{}}}"#,
-            serde_json::to_string(pointer_json).unwrap()
-        );
+        let ptr_resp = serde_json::json!({"item_value": pointer_json}).to_string();
         let key_responses = vec![(TEST_CONFIG_ID.to_owned(), ptr_resp)];
         let fake = fake_fastly_with_key_dispatch(dir.path(), &key_responses);
         let _path = PathPrepend::new(fake.path());
@@ -9189,10 +9404,7 @@ echo 'unexpected' >&2; exit 1
         // Corrupt first chunk's content.
         let (first_chunk_key, first_chunk_val) = &physical[0];
         let corrupted: String = first_chunk_val.chars().map(|_| 'Z').collect();
-        let corrupt_resp = format!(
-            r#"{{"item_value":{}}}"#,
-            serde_json::to_string(&corrupted).unwrap()
-        );
+        let corrupt_resp = serde_json::json!({"item_value": corrupted}).to_string();
         key_responses.push((first_chunk_key.clone(), corrupt_resp));
         // Remaining chunks as normal.
         for (pk, pv) in physical
@@ -9202,15 +9414,12 @@ echo 'unexpected' >&2; exit 1
         {
             key_responses.push((
                 pk.clone(),
-                format!(r#"{{"item_value":{}}}"#, serde_json::to_string(pv).unwrap()),
+                serde_json::json!({"item_value": pv}).to_string(),
             ));
         }
         key_responses.push((
             TEST_CONFIG_ID.to_owned(),
-            format!(
-                r#"{{"item_value":{}}}"#,
-                serde_json::to_string(pointer_json).unwrap()
-            ),
+            serde_json::json!({"item_value": pointer_json}).to_string(),
         ));
         let fake = fake_fastly_with_key_dispatch(dir.path(), &key_responses);
         let _path = PathPrepend::new(fake.path());
@@ -9241,11 +9450,10 @@ echo 'unexpected' >&2; exit 1
         // `describe` SUCCEEDS (the entry exists), so a resolve failure is CORRUPT
         // stored state, not an IO error: the read must report `Corrupt` so a push
         // can overwrite it (in-band repair), NOT hard-error and block recovery.
-        let bad_json = r#"{"edgezero_kind":"fastly_config_chunks","some_field":"x"}"#;
-        let item_json = format!(
-            r#"{{"item_value":{}}}"#,
-            serde_json::to_string(bad_json).unwrap()
-        );
+        let bad_json =
+            &serde_json::json!({"edgezero_kind": "fastly_config_chunks", "some_field": "x"})
+                .to_string();
+        let item_json = serde_json::json!({"item_value": bad_json}).to_string();
         let fake = fake_fastly_returning(&item_json, "", 0);
         let _path = PathPrepend::new(fake.path());
 
@@ -9303,7 +9511,7 @@ echo 'unexpected' >&2; exit 1
         // error: the read was incomplete, so a push must not overwrite.
         let infra = classify_resolved_read(
             Err(ResolveFailure::Corrupt("boom".to_owned())),
-            "{\"edgezero_kind\":\"fastly_config_chunks\"}",
+            &json!({"edgezero_kind": "fastly_config_chunks"}).to_string(),
             true,
         );
         assert!(
@@ -9317,7 +9525,7 @@ echo 'unexpected' >&2; exit 1
         // never offered for overwrite.
         let unknown = classify_resolved_read(
             Err(ResolveFailure::FutureFormat("x".to_owned())),
-            r#"{"edgezero_kind":"fastly_config_chunks_v2"}"#,
+            &serde_json::json!({"edgezero_kind": "fastly_config_chunks_v2"}).to_string(),
             false,
         );
         assert!(
@@ -9336,7 +9544,7 @@ echo 'unexpected' >&2; exit 1
             Err(ResolveFailure::FutureFormat(
                 "newer inner envelope".to_owned(),
             )),
-            r#"{"edgezero_kind":"fastly_config_chunks","version":1,"chunks":[]}"#,
+            &serde_json::json!({"edgezero_kind": "fastly_config_chunks", "version": 1_u64, "chunks": []}).to_string(),
             false,
         );
         assert!(
@@ -9350,7 +9558,8 @@ echo 'unexpected' >&2; exit 1
         assert!(matches!(
             classify_resolved_read(
                 Err(ResolveFailure::Corrupt("bad chunk".to_owned())),
-                r#"{"edgezero_kind":"fastly_config_chunks","chunks":[]}"#,
+                &serde_json::json!({"edgezero_kind": "fastly_config_chunks", "chunks": []})
+                    .to_string(),
                 false
             ),
             Ok(ReadConfigEntry::Corrupt(_))
@@ -9370,7 +9579,7 @@ echo 'unexpected' >&2; exit 1
 
         // A future POINTER version (resolve fails on the version check) is a hard
         // error too -- the pointer kind is ours, but the version is newer.
-        let v2_ptr = r#"{"edgezero_kind":"fastly_config_chunks","version":2,"chunks":[]}"#;
+        let v2_ptr = &serde_json::json!({"edgezero_kind": "fastly_config_chunks", "version": 2_u64, "chunks": []}).to_string();
         assert!(
             classify_resolved_read(
                 Err(ResolveFailure::FutureFormat(
@@ -9467,10 +9676,15 @@ echo 'unexpected' >&2; exit 1
         // A pointer-KIND value that is invalid (missing the chunks it needs).
         // The resolver would error on this; the local read must NOT propagate
         // that as `Err`.
-        let broken_pointer = format!(
-            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"cfg{CHUNK_KEY_INFIX}{sha}.0","len":10,"sha256":"x"}}],"data_sha256":"","envelope_len":10,"envelope_sha256":"{sha}"}}"#,
-            sha = "a".repeat(64),
-        );
+        let sha = "a".repeat(64);
+        let broken_pointer = serde_json::json!({
+            "edgezero_kind": POINTER_KIND,
+            "version": 1_u32,
+            "chunks": [{"key": format!("cfg{CHUNK_KEY_INFIX}{sha}.0"), "len": 10_u32, "sha256": "x"}],
+            "data_sha256": "",
+            "envelope_len": 10_u32,
+            "envelope_sha256": sha,
+        }).to_string();
         write_fastly_local_config_store(
             &fastly_toml,
             TEST_CONFIG_ID,
@@ -9718,19 +9932,25 @@ echo 'unexpected' >&2; exit 1
              if [ \"$1\" = \"compute\" ] && [ \"$2\" = \"update\" ]; then\n  \
                printf '%s\\n' '{update_stdout}'\n\
              elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  \
-               printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}},{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging_SVC1\"}}]'\n\
+               printf '%s\\n' '{stores}'\n\
              elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"update\" ]; then\n  \
                cat >/dev/null\n\
              elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  \
                case \"$*\" in\n    \
-                 *--store-id=ENVSEL1*) printf '%s\\n' '[{{\"item_key\":\"EDGEZERO__SERVICES__SVC1__LOGGING__LEVEL\",\"item_value\":\"debug\"}}]' ;;\n    \
+                 *--store-id=ENVSEL1*) printf '%s\\n' '{entries}' ;;\n    \
                  *) printf '%s\\n' '[]' ;;\n  \
                esac\n\
              elif [ \"$1\" = \"resource-link\" ] && [ \"$2\" = \"list\" ]; then\n  \
-               printf '%s\\n' '[{{\"id\":\"LINK1\",\"name\":\"edgezero_runtime_env\"}}]'\n\
+               printf '%s\\n' '{links}'\n\
              fi\n\
              exit 0\n",
             record = record.display(),
+            stores = serde_json::json!([
+                {"id": "ENVSEL1", "name": "edgezero_runtime_env"},
+                {"id": "STAGEID1", "name": "edgezero_runtime_env_staging_SVC1"},
+            ]),
+            entries = serde_json::json!([{"item_key": "EDGEZERO__SERVICES__SVC1__LOGGING__LEVEL", "item_value": "debug"}]),
+            links = serde_json::json!([{"id": "LINK1", "name": "edgezero_runtime_env"}]),
         );
         fs::write(&script_path, script).expect("write fake fastly");
         let mut perms = fs::metadata(&script_path).expect("meta").permissions();
@@ -10896,10 +11116,9 @@ echo 'unexpected' >&2; exit 1
         let live = gen_envelope("live");
         let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
         listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
-        let enveloped = format!(
-            r#"{{"items":{},"next_cursor":"abc"}}"#,
-            entry_list_json(&listing)
-        );
+        let items: serde_json::Value =
+            serde_json::from_str(&entry_list_json(&listing)).expect("entry list");
+        let enveloped = serde_json::json!({"items": items, "next_cursor": "abc"}).to_string();
 
         let fake = fake_fastly_gc_raw_list(TEST_CONFIG_ID, &enveloped, &oplog);
         let _path = PathPrepend::new(fake.path());
@@ -11225,10 +11444,7 @@ echo 'unexpected' >&2; exit 1
         // The link's `name` is an alias defaulting to the resource's name. The
         // staging relink depends on that alias: a store named
         // `edgezero_runtime_env_staging` is linked AS `edgezero_runtime_env`.
-        let json = r#"[
-            {"id":"LINK_KV","name":"sessions"},
-            {"id":"LINK_ENV","name":"edgezero_runtime_env"}
-        ]"#;
+        let json = &serde_json::json!([{"id": "LINK_KV", "name": "sessions"}, {"id": "LINK_ENV", "name": "edgezero_runtime_env"}]).to_string();
         assert_eq!(
             find_resource_link_id(json, "edgezero_runtime_env").as_deref(),
             Some("LINK_ENV")
@@ -11236,7 +11452,9 @@ echo 'unexpected' >&2; exit 1
         // Absent link -> nothing to delete, not an error.
         assert_eq!(find_resource_link_id(json, "nope"), None);
         // Tolerates the `{"items": [...]}` envelope, like the store lookup.
-        let enveloped = r#"{"items":[{"id":"L1","name":"edgezero_runtime_env"}]}"#;
+        let enveloped =
+            &serde_json::json!({"items": [{"id": "L1", "name": "edgezero_runtime_env"}]})
+                .to_string();
         assert_eq!(
             find_resource_link_id(enveloped, "edgezero_runtime_env").as_deref(),
             Some("L1")
@@ -11399,20 +11617,26 @@ echo 'unexpected' >&2; exit 1
                : > '{marker}'\n\
              elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  \
                if [ -f '{marker}' ]; then\n    \
-                 printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}},{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging_SVC1\"}}]'\n  \
+                 printf '%s\\n' '{created_stores}'\n  \
                else\n    \
-                 printf '%s\\n' '[{{\"id\":\"ENVSEL1\",\"name\":\"edgezero_runtime_env\"}}]'\n  \
+                 printf '%s\\n' '{stores}'\n  \
                fi\n\
              elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"update\" ]; then\n  \
                cat >/dev/null\n\
              elif [ \"$1\" = \"config-store-entry\" ] && [ \"$2\" = \"list\" ]; then\n  \
                printf '%s\\n' '[]'\n\
              elif [ \"$1\" = \"resource-link\" ] && [ \"$2\" = \"list\" ]; then\n  \
-               printf '%s\\n' '[{{\"id\":\"LINK1\",\"name\":\"edgezero_runtime_env\"}}]'\n\
+               printf '%s\\n' '{links}'\n\
              fi\n\
              exit 0\n",
             record = record.display(),
             marker = marker.display(),
+            stores = serde_json::json!([{"id": "ENVSEL1", "name": "edgezero_runtime_env"}]),
+            created_stores = serde_json::json!([
+                {"id": "ENVSEL1", "name": "edgezero_runtime_env"},
+                {"id": "STAGEID1", "name": "edgezero_runtime_env_staging_SVC1"},
+            ]),
+            links = serde_json::json!([{"id": "LINK1", "name": "edgezero_runtime_env"}]),
         );
         fs::write(&script_path, script).expect("write fake");
         let mut perms = fs::metadata(&script_path).expect("meta").permissions();
@@ -11467,7 +11691,7 @@ echo 'unexpected' >&2; exit 1
                : > '{marker}'\n\
              elif [ \"$1\" = \"config-store\" ] && [ \"$2\" = \"list\" ]; then\n  \
                if [ -f '{marker}' ]; then\n    \
-                 printf '%s\\n' '[{{\"id\":\"STAGEID1\",\"name\":\"edgezero_runtime_env_staging_SVC1\"}}]'\n  \
+                 printf '%s\\n' '{created_stores}'\n  \
                else\n    \
                  printf '%s\\n' '[]'\n  \
                fi\n\
@@ -11481,6 +11705,7 @@ echo 'unexpected' >&2; exit 1
              exit 0\n",
             record = record.display(),
             marker = marker.display(),
+            created_stores = serde_json::json!([{"id": "STAGEID1", "name": "edgezero_runtime_env_staging_SVC1"}]),
         );
         fs::write(&script_path, script).expect("write fake");
         let mut perms = fs::metadata(&script_path).expect("meta").permissions();
@@ -11765,7 +11990,7 @@ echo 'unexpected' >&2; exit 1
         let dead = gen_envelope("dead");
 
         // Envelope-shaped, no discriminator, VERSION 2 -> a newer direct envelope.
-        let future = r#"{"data":{"x":1},"sha256":"0000000000000000000000000000000000000000000000000000000000000000","generated_at":"2026-01-01T00:00:00Z","version":2}"#;
+        let future = &serde_json::json!({"data": {"x": 1_u64}, "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "generated_at": "2026-01-01T00:00:00Z", "version": 2_u64}).to_string();
         let mut listing = vec![(
             "app_config".to_owned(),
             stamp_secs_ago(172_800),
@@ -11911,7 +12136,8 @@ echo 'unexpected' >&2; exit 1
 
         let dead = gen_envelope("dead");
         // Root value is pointer-kind but invalid.
-        let bad = r#"{"edgezero_kind":"fastly_config_chunks","version":2}"#.to_owned();
+        let bad = serde_json::json!({"edgezero_kind": "fastly_config_chunks", "version": 2_u64})
+            .to_string();
         let mut listing = vec![(TEST_CONFIG_ID.to_owned(), stamp_secs_ago(3_600), bad)];
         listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
 
@@ -12363,7 +12589,10 @@ echo 'unexpected' >&2; exit 1
             .expect("a chunk key");
         contents.insert(
             &victim,
-            toml_edit::value(r#"{"edgezero_kind":"fastly_config_chunks_v2","new":true}"#),
+            toml_edit::value(
+                serde_json::json!({"edgezero_kind": "fastly_config_chunks_v2", "new": true})
+                    .to_string(),
+            ),
         );
         fs::write(&fastly_toml, doc.to_string()).expect("write");
 
@@ -12546,13 +12775,19 @@ echo 'unexpected' >&2; exit 1
         let fastly_toml = dir.path().join("fastly.toml");
         // Seed the root with a pointer-kind-but-invalid value AND a real
         // chunk-like key so "no deletes" is non-vacuous.
-        let seed = concat!(
-            "name = \"demo\"\n\n",
-            "[local_server.config_stores.app_config]\n",
-            "format = \"inline-toml\"\n\n",
-            "[local_server.config_stores.app_config.contents]\n",
-            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":1}\"\n",
-            "\"app_config.__edgezero_chunks.deadbeef.0\" = \"seeded-chunk-payload\"\n",
+        let seed = format!(
+            concat!(
+                "name = \"demo\"\n\n",
+                "[local_server.config_stores.app_config]\n",
+                "format = \"inline-toml\"\n\n",
+                "[local_server.config_stores.app_config.contents]\n",
+                "app_config = {prior}\n",
+                "\"app_config.__edgezero_chunks.deadbeef.0\" = \"seeded-chunk-payload\"\n",
+            ),
+            prior = toml_edit::value(
+                serde_json::json!({"edgezero_kind": "fastly_config_chunks", "version": 1_u32})
+                    .to_string()
+            ),
         );
         fs::write(&fastly_toml, seed).expect("seed");
 
@@ -12609,14 +12844,17 @@ echo 'unexpected' >&2; exit 1
         let dir = tempdir().expect("tempdir");
         let fastly_toml = dir.path().join("fastly.toml");
         // The root now holds a v2 direct envelope from a newer writer.
-        let seed = concat!(
-            "name = \"demo\"\n\n",
-            "[local_server.config_stores.app_config]\n",
-            "format = \"inline-toml\"\n\n",
-            "[local_server.config_stores.app_config.contents]\n",
-            "app_config = \"{\\\"data\\\":{},\\\"sha256\\\":\\\"x\\\",\\\"generated_at\\\":\\\"t\\\",\\\"version\\\":2}\"\n",
+        let seed = format!(
+            concat!(
+                "name = \"demo\"\n\n",
+                "[local_server.config_stores.app_config]\n",
+                "format = \"inline-toml\"\n\n",
+                "[local_server.config_stores.app_config.contents]\n",
+                "app_config = {prior}\n",
+            ),
+            prior = toml_edit::value(serde_json::json!({"data": {}, "sha256": "x", "generated_at": "t", "version": 2_u32}).to_string()),
         );
-        fs::write(&fastly_toml, seed).expect("seed");
+        fs::write(&fastly_toml, &seed).expect("seed");
 
         let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
         let err = FastlyCliAdapter
@@ -12636,10 +12874,7 @@ echo 'unexpected' >&2; exit 1
         );
         // The v2 value must survive untouched.
         let after = fs::read_to_string(&fastly_toml).expect("read");
-        assert!(
-            after.contains("\\\"version\\\":2"),
-            "the newer-format value must be left intact: {after}"
-        );
+        assert_eq!(after, seed, "the newer-format file must be left intact");
     }
 
     /// The locked downgrade guard must catch a future INNER envelope hidden behind
@@ -13279,12 +13514,18 @@ echo 'unexpected' >&2; exit 1
         let fastly_toml = dir.path().join("fastly.toml");
         // A pointer-kind prior value missing its required fields — malformed, so
         // `prior_chunk_keys` returns Err (warn, delete nothing).
-        let seed = concat!(
-            "name = \"demo\"\n\n",
-            "[local_server.config_stores.app_config]\n",
-            "format = \"inline-toml\"\n\n",
-            "[local_server.config_stores.app_config.contents]\n",
-            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":1}\"\n",
+        let seed = format!(
+            concat!(
+                "name = \"demo\"\n\n",
+                "[local_server.config_stores.app_config]\n",
+                "format = \"inline-toml\"\n\n",
+                "[local_server.config_stores.app_config.contents]\n",
+                "app_config = {prior}\n",
+            ),
+            prior = toml_edit::value(
+                serde_json::json!({"edgezero_kind": "fastly_config_chunks", "version": 1_u32})
+                    .to_string()
+            ),
         );
         fs::write(&fastly_toml, seed).expect("seed");
 
@@ -13373,12 +13614,18 @@ echo 'unexpected' >&2; exit 1
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let dir = tempdir().expect("tempdir");
         let fastly_toml = dir.path().join("fastly.toml");
-        let seed = concat!(
-            "name = \"demo\"\n\n",
-            "[local_server.config_stores.app_config]\n",
-            "format = \"inline-toml\"\n\n",
-            "[local_server.config_stores.app_config.contents]\n",
-            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":1}\"\n",
+        let seed = format!(
+            concat!(
+                "name = \"demo\"\n\n",
+                "[local_server.config_stores.app_config]\n",
+                "format = \"inline-toml\"\n\n",
+                "[local_server.config_stores.app_config.contents]\n",
+                "app_config = {prior}\n",
+            ),
+            prior = toml_edit::value(
+                serde_json::json!({"edgezero_kind": "fastly_config_chunks", "version": 1_u32})
+                    .to_string()
+            ),
         );
         fs::write(&fastly_toml, seed).expect("seed");
 

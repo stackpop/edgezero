@@ -15,10 +15,15 @@ handler = "my_app_core::handlers::hello"
 
 [[triggers.http]]
 id = "echo"
+class = "interactive"
 path = "/echo/{name}"
 methods = ["GET", "POST"]
 handler = "my_app_core::handlers::echo"
 ```
+
+An optional `class` is opaque application metadata for ingress admission. It is available through
+`RouteMetadata::class()` for matched and method-not-allowed resolutions and does not change the
+route's stable identity.
 
 You can also build routes programmatically using convenience methods:
 
@@ -40,7 +45,7 @@ use edgezero_core::http::Method;
 
 let router = RouterService::builder()
     .route("/hello", Method::GET, hello_handler)
-    .route("/echo/{name}", Method::GET, echo_handler)
+    .route_with_class("/echo/{name}", Method::GET, "interactive", echo_handler)
     .route("/echo", Method::POST, echo_json_handler)
     .build();
 ```
@@ -111,7 +116,9 @@ RouterService::builder()
     .build()
 ```
 
-EdgeZero automatically returns `405 Method Not Allowed` for requests that match a path but use an unsupported method.
+EdgeZero automatically returns `405 Method Not Allowed` for requests that match a path but use an
+unsupported method. The response includes an `Allow` header containing the sorted, deduplicated
+method set registered for that path.
 
 ## Introspection Routes
 
@@ -175,11 +182,12 @@ Axum-style `:name` parameters are **not supported**. Use `{name}` instead.
 
 Routes are matched by specificity (static segments first, then parameters, then catch-alls).
 Registering two routes that conflict for the same method (for example, two routes that both look
-like `/users/{id}`) panics while the routes are registered (inside `build_app()`) with
+like `/users/{id}`) panics while the routes are registered (inside `App::build::<A>(platform)`) with
 `duplicate route definition for <path>`.
 When that happens depends on the adapter: Axum builds the router once at startup, so the conflict
-surfaces before any traffic, but the Fastly, Cloudflare, and Spin entry points call `build_app()`
-per request, so a conflicting route deploys successfully and then panics on the first request.
+surfaces before any traffic, but the Fastly, Cloudflare, and Spin entry points call
+`App::build::<A>(platform)` per request, so a conflicting route deploys successfully and then panics on
+the first request.
 Run the app under the Axum dev server before deploying to an edge target.
 
 ## Next Steps

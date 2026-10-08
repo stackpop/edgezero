@@ -46,6 +46,13 @@ Contributor build with the bundled example:
 cargo run -p edgezero-cli --features "cli,demo-example" -- demo
 ```
 
+The bundled demo uses the same Axum logger as the standalone app-demo adapter, not the CLI's
+fixed-Info backend. It honors `EDGEZERO__LOGGING__LEVEL`; runtime `Off` suppresses ordinary
+startup messages, while managed boot warnings remain at `Warn`. Capability checks run after
+logger setup and before application configuration or listener binding. Terminal failures print
+to stderr even with logging disabled. Generated adapter entrypoints likewise delegate to reusable
+runners; no logging implementation is copied into their templates.
+
 ## Built-in commands
 
 `edgezero` ships with these subcommands (see `edgezero --help` for full

@@ -11,7 +11,11 @@
 #![cfg(test)]
 
 use app_demo_core::config::AppDemoConfig;
+use edgezero_adapter::cli_support::validate_spin_outbound_host_contract;
+use edgezero_adapter_axum::config_store_limits::ConfigStoreLimits;
 use edgezero_cli::args::{ConfigPushArgs, ConfigValidateArgs};
+use edgezero_core::manifest::ManifestLoader;
+use edgezero_core::Capability;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -121,6 +125,43 @@ fn push_args(manifest: &Path, adapter: &str, dry_run: bool) -> ConfigPushArgs {
 }
 
 #[test]
+fn app_demo_manifest_declares_outbound_http_optional() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let app_manifest_path = root.join("edgezero.toml");
+    let spin_manifest_path = root.join("crates/app-demo-adapter-spin/spin.toml");
+    let manifest =
+        ManifestLoader::from_path(&app_manifest_path).expect("parse shipped app-demo manifest");
+    assert_eq!(
+        manifest.manifest().capabilities.optional,
+        [Capability::OutboundHttp]
+    );
+    let hosts = manifest
+        .manifest()
+        .capabilities
+        .outbound
+        .hosts
+        .as_deref()
+        .expect("app-demo outbound hosts");
+    assert_eq!(hosts, ["https://*:*"]);
+
+    let spin = fs::read_to_string(&spin_manifest_path).expect("read shipped Spin manifest");
+    assert_eq!(
+        spin.matches("allowed_outbound_hosts = [\"https://*:*\"]")
+            .count(),
+        1,
+        "app-demo Spin manifest must grant exactly the canonical HTTPS wildcard"
+    );
+    assert!(!spin.contains("allowed_outbound_hosts = [\"http://"));
+    validate_spin_outbound_host_contract(
+        manifest.manifest(),
+        &app_manifest_path,
+        &spin_manifest_path,
+        None,
+    )
+    .expect("app-demo application and selected Spin component must remain aligned");
+}
+
+#[test]
 fn config_validate_strict_passes_against_app_demo_config() {
     // Typed validator runs the raw checks (manifest schema, store
     // declarations) plus the typed `#[secret]` / store-ref
@@ -215,7 +256,11 @@ fn config_typed_handler_deserialises_blob_envelope_to_greeting() {
     });
     let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
     let blob_str = serde_json::to_string(&envelope).expect("envelope JSON");
-    let store = AxumConfigStore::from_map([("app_config".to_owned(), blob_str)]);
+    let store = AxumConfigStore::from_map(
+        [("app_config".to_owned(), blob_str)],
+        ConfigStoreLimits::default(),
+    )
+    .expect("bounded snapshot");
 
     let config_registry: ConfigRegistry = StoreRegistry::single_id(
         "app_config".to_owned(),

@@ -19,7 +19,8 @@ cli = [
     "dep:toml_edit",
     "dep:walkdir",
 ]
-fastly = ["dep:fastly", "dep:log-fastly"]
+fastly = ["dep:fastly", "dep:fastly-shared", "dep:fastly-sys", "dep:log-fastly"]
+test-utils = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -33,6 +34,8 @@ brotli = { workspace = true }
 bytes = { workspace = true }
 ctor = { workspace = true, optional = true }
 fastly = { workspace = true, optional = true }
+fastly-shared = { workspace = true, optional = true }
+fastly-sys = { workspace = true, optional = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
@@ -41,7 +44,7 @@ log-fastly = { workspace = true, optional = true }
 fern = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 toml_edit = { workspace = true, optional = true }
@@ -51,3 +54,6 @@ walkdir = { workspace = true, optional = true }
 edgezero-core = { path = "../edgezero-core", features = ["test-utils"] }
 handlebars = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+log-fastly = { workspace = true, features = ["native-test-stubs"] }

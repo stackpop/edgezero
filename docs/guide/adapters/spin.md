@@ -26,11 +26,11 @@ crates/my-app-adapter-spin/
 The Spin entrypoint wires the adapter via `#[http_service]`:
 
 ```rust
-use spin_sdk::{http::IntoResponse, http::Request, http_service};
+use spin_sdk::{http::Request, http_service};
 use my_app_core::App;
 
 #[http_service]
-async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
+async fn handle(req: Request) -> anyhow::Result<edgezero_adapter_spin::SpinResponse> {
     edgezero_adapter_spin::run_app::<App>(req).await
 }
 ```
@@ -38,6 +38,8 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
 `run_app` reads the portable store metadata baked into `App` by the `app!`
 macro plus `EDGEZERO__*` environment variables; it does not require an
 `edgezero.toml` to be present at runtime.
+If `Hooks::configure` fails, `run_app` returns the source-preserving
+`application configuration failed` error before converting or dispatching the request.
 
 ## Building
 
@@ -70,6 +72,25 @@ edgezero deploy --adapter spin
 # Or directly
 spin deploy --from crates/my-app-adapter-spin
 ```
+
+## Outbound HTTP
+
+`SpinOutboundClient` uses the WASI HTTP 0.3 interfaces directly so request-body production,
+response completion, limits, and the guest-visible deadline race share one owner. Generated
+`spin.toml` files default `allowed_outbound_hosts` to `https://*:*`; cleartext requires an explicit
+manifest declaration.
+
+Spin exposes raw header bytes and drives isolated batch slots in completion order. Cache bypass
+adds no synthetic origin header because the adapter owns no intermediary cache. A wire-authority
+override is rejected during preflight: WASI HTTP uses the same authority for connection routing,
+so Spin cannot preserve URI-owned routing and TLS identity while changing only the HTTP authority.
+Deadline, batch cancellation, and streamed-upload cancellation remain BestEffort until host
+teardown has a documented observed bound, and provider phase-timer defaults may prevent a fully
+elastic budget. Downstream response
+delivery owns the raw WASI response, body, and result writers in one coordinator and preserves
+lazy body production under host backpressure. Successful close is a host handoff, not proof of
+client receipt, so response-egress capabilities also remain BestEffort. See
+[Capabilities](/guide/capabilities).
 
 ## KV Storage
 
@@ -196,9 +217,10 @@ Schema-coupling note: the SQLite writer uses the exact `spin_key_value`
 schema and `INSERT … ON CONFLICT DO UPDATE` statement vendored from
 spinframework/spin's `crates/key-value-spin/src/store.rs`. A contract
 test in `edgezero-adapter-spin/src/cli/push_sqlite.rs` asserts
-byte-equality against the upstream string, and the workspace's
-`spin-sdk = "~6.0"` pin blocks any Spin minor bump that would change
-the schema until the operator opts in.
+byte-equality against the upstream Spin 4.1.0 strings. The workspace's
+exact `spin-sdk = "=7.0.0"` pin makes every SDK upgrade explicit, and
+the CLI warns when the installed Spin runtime major is outside the
+schema-verified 2.x through 4.x range.
 
 ```bash
 # Local dev: writes through to .spin/sqlite_key_value.db.
@@ -253,30 +275,17 @@ surfaces before `provision` / `config push` run.
 
 ## Logging
 
-`edgezero_adapter_spin::init_logger()` is a no-op today because Spin manages its own
-logging internally; `run_app` calls it unless your app sets `owns_logging = true`. An
+`edgezero_adapter_spin::init_logger()` is a no-op; `run_app` calls it before application
+configuration unless your app sets `owns_logging = true`. An
 `[adapters.spin.logging]` table in `edgezero.toml` is not consumed by the Spin runtime.
 View output through `spin up` or your Spin host's log files.
 
 ::: tip Logging status
-Spin logging is handled by the runtime; install your own `log` implementation in the
-entrypoint if you need structured output.
+Host stdout/stderr capture does not install a Rust `log` backend. Install yours before the
+adapter entrypoint and set `owns_logging = true` if you need facade output. Resolve ordinary
+levels with `edgezero_core::resolve_logging_level(&EnvConfig)` and apply both backend and facade
+filters; the adapter does not promise boot-target visibility without that backend.
 :::
-
-## Proxy Client
-
-The Spin adapter forwards outbound requests through `spin_sdk::http::send`:
-
-```rust
-use edgezero_adapter_spin::proxy::SpinProxyClient;
-use edgezero_core::proxy::ProxyService;
-
-let response = ProxyService::new(SpinProxyClient).forward(request).await?;
-```
-
-Proxied responses carry `x-edgezero-proxy: spin`. Every upstream host must be listed
-in the component's `allowed_outbound_hosts` in `spin.toml` or the send fails at
-runtime.
 
 ## Context Access
 
@@ -328,29 +337,52 @@ application logging before the cache's synchronous app constructor. Do not use a
 generic unkeyed static or hold a lock across an await.
 
 ```rust
-use edgezero_core::app::{App, Hooks};
-use spin_sdk::{http::{IntoResponse, Request}, http_service};
+use edgezero_adapter_spin::{SPIN_PLATFORM, SpinResponse};
+use edgezero_core::{app::App, EdgeError};
+use my_app_core::App as MyApp;
+use spin_sdk::{http::Request, http_service};
 use std::sync::OnceLock;
 
 static APP: OnceLock<App> = OnceLock::new();
 
+fn retained_app() -> Result<&'static App, EdgeError> {
+    if let Some(app) = APP.get() {
+        return Ok(app);
+    }
+    let app = App::build::<MyApp>(SPIN_PLATFORM)?;
+    Ok(APP.get_or_init(|| app))
+}
+
 #[http_service]
-async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
-    let app = APP.get_or_init(MyApp::build_app);
+async fn handle(req: Request) -> anyhow::Result<SpinResponse> {
+    let app = retained_app()?;
     edgezero_adapter_spin::dispatch_app::<MyApp>(app, req).await
 }
 ```
 
-The pinned SDK 6 macro exports a P3 HTTP interface. The `wasm32-wasip2` Rust target
+`App::build::<MyApp>(SPIN_PLATFORM)` returns `Result<App, EdgeError>` and invokes
+fallible `Hooks::configure` after installing platform metadata. For Akamai Functions,
+select `AKAMAI_FUNCTIONS_PLATFORM`; other hosts can supply metadata matching their
+configured limits. Only a successful app is cached, so a failed build can be retried.
+Concurrent construction attempts may build multiple candidates; only one is retained.
+The app must be built from the same `Hooks` type used by dispatch.
+
+`dispatch_app<A: Hooks>(&App, SpinRequest) -> anyhow::Result<SpinResponse>` returns
+the raw WASI response, not a collected SDK response. Each invocation resolves fresh
+registries and runs admission and response egress; the adapter's coordinator owns
+the body writer and transmission-result observation through terminal delivery.
+
+The pinned SDK 7 macro exports a P3 HTTP interface. The `wasm32-wasip2` Rust target
 name does not establish the component's HTTP lifecycle. Verify the emitted
-interface and host together. spin-sdk 6 requires Spin 3.7 or later. See Spin's
+interface and host together. See Spin's
 [instance-reuse documentation](https://spinframework.dev/v4/http-trigger#controlling-instance-reuse)
 for the reuse and concurrency controls your host version supports.
 
 Test both sequential reuse and overlapping invocations in the same instance.
 Different guest instances are not evidence of concurrent isolation. Keep
-request/response bodies and pending operations invocation-local. Existing
-response buffering and stream collection limits still apply. Restore `run_app`
+request/response bodies, admission resources, delivery coordinators, and pending
+operations invocation-local. Standard response delivery remains lazy under host
+backpressure; retention adds no whole-response buffer or collection cap. Restore `run_app`
 and remove the cache to roll back; default generated entry points are unchanged.
 
 ## Next Steps

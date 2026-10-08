@@ -29,10 +29,18 @@ The Wrangler manifest configures your Worker:
 name = "my-app"
 main = "build/worker/shim.mjs"
 compatibility_date = "2023-05-01"
+compatibility_flags = ["enable_request_signal", "enable_weak_ref"]
 
 [build]
 command = "worker-build --release"
 ```
+
+Keep both compatibility flags when migrating an existing application. `enable_request_signal`
+exposes incoming-request cancellation. Bounded config KV reads require `FinalizationRegistry`
+for wasm-bindgen cleanup callbacks and fail before dispatch if it is absent; `enable_weak_ref`
+enables that support even with an older compatibility date. GC timing is nondeterministic and
+does not provide a certified allocation or teardown bound. See
+[Cloudflare's compatibility contract](https://developers.cloudflare.com/workers/configuration/compatibility-flags/#enable-finalizationregistry-and-weakref).
 
 ### Entrypoint
 
@@ -55,6 +63,9 @@ derived from the baked store ids and queried individually). Per-id
 `KV` / `Config` / `Secret` registries are built and injected into
 request extensions automatically. No `edgezero.toml` is loaded by
 the runtime — see [the migration guide](../manifest-store-migration.md).
+If `Hooks::configure` fails, `run_app` logs only the stable EdgeZero error category and returns the
+fixed `application configuration failed` worker error before request conversion. Application or
+provider diagnostics are not exposed on the wire.
 
 For fully manual wiring, `CloudflareService::new(&app)` builds a dispatcher one
 store at a time: `.with_config(binding)` (a KV binding name),
@@ -64,14 +75,15 @@ matching `.require_kv()` / `.require_secrets()` flags, and finally
 to open bindings:
 
 ```rust
-use edgezero_adapter_cloudflare::request::CloudflareService;
-use edgezero_core::app::Hooks as _;
+use edgezero_adapter_cloudflare::{CLOUDFLARE_PLATFORM, request::CloudflareService};
+use edgezero_core::app::App as EdgeZeroApp;
 use my_app_core::App;
 use worker::*;
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    let app = App::build_app();
+    let app = EdgeZeroApp::build::<App>(CLOUDFLARE_PLATFORM)
+        .map_err(|_| Error::RustError("application configuration failed".to_owned()))?;
     CloudflareService::new(&app)
         .with_config("app_config")
         .with_kv("sessions")
@@ -120,23 +132,40 @@ wrangler deploy --cwd crates/my-app-adapter-cloudflare
 
 ## Fetch API
 
-Cloudflare Workers use the global `fetch` API for outbound requests:
+`CloudflareOutboundClient` uses the Workers global `fetch` API and is injected into core request
+extensions. Workers needs no backend registration, but application manifests still declare
+outbound hosts so the same portable contract validates on every target.
 
-```rust
-use edgezero_adapter_cloudflare::proxy::CloudflareProxyClient;
-use edgezero_core::proxy::ProxyService;
+The adapter requests raw encoded upstream bytes with manual fetch encoding, disables automatic
+redirect following, and owns an abort signal for the absolute request deadline. When an encoded
+body is passed through to the downstream response, the response converter separately selects
+manual response-body encoding so Workers does not encode it again. These are two distinct
+controls. The abort path is implemented, but outbound and streamed-upload deadlines remain
+BestEffort until a deployed host-observed cancellation fixture proves a finite bound. Cloudflare
+drives batch slots in completion order, maps cache bypass to `NoStore`, and applies a validated
+wire-authority override. The platform has not yet proved finite abort teardown or that its final
+wire request preserves authority independently from the connection target, so cancellation and
+authority override remain BestEffort. Cloudflare and Axum have Native lazy streamed response passthrough;
+raw header octets and original non-`set-cookie` field boundaries remain unavailable, so header
+fidelity is BestEffort. See [Capabilities](/guide/capabilities).
 
-let client = CloudflareProxyClient;
-let response = ProxyService::new(client).forward(request).await?;
-```
-
-Unlike Fastly, there's no backend configuration needed - Workers can fetch any URL directly.
+Downstream response delivery uses one JavaScript stream writer owned by a coordinator registered
+with `Context::wait_until`. It awaits writer backpressure and races the request abort signal and
+absolute write deadline. Writer acceptance and close are host-handoff observations; deployed
+disconnect and network-completion timing remain unproved, so response-egress capabilities are
+BestEffort.
 
 ## Logging
 
 EdgeZero does not install a Cloudflare logger by default. Use your preferred logger (for example
 `console_log` or your own `log` implementation), and view output in Wrangler or the Cloudflare
 dashboard.
+
+Workers console capture does not install a Rust `log` backend. Initialize your backend and
+both its filter and facade maximum **before** `run_app`, and set `owns_logging = true`.
+`edgezero_core::resolve_logging_level(&env_config)` resolves a supplied platform `EnvConfig`;
+`edgezero::boot` is available for separately filtered startup diagnostics. The no-op adapter
+initializer cannot guarantee their visibility.
 
 ::: tip Logging status
 Cloudflare logging is opt-in; install a logger (such as `console_log`) in your entrypoint if you
@@ -316,18 +345,29 @@ For explicit retention, keep a cache owned by one concrete application and
 select its `Hooks` type with `dispatch_app::<MyApp>` on every fetch:
 
 ```rust
-use edgezero_core::app::{App, Hooks};
+use edgezero_adapter_cloudflare::CLOUDFLARE_PLATFORM;
+use edgezero_core::{app::App, EdgeError};
+use my_app_core::App as MyApp;
 use std::sync::OnceLock;
 
 static APP: OnceLock<App> = OnceLock::new();
+
+fn retained_app() -> Result<&'static App, EdgeError> {
+    if let Some(app) = APP.get() {
+        return Ok(app);
+    }
+    let app = App::build::<MyApp>(CLOUDFLARE_PLATFORM)?;
+    Ok(APP.get_or_init(|| app))
+}
 
 #[worker::event(fetch)]
 async fn fetch(req: worker::Request, env: worker::Env, ctx: worker::Context)
     -> worker::Result<worker::Response>
 {
-    edgezero_adapter_cloudflare::dispatch_app::<MyApp>(
-        APP.get_or_init(MyApp::build_app), req, env, ctx,
-    ).await
+    let app = retained_app().map_err(|_| {
+        worker::Error::RustError("application configuration failed".to_owned())
+    })?;
+    edgezero_adapter_cloudflare::dispatch_app::<MyApp>(app, req, env, ctx).await
 }
 ```
 
@@ -336,12 +376,21 @@ the first application value replaces any body-generated default. This correction
 also applies to existing `run_app` users.
 
 `dispatch_app::<MyApp>` reads `MyApp::stores()` and does not initialize logging
-or construct an app. Pass an app built from the same `Hooks` type. The caller owns
-initialization before construction. It resolves configuration and bindings for
-each invocation; never retain `Env`, `Context`, request bodies, or registries in
-this cache. The initializer is synchronous and must not recursively access the
-cache or block waiting for async initialization. Apps needing fallible or async
-initialization own that state machine and publish only a complete snapshot.
+or construct an app. Its signature is
+`dispatch_app<A: Hooks>(&App, Request, Env, Context) -> Result<Response, worker::Error>`.
+Pass an app built from the same `Hooks` type with `CLOUDFLARE_PLATFORM`; the caller
+owns logging setup before construction. `App::build` returns `Result<App, EdgeError>`
+and invokes fallible `Hooks::configure` after installing platform metadata.
+Only a complete successful app enters the cache; an initialization error leaves it
+empty for a later attempt. Concurrent construction attempts may build separate
+successful candidates, but only one is retained.
+
+Each invocation resolves fresh configuration, runtime variables, and store
+registries, then runs fresh admission and response egress. Never retain `Env`,
+`Context`, request bodies, admission resources, or delivery coordinators in the
+app cache. Construction is synchronous and must not recursively access the cache
+or block waiting for async initialization. Apps needing async initialization or
+refresh own that state machine and publish only a complete successful snapshot.
 
 Fetch invocations may overlap. Verify isolation while two requests are actually
 in flight in the same instance. A serialized test or two separate instances does

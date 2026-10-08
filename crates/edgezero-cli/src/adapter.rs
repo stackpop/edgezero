@@ -1,5 +1,10 @@
+use edgezero_adapter::cli_support::validate_spin_outbound_host_contract;
 use edgezero_adapter::registry::{self as adapter_registry, AdapterAction};
-use edgezero_core::manifest::{Manifest, ManifestLoader, ResolvedEnvironment};
+use edgezero_core::manifest::{
+    CapabilitySupport, Manifest, ManifestContract, ManifestLoader, ResolvedEnvironment,
+};
+
+use crate::manifest_source::{ResolvedAdapterTarget, ResolvedRuntime};
 
 use std::env;
 use std::fmt;
@@ -80,14 +85,7 @@ fn apply_environment(
     // `env::var_os` first and skip the explicit set when the parent
     // already has one. This mirrors the precedence the plan + the
     // typed-config env-overlay docs both promise.
-    for binding in &environment.variables {
-        if let Some(value) = &binding.value {
-            if env::var_os(&binding.env).is_some() {
-                continue;
-            }
-            command.env(&binding.env, value);
-        }
-    }
+    command.envs(resolve_environment_defaults(environment));
 
     let mut missing = Vec::new();
     for binding in &environment.secrets {
@@ -163,6 +161,10 @@ pub fn execute(
 /// the inherited stdio, so there is nothing for us to capture and the
 /// caller must fall back to another source of truth (for Fastly deploy:
 /// the Fastly API).
+#[expect(
+    dead_code,
+    reason = "retained operational dispatcher API; runtime-producing actions use execute_capture_runtime"
+)]
 pub fn execute_capture(
     adapter_name: &str,
     action: Action,
@@ -190,20 +192,235 @@ pub fn execute_capture(
     Ok(None)
 }
 
-/// Whether `action` for `adapter_name` resolves to a manifest-declared
-/// shell command (rather than the registered adapter's built-in logic).
-///
-/// Callers use this to decide whether an EdgeZero-internal directive
-/// (e.g. `--manifest-path`, understood only by the built-in adapter) is
-/// safe to thread into `adapter_args`: a manifest shell command receives
-/// those args verbatim and would choke on a flag its own CLI lacks.
-pub fn has_manifest_command(
-    manifest_loader: Option<&ManifestLoader>,
+/// Dispatch a runtime-producing action against one pre-resolved target/contract pair.
+pub(crate) fn execute_runtime(
+    runtime: &ResolvedRuntime,
+    adapter_args: &[String],
+) -> Result<(), String> {
+    ensure_action_capabilities(runtime)?;
+    execute_after_gate(runtime, adapter_args)
+}
+
+/// Capturing variant of [`execute_runtime`] for manifest shell commands.
+pub(crate) fn execute_capture_runtime(
+    runtime: &ResolvedRuntime,
+    adapter_args: &[String],
+) -> Result<Option<String>, String> {
+    ensure_action_capabilities(runtime)?;
+    if let ResolvedAdapterTarget::Shell(shell) = runtime.target() {
+        return run_shell_tee(
+            shell.command(),
+            shell.root(),
+            runtime.adapter_name(),
+            runtime.action(),
+            Some(shell.environment().clone()),
+            (shell.bind_host().map(str::to_owned), shell.bind_port()),
+            adapter_args,
+        )
+        .map(Some);
+    }
+    execute_registered_after_gate(runtime, adapter_args)?;
+    Ok(None)
+}
+
+fn ensure_action_capabilities(runtime: &ResolvedRuntime) -> Result<(), String> {
+    if !produces_current_runtime(runtime.action()) {
+        return Err("operational action entered outbound runtime dispatcher".to_owned());
+    }
+    ensure_spin_outbound_hosts(runtime)?;
+    ensure_capabilities(
+        runtime.adapter_name(),
+        ManifestContract::from_opt(runtime.manifest()),
+    )
+}
+
+fn ensure_spin_outbound_hosts(runtime: &ResolvedRuntime) -> Result<(), String> {
+    if !runtime.adapter_name().eq_ignore_ascii_case("spin") {
+        return Ok(());
+    }
+    let Some(manifest) = runtime.manifest() else {
+        return Ok(());
+    };
+    let manifest_path = runtime
+        .manifest_path()
+        .ok_or_else(|| "resolved Spin runtime lost its application manifest path".to_owned())?;
+    let (platform_manifest, component) = match runtime.target() {
+        ResolvedAdapterTarget::Registered(target) => {
+            (target.platform_manifest(), target.component())
+        }
+        ResolvedAdapterTarget::Shell(shell) => (shell.platform_manifest(), shell.component()),
+    };
+    let platform_manifest_path = platform_manifest.ok_or_else(|| {
+        format!(
+            "Spin runtime in {} has no selected spin.toml; set [adapters.spin.adapter].manifest",
+            manifest_path.display()
+        )
+    })?;
+    validate_spin_outbound_host_contract(manifest, manifest_path, platform_manifest_path, component)
+}
+
+fn execute_after_gate(runtime: &ResolvedRuntime, adapter_args: &[String]) -> Result<(), String> {
+    match runtime.target() {
+        ResolvedAdapterTarget::Registered(_target) => {
+            execute_registered_after_gate(runtime, adapter_args)
+        }
+        ResolvedAdapterTarget::Shell(shell) => run_shell(
+            shell.command(),
+            shell.root(),
+            runtime.adapter_name(),
+            runtime.action(),
+            Some(shell.environment().clone()),
+            (shell.bind_host().map(str::to_owned), shell.bind_port()),
+            adapter_args,
+        ),
+    }
+}
+
+fn execute_registered_after_gate(
+    runtime: &ResolvedRuntime,
+    adapter_args: &[String],
+) -> Result<(), String> {
+    let ResolvedAdapterTarget::Registered(target) = runtime.target() else {
+        return Err("registered runtime dispatcher received a shell target".to_owned());
+    };
+    let adapter = adapter_registry::get_adapter(runtime.adapter_name()).ok_or_else(|| {
+        let available = adapter_registry::registered_adapters();
+        if available.is_empty() {
+            format!(
+                "adapter `{}` is not registered (no adapters available)",
+                runtime.adapter_name()
+            )
+        } else {
+            format!(
+                "adapter `{}` is not registered (available: {})",
+                runtime.adapter_name(),
+                available.join(", ")
+            )
+        }
+    })?;
+    let defaults = runtime.manifest().map_or_else(Vec::new, |manifest| {
+        resolve_environment_defaults(&manifest.environment_for(runtime.adapter_name()))
+    });
+    let selected = target.clone().with_environment_defaults(defaults);
+    adapter.execute_target(
+        AdapterAction::from(runtime.action()),
+        &selected,
+        adapter_args,
+    )
+}
+
+fn resolve_environment_defaults(environment: &ResolvedEnvironment) -> Vec<(String, String)> {
+    let mut defaults = Vec::new();
+    for binding in &environment.variables {
+        if let Some(value) = &binding.value
+            && env::var_os(&binding.env).is_none()
+        {
+            // Keep declaration order; Command owns platform-specific key identity.
+            defaults.push((binding.env.clone(), value.clone()));
+        }
+    }
+    defaults
+}
+
+pub(crate) fn ensure_capabilities(
     adapter_name: &str,
-    action: Action,
-) -> bool {
-    manifest_loader
-        .is_some_and(|loader| manifest_command(loader.manifest(), adapter_name, action).is_some())
+    contract: ManifestContract<'_>,
+) -> Result<(), String> {
+    let verified_manifest = match contract {
+        ManifestContract::Malformed(reason) => {
+            return Err(format!(
+                "capability check aborted: {reason}. This is an EdgeZero/app! contract bug; the baked manifest is unreadable, so required capabilities cannot be verified. Refusing to proceed rather than silently skipping enforcement."
+            ));
+        }
+        ManifestContract::None => return Ok(()),
+        ManifestContract::Present(present_manifest) => present_manifest,
+        _ => {
+            return Err(
+                "capability check aborted: unrecognized manifest-contract state. Refusing to proceed rather than skipping enforcement."
+                    .to_owned(),
+            );
+        }
+    };
+    let capabilities = &verified_manifest.capabilities;
+    let Some(adapter) = adapter_registry::get_adapter(adapter_name) else {
+        if capabilities.required.is_empty() {
+            if capabilities.optional.is_empty() {
+                log::warn!(
+                    target: edgezero_core::BOOT_LOG_TARGET,
+                    "adapter '{adapter_name}' not in registry; capability check skipped (no capabilities declared)"
+                );
+            } else {
+                log::warn!(
+                    target: edgezero_core::BOOT_LOG_TARGET,
+                    "adapter '{adapter_name}' not in registry; cannot verify its OPTIONAL capabilities; proceeding, since optional capabilities never hard-fail"
+                );
+            }
+            return Ok(());
+        }
+        return Err(format!(
+            "adapter '{adapter_name}' is not in the registry; cannot verify REQUIRED capabilities. Register an adapter stub that returns capability metadata, or move those entries to `optional`."
+        ));
+    };
+
+    let mut best_effort = Vec::new();
+    let mut unsupported = Vec::new();
+    for capability in capabilities.required.iter().copied() {
+        match adapter.capability(capability) {
+            CapabilitySupport::BestEffort => best_effort.push(capability.as_str()),
+            CapabilitySupport::BoundedCooperative => log::info!(
+                "adapter '{adapter_name}': required capability '{}' is bounded-cooperative; see capability docs for the bound",
+                capability.as_str()
+            ),
+            CapabilitySupport::Native => {}
+            CapabilitySupport::Unsupported | _ => unsupported.push(capability.as_str()),
+        }
+    }
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "adapter '{adapter_name}' does not support required capabilities: {}",
+            unsupported.join(", ")
+        ));
+    }
+    if !best_effort.is_empty() {
+        return Err(format!(
+            "adapter '{adapter_name}': required capabilities are only best-effort: {}. See https://edgezero.dev/guide/capabilities and declare them `optional` only when the documented limitation is acceptable.",
+            best_effort.join(", ")
+        ));
+    }
+
+    for capability in capabilities.optional.iter().copied() {
+        match adapter.capability(capability) {
+            CapabilitySupport::BestEffort => log::warn!(
+                target: edgezero_core::BOOT_LOG_TARGET,
+                "adapter '{adapter_name}': optional capability '{}' is best-effort; see https://edgezero.dev/guide/capabilities",
+                capability.as_str()
+            ),
+            CapabilitySupport::BoundedCooperative | CapabilitySupport::Native => {}
+            CapabilitySupport::Unsupported => log::warn!(
+                target: edgezero_core::BOOT_LOG_TARGET,
+                "adapter '{adapter_name}': optional capability '{}' unavailable",
+                capability.as_str()
+            ),
+            _ => log::warn!(
+                target: edgezero_core::BOOT_LOG_TARGET,
+                "adapter '{adapter_name}': optional capability '{}' reports an unrecognized support level; treating as degraded",
+                capability.as_str()
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn produces_current_runtime(action: Action) -> bool {
+    match action {
+        Action::Build | Action::Deploy | Action::DeployStaging | Action::Serve => true,
+        Action::AuthLogin
+        | Action::AuthLogout
+        | Action::AuthStatus
+        | Action::EmitVersion
+        | Action::Healthcheck
+        | Action::Rollback => false,
+    }
 }
 
 fn manifest_command<'manifest>(
@@ -443,11 +660,174 @@ fn shell_join(args: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedEnvironment, apply_environment};
+    use super::{ResolvedEnvironment, apply_environment, ensure_capabilities, execute_runtime};
+    use crate::adapter::Action;
+    use crate::manifest_source::resolve_runtime_from;
     use crate::test_support::manifest_guard;
-    use edgezero_core::manifest::ResolvedEnvironmentBinding;
+    use edgezero_adapter::registry::{
+        Adapter, AdapterAction, AdapterExecutionTarget, register_adapter,
+    };
+    use edgezero_core::manifest::{
+        Capability, CapabilitySupport, ManifestContract, ManifestLoader, ResolvedEnvironmentBinding,
+    };
     use edgezero_core::test_env::EnvOverride;
+    use std::env;
+    use std::ffi::{OsStr, OsString};
+    use std::fs;
     use std::process::Command;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    static BEST_EFFORT_ADAPTER: GateAdapter = GateAdapter {
+        name: "gate-best-effort",
+        support: CapabilitySupport::BestEffort,
+    };
+    static ENVIRONMENT_ADAPTER: EnvironmentAdapter = EnvironmentAdapter;
+    static ENVIRONMENT_TARGETS: Mutex<Vec<AdapterExecutionTarget>> = Mutex::new(Vec::new());
+    static BOUNDED_ADAPTER: GateAdapter = GateAdapter {
+        name: "gate-bounded",
+        support: CapabilitySupport::BoundedCooperative,
+    };
+    static NATIVE_ADAPTER: GateAdapter = GateAdapter {
+        name: "gate-native",
+        support: CapabilitySupport::Native,
+    };
+    static UNSUPPORTED_ADAPTER: GateAdapter = GateAdapter {
+        name: "gate-unsupported",
+        support: CapabilitySupport::Unsupported,
+    };
+
+    struct GateAdapter {
+        name: &'static str,
+        support: CapabilitySupport,
+    }
+
+    struct EnvironmentAdapter;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "records pinned target dispatch without launching a child"
+    )]
+    impl Adapter for EnvironmentAdapter {
+        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+            Err("pinned dispatch must not rediscover the invocation project".to_owned())
+        }
+
+        fn execute_target(
+            &self,
+            _action: AdapterAction,
+            target: &AdapterExecutionTarget,
+            _args: &[String],
+        ) -> Result<(), String> {
+            ENVIRONMENT_TARGETS
+                .lock()
+                .map_err(|_poison| "fixture target lock poisoned")?
+                .push(target.clone());
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "gate-environment"
+        }
+    }
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "capability-gate fixture overrides only the relevant trait methods"
+    )]
+    impl Adapter for GateAdapter {
+        fn capability(&self, _capability: Capability) -> CapabilitySupport {
+            self.support
+        }
+
+        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    fn capability_manifest(section: &str) -> ManifestLoader {
+        ManifestLoader::load_from_str(&format!("[capabilities]\n{section}\n[adapters.gate]\n"))
+    }
+
+    #[test]
+    fn registered_dispatch_carries_only_selected_manifest_defaults_in_order() {
+        const KEY: &str = "EDGEZERO_TEST_REGISTERED_INGRESS";
+        let _lock = manifest_guard().lock().unwrap();
+        let _unset = EnvOverride::remove(KEY);
+        register_adapter(&ENVIRONMENT_ADAPTER);
+        let invocation = tempdir().unwrap();
+        let selected = tempdir().unwrap();
+        fs::write(invocation.path().join("edgezero.toml"),
+            format!("[adapters.gate-environment]\n[[environment.variables]]\nname = '{KEY}'\nvalue = 'wrong-project'\n")).unwrap();
+        let manifest_path = selected.path().join("edgezero.toml");
+        fs::write(&manifest_path, format!(
+            "[adapters.gate-environment]\n\
+             [[environment.variables]]\nname = 'first'\nenv = '{KEY}'\nvalue = 'global'\n\
+             [[environment.variables]]\nname = 'second'\nenv = '{KEY}'\nvalue = 'selected'\nadapters = ['gate-environment']\n\
+             [[environment.variables]]\nname = 'excluded'\nenv = '{KEY}'\nvalue = 'wrong-adapter'\nadapters = ['spin']\n\
+             [[environment.variables]]\nname = 'last'\nenv = '{KEY}'\nvalue = ''\n"
+        )).unwrap();
+        for action in [Action::Build, Action::Serve] {
+            let runtime = resolve_runtime_from(
+                "gate-environment",
+                action,
+                invocation.path(),
+                Some(OsString::from(&manifest_path)),
+            )
+            .unwrap();
+            execute_runtime(&runtime, &[]).unwrap();
+        }
+        let mut targets = ENVIRONMENT_TARGETS.lock().unwrap();
+        assert_eq!(targets.len(), 2);
+        for target in targets.drain(..) {
+            assert_eq!(target.app_root(), selected.path().canonicalize().unwrap());
+            assert_eq!(
+                target.environment_defaults(),
+                &[
+                    (KEY.to_owned(), "global".to_owned()),
+                    (KEY.to_owned(), "selected".to_owned()),
+                    (KEY.to_owned(), String::new())
+                ]
+            );
+            let mut child = Command::new("echo");
+            child.envs(target.environment_defaults().iter().cloned());
+            assert!(
+                child
+                    .get_envs()
+                    .any(|(key, value)| key == KEY && value.is_some_and(OsStr::is_empty))
+            );
+        }
+        assert!(env::var_os(KEY).is_none());
+    }
+
+    #[test]
+    fn environment_defaults_filter_before_collapsing_and_preserve_parent_values() {
+        const KEY: &str = "EDGEZERO_TEST_INGRESS_PROPAGATION";
+        let _lock = manifest_guard().lock().unwrap();
+        let _unset = EnvOverride::remove(KEY);
+        let loader = ManifestLoader::load_from_str(&format!(
+            "[[environment.variables]]\nname = 'first'\nenv = '{KEY}'\nvalue = 'global'\n\
+             [[environment.variables]]\nname = 'selected'\nenv = '{KEY}'\nvalue = 'selected'\nadapters = ['AxUm']\n\
+             [[environment.variables]]\nname = 'excluded'\nenv = '{KEY}'\nvalue = 'wrong'\nadapters = ['spin']\n\
+             [[environment.variables]]\nname = 'valueless'\nenv = '{KEY}'\n"
+        ));
+        let resolved = loader.manifest().environment_for("axum");
+        let defaults = super::resolve_environment_defaults(&resolved);
+        let mut child = Command::new("echo");
+        child.envs(defaults);
+        assert!(
+            child.get_envs().any(|(key, value)| key == KEY
+                && value.is_some_and(|configured| configured == "selected"))
+        );
+        for value in ["operator", ""] {
+            let _parent = EnvOverride::set(KEY, value);
+            assert!(super::resolve_environment_defaults(&resolved).is_empty());
+        }
+    }
 
     #[test]
     fn apply_environment_sets_defaults_and_checks_secrets() {
@@ -553,6 +933,138 @@ mod tests {
             injected,
             "manifest default must fill the slot when parent env is unset"
         );
+    }
+
+    #[test]
+    fn capability_gate_accepts_native_and_bounded_required_support() {
+        register_adapter(&NATIVE_ADAPTER);
+        register_adapter(&BOUNDED_ADAPTER);
+        let loader = capability_manifest("required = [\"outbound-http\"]");
+        for name in [NATIVE_ADAPTER.name, BOUNDED_ADAPTER.name] {
+            assert_eq!(
+                ensure_capabilities(name, ManifestContract::from_opt(Some(loader.manifest()))),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn capability_gate_fails_closed_for_malformed_contract() {
+        let result = ensure_capabilities(
+            "gate-missing-malformed",
+            ManifestContract::Malformed("fixture corruption"),
+        );
+        assert!(result.is_err_and(|error| error.contains("fixture corruption")));
+    }
+
+    #[test]
+    fn capability_gate_rejects_best_effort_and_unsupported_required_support() {
+        register_adapter(&BEST_EFFORT_ADAPTER);
+        register_adapter(&UNSUPPORTED_ADAPTER);
+        let loader = capability_manifest("required = [\"outbound-http\"]");
+        for name in [BEST_EFFORT_ADAPTER.name, UNSUPPORTED_ADAPTER.name] {
+            assert!(
+                ensure_capabilities(name, ManifestContract::from_opt(Some(loader.manifest())))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn capability_gate_treats_missing_registry_by_requirement_level() {
+        let required = capability_manifest("required = [\"outbound-http\"]");
+        let optional = capability_manifest("optional = [\"outbound-http\"]");
+        assert!(
+            ensure_capabilities(
+                "gate-missing-required",
+                ManifestContract::from_opt(Some(required.manifest()))
+            )
+            .is_err()
+        );
+        assert_eq!(
+            ensure_capabilities(
+                "gate-missing-optional",
+                ManifestContract::from_opt(Some(optional.manifest()))
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            ensure_capabilities("gate-missing-none", ManifestContract::None),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn optional_capability_degradation_never_hard_fails() {
+        register_adapter(&BEST_EFFORT_ADAPTER);
+        register_adapter(&UNSUPPORTED_ADAPTER);
+        let loader = capability_manifest("optional = [\"outbound-http\"]");
+        for name in [BEST_EFFORT_ADAPTER.name, UNSUPPORTED_ADAPTER.name] {
+            assert_eq!(
+                ensure_capabilities(name, ManifestContract::from_opt(Some(loader.manifest()))),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn spin_host_drift_blocks_runtime_actions_before_dispatch() {
+        let dir = tempdir().expect("temp dir");
+        let marker = dir.path().join("runtime-started");
+        let manifest_path = dir.path().join("edgezero.toml");
+        fs::write(
+            dir.path().join("spin.toml"),
+            "[component.app]\nallowed_outbound_hosts = [\"https://actual.example\"]\n",
+        )
+        .expect("write Spin manifest");
+        fs::write(
+            &manifest_path,
+            format!(
+                "[capabilities.outbound]\nhosts = [\"https://expected.example\"]\n\
+                 [adapters.spin.adapter]\nmanifest = \"spin.toml\"\ncomponent = \"app\"\n\
+                 [adapters.spin.commands]\nbuild = \"touch {}\"\nserve = \"touch {}\"\ndeploy = \"touch {}\"\n",
+                marker.display(),
+                marker.display(),
+                marker.display()
+            ),
+        )
+        .expect("write application manifest");
+
+        for action in [
+            Action::Build,
+            Action::Serve,
+            Action::Deploy,
+            Action::DeployStaging,
+        ] {
+            let runtime = resolve_runtime_from(
+                "spin",
+                action,
+                dir.path(),
+                Some(OsString::from(&manifest_path)),
+            )
+            .expect("resolve runtime");
+            let error = execute_runtime(&runtime, &[]).expect_err("host drift must fail closed");
+            assert!(error.contains("Spin outbound host drift"), "{error}");
+            assert!(!marker.exists(), "runtime side effect for {action}");
+        }
+
+        fs::write(
+            &manifest_path,
+            "[capabilities.outbound]\nhosts = [\"https://expected.example\"]\n\
+             [adapters.spin.adapter]\nmanifest = \"spin.toml\"\ncomponent = \"app\"\n",
+        )
+        .expect("replace application manifest with registered target");
+        let registered = resolve_runtime_from(
+            "spin",
+            Action::Build,
+            dir.path(),
+            Some(OsString::from(&manifest_path)),
+        )
+        .expect("resolve registered runtime");
+        let error = execute_runtime(&registered, &[])
+            .expect_err("registered target host drift must fail before adapter dispatch");
+        assert!(error.contains("Spin outbound host drift"), "{error}");
+        assert!(!marker.exists(), "registered adapter must not run on drift");
     }
 
     #[test]

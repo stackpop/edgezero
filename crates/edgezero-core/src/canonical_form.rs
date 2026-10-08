@@ -17,19 +17,46 @@
 
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
-use std::fmt::Write as _;
+use std::fmt::{self, Write};
 
-/// SHA-256 of the canonical form of `data`. See module docs.
+struct CanonicalHasher(Sha256);
+
+impl CanonicalHasher {
+    fn push(&mut self, character: char) {
+        let mut bytes = [0_u8; 4];
+        self.push_str(character.encode_utf8(&mut bytes));
+    }
+
+    fn push_str(&mut self, text: &str) {
+        self.0.update(text.as_bytes());
+    }
+}
+
+impl Write for CanonicalHasher {
+    fn write_char(&mut self, c: char) -> fmt::Result {
+        self.push(c);
+        Ok(())
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        fmt::write(self, args)
+    }
+
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.push_str(s);
+        Ok(())
+    }
+}
+
+/// SHA-256 of the canonical form of `data`, without a serialized output buffer.
 #[must_use]
 #[inline]
 pub fn canonical_data_sha256(data: &Value) -> String {
     #[cfg(test)]
     test_hooks::CALL_COUNT.with(|cell| cell.set(cell.get().saturating_add(1)));
-    let mut buf = String::new();
-    write_canonical(&mut buf, data);
-    let mut hasher = Sha256::new();
-    hasher.update(buf.as_bytes());
-    format!("{:x}", hasher.finalize())
+    let mut sink = CanonicalHasher(Sha256::new());
+    write_canonical(&mut sink, data);
+    format!("{:x}", sink.0.finalize())
 }
 
 #[cfg(test)]
@@ -45,7 +72,7 @@ pub(crate) mod test_hooks {
     }
 }
 
-fn write_canonical(out: &mut String, value: &Value) {
+fn write_canonical(out: &mut CanonicalHasher, value: &Value) {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
@@ -86,9 +113,9 @@ fn write_canonical(out: &mut String, value: &Value) {
     clippy::panic,
     reason = "unreachable branch — serde_json::Number always exposes i64/u64/f64"
 )]
-fn write_number(out: &mut String, n: &serde_json::Number) {
+fn write_number(out: &mut CanonicalHasher, n: &serde_json::Number) {
     if let Some(int_val) = n.as_i64() {
-        // Infallible: writing to a String never fails.
+        // Infallible: this sink feeds bytes directly into the hasher.
         write!(out, "{int_val}").unwrap_or_default();
     } else if let Some(uint_val) = n.as_u64() {
         write!(out, "{uint_val}").unwrap_or_default();
@@ -110,7 +137,7 @@ fn write_number(out: &mut String, n: &serde_json::Number) {
     }
 }
 
-fn write_string(out: &mut String, raw: &str) {
+fn write_string(out: &mut CanonicalHasher, raw: &str) {
     // Escape table byte-identical to serde_json::to_string(raw)'s
     // default. Pinned by spec 4.2 — DO NOT change without bumping
     // BlobEnvelope::version.
@@ -140,6 +167,16 @@ fn write_string(out: &mut String, raw: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn large_escaped_payload_matches_canonical_wire_hash() {
+        let value = json!({ "payload": "\n\t\u{0001}\"\\".repeat(0x0001_0000) });
+        let wire = serde_json::to_vec(&value).expect("canonical single-key fixture");
+        assert_eq!(
+            canonical_data_sha256(&value),
+            format!("{:x}", Sha256::digest(&wire))
+        );
+    }
 
     #[test]
     fn object_keys_sorted_by_utf8_bytes() {

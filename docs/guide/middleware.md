@@ -231,4 +231,4 @@ If you already hold an `Arc<dyn Middleware>` (`BoxMiddleware`), register it with
 ## Next Steps
 
 - Learn about [Streaming](/guide/streaming) for progressive responses
-- Explore [Proxying](/guide/proxying) for upstream forwarding
+- Explore [Outbound HTTP](/guide/proxying) for upstream requests

@@ -6,8 +6,14 @@ fn main() {
     use edgezero_cli::args::{self, Args, Command, ConfigCmd};
     use std::process;
 
+    let cmd = Args::parse().cmd;
+    #[cfg(feature = "demo-example")]
+    if !matches!(&cmd, Command::Demo) {
+        edgezero_cli::init_cli_logger();
+    }
+    #[cfg(not(feature = "demo-example"))]
     edgezero_cli::init_cli_logger();
-    let result = match Args::parse().cmd {
+    let result = match cmd {
         Command::Auth(cmd_args) => edgezero_cli::run_auth(&cmd_args),
         Command::Build(cmd_args) => edgezero_cli::run_build(&cmd_args),
         // `config push` and `config diff` require a typed app-config struct
@@ -18,7 +24,7 @@ fn main() {
             #[expect(
                 clippy::print_stderr,
                 reason = "intentional: pointer text must reach the user even when \
-                          stdout is piped; this is the only stderr write in main"
+                          stdout is piped"
             )]
             {
                 eprintln!("{}", args::STUB_POINTER_AFTER_HELP);
@@ -42,7 +48,13 @@ fn main() {
         Command::Serve(cmd_args) => edgezero_cli::run_serve(&cmd_args),
     };
     if let Err(err) = result {
-        log::error!("[edgezero] {err}");
+        #[expect(
+            clippy::print_stderr,
+            reason = "terminal command errors must remain visible when runtime logging is Off"
+        )]
+        {
+            eprintln!("[edgezero] {err}");
+        };
         process::exit(1);
     }
 }

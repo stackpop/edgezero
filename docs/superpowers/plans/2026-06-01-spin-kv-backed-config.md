@@ -1,5 +1,10 @@
 # Plan: Move Spin Config Store onto KV
 
+**Implementation update (2026-10-02):** The eager config-store open described
+below was superseded. Declared labels are now bound without host calls during
+dispatch; `SpinConfigStore` opens inside the bounded extraction read, after
+admission. The config design specifies the current behavior.
+
 **Status:** v12 — REVISION after tenth reviewer pass. Ready for
 execution. **Reviewer green-lighted start.**
 

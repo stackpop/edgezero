@@ -35,6 +35,45 @@ impl std::fmt::Display for InterruptedResponse {
     }
 }
 impl std::error::Error for InterruptedResponse {}
+
+#[derive(Debug)]
+pub struct ResponseHeadAborted(std::io::ErrorKind);
+impl std::fmt::Display for ResponseHeadAborted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "response ended before its status: {:?}", self.0)
+    }
+}
+impl std::error::Error for ResponseHeadAborted {}
+
+fn read_status(reader: &mut impl BufRead) -> Result<u16> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => {
+            return Err(Box::new(ResponseHeadAborted(
+                std::io::ErrorKind::UnexpectedEof,
+            )));
+        }
+        Err(error)
+            if line.is_empty()
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::UnexpectedEof
+                ) =>
+        {
+            return Err(Box::new(ResponseHeadAborted(error.kind())));
+        }
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    Ok(line
+        .split_whitespace()
+        .nth(1)
+        .ok_or("missing HTTP response status")?
+        .parse()?)
+}
+
 pub fn release(signal: &Signal) {
     *signal.0.lock().unwrap() = true;
     signal.1.notify_all();
@@ -156,6 +195,13 @@ fn serve(
         stream.write_all(
             b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial",
         )?;
+        if path.contains("gated=1") {
+            stream.flush()?;
+            let (_observed, _) = signal
+                .1
+                .wait_timeout_while(signal.0.lock().unwrap(), Duration::from_secs(8), |v| !*v)
+                .map_err(|_| "release poisoned")?;
+        }
     } else {
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")?;
     }
@@ -201,13 +247,8 @@ pub fn request(
     write!(stream, "\r\n{body}")?;
     stream.flush()?;
     let mut reader = BufReader::new(stream);
+    let status = read_status(&mut reader)?;
     let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let status: u16 = line
-        .split_whitespace()
-        .nth(1)
-        .ok_or("missing HTTP response status")?
-        .parse()?;
     let mut headers = Vec::new();
     let mut length = None;
     let mut chunked = false;
@@ -307,6 +348,35 @@ pub fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_response_head_classification_excludes_timeouts_and_malformed_bytes() {
+        struct FailedRead(std::io::ErrorKind);
+        impl Read for FailedRead {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(self.0))
+            }
+        }
+        let eof = read_status(&mut std::io::Cursor::new(b"")).unwrap_err();
+        assert!(eof.downcast_ref::<ResponseHeadAborted>().is_some());
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            let error = read_status(&mut BufReader::new(FailedRead(kind))).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<ResponseHeadAborted>().is_some(),
+                kind == std::io::ErrorKind::ConnectionReset
+            );
+        }
+        let invalid = read_status(&mut std::io::Cursor::new(b"invalid\r\n")).unwrap_err();
+        assert!(invalid.downcast_ref::<ResponseHeadAborted>().is_none());
+        assert_eq!(
+            read_status(&mut std::io::Cursor::new(b"HTTP/1.1 500 Error\r\n")).unwrap(),
+            500
+        );
+    }
+
     #[test]
     fn nonblocking_connection_waits_for_request_bytes() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -344,6 +414,37 @@ mod tests {
             .expect("response started");
         assert_eq!(partial.status, 200);
         assert_eq!(partial.body, b"partial");
+    }
+
+    #[test]
+    fn gated_abort_waits_for_client_observation_before_closing() {
+        let backend = Backend::start().unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", backend.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        stream
+            .write_all(b"GET /abort?gated=1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let mut partial = [0; 7];
+        reader.read_exact(&mut partial).unwrap();
+        assert_eq!(&partial, b"partial");
+        let before_release = reader.read(&mut [0]);
+        release(&backend.release);
+        assert!(matches!(
+            before_release,
+            Err(error) if matches!(error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+        ));
+        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
     }
 
     #[test]

@@ -5,11 +5,16 @@
 //! backends complete synchronously and resolve immediately.
 
 use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Error as AnyError;
 use async_trait::async_trait;
 use thiserror::Error;
+
+use crate::error::EdgeError;
+use crate::time::{DEADLINE_FAR_FUTURE, Deadline, MonotonicClock};
 
 // ---------------------------------------------------------------------------
 // Contract test macro
@@ -32,7 +37,7 @@ use thiserror::Error;
 ///     AxumConfigStore::from_map([
 ///         ("contract.key.a".to_owned(), "value_a".to_owned()),
 ///         ("contract.key.b".to_owned(), "value_b".to_owned()),
-///     ])
+///     ], ConfigStoreLimits::default()).expect("bounded snapshot")
 /// });
 /// ```
 #[macro_export]
@@ -52,7 +57,7 @@ macro_rules! config_store_contract_tests {
                 run(async {
                     assert_eq!(
                         store.get("contract.key.a").await.expect("config value"),
-                        Some("value_a".to_owned())
+                        Some($crate::ConfigValue::from("value_a"))
                     );
                 });
             }
@@ -74,11 +79,11 @@ macro_rules! config_store_contract_tests {
                 run(async {
                     assert_eq!(
                         store.get("contract.key.a").await.expect("first config value"),
-                        Some("value_a".to_owned())
+                        Some($crate::ConfigValue::from("value_a"))
                     );
                     assert_eq!(
                         store.get("contract.key.b").await.expect("second config value"),
-                        Some("value_b".to_owned())
+                        Some($crate::ConfigValue::from("value_b"))
                     );
                 });
             }
@@ -119,7 +124,7 @@ macro_rules! config_store_contract_tests {
                 run(async {
                     assert_eq!(
                         handle.get("contract.key.a").await.expect("handle value"),
-                        Some("value_a".to_owned())
+                        Some($crate::ConfigValue::from("value_a"))
                     );
                     assert_eq!(
                         handle.get("contract.key.missing").await.expect("handle miss"),
@@ -153,6 +158,76 @@ macro_rules! config_store_contract_tests {
     };
 }
 
+pub const DEFAULT_CONFIG_BACKEND_BYTES: u64 = 0x0100_0000;
+pub const DEFAULT_CONFIG_BLOB_BYTES: u64 = 0x0080_0000;
+pub const DEFAULT_CONFIG_EXTRACTION_BYTES: u64 = 0x0100_0000;
+pub const DEFAULT_CONFIG_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_CONFIG_JSON_DEPTH: u32 = 64;
+pub const DEFAULT_CONFIG_JSON_NODES: u32 = 8_192;
+pub const DEFAULT_CONFIG_SECRET_BYTES: u64 = 0x0010_0000;
+
+/// Per-extraction limits shared by the root config blob and every referenced secret.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigExtractionLimits {
+    pub max_backend_bytes: u64,
+    pub max_blob_bytes: u64,
+    pub max_json_depth: u32,
+    pub max_json_nodes: u32,
+    pub max_secret_bytes: u64,
+    pub max_total_bytes: u64,
+    pub timeout: Duration,
+}
+
+impl ConfigExtractionLimits {
+    /// Validates this startup policy before an adapter begins serving.
+    ///
+    /// # Errors
+    /// Returns an internal policy error for zero, inconsistent, or unbounded values.
+    #[inline]
+    pub fn validate(self) -> Result<Self, EdgeError> {
+        if self.max_backend_bytes == 0
+            || self.max_blob_bytes == 0
+            || self.max_secret_bytes == 0
+            || self.max_total_bytes == 0
+        {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "config extraction byte limits must be nonzero"
+            )));
+        }
+        if self.max_total_bytes < self.max_blob_bytes.max(self.max_secret_bytes) {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "config extraction total byte limit is below a per-value limit"
+            )));
+        }
+        if self.max_json_depth == 0 || self.max_json_depth > 127 || self.max_json_nodes == 0 {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "config extraction JSON structure limits must be finite and nonzero"
+            )));
+        }
+        if self.timeout.is_zero() || self.timeout > DEADLINE_FAR_FUTURE {
+            return Err(EdgeError::internal(anyhow::anyhow!(
+                "config extraction timeout must be finite and nonzero"
+            )));
+        }
+        Ok(self)
+    }
+}
+
+impl Default for ConfigExtractionLimits {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            max_backend_bytes: DEFAULT_CONFIG_BACKEND_BYTES,
+            max_blob_bytes: DEFAULT_CONFIG_BLOB_BYTES,
+            max_secret_bytes: DEFAULT_CONFIG_SECRET_BYTES,
+            max_total_bytes: DEFAULT_CONFIG_EXTRACTION_BYTES,
+            max_json_depth: DEFAULT_CONFIG_JSON_DEPTH,
+            max_json_nodes: DEFAULT_CONFIG_JSON_NODES,
+            timeout: DEFAULT_CONFIG_EXTRACTION_TIMEOUT,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -163,6 +238,9 @@ macro_rules! config_store_contract_tests {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConfigStoreError {
+    /// The absolute read deadline expired before a complete value was available.
+    #[error("config store read deadline exceeded")]
+    DeadlineExceeded,
     /// An unexpected backend or provider failure occurred.
     #[error("config store error: {source}")]
     Internal { source: AnyError },
@@ -172,6 +250,9 @@ pub enum ConfigStoreError {
     /// The configured backend cannot currently serve requests.
     #[error("config store unavailable: {message}")]
     Unavailable { message: String },
+    /// The value or guest-visible backend read exceeded its supplied allowance.
+    #[error("config store value exceeds configured byte limit")]
+    ValueTooLarge,
 }
 
 impl ConfigStoreError {
@@ -203,10 +284,107 @@ impl ConfigStoreError {
     }
 }
 
+/// Classification retained when a declared config store cannot be opened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigStoreOpenFailure {
+    /// The declared binding or store name is invalid or missing.
+    InvalidConfiguration,
+    /// The provider could not resolve or serve the declared binding.
+    Unavailable,
+}
+
+/// An immutable UTF-8 configuration value. Cloning shares its allocation.
+///
+/// Each value owns only its own payload, never a slice retaining a larger store file.
+/// Debug output deliberately excludes configuration contents.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct ConfigValue {
+    value: Arc<str>,
+}
+
+impl ConfigValue {
+    /// Borrow the UTF-8 payload without allocating.
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+}
+
+impl AsRef<str> for ConfigValue {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Debug for ConfigValue {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigValue")
+            .field("bytes", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Deref for ConfigValue {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<&str> for ConfigValue {
+    #[inline]
+    fn from(value: &str) -> Self {
+        Self {
+            value: Arc::from(value),
+        }
+    }
+}
+
+impl From<String> for ConfigValue {
+    #[inline]
+    fn from(value: String) -> Self {
+        Self {
+            value: Arc::from(value),
+        }
+    }
+}
+
+impl serde::Serialize for ConfigValue {
+    #[inline]
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl ConfigStoreOpenFailure {
+    fn as_error(self) -> ConfigStoreError {
+        match self {
+            Self::Unavailable => {
+                ConfigStoreError::unavailable("declared config store is unavailable")
+            }
+            Self::InvalidConfiguration => ConfigStoreError::internal(anyhow::anyhow!(
+                "declared config store could not be opened"
+            )),
+        }
+    }
+}
+
+/// Result of one bounded store lookup, including all bytes exposed to guest code.
+#[derive(Debug)]
+pub struct BoundedStoreRead<T> {
+    pub backend_bytes: u64,
+    pub value: Option<T>,
+}
+
 /// Object-safe interface for read-only configuration store backends.
 ///
 /// Implementations exist per adapter:
-/// - `AxumConfigStore` (axum adapter) — env vars + in-memory defaults for dev
+/// - `AxumConfigStore` (axum adapter) — bounded immutable local-file snapshots
 /// - `FastlyConfigStore` (fastly adapter) — Fastly Config Store
 /// - `CloudflareConfigStore` (cloudflare adapter) — Cloudflare KV namespace
 /// - `SpinConfigStore` (spin adapter) — Spin KV (`spin_sdk::key_value::Store`)
@@ -216,8 +394,81 @@ pub trait ConfigStore: Send + Sync {
     ///
     /// # Errors
     /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
-    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;
+    async fn get(&self, key: &str) -> Result<Option<crate::ConfigValue>, ConfigStoreError>;
+
+    /// Retrieves one value under an absolute deadline and independent backend/value caps.
+    ///
+    /// Implementations must define their deadline and allocation behavior explicitly. There is
+    /// no compatibility default because awaiting an unbounded provider call can hide a
+    /// never-ready future.
+    async fn get_bounded(
+        &self,
+        key: &str,
+        clock: &MonotonicClock,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<crate::ConfigValue>, ConfigStoreError>;
 }
+
+#[cfg(test)]
+macro_rules! ready_config_store_bounded_read {
+    () => {
+        fn get_bounded<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            key: &'life1 str,
+            clock: &'life2 $crate::time::MonotonicClock,
+            deadline: $crate::time::Deadline,
+            max_backend_bytes: u64,
+            max_value_bytes: u64,
+        ) -> ::std::pin::Pin<
+            Box<
+                dyn ::std::future::Future<
+                        Output = Result<
+                            $crate::config_store::BoundedStoreRead<$crate::ConfigValue>,
+                            $crate::config_store::ConfigStoreError,
+                        >,
+                    > + 'async_trait,
+            >,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                if deadline.is_expired_at(clock.now()) {
+                    return Err($crate::config_store::ConfigStoreError::DeadlineExceeded);
+                }
+                let Some(result) = ::futures_util::FutureExt::now_or_never(self.get(key)) else {
+                    return Err($crate::config_store::ConfigStoreError::internal(
+                        ::anyhow::anyhow!("ready config-store test fixture returned pending"),
+                    ));
+                };
+                if deadline.is_expired_at(clock.now()) {
+                    return Err($crate::config_store::ConfigStoreError::DeadlineExceeded);
+                }
+                let value = result?;
+                let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+                    u64::try_from(stored_value.len()).map_err(|_length_error| {
+                        $crate::config_store::ConfigStoreError::ValueTooLarge
+                    })
+                })?;
+                if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+                    return Err($crate::config_store::ConfigStoreError::ValueTooLarge);
+                }
+                Ok($crate::config_store::BoundedStoreRead {
+                    backend_bytes,
+                    value,
+                })
+            })
+        }
+    };
+}
+
+#[cfg(test)]
+pub(crate) use ready_config_store_bounded_read;
 
 // ---------------------------------------------------------------------------
 // Handle
@@ -237,13 +488,40 @@ impl fmt::Debug for ConfigStoreHandle {
 }
 
 impl ConfigStoreHandle {
+    /// Keep a declared binding resolvable when its provider open fails.
+    ///
+    /// Provider diagnostics should be logged by the adapter, not stored in this handle.
+    #[inline]
+    #[must_use]
+    pub fn failed_open(failure: ConfigStoreOpenFailure) -> Self {
+        Self::new(Arc::new(FailedOpenConfigStore { failure }))
+    }
+
     /// Get a config value by key.
     ///
     /// # Errors
     /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
     #[inline]
-    pub async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+    pub async fn get(&self, key: &str) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
         self.store.get(key).await
+    }
+
+    /// Get a config value under one absolute deadline and two byte limits.
+    ///
+    /// # Errors
+    /// Preserves the provider's typed bounded-read error.
+    #[inline]
+    pub async fn get_bounded(
+        &self,
+        key: &str,
+        clock: &MonotonicClock,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<crate::ConfigValue>, ConfigStoreError> {
+        self.store
+            .get_bounded(key, clock, deadline, max_backend_bytes, max_value_bytes)
+            .await
     }
 
     /// Create a new handle wrapping a config store implementation.
@@ -251,6 +529,74 @@ impl ConfigStoreHandle {
     pub fn new(store: Arc<dyn ConfigStore>) -> Self {
         Self { store }
     }
+}
+
+struct FailedOpenConfigStore {
+    failure: ConfigStoreOpenFailure,
+}
+
+#[async_trait(?Send)]
+impl ConfigStore for FailedOpenConfigStore {
+    async fn get(&self, _key: &str) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+        Err(self.failure.as_error())
+    }
+
+    async fn get_bounded(
+        &self,
+        _key: &str,
+        clock: &MonotonicClock,
+        deadline: Deadline,
+        max_backend_bytes: u64,
+        max_value_bytes: u64,
+    ) -> Result<BoundedStoreRead<crate::ConfigValue>, ConfigStoreError> {
+        finish_bounded_config_read::<ConfigValue>(
+            Err(self.failure.as_error()),
+            clock,
+            deadline,
+            max_backend_bytes,
+            max_value_bytes,
+        )
+    }
+}
+
+/// Applies post-read deadline precedence and byte caps to one materialized config result.
+///
+/// This helper does not dispatch, await, cancel, or time out the provider operation. A
+/// [`ConfigStore::get_bounded`] implementation must still reject an already-expired deadline and
+/// arrange any target-specific timer race before calling it.
+///
+/// # Errors
+/// Returns the provider error, [`ConfigStoreError::DeadlineExceeded`], or
+/// [`ConfigStoreError::ValueTooLarge`] according to post-read precedence.
+/// Conversion must preserve the UTF-8 bytes exposed by `AsRef<str>`; `String`
+/// becomes shared only after the caps pass. Conversion overlap is adapter-accounted.
+#[inline]
+pub fn finish_bounded_config_read<T: AsRef<str> + Into<ConfigValue>>(
+    result: Result<Option<T>, ConfigStoreError>,
+    clock: &MonotonicClock,
+    deadline: Deadline,
+    max_backend_bytes: u64,
+    max_value_bytes: u64,
+) -> Result<BoundedStoreRead<crate::ConfigValue>, ConfigStoreError> {
+    if deadline.is_expired_at(clock.now()) {
+        return Err(ConfigStoreError::DeadlineExceeded);
+    }
+    let value = result?;
+    let backend_bytes = value.as_ref().map_or(Ok(0_u64), |stored_value| {
+        u64::try_from(stored_value.as_ref().len())
+            .map_err(|_length_error| ConfigStoreError::ValueTooLarge)
+    })?;
+    if backend_bytes > max_backend_bytes || backend_bytes > max_value_bytes {
+        return Err(ConfigStoreError::ValueTooLarge);
+    }
+    let shared_value = value.map(Into::into);
+    if deadline.is_expired_at(clock.now()) {
+        return Err(ConfigStoreError::DeadlineExceeded);
+    }
+    Ok(BoundedStoreRead {
+        backend_bytes,
+        value: shared_value,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -266,27 +612,34 @@ mod tests {
     );
 
     use super::*;
+    use crate::time::{Deadline, MonotonicClock, MonotonicInstant};
     use futures::executor::block_on;
     use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     struct FailingConfigStore;
 
     struct TestConfigStore {
-        data: HashMap<String, String>,
+        data: HashMap<String, ConfigValue>,
     }
 
     #[async_trait(?Send)]
     impl ConfigStore for FailingConfigStore {
-        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(&self, _key: &str) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
             Err(ConfigStoreError::unavailable("backend offline"))
         }
+
+        ready_config_store_bounded_read!();
     }
 
     #[async_trait(?Send)]
     impl ConfigStore for TestConfigStore {
-        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(&self, key: &str) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
             Ok(self.data.get(key).cloned())
         }
+
+        ready_config_store_bounded_read!();
     }
 
     impl TestConfigStore {
@@ -294,7 +647,7 @@ mod tests {
             Self {
                 data: entries
                     .iter()
-                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                    .map(|(key, value)| ((*key).to_owned(), ConfigValue::from(*value)))
                     .collect(),
             }
         }
@@ -302,6 +655,70 @@ mod tests {
 
     fn handle(entries: &[(&str, &str)]) -> ConfigStoreHandle {
         ConfigStoreHandle::new(Arc::new(TestConfigStore::new(entries)))
+    }
+
+    #[test]
+    fn shared_config_value_clones_payload_without_revealing_it_in_debug() {
+        let value = ConfigValue::from("credential=private");
+        let clone = value.clone();
+        assert_eq!(clone.as_ptr(), value.as_ptr());
+        assert_eq!(clone.as_str(), "credential=private");
+        assert!(!format!("{value:?}").contains("credential=private"));
+        assert_eq!(
+            serde_json::to_value(&value).expect("serialize"),
+            serde_json::json!("credential=private")
+        );
+    }
+
+    #[test]
+    fn bounded_read_caps_precede_conversion_and_conversion_expiry_wins() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ConversionProbe {
+            calls: Arc<AtomicUsize>,
+            text: String,
+        }
+        impl AsRef<str> for ConversionProbe {
+            fn as_ref(&self) -> &str {
+                &self.text
+            }
+        }
+        impl From<ConversionProbe> for ConfigValue {
+            #[inline]
+            fn from(value: ConversionProbe) -> Self {
+                value.calls.fetch_add(1, Ordering::SeqCst);
+                Self::from(value.text)
+            }
+        }
+        let start = MonotonicInstant::now();
+        let end = start.checked_add(Duration::from_secs(1)).expect("end");
+        for (cap, expected_conversions) in [(4, 0), (5, 1)] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let samples = Arc::clone(&calls);
+            let clock = MonotonicClock::new(move || {
+                if samples.load(Ordering::SeqCst) == 0 {
+                    start
+                } else {
+                    end
+                }
+            });
+            let error = finish_bounded_config_read(
+                Ok(Some(ConversionProbe {
+                    calls: Arc::clone(&calls),
+                    text: "value".to_owned(),
+                })),
+                &clock,
+                Deadline::at_instant(end),
+                cap,
+                cap,
+            )
+            .expect_err("bounded failure");
+            if cap == 4 {
+                assert!(matches!(error, ConfigStoreError::ValueTooLarge));
+            } else {
+                assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), expected_conversions);
+        }
     }
 
     #[test]
@@ -318,8 +735,139 @@ mod tests {
         let store_handle = handle(&[("feature.checkout", "true")]);
         assert_eq!(
             block_on(store_handle.get("feature.checkout")).expect("config value"),
-            Some("true".to_owned())
+            Some(ConfigValue::from("true"))
         );
+    }
+
+    #[test]
+    fn bounded_exact_cap_succeeds_and_over_cap_discards_value() {
+        let store_handle = handle(&[("feature.checkout", "true")]);
+        let clock = MonotonicClock::default();
+        let exact = block_on(store_handle.get_bounded(
+            "feature.checkout",
+            &clock,
+            Deadline::after(Duration::from_secs(1)),
+            4,
+            4,
+        ))
+        .expect("exact bounded read");
+        assert_eq!(exact.backend_bytes, 4);
+        assert_eq!(exact.value.as_deref(), Some("true"));
+
+        let error = block_on(store_handle.get_bounded(
+            "feature.checkout",
+            &clock,
+            Deadline::after(Duration::from_secs(1)),
+            3,
+            4,
+        ))
+        .expect_err("backend cap");
+        assert!(matches!(error, ConfigStoreError::ValueTooLarge));
+    }
+
+    #[test]
+    fn bounded_read_uses_injected_clock() {
+        let store_handle = handle(&[("feature.checkout", "true")]);
+        let process_now = MonotonicInstant::now();
+        let injected_now = process_now
+            .checked_sub(Duration::from_mins(1))
+            .expect("injected instant");
+        let deadline = Deadline::at_instant(
+            injected_now
+                .checked_add(Duration::from_secs(1))
+                .expect("deadline instant"),
+        );
+        let clock = MonotonicClock::new(move || injected_now);
+
+        let read = block_on(store_handle.get_bounded("feature.checkout", &clock, deadline, 4, 4))
+            .expect("the application clock is still before its deadline");
+
+        assert_eq!(read.value.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn bounded_read_deadline_wins_ready_provider_error() {
+        struct AdvancingErrorStore {
+            now: Arc<Mutex<MonotonicInstant>>,
+            terminal: MonotonicInstant,
+        }
+
+        #[async_trait(?Send)]
+        impl ConfigStore for AdvancingErrorStore {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                *self.now.lock().expect("clock lock") = self.terminal;
+                Err(ConfigStoreError::unavailable("provider failed at expiry"))
+            }
+
+            ready_config_store_bounded_read!();
+        }
+
+        let start = MonotonicInstant::now();
+        let terminal = start
+            .checked_add(Duration::from_secs(1))
+            .expect("terminal instant");
+        let now = Arc::new(Mutex::new(start));
+        let clock_now = Arc::clone(&now);
+        let clock = MonotonicClock::new(move || *clock_now.lock().expect("clock lock"));
+        let store_handle = ConfigStoreHandle::new(Arc::new(AdvancingErrorStore { now, terminal }));
+
+        let error = block_on(store_handle.get_bounded(
+            "feature.checkout",
+            &clock,
+            Deadline::at_instant(terminal),
+            4,
+            4,
+        ))
+        .expect_err("equality expiry must beat a ready provider error");
+
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+    }
+
+    #[test]
+    fn bounded_limit_defaults_are_finite_and_validation_rejects_invalid_relationships() {
+        let limits = ConfigExtractionLimits::default();
+        assert_eq!(limits.max_blob_bytes, DEFAULT_CONFIG_BLOB_BYTES);
+        assert_eq!(limits.max_backend_bytes, DEFAULT_CONFIG_BACKEND_BYTES);
+        assert_eq!(limits.max_secret_bytes, DEFAULT_CONFIG_SECRET_BYTES);
+        assert_eq!(limits.max_total_bytes, DEFAULT_CONFIG_EXTRACTION_BYTES);
+        assert_eq!(limits.max_json_depth, DEFAULT_CONFIG_JSON_DEPTH);
+        assert_eq!(limits.max_json_nodes, DEFAULT_CONFIG_JSON_NODES);
+        assert_eq!(limits.timeout, DEFAULT_CONFIG_EXTRACTION_TIMEOUT);
+        limits.validate().expect("valid defaults");
+
+        let invalid_total = ConfigExtractionLimits {
+            max_total_bytes: 1,
+            ..limits
+        };
+        invalid_total
+            .validate()
+            .expect_err("total below per-value cap");
+
+        let invalid_timeout = ConfigExtractionLimits {
+            timeout: Duration::ZERO,
+            ..limits
+        };
+        invalid_timeout.validate().expect_err("zero timeout");
+
+        for invalid in [
+            ConfigExtractionLimits {
+                max_json_depth: 0,
+                ..limits
+            },
+            ConfigExtractionLimits {
+                max_json_depth: 128,
+                ..limits
+            },
+            ConfigExtractionLimits {
+                max_json_nodes: 0,
+                ..limits
+            },
+        ] {
+            invalid.validate().expect_err("invalid JSON structure cap");
+        }
     }
 
     #[test]
@@ -345,7 +893,7 @@ mod tests {
         let store_handle = ConfigStoreHandle::new(store);
         assert_eq!(
             block_on(store_handle.get("a")).expect("arc-backed config"),
-            Some("1".to_owned())
+            Some(ConfigValue::from("1"))
         );
     }
 
@@ -357,11 +905,108 @@ mod tests {
     }
 
     #[test]
+    fn declared_failed_open_remains_resolvable_and_typed() {
+        use crate::store_registry::{ConfigStoreBinding, StoreRegistry};
+
+        let binding = ConfigStoreBinding {
+            handle: ConfigStoreHandle::failed_open(ConfigStoreOpenFailure::Unavailable),
+            default_key: "config".to_owned(),
+        };
+        let registry = StoreRegistry::from_parts(
+            [("primary".to_owned(), binding)].into(),
+            "primary".to_owned(),
+        )
+        .expect("declared binding remains registered");
+
+        assert_eq!(registry.ids().collect::<Vec<_>>(), vec!["primary"]);
+        let clock = MonotonicClock::default();
+        let error = block_on(
+            registry
+                .default()
+                .expect("default handle")
+                .handle
+                .get_bounded(
+                    "config",
+                    &clock,
+                    Deadline::after(Duration::from_secs(1)),
+                    1,
+                    1,
+                ),
+        )
+        .expect_err("failed open is not a missing key");
+        assert!(matches!(error, ConfigStoreError::Unavailable { .. }));
+    }
+
+    #[test]
+    fn failed_named_open_does_not_disappear_beside_healthy_default() {
+        use crate::store_registry::{ConfigStoreBinding, StoreRegistry};
+
+        let registry = StoreRegistry::from_parts(
+            [
+                (
+                    "default".to_owned(),
+                    ConfigStoreBinding {
+                        handle: handle(&[("config", "ready")]),
+                        default_key: "config".to_owned(),
+                    },
+                ),
+                (
+                    "named".to_owned(),
+                    ConfigStoreBinding {
+                        handle: ConfigStoreHandle::failed_open(
+                            ConfigStoreOpenFailure::InvalidConfiguration,
+                        ),
+                        default_key: "config".to_owned(),
+                    },
+                ),
+            ]
+            .into(),
+            "default".to_owned(),
+        )
+        .expect("healthy default registry");
+
+        assert_eq!(registry.ids().collect::<Vec<_>>(), vec!["default", "named"]);
+        let clock = MonotonicClock::default();
+        let error = block_on(
+            registry
+                .named("named")
+                .expect("failed declared id remains present")
+                .handle
+                .get_bounded(
+                    "config",
+                    &clock,
+                    Deadline::after(Duration::from_secs(1)),
+                    1,
+                    1,
+                ),
+        )
+        .expect_err("named open failed");
+        assert!(matches!(error, ConfigStoreError::Internal { .. }));
+    }
+
+    #[test]
+    fn failed_open_bounded_read_preserves_deadline_precedence() {
+        let handle = ConfigStoreHandle::failed_open(ConfigStoreOpenFailure::InvalidConfiguration);
+        let clock = MonotonicClock::default();
+        let deadline = Deadline::at_instant(clock.now());
+        let error = block_on(handle.get_bounded("config", &clock, deadline, 1, 1))
+            .expect_err("expired deadline wins");
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
+    }
+
+    #[test]
+    fn failed_open_structural_failure_is_typed() {
+        let handle = ConfigStoreHandle::failed_open(ConfigStoreOpenFailure::InvalidConfiguration);
+        let error = block_on(handle.get("config")).expect_err("open failure");
+        assert!(matches!(error, ConfigStoreError::Internal { .. }));
+    }
+
+    #[test]
     fn config_store_handle_wraps_and_delegates() {
         let store_handle = handle(&[("timeout_ms", "1500")]);
         assert_eq!(
             block_on(store_handle.get("timeout_ms")).expect("config value"),
-            Some("1500".to_owned())
+            Some(ConfigValue::from("1500"))
         );
         assert_eq!(
             block_on(store_handle.get("missing")).expect("missing config"),

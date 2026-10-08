@@ -11,8 +11,8 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
-    register_adapter,
+    Adapter, AdapterAction, AdapterExecutionTarget, AdapterPushContext, ProvisionStores,
+    ReadConfigEntry, ResolvedStoreId, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
@@ -20,6 +20,7 @@ use edgezero_adapter::scaffold::{
 };
 use edgezero_core::addr;
 use edgezero_core::manifest::ManifestLoader;
+use edgezero_core::{Capability, CapabilitySupport, PlatformMetadata};
 use toml::Value;
 use walkdir::WalkDir;
 
@@ -133,6 +134,35 @@ struct EdgezeroAxumConfig {
     reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` delegates to `read_config_entry_local` (axum is local-only). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for AxumCliAdapter {
+    fn capability(&self, capability: Capability) -> CapabilitySupport {
+        match capability {
+            Capability::ConfigReadDeadlines
+            | Capability::ResponseEgressAbort
+            | Capability::ResponseEgressBackpressure
+            | Capability::ResponseEgressCompletion
+            | Capability::ResponseWriteDeadlines => CapabilitySupport::BestEffort,
+            Capability::InboundReadDeadlines
+            | Capability::IngressAdmission
+            | Capability::IngressAdmissionAbort
+            | Capability::OutboundAuthorityOverride
+            | Capability::OutboundBatchCancellation
+            | Capability::OutboundBatchCompletionOrder
+            | Capability::OutboundBatchSlotIsolation
+            | Capability::OutboundCacheBypass
+            | Capability::OutboundDeadlines
+            | Capability::OutboundFlexiblePhaseBudget
+            | Capability::OutboundHeaderFidelity
+            | Capability::OutboundHttp
+            | Capability::LazyStreamedResponsePassthrough
+            | Capability::StreamedUploadDeadlines => CapabilitySupport::Native,
+            Capability::ConfigReadAllocationBounds
+            | Capability::OutboundCompleteResourceAccounting
+            | Capability::RawIngressFramingValidation
+            | Capability::RawIngressHeadLimits
+            | _ => CapabilitySupport::Unsupported,
+        }
+    }
+
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             // The axum adapter is the in-process native dev server —
@@ -158,8 +188,35 @@ impl Adapter for AxumCliAdapter {
         }
     }
 
+    fn execute_target(
+        &self,
+        action: AdapterAction,
+        target: &AdapterExecutionTarget,
+        args: &[String],
+    ) -> Result<(), String> {
+        match action {
+            AdapterAction::Build => build_target(target, args),
+            AdapterAction::Deploy => deploy(args),
+            AdapterAction::Serve => serve_target(target, args),
+            AdapterAction::AuthLogin
+            | AdapterAction::AuthLogout
+            | AdapterAction::AuthStatus
+            | AdapterAction::DeployStaging
+            | AdapterAction::EmitVersion
+            | AdapterAction::Healthcheck
+            | AdapterAction::Rollback
+            | _ => Err(format!(
+                "axum adapter does not support pinned target action {action:?}"
+            )),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "axum"
+    }
+
+    fn platform_metadata(&self) -> PlatformMetadata {
+        crate::AXUM_PLATFORM
     }
 
     fn provision(
@@ -371,12 +428,35 @@ fn register_ctor() {
 
 fn build(extra_args: &[String]) -> Result<(), String> {
     let project = locate_project()?;
-    run_cargo(&project, "build", extra_args)
+    run_cargo(&project, "build", extra_args, &[])
+}
+
+fn build_target(target: &AdapterExecutionTarget, extra_args: &[String]) -> Result<(), String> {
+    let project = read_axum_project(&target_manifest(target, "axum.toml")?)?;
+    run_cargo(&project, "build", extra_args, target.environment_defaults())
 }
 
 fn serve(extra_args: &[String]) -> Result<(), String> {
     let project = locate_project()?;
-    run_cargo(&project, "run", extra_args)
+    run_cargo(&project, "run", extra_args, &[])
+}
+
+fn serve_target(target: &AdapterExecutionTarget, extra_args: &[String]) -> Result<(), String> {
+    let project = read_axum_project(&target_manifest(target, "axum.toml")?)?;
+    run_cargo(&project, "run", extra_args, target.environment_defaults())
+}
+
+fn target_manifest(target: &AdapterExecutionTarget, name: &str) -> Result<PathBuf, String> {
+    let manifest = target
+        .platform_manifest()
+        .map_or_else(|| target.app_root().join(name), Path::to_path_buf);
+    if !manifest.is_file() {
+        return Err(format!(
+            "pinned axum manifest {} is not a regular file",
+            manifest.display()
+        ));
+    }
+    Ok(manifest)
 }
 
 fn deploy(_extra_args: &[String]) -> Result<(), String> {
@@ -389,7 +469,12 @@ fn locate_project() -> Result<AxumProject, String> {
     read_axum_project(&manifest)
 }
 
-fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> Result<(), String> {
+fn cargo_command(
+    project: &AxumProject,
+    subcommand: &str,
+    extra_args: &[String],
+    defaults: &[(String, String)],
+) -> Result<Command, String> {
     let resolution = resolve_subprocess_addr(project)?;
     for warning in &resolution.warnings {
         log::warn!("[edgezero] {warning}");
@@ -418,6 +503,17 @@ fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> 
     // no-op for the child process.
     command.env("EDGEZERO__ADAPTER__HOST", bind_addr.ip().to_string());
     command.env("EDGEZERO__ADAPTER__PORT", bind_addr.port().to_string());
+    command.envs(defaults.iter().map(|(key, value)| (key, value)));
+    Ok(command)
+}
+
+fn run_cargo(
+    project: &AxumProject,
+    subcommand: &str,
+    extra_args: &[String],
+    defaults: &[(String, String)],
+) -> Result<(), String> {
+    let mut command = cargo_command(project, subcommand, extra_args, defaults)?;
     let status = command
         .status()
         .map_err(|err| format!("failed to run cargo {subcommand}: {err}"))?;
@@ -694,6 +790,154 @@ mod tests {
     use edgezero_adapter::cli_support::find_manifest_upwards;
     use std::net::Ipv6Addr;
     use tempfile::tempdir;
+
+    #[test]
+    fn cargo_commands_preserve_ingress_defaults_and_bind_precedence() {
+        let dir = tempdir().unwrap();
+        let project = AxumProject {
+            addr: SocketAddr::from(([127, 0, 0, 1], 8787)),
+            axum_host: None,
+            axum_manifest: dir.path().join("axum.toml"),
+            axum_port: None,
+            cargo_manifest: dir.path().join("Cargo.toml"),
+            crate_dir: dir.path().to_path_buf(),
+            crate_name: "fixture".to_owned(),
+            env_host: None,
+            env_port: None,
+        };
+        let defaults = vec![
+            (
+                "EDGEZERO__ADAPTER__INGRESS__MAX_CONNECTIONS".to_owned(),
+                "3".to_owned(),
+            ),
+            ("EDGEZERO__ADAPTER__PORT".to_owned(), "9090".to_owned()),
+        ];
+        for subcommand in ["build", "run"] {
+            let command = cargo_command(&project, subcommand, &[], &defaults).unwrap();
+            assert!(command.get_envs().any(|(key, value)| key
+                == "EDGEZERO__ADAPTER__INGRESS__MAX_CONNECTIONS"
+                && value.is_some_and(|configured| configured == "3")));
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == "EDGEZERO__ADAPTER__PORT"
+                        && value.is_some_and(|configured| configured == "9090"))
+            );
+        }
+    }
+
+    #[test]
+    fn adapter_capability_matrix_matches_contracts() {
+        let expected = [
+            (
+                Capability::ConfigReadAllocationBounds,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ConfigReadDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::InboundReadDeadlines, CapabilitySupport::Native),
+            (Capability::IngressAdmission, CapabilitySupport::Native),
+            (Capability::IngressAdmissionAbort, CapabilitySupport::Native),
+            (
+                Capability::RawIngressFramingValidation,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::RawIngressHeadLimits,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::ResponseEgressAbort,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::ResponseEgressBackpressure,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::ResponseEgressCompletion,
+                CapabilitySupport::BestEffort,
+            ),
+            (
+                Capability::ResponseWriteDeadlines,
+                CapabilitySupport::BestEffort,
+            ),
+            (Capability::OutboundHttp, CapabilitySupport::Native),
+            (
+                Capability::OutboundCompleteResourceAccounting,
+                CapabilitySupport::Unsupported,
+            ),
+            (
+                Capability::OutboundHeaderFidelity,
+                CapabilitySupport::Native,
+            ),
+            (Capability::OutboundDeadlines, CapabilitySupport::Native),
+            (
+                Capability::OutboundFlexiblePhaseBudget,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::OutboundAuthorityOverride,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::OutboundBatchCancellation,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::OutboundBatchCompletionOrder,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::OutboundBatchSlotIsolation,
+                CapabilitySupport::Native,
+            ),
+            (Capability::OutboundCacheBypass, CapabilitySupport::Native),
+            (
+                Capability::StreamedUploadDeadlines,
+                CapabilitySupport::Native,
+            ),
+            (
+                Capability::LazyStreamedResponsePassthrough,
+                CapabilitySupport::Native,
+            ),
+        ];
+
+        for (capability, support) in expected {
+            assert_eq!(
+                AXUM_ADAPTER.capability(capability),
+                support,
+                "{capability:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adapter_platform_metadata_matches_runtime_metadata() {
+        let metadata = AXUM_ADAPTER.platform_metadata();
+
+        assert_eq!(metadata, crate::AXUM_PLATFORM);
+        assert_eq!(
+            metadata.memory_ceiling(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::OperatorConfigured
+            )
+        );
+        assert_eq!(
+            metadata.inbound_request_population_bound(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::OperatorConfigured
+            )
+        );
+        assert_eq!(
+            metadata.host_ingress_memory_accounting(),
+            edgezero_core::PlatformFact::unknown(
+                edgezero_core::PlatformUnknownReason::OperatorConfigured
+            )
+        );
+    }
 
     #[test]
     fn read_axum_project_loads_defaults() {
@@ -1314,7 +1558,7 @@ mod tests {
         fs::create_dir_all(&local_dir).expect("create dir");
         fs::write(
             local_dir.join("local-config-app_config.json"),
-            r#"{"other_key": "value"}"#,
+            serde_json::json!({"other_key": "value"}).to_string(),
         )
         .expect("write");
         let result = AxumCliAdapter
@@ -1340,7 +1584,7 @@ mod tests {
         fs::create_dir_all(&local_dir).expect("create dir");
         fs::write(
             local_dir.join("local-config-app_config.json"),
-            r#"{"greeting": "hello-axum"}"#,
+            serde_json::json!({"greeting": "hello-axum"}).to_string(),
         )
         .expect("write");
         let result = AxumCliAdapter
@@ -1368,7 +1612,7 @@ mod tests {
         fs::create_dir_all(&local_dir).expect("create dir");
         fs::write(
             local_dir.join("local-config-app_config.json"),
-            r#"{"greeting": "hello-axum"}"#,
+            serde_json::json!({"greeting": "hello-axum"}).to_string(),
         )
         .expect("write");
         let store = ResolvedStoreId::from_logical("app_config");

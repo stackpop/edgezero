@@ -3,3 +3,8 @@ crate = "{{proj_axum}}"
 crate_dir = "."
 host = "127.0.0.1"
 port = 8787
+
+# Config snapshots load before listener bind; restart after config push.
+# Set EDGEZERO__ADAPTER__CONFIG_STORE__* for allocation budgets.
+# Defaults: file 16 MiB, 1024 entries, key 1024 bytes, value 8 MiB,
+# all-store residency 32 MiB, startup residency plus staging 112 MiB.

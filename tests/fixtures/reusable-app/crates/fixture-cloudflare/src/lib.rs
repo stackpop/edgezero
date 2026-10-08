@@ -1,9 +1,20 @@
+#![cfg(target_arch = "wasm32")]
+
 use edgezero_core::app::{App, Hooks};
-use fixture_core::{FixtureApp, MissingBindingApp, OtherApp};
+#[cfg(not(feature = "qualification"))]
+use fixture_core::FixtureApp;
+#[cfg(feature = "qualification")]
+use fixture_core::qualification::QualificationApp as FixtureApp;
+use fixture_core::{MissingBindingApp, OtherApp, retained_app};
 use std::sync::OnceLock;
 use worker::{Context, Env, Request, Response, event};
 static APP: OnceLock<App> = OnceLock::new();
 static OTHER_APP: OnceLock<App> = OnceLock::new();
+
+fn retained_app_for_dispatch<A: Hooks>(cell: &OnceLock<App>) -> worker::Result<&App> {
+    retained_app::<A>(cell, edgezero_adapter_cloudflare::CLOUDFLARE_PLATFORM)
+        .map_err(|_error| worker::Error::RustError("application configuration failed".to_owned()))
+}
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
@@ -15,15 +26,13 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Response>
         .map(|v| v.to_string() == "retained")
         .unwrap_or(false);
     if retained && req.path() == "/binding-failure" {
-        // Pairs MissingBindingApp with FixtureApp's router; valid only while
-        // dispatch_app reads nothing but A::stores() (see MissingBindingApp).
-        let result = edgezero_adapter_cloudflare::dispatch_app::<MissingBindingApp>(
-            APP.get_or_init(FixtureApp::build_app),
-            req,
-            env,
-            ctx,
-        )
-        .await;
+        let app = App::build::<MissingBindingApp>(edgezero_adapter_cloudflare::CLOUDFLARE_PLATFORM)
+            .map_err(|_error| {
+                worker::Error::RustError("application configuration failed".to_owned())
+            })?;
+        let result =
+            edgezero_adapter_cloudflare::dispatch_app::<MissingBindingApp>(&app, req, env, ctx)
+                .await;
         return match result {
             Err(error) => Response::from_json(&serde_json::json!({"instance":fixture_core::instance_id(),"source":"injected_required_binding","error":error.to_string()})).map(|r|r.with_status(503)),
             Ok(response) => Ok(response),
@@ -34,7 +43,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Response>
             return edgezero_adapter_cloudflare::run_app::<OtherApp>(req, env, ctx).await;
         }
         return edgezero_adapter_cloudflare::dispatch_app::<OtherApp>(
-            OTHER_APP.get_or_init(OtherApp::build_app),
+            retained_app_for_dispatch::<OtherApp>(&OTHER_APP)?,
             req,
             env,
             ctx,
@@ -43,7 +52,7 @@ async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Response>
     }
     if retained {
         edgezero_adapter_cloudflare::dispatch_app::<FixtureApp>(
-            APP.get_or_init(FixtureApp::build_app),
+            retained_app_for_dispatch::<FixtureApp>(&APP)?,
             req,
             env,
             ctx,

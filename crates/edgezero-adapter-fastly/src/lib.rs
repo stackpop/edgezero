@@ -5,16 +5,23 @@
     feature = "fastly",
     expect(
         clippy::pub_use,
-        reason = "re-export the SDK serving builder rather than duplicate its API"
+        reason = "reuse the platform serving limits and summary"
     )
 )]
+
+#[cfg(feature = "fastly")]
+use anyhow::Context as _;
 
 // Only compiled where it is actually used (the CLI push/GC path and the Fastly
 // runtime resolver). Gating it keeps a `--no-default-features` build dead-code
 // clean instead of dragging in helpers no feature references.
-#[cfg(any(feature = "cli", feature = "fastly", test))]
+#[cfg(any(
+    feature = "fastly",
+    test,
+    all(feature = "cli", not(target_arch = "wasm32"))
+))]
 pub(crate) mod chunked_config;
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", not(target_arch = "wasm32")))]
 pub mod cli;
 #[cfg(feature = "fastly")]
 pub mod config_store;
@@ -22,36 +29,69 @@ pub mod context;
 #[cfg(feature = "fastly")]
 pub mod key_value_store;
 pub mod lifecycle;
-#[cfg(feature = "fastly")]
+#[cfg(any(feature = "fastly", all(test, not(target_arch = "wasm32"))))]
 pub mod logger;
-#[cfg(feature = "fastly")]
-pub mod proxy;
+#[cfg(any(test, feature = "test-utils", feature = "fastly"))]
+pub mod outbound;
 #[cfg(feature = "fastly")]
 pub mod request;
-#[cfg(feature = "fastly")]
+#[cfg(any(test, feature = "fastly"))]
 pub mod response;
 #[cfg(feature = "fastly")]
 pub mod secret_store;
 
 #[cfg(any(feature = "fastly", test))]
-use edgezero_core::app::App;
-#[cfg(feature = "fastly")]
-use edgezero_core::app::Hooks;
-#[cfg(any(feature = "fastly", test))]
 use edgezero_core::app::StoresMetadata;
 #[cfg(any(feature = "fastly", test))]
+use edgezero_core::app::{App, Hooks};
+#[cfg(any(feature = "fastly", test))]
 use edgezero_core::env_config::EnvConfig;
+#[cfg(any(feature = "fastly", test))]
+use edgezero_core::error::EdgeError;
 #[cfg(feature = "fastly")]
-use edgezero_core::http::Extensions;
+use edgezero_core::http::{Extensions, Response};
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::manifest::ResolvedLoggingConfig;
 #[cfg(feature = "fastly")]
 use fastly::compute_runtime::service_id;
 #[cfg(feature = "fastly")]
 pub use fastly::http::serve::{Serve, ServeSummary};
+#[cfg(any(feature = "fastly", test))]
+use std::mem;
+use std::num::NonZeroU32;
+#[cfg(feature = "fastly")]
+use std::sync::Once;
 
-#[cfg(any(feature = "cli", feature = "fastly", test))]
+/// Fastly Compute's published per-execution heap and stack limits.
+pub const FASTLY_PLATFORM: edgezero_core::PlatformMetadata = edgezero_core::PlatformMetadata::new(
+    edgezero_core::PlatformFact::known(
+        edgezero_core::MemoryCeiling::new(
+            128_000_000,
+            edgezero_core::MemoryCeilingScope::PerExecution,
+            Some(1_000_000),
+        ),
+        edgezero_core::PlatformResourceSource::PlatformLimit {
+            provider: "Fastly Compute",
+        },
+    ),
+    edgezero_core::PlatformFact::known(
+        edgezero_core::InboundRequestPopulationBound::new(NonZeroU32::MIN),
+        edgezero_core::PlatformResourceSource::PlatformLimit {
+            provider: "Fastly Compute",
+        },
+    ),
+    edgezero_core::PlatformFact::unknown(edgezero_core::PlatformUnknownReason::ProviderUnpublished),
+);
+
+#[cfg(any(feature = "fastly", all(feature = "cli", not(target_arch = "wasm32"))))]
 const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";
+
+#[cfg(any(feature = "fastly", test))]
+const RUNTIME_ENV_WARNING: &str = "Fastly Config Store `edgezero_runtime_env` could not be opened; \
+     EDGEZERO__* runtime overrides will use baked-in defaults. \
+     Run `edgezero provision --adapter fastly` to create the store, \
+     then populate per-environment override keys with \
+     `fastly config-store-entry update --upsert`.";
 
 /// Name of the Fastly Config Store the runtime opens for `EDGEZERO__*`
 /// overrides.
@@ -61,6 +101,9 @@ const RUNTIME_ENV_PREFIX: &str = "EDGEZERO__";
 /// how the runtime resolves staged selectors without knowing the twin exists.
 pub const RUNTIME_ENV_STORE_NAME: &str = "edgezero_runtime_env";
 
+#[cfg(feature = "fastly")]
+static FASTLY_ABI_INIT: Once = Once::new();
+
 #[cfg(any(feature = "fastly", test))]
 #[derive(Debug, Clone)]
 pub struct FastlyLogging {
@@ -68,6 +111,35 @@ pub struct FastlyLogging {
     pub endpoint: Option<String>,
     pub level: log::LevelFilter,
     pub use_fastly_logger: bool,
+}
+
+/// Resolved runtime overrides and bounded diagnostics deferred until logging is ready.
+#[cfg(any(feature = "fastly", test))]
+#[derive(Debug)]
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "runtime overrides are public but one-shot diagnostic state must remain private"
+)]
+pub struct FastlyRuntimeConfig {
+    /// Canonical `EDGEZERO__*` overrides for logging and request dispatch.
+    pub env: EnvConfig,
+    runtime_env_unavailable: bool,
+}
+
+#[cfg(any(feature = "fastly", test))]
+impl FastlyRuntimeConfig {
+    /// Emit pending boot warnings at most once, after installing a logging backend.
+    /// Without a backend the warning is not observable; this does not install one.
+    #[inline]
+    pub fn emit_boot_diagnostics(&mut self) {
+        if let Some(warning) = self.take_boot_warning() {
+            log::warn!(target: edgezero_core::BOOT_LOG_TARGET, "{warning}");
+        }
+    }
+
+    fn take_boot_warning(&mut self) -> Option<&'static str> {
+        mem::take(&mut self.runtime_env_unavailable).then_some(RUNTIME_ENV_WARNING)
+    }
 }
 
 #[cfg(any(feature = "fastly", test))]
@@ -95,12 +167,7 @@ impl From<ResolvedLoggingConfig> for FastlyLogging {
 impl From<&EnvConfig> for FastlyLogging {
     #[inline]
     fn from(env: &EnvConfig) -> Self {
-        use std::str::FromStr as _;
-
-        let level = env
-            .logging_level()
-            .and_then(|raw| log::LevelFilter::from_str(raw).ok())
-            .unwrap_or(log::LevelFilter::Info);
+        let level = edgezero_core::resolve_logging_level(env);
         // Only attach Fastly's named-endpoint logger when `EDGEZERO__LOGGING__ENDPOINT`
         // is set. Production deployments set it to a real `[log_endpoints]` entry from
         // `fastly.toml`; local Viceroy runs leave it unset and avoid the
@@ -117,33 +184,27 @@ impl From<&EnvConfig> for FastlyLogging {
     }
 }
 
-#[cfg(any(feature = "fastly", test))]
-#[derive(Default)]
-struct RetainedApp {
-    app: Option<App>,
+#[cfg(feature = "fastly")]
+fn build_app_for_dispatch<A: Hooks>() -> Result<App, fastly::Error> {
+    build_target_app::<A>().context("application configuration failed")
 }
 
 #[cfg(any(feature = "fastly", test))]
-impl RetainedApp {
-    fn get_or_init<E>(
-        &mut self,
-        env: &EnvConfig,
-        owns_logging: impl FnOnce() -> bool,
-        install_logger: impl FnOnce(&str, log::LevelFilter, bool) -> Result<(), E>,
-        build: impl FnOnce() -> App,
-    ) -> Result<&App, E> {
-        if self.app.is_none() {
-            let logging = FastlyLogging::from(env);
-            if logging.use_fastly_logger && !owns_logging() {
-                install_logger(
-                    logging.endpoint.as_deref().unwrap_or("stdout"),
-                    logging.level,
-                    logging.echo_stdout,
-                )?;
-            }
-        }
-        Ok(self.app.get_or_insert_with(build))
-    }
+fn build_target_app<A: Hooks>() -> Result<App, EdgeError> {
+    App::build::<A>(FASTLY_PLATFORM)
+}
+
+/// Test seam for the production application-assembly error mapping.
+#[cfg(all(feature = "test-utils", feature = "fastly"))]
+#[doc(hidden)]
+#[inline]
+pub fn build_app_for_test<A: Hooks>() -> Result<App, fastly::Error> {
+    build_app_for_dispatch::<A>()
+}
+
+#[cfg(feature = "fastly")]
+fn init_fastly_abi() {
+    FASTLY_ABI_INIT.call_once(fastly::init);
 }
 
 /// Prefix a canonical `EDGEZERO__*` key with its owning Fastly service.
@@ -151,7 +212,7 @@ impl RetainedApp {
 /// The shared `edgezero_runtime_env` Config Store is account-wide. Service
 /// scoping prevents two linked services that declare the same logical store id
 /// from overwriting one another's runtime mappings.
-#[cfg(any(feature = "cli", feature = "fastly", test))]
+#[cfg(any(feature = "fastly", all(feature = "cli", not(target_arch = "wasm32"))))]
 fn service_scoped_runtime_env_key(service_id: &str, canonical_key: &str) -> String {
     let suffix = canonical_key
         .strip_prefix(RUNTIME_ENV_PREFIX)
@@ -196,37 +257,102 @@ pub fn init_logger(
 /// Returns an error if logger setup fails or any required store cannot be opened.
 #[cfg(feature = "fastly")]
 #[inline]
-pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-    run_app_with_request_extensions::<A, _>(req, |_req, _extensions| {})
+pub fn run_app<A: Hooks>() -> Result<(), fastly::Error> {
+    run_app_with_hooks::<A, _, _, ()>(|_req, _extensions| {}, |_response| ()).map(|_state| ())
 }
 
-/// Like [`run_app`], but runs `extend` against a scratch
-/// [`Extensions`] populated from the raw
-/// `fastly::Request` (TLS JA4, H2 fingerprint, client IP, …) before the request
-/// is converted; the scratch values are merged into the core request's
-/// extensions and are visible to middleware and the `State`/extractor layer.
+/// Runs the manifest-wired app through Fastly's closed request/response lifecycle.
+///
+/// `prepare` borrows the raw request and extension bag before conversion. `finalize` borrows only
+/// routed responses before response-egress policy and framing. `EdgeZero` retains transmission
+/// ownership; routed hook state is returned only after terminal delivery, while detached ingress
+/// responses skip `finalize` and return `None`.
 ///
 /// # Errors
 /// Returns an error if logger setup fails or any required store cannot be opened.
 #[cfg(feature = "fastly")]
 #[inline]
-pub fn run_app_with_request_extensions<A, F>(
-    req: fastly::Request,
-    extend: F,
-) -> Result<fastly::Response, fastly::Error>
+pub fn run_app_with_hooks<A, Prepare, Finalize, State>(
+    prepare: Prepare,
+    finalize: Finalize,
+) -> Result<Option<State>, fastly::Error>
 where
     A: Hooks,
-    F: FnOnce(&fastly::Request, &mut Extensions),
+    Prepare: FnOnce(&mut fastly::Request, &mut Extensions),
+    Finalize: FnOnce(&mut Response) -> State,
 {
+    init_fastly_abi();
     let stores = A::stores();
-    let env = runtime_env_config(stores);
-    let logging = FastlyLogging::from(&env);
+    let mut config = runtime_env_config(stores);
+    let logging = FastlyLogging::from(&config.env);
     if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
-    let app = A::build_app();
-    request::dispatch_with_registries(&app, req, stores, &env, extend)
+    let app = build_app_for_dispatch::<A>();
+    config.emit_boot_diagnostics();
+    request::send_with_registries_and_hooks(&app?, stores, &config.env, prepare, finalize)
+}
+
+/// Retain a successfully built app while the SDK serves sequential requests.
+///
+/// Each callback resolves fresh runtime configuration and store registries. Logging
+/// uses the first snapshot, and the adapter owns response delivery without SDK resends.
+#[cfg(feature = "fastly")]
+#[must_use = "inspect the summary or handle its terminal error with into_result()"]
+#[inline]
+pub fn serve_app<A: Hooks>(serve: Serve) -> ServeSummary<fastly::Error> {
+    serve_app_with_hooks::<A, _, _, _>(serve, |_request, _extensions| {}, |_response| ())
+}
+
+/// Retained serving with request-local preparation and routed response finalization.
+///
+/// The hooks follow [`run_app_with_hooks`]. Preparation runs before admission;
+/// finalization runs only for routed responses, before adapter-owned delivery.
+/// Captures persist across callbacks and must not accidentally retain request resources.
+#[cfg(feature = "fastly")]
+#[must_use = "inspect the summary or handle its terminal error with into_result()"]
+#[inline]
+pub fn serve_app_with_hooks<A, Prepare, Finalize, State>(
+    serve: Serve,
+    mut prepare: Prepare,
+    mut finalize: Finalize,
+) -> ServeSummary<fastly::Error>
+where
+    A: Hooks,
+    Prepare: FnMut(&mut fastly::Request, &mut Extensions),
+    Finalize: FnMut(&mut Response) -> State,
+{
+    init_fastly_abi();
+    let stores = A::stores();
+    lifecycle::serve_custom(serve, move |req, retained: &mut lifecycle::Sandbox<App>| {
+        let mut runtime = runtime_env_config(stores);
+        retained.setup_once(|| {
+            let logging = FastlyLogging::from(&runtime.env);
+            if logging.use_fastly_logger && !A::owns_logging() {
+                init_logger(
+                    logging.endpoint.as_deref().unwrap_or("stdout"),
+                    logging.level,
+                    logging.echo_stdout,
+                )?;
+            }
+            Ok::<(), fastly::Error>(())
+        })?;
+        runtime.emit_boot_diagnostics();
+        retained.initialize(build_app_for_dispatch::<A>)?;
+        let app = retained.state().ok_or_else(|| {
+            fastly::Error::msg("application initialization did not retain an app")
+        })?;
+        request::send_request_with_registries_and_hooks(
+            app,
+            stores,
+            req,
+            &runtime.env,
+            &mut prepare,
+            &mut finalize,
+        )
+        .map(|_state| ())
+    })
 }
 
 /// Build an [`EnvConfig`] from the optional `edgezero_runtime_env`
@@ -242,7 +368,7 @@ where
 /// read because they have no safe owner when this Config Store is linked to more
 /// than one service. The returned [`EnvConfig`] contains canonical unscoped keys.
 ///
-/// [`run_app`] and [`run_app_with_request_extensions`] call this themselves.
+/// [`run_app`] and [`run_app_with_hooks`] call this themselves.
 /// [`run_app_with_config`] does NOT, and neither does a hand-built
 /// [`FastlyService`](request::FastlyService). A custom entry point on either path
 /// must call this explicitly.
@@ -251,37 +377,32 @@ where
 /// [`Hooks`] impl inherits the empty [`StoresMetadata::default`] and must
 /// override `stores()` or pass explicit metadata here.
 ///
-/// If the store cannot be opened, the function logs a warning and returns an
-/// empty [`EnvConfig`]. Callers then use their baked-in adapter and store defaults.
+/// If the store cannot be opened, the result contains an empty [`EnvConfig`] and
+/// one deferred warning. Custom entrypoints must initialize their logger, then
+/// call [`FastlyRuntimeConfig::emit_boot_diagnostics`]. No logging occurs here.
 #[cfg(feature = "fastly")]
 #[must_use]
 #[inline]
-pub fn runtime_env_config(stores: StoresMetadata) -> EnvConfig {
+pub fn runtime_env_config(stores: StoresMetadata) -> FastlyRuntimeConfig {
     use fastly::ConfigStore;
-    use std::iter::empty;
     let Ok(dict) = ConfigStore::try_open(RUNTIME_ENV_STORE_NAME) else {
-        // The store is optional -- a clean cutover deploy with all
-        // baked-in defaults works without it. But the absence means
-        // EDGEZERO__* runtime overrides (spec 5.4 __KEY, spec 5.2
-        // __NAME) will silently fall back to baked defaults. Log
-        // once at request time so operators can spot the gap in
-        // their Fastly logs and run `edgezero provision --adapter fastly`
-        // to create the store.
-        log::warn!(
-            "Fastly Config Store `edgezero_runtime_env` not found; \
-             EDGEZERO__* runtime overrides will use baked-in defaults. \
-             Run `edgezero provision --adapter fastly` to create the store, \
-             then populate per-environment override keys with \
-             `fastly config-store-entry update --upsert`."
-        );
-        return EnvConfig::from_vars(empty::<(String, String)>());
+        return FastlyRuntimeConfig {
+            env: EnvConfig::default(),
+            runtime_env_unavailable: true,
+        };
     };
     let current_service_id = service_id();
     let vars = runtime_env_vars_for_service(stores, current_service_id, |key| dict.get(key));
-    EnvConfig::from_vars(vars)
+    FastlyRuntimeConfig {
+        env: EnvConfig::from_vars(vars),
+        runtime_env_unavailable: false,
+    }
 }
 
-#[cfg(any(feature = "fastly", test))]
+#[cfg(any(
+    feature = "fastly",
+    all(feature = "cli", test, not(target_arch = "wasm32"))
+))]
 fn runtime_env_vars_for_service<F>(
     stores: StoresMetadata,
     service_id: &str,
@@ -335,7 +456,7 @@ fn runtime_env_keys(stores: StoresMetadata) -> Vec<String> {
 /// [`EnvConfig`] overlay: the store name comes directly from
 /// `config_store_name`, and its default key is always `"default"`, so staged or
 /// overridden `__NAME` / `__KEY` selectors are ignored. Use
-/// [`runtime_env_config`] with [`request::dispatch_with_registries`] for the
+/// [`runtime_env_config`] with [`request::send_with_registries_and_hooks`] for the
 /// same selector resolution as [`run_app`]. KV is not auto-injected on this
 /// path; chain `.with_kv(name)` on a [`request::FastlyService`] builder if you
 /// need KV alongside the config store.
@@ -346,25 +467,72 @@ fn runtime_env_keys(stores: StoresMetadata) -> Vec<String> {
 #[inline]
 pub fn run_app_with_config<A: Hooks>(
     logging: &FastlyLogging,
-    req: fastly::Request,
     config_store_name: Option<&str>,
-) -> Result<fastly::Response, fastly::Error> {
+) -> Result<(), fastly::Error> {
+    init_fastly_abi();
     if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
-    let app = A::build_app();
+    let app = build_app_for_dispatch::<A>()?;
     let mut service = request::FastlyService::new(&app);
     if let Some(name) = config_store_name {
         service = service.with_config(name);
     }
-    service.dispatch(req)
+    service.send()
 }
 
 #[cfg(test)]
 mod fastly_logging_tests {
     use super::*;
     use edgezero_core::manifest::LogLevel;
+
+    #[test]
+    fn runtime_env_warning_is_deferred_and_taken_once() {
+        let mut config = FastlyRuntimeConfig {
+            env: EnvConfig::default(),
+            runtime_env_unavailable: true,
+        };
+        assert!(config.env.logging_level().is_none());
+        assert_eq!(config.take_boot_warning(), Some(RUNTIME_ENV_WARNING));
+        assert!(config.take_boot_warning().is_none());
+    }
+
+    #[test]
+    fn available_empty_runtime_env_has_no_boot_warning() {
+        let mut config = FastlyRuntimeConfig {
+            env: EnvConfig::default(),
+            runtime_env_unavailable: false,
+        };
+        assert!(config.take_boot_warning().is_none());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn public_boot_diagnostic_emission_is_once_and_empty_store_is_silent() {
+        let guard = log_fastly::reset_logger(
+            log_fastly::Logger::builder()
+                .default_endpoint("diagnostic-test")
+                .max_level(log::LevelFilter::Warn)
+                .build()
+                .expect("SDK capture"),
+        );
+        let mut config = FastlyRuntimeConfig {
+            env: EnvConfig::default(),
+            runtime_env_unavailable: true,
+        };
+        config.emit_boot_diagnostics();
+        guard.assert_contains("diagnostic-test", RUNTIME_ENV_WARNING);
+        log::warn!("diagnostic emission sentinel");
+        config.emit_boot_diagnostics();
+        guard.assert_contains("diagnostic-test", "diagnostic emission sentinel");
+        let mut available = FastlyRuntimeConfig {
+            env: EnvConfig::default(),
+            runtime_env_unavailable: false,
+        };
+        available.emit_boot_diagnostics();
+        guard.assert_contains("diagnostic-test", "diagnostic emission sentinel");
+    }
 
     #[test]
     fn fastly_logging_from_manifest_converts_defaults() {
@@ -476,164 +644,36 @@ mod runtime_env_key_tests {
 }
 
 #[cfg(test)]
-mod retained_app_tests {
-    use super::*;
+mod platform_tests {
     use edgezero_core::app::{App, Hooks};
+    use edgezero_core::error::EdgeError;
     use edgezero_core::router::RouterService;
-    use std::cell::{Cell, RefCell};
 
-    struct CountedApp;
-    thread_local! { static CONFIGURES: Cell<usize> = const { Cell::new(0) }; }
+    struct PlatformAwareConfiguration;
+
     #[expect(
         clippy::missing_trait_methods,
-        reason = "exercise default app construction"
+        reason = "test hook exercises only target metadata propagation"
     )]
-    impl Hooks for CountedApp {
-        fn configure(app: &mut App) {
-            CONFIGURES.with(|count| count.set(count.get().checked_add(1).unwrap()));
-            app.set_name("retained");
+    impl Hooks for PlatformAwareConfiguration {
+        fn configure(app: &mut App) -> Result<(), EdgeError> {
+            if app.platform() == crate::FASTLY_PLATFORM {
+                Ok(())
+            } else {
+                Err(EdgeError::service_unavailable("wrong application platform"))
+            }
         }
+
         fn routes() -> RouterService {
             RouterService::builder().build()
         }
     }
 
-    fn configured_env() -> EnvConfig {
-        EnvConfig::from_vars([
-            ("EDGEZERO__LOGGING__ENDPOINT", "fixture-logs"),
-            ("EDGEZERO__LOGGING__LEVEL", "debug"),
-        ])
-    }
-
     #[test]
-    fn retained_app_initializes_logging_before_build_once() {
-        let mut retained = RetainedApp::default();
-        let events = RefCell::new(Vec::new());
-        CONFIGURES.with(|count| count.set(0));
-        for _ in 0_usize..2 {
-            let app = retained
-                .get_or_init(
-                    &configured_env(),
-                    || false,
-                    |endpoint, level, echo| {
-                        assert_eq!(endpoint, "fixture-logs");
-                        assert_eq!(level, log::LevelFilter::Debug);
-                        assert!(echo);
-                        events.borrow_mut().push("logger");
-                        Ok::<(), &'static str>(())
-                    },
-                    || {
-                        events.borrow_mut().push("build");
-                        CountedApp::build_app()
-                    },
-                )
-                .unwrap();
-            assert_eq!(app.name(), "retained");
-        }
-        assert_eq!(*events.borrow(), ["logger", "build"]);
-        CONFIGURES.with(|count| assert_eq!(count.get(), 1));
+    fn application_configuration_receives_fastly_platform_metadata() {
+        let app = super::build_target_app::<PlatformAwareConfiguration>()
+            .expect("configured application");
+
+        assert_eq!(app.platform(), crate::FASTLY_PLATFORM);
     }
-
-    #[test]
-    fn retained_app_keeps_first_degraded_snapshot() {
-        let mut retained = RetainedApp::default();
-        let builds = Cell::new(0_usize);
-        for env in [EnvConfig::default(), configured_env()] {
-            retained
-                .get_or_init(
-                    &env,
-                    || false,
-                    |_, _, _| -> Result<(), &'static str> { panic!("must not install later") },
-                    || {
-                        builds.set(builds.get().checked_add(1).unwrap());
-                        CountedApp::build_app()
-                    },
-                )
-                .unwrap();
-        }
-        assert_eq!(builds.get(), 1);
-    }
-
-    #[test]
-    fn retained_app_respects_owned_logging_and_fresh_owners() {
-        let builds = Cell::new(0_usize);
-        for _ in 0_usize..2 {
-            let mut retained = RetainedApp::default();
-            retained
-                .get_or_init(
-                    &configured_env(),
-                    || true,
-                    |_, _, _| -> Result<(), &'static str> { panic!("caller owns logging") },
-                    || {
-                        builds.set(builds.get().checked_add(1).unwrap());
-                        CountedApp::build_app()
-                    },
-                )
-                .unwrap();
-        }
-        assert_eq!(builds.get(), 2);
-    }
-
-    #[test]
-    fn retained_app_logger_error_prevents_construction() {
-        let mut retained = RetainedApp::default();
-        let result = retained.get_or_init(
-            &configured_env(),
-            || false,
-            |_, _, _| Err("logger failed"),
-            || panic!("must not build"),
-        );
-        assert_eq!(result.err(), Some("logger failed"));
-        assert!(retained.app.is_none());
-    }
-}
-
-#[cfg(feature = "fastly")]
-/// Serve requests with an app initialized once on the first callback.
-///
-/// Opt in using an ordinary `main` and an explicitly bounded [`Serve`]. The
-/// runtime may exit before any configured limit; every request must tolerate
-/// fresh initialization. The standard response conversion buffers core streams.
-/// Inspect the returned summary (whose request count includes failed attempts)
-/// or call its `into_result()` method to propagate terminal callback errors.
-#[must_use = "inspect the serving summary or call into_result() to handle terminal errors"]
-#[inline]
-pub fn serve_app<A: Hooks>(serve: Serve) -> ServeSummary<fastly::Error> {
-    serve_app_with_request_extensions::<A, _>(serve, |_request, _extensions| {})
-}
-
-#[cfg(feature = "fastly")]
-/// Serve a retained app with fresh request extensions and store registries.
-///
-/// Runtime configuration is read on every callback. Logging uses only the first
-/// snapshot, before app construction, unless `Hooks::owns_logging` is true.
-/// An unavailable optional configuration store freezes logging as disabled,
-/// even if later reads recover store selectors. Any returned error (logger setup,
-/// required-KV open, request conversion, response-stream collection, or an
-/// `EdgeError` that fails to render) sends a
-/// 500 and terminates the SDK loop. Handler `EdgeError`s render as responses and
-/// do not terminate it. Construction panics remain sandbox failures.
-///
-/// The callback runs per request, but the closure and its captured state live
-/// for the entire serving loop. Only the supplied extensions are freshly created
-/// for each request; create request-local mutable data inside the callback.
-/// For mutable native requests, manual streaming, response finalization, or
-/// custom initialization, use [`lifecycle::serve_custom`].
-#[must_use = "inspect the serving summary or call into_result() to handle terminal errors"]
-#[inline]
-pub fn serve_app_with_request_extensions<A, F>(
-    serve: Serve,
-    mut extend: F,
-) -> ServeSummary<fastly::Error>
-where
-    A: Hooks,
-    F: FnMut(&fastly::Request, &mut Extensions),
-{
-    let stores = A::stores();
-    let mut retained = RetainedApp::default();
-    serve.run(move |req| -> Result<fastly::Response, fastly::Error> {
-        let env = runtime_env_config(stores);
-        let app = retained.get_or_init(&env, A::owns_logging, init_logger, A::build_app)?;
-        request::dispatch_with_registries(app, req, stores, &env, &mut extend)
-    })
 }
