@@ -1,3 +1,6 @@
+#[cfg(feature = "qualification")]
+pub mod qualification;
+
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::http::{Method, Response, response_builder};
 use edgezero_core::outbound::OutboundRequest;

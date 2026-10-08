@@ -29,10 +29,18 @@ The Wrangler manifest configures your Worker:
 name = "my-app"
 main = "build/worker/shim.mjs"
 compatibility_date = "2023-05-01"
+compatibility_flags = ["enable_request_signal", "enable_weak_ref"]
 
 [build]
 command = "worker-build --release"
 ```
+
+Keep both compatibility flags when migrating an existing application. `enable_request_signal`
+exposes incoming-request cancellation. Bounded config KV reads require `FinalizationRegistry`
+for wasm-bindgen cleanup callbacks and fail before dispatch if it is absent; `enable_weak_ref`
+enables that support even with an older compatibility date. GC timing is nondeterministic and
+does not provide a certified allocation or teardown bound. See
+[Cloudflare's compatibility contract](https://developers.cloudflare.com/workers/configuration/compatibility-flags/#enable-finalizationregistry-and-weakref).
 
 ### Entrypoint
 

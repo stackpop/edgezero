@@ -19,7 +19,10 @@
 //! }
 //! ```
 
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde_json::value::RawValue;
 use sha2::{Digest as _, Sha256};
+use std::fmt;
 
 #[cfg(any(feature = "fastly", test))]
 use edgezero_core::config_store::ConfigStoreError;
@@ -99,6 +102,17 @@ enum RootValueKind {
     /// does not understand — corrupt or future-versioned state.
     UnknownKind,
 }
+
+// Borrow only the two discriminator tokens. Skipped payloads must never become
+// a Value tree before the extractor's application-owned structural preflight.
+#[derive(Default)]
+struct RootMetadata<'raw> {
+    ambiguous: bool,
+    edgezero_kind: Option<&'raw RawValue>,
+    version: Option<&'raw RawValue>,
+}
+
+struct MetadataVisitor;
 
 /// Why resolving a stored root value failed. Keeping the future-format case
 /// DISTINCT from corruption is the whole point: a newer format must never be
@@ -186,6 +200,88 @@ pub(crate) enum GcRootValue {
 // ---------------------------------------------------------------------------
 // Public helpers
 // ---------------------------------------------------------------------------
+
+impl<'de> serde::Deserialize<'de> for RootMetadata<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(MetadataVisitor)
+    }
+
+    fn deserialize_in_place<D: serde::Deserializer<'de>>(
+        deserializer: D,
+        place: &mut Self,
+    ) -> Result<(), D::Error> {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
+    }
+}
+
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "deserialize_map only dispatches JSON objects to this metadata visitor"
+)]
+impl<'de> Visitor<'de> for MetadataVisitor {
+    type Value = RootMetadata<'de>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a config metadata object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut metadata = RootMetadata::default();
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "edgezero_kind" => {
+                    metadata.ambiguous |= metadata.edgezero_kind.is_some();
+                    metadata.edgezero_kind = Some(map.next_value()?);
+                }
+                "version" => {
+                    metadata.ambiguous |= metadata.version.is_some();
+                    metadata.version = Some(map.next_value()?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(metadata)
+    }
+}
+
+#[cfg(any(feature = "fastly", test))]
+fn check_bounded_root(
+    root_key: &str,
+    root_value: &str,
+    remaining_backend: u64,
+    max_value_bytes: u64,
+) -> Result<(), BoundedResolveFailure> {
+    match classify_root_value(root_value) {
+        RootValueKind::Pointer
+            if root_value.len() <= FASTLY_CONFIG_ENTRY_LIMIT
+                && !value_is_future_format(root_value) =>
+        {
+            let pointer: FastlyChunkPointer =
+                serde_json::from_str(root_value).map_err(|_error| {
+                    BoundedResolveFailure::Resolve(ResolveFailure::Corrupt(
+                        "config chunk pointer is malformed".to_owned(),
+                    ))
+                })?;
+            validate_pointer_chunks(root_key, &pointer)
+                .map_err(|error| BoundedResolveFailure::Resolve(ResolveFailure::Corrupt(error)))?;
+            let envelope_bytes = u64::try_from(pointer.envelope_len)
+                .map_err(|_error| BoundedResolveFailure::ValueTooLarge)?;
+            if envelope_bytes > max_value_bytes || envelope_bytes > remaining_backend {
+                return Err(BoundedResolveFailure::ValueTooLarge);
+            }
+        }
+        RootValueKind::Foreign | RootValueKind::MalformedObject => {
+            if u64::try_from(root_value.len()).map_or(true, |length| length > max_value_bytes) {
+                return Err(BoundedResolveFailure::ValueTooLarge);
+            }
+        }
+        RootValueKind::Pointer | RootValueKind::UnknownKind => {}
+    }
+    Ok(())
+}
 
 /// Account for the exact bytes materialized by a Fastly store operation.
 #[cfg(any(feature = "fastly", test))]
@@ -508,7 +604,19 @@ pub(crate) fn chunk_lengths(chunks: &[GcChunkRef]) -> Vec<usize> {
 pub(crate) fn resolve_fastly_config_value_typed<F>(
     root_key: &str,
     root_value: String,
+    fetch: F,
+) -> Result<String, ResolveFailure>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+{
+    resolve_fastly_config_value_inner(root_key, root_value, fetch, true)
+}
+
+fn resolve_fastly_config_value_inner<F>(
+    root_key: &str,
+    root_value: String,
     mut fetch: F,
+    verify_inner_envelope: bool,
 ) -> Result<String, ResolveFailure>
 where
     F: FnMut(&str) -> Result<Option<String>, String>,
@@ -588,11 +696,14 @@ where
 
     // Fetch, verify, and concatenate all chunks.
     //
-    // NOT `with_capacity(pointer.envelope_len)`: that length is untrusted stored
-    // metadata, and this runs in the edge guest. A pointer declaring `usize::MAX`
-    // would abort the worker on a capacity overflow before any of the checks
-    // below could reject it. Grow from the bytes we actually fetch instead.
+    // Metadata has already passed checked length summation and per-chunk caps.
+    // The bounded caller also checks both aggregate allowances before this point.
     let mut reconstructed = String::new();
+    reconstructed
+        .try_reserve_exact(pointer.envelope_len)
+        .map_err(|_error| {
+            ResolveFailure::Corrupt("config reassembly allocation failed".to_owned())
+        })?;
     for (position, chunk_ref) in pointer.chunks.iter().enumerate() {
         let chunk_value = fetch(&chunk_ref.key)
             .map_err(|_err| {
@@ -642,8 +753,7 @@ where
     }
 
     // Verify total envelope SHA.
-    let actual_env_sha = sha256_hex(reconstructed.as_bytes());
-    if actual_env_sha != pointer.envelope_sha256 {
+    if sha256_hex(reconstructed.as_bytes()) != pointer.envelope_sha256 {
         // Neither SHA is echoed: the expected one is `pointer.envelope_sha256`,
         // a stored, value-controlled string that a malformed pointer can set to
         // anything (a secret), and this runs on the read path where diagnostics
@@ -658,7 +768,14 @@ where
     verify_writer_split_layout(root_key, &reconstructed, &declared_lens)
         .map_err(ResolveFailure::Corrupt)?;
 
-    finalize_reconstructed_envelope(root_key, reconstructed)
+    if verify_inner_envelope {
+        finalize_reconstructed_envelope(root_key, reconstructed)
+    } else {
+        // This path verifies storage transport integrity, not typed config.
+        // The extractor owns envelope verification after its structural scan,
+        // exactly as for a directly stored envelope.
+        Ok(reconstructed)
+    }
 }
 
 /// Resolve a Fastly value while accounting for every materialized store byte.
@@ -694,72 +811,92 @@ where
         return Err(BoundedResolveFailure::ValueTooLarge);
     }
 
+    let preflight = check_bounded_root(
+        root_key,
+        &root_value,
+        max_backend_bytes.saturating_sub(root_backend_bytes),
+        max_value_bytes,
+    );
+    if deadline.is_expired_at(clock.now()) {
+        return Err(BoundedResolveFailure::DeadlineExceeded);
+    }
+    preflight?;
+
     let mut backend_bytes = root_backend_bytes;
     let mut chunk_value_bytes = 0_u64;
     let mut boundary_error = None;
-    let resolve_outcome = resolve_fastly_config_value_typed(root_key, root_value, |chunk_key| {
-        if deadline.is_expired_at(clock.now()) {
-            boundary_error = Some(BoundedResolveFailure::DeadlineExceeded);
-            return Err("bounded config read failed".to_owned());
-        }
-
-        let Some(remaining_backend_bytes) = max_backend_bytes.checked_sub(backend_bytes) else {
-            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
-            return Err("bounded config read failed".to_owned());
-        };
-        let read = match fetch(chunk_key, remaining_backend_bytes) {
-            Ok(read) => read,
-            Err(error) => {
-                boundary_error = Some(BoundedResolveFailure::Backend(error));
+    let resolve_outcome = resolve_fastly_config_value_inner(
+        root_key,
+        root_value,
+        |chunk_key| {
+            if deadline.is_expired_at(clock.now()) {
+                boundary_error = Some(BoundedResolveFailure::DeadlineExceeded);
                 return Err("bounded config read failed".to_owned());
             }
-        };
 
-        if deadline.is_expired_at(clock.now()) {
-            boundary_error = Some(BoundedResolveFailure::DeadlineExceeded);
-            return Err("bounded config read failed".to_owned());
-        }
-
-        let value_bytes = match read.value.as_ref() {
-            Some(value) => {
-                let Ok(value_bytes) = u64::try_from(value.len()) else {
-                    boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+            let Some(remaining_backend_bytes) = max_backend_bytes.checked_sub(backend_bytes) else {
+                boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+                return Err("bounded config read failed".to_owned());
+            };
+            let remaining_value_bytes = max_value_bytes.saturating_sub(chunk_value_bytes);
+            let read_limit = remaining_backend_bytes
+                .min(remaining_value_bytes)
+                .min(7_000);
+            let read = match fetch(chunk_key, read_limit) {
+                Ok(read) => read,
+                Err(error) => {
+                    boundary_error = Some(BoundedResolveFailure::Backend(error));
                     return Err("bounded config read failed".to_owned());
-                };
-                value_bytes
+                }
+            };
+
+            if deadline.is_expired_at(clock.now()) {
+                boundary_error = Some(BoundedResolveFailure::DeadlineExceeded);
+                return Err("bounded config read failed".to_owned());
             }
-            None => 0,
-        };
-        if read.backend_bytes != value_bytes || read.backend_bytes > remaining_backend_bytes {
-            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
-            return Err("bounded config read failed".to_owned());
-        }
 
-        let Some(next_backend_bytes) = backend_bytes.checked_add(read.backend_bytes) else {
-            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
-            return Err("bounded config read failed".to_owned());
-        };
-        let Some(next_chunk_value_bytes) = chunk_value_bytes.checked_add(value_bytes) else {
-            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
-            return Err("bounded config read failed".to_owned());
-        };
-        if next_backend_bytes > max_backend_bytes || next_chunk_value_bytes > max_value_bytes {
-            boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
-            return Err("bounded config read failed".to_owned());
-        }
+            let value_bytes = match read.value.as_ref() {
+                Some(value) => {
+                    let Ok(value_bytes) = u64::try_from(value.len()) else {
+                        boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+                        return Err("bounded config read failed".to_owned());
+                    };
+                    value_bytes
+                }
+                None => 0,
+            };
+            if read.backend_bytes != value_bytes || read.backend_bytes > read_limit {
+                boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+                return Err("bounded config read failed".to_owned());
+            }
 
-        backend_bytes = next_backend_bytes;
-        chunk_value_bytes = next_chunk_value_bytes;
-        Ok(read.value)
-    });
+            let Some(next_backend_bytes) = backend_bytes.checked_add(read.backend_bytes) else {
+                boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+                return Err("bounded config read failed".to_owned());
+            };
+            let Some(next_chunk_value_bytes) = chunk_value_bytes.checked_add(value_bytes) else {
+                boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+                return Err("bounded config read failed".to_owned());
+            };
+            if next_backend_bytes > max_backend_bytes || next_chunk_value_bytes > max_value_bytes {
+                boundary_error = Some(BoundedResolveFailure::ValueTooLarge);
+                return Err("bounded config read failed".to_owned());
+            }
 
+            backend_bytes = next_backend_bytes;
+            chunk_value_bytes = next_chunk_value_bytes;
+            Ok(read.value)
+        },
+        false,
+    );
+
+    if deadline.is_expired_at(clock.now()) {
+        return Err(BoundedResolveFailure::DeadlineExceeded);
+    }
     if let Some(error) = boundary_error {
         return Err(error);
     }
     let resolved_value = resolve_outcome.map_err(BoundedResolveFailure::Resolve)?;
-    if deadline.is_expired_at(clock.now()) {
-        return Err(BoundedResolveFailure::DeadlineExceeded);
-    }
     let resolved_bytes = u64::try_from(resolved_value.len())
         .map_err(|_length_error| BoundedResolveFailure::ValueTooLarge)?;
     if resolved_bytes > max_value_bytes {
@@ -1052,17 +1189,25 @@ fn classify_root_value(raw: &str) -> RootValueKind {
     }
     // It LOOKS like an object. If it does not parse, it is a malformed object --
     // possibly a truncated/corrupt pointer -- NOT a value GC may assume is inert.
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+    let Ok(value) = serde_json::from_str::<RootMetadata<'_>>(raw) else {
         return RootValueKind::MalformedObject;
     };
+    if value.ambiguous {
+        return RootValueKind::UnknownKind;
+    }
     // Discriminate on the PRESENCE of `edgezero_kind`, not just a string match. A
     // field of ANY type claims our reserved namespace, so a non-string value
     // (`edgezero_kind: 7`, an object, null) is `UnknownKind`, never `Foreign` --
     // otherwise GC would wrongly treat it as an inert value and reclaim chunks a
     // future/foreign format still references.
-    match value.get("edgezero_kind") {
+    match value.edgezero_kind {
         None => RootValueKind::Foreign,
-        Some(serde_json::Value::String(kind)) if kind == POINTER_KIND => RootValueKind::Pointer,
+        Some(kind)
+            if serde_json::from_str::<String>(kind.get())
+                .is_ok_and(|token| token == POINTER_KIND) =>
+        {
+            RootValueKind::Pointer
+        }
         Some(_) => RootValueKind::UnknownKind,
     }
 }
@@ -1140,19 +1285,27 @@ pub(crate) fn value_is_unknown_kind(raw: &str) -> bool {
 /// the resolver is compiled regardless of feature set.
 pub(crate) fn value_is_future_format(raw: &str) -> bool {
     use edgezero_core::blob_envelope::ENVELOPE_VERSION_V1;
-    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw) else {
+    let Ok(obj) = serde_json::from_str::<RootMetadata<'_>>(raw) else {
         return false;
     };
+    if obj.ambiguous {
+        return true;
+    }
     // A `version` field that is PRESENT but not EXACTLY the JSON integer 1 is a
     // newer format. Keying on `as_u64()` alone fails open: `"2"`, `-1`, `2.5`, or
     // `1.0` all yield `None` and would slip through as repairable corruption. Any
     // present-and-not-integer-1 version fails closed.
-    let version_is_not_one = obj
-        .get("version")
-        .is_some_and(|version| version.as_u64() != Some(u64::from(ENVELOPE_VERSION_V1)));
-    match obj.get("edgezero_kind") {
+    let version_is_not_one = obj.version.is_some_and(|version| {
+        serde_json::from_str::<u64>(version.get()).ok() != Some(u64::from(ENVELOPE_VERSION_V1))
+    });
+    match obj.edgezero_kind {
         // Our pointer kind, but a newer POINTER version.
-        Some(serde_json::Value::String(kind)) if kind == POINTER_KIND => version_is_not_one,
+        Some(kind)
+            if serde_json::from_str::<String>(kind.get())
+                .is_ok_and(|token| token == POINTER_KIND) =>
+        {
+            version_is_not_one
+        }
         // A discriminator we do not recognise (unknown string, or non-string).
         Some(_) => true,
         // No discriminator: any object carrying a bumped `version` is a newer
@@ -1527,6 +1680,64 @@ mod tests {
     }
 
     #[test]
+    fn metadata_classification_rejects_duplicate_reserved_fields_and_arrays() {
+        // Duplicate JSON members intentionally cannot be constructed with json!.
+        for raw in [
+            r#"{"version":1,"version":2}"#,
+            r#"{"version":1,"version":1}"#,
+            r#"{"edgezero_kind":"fastly_config_chunks","edgezero_kind":"future"}"#,
+        ] {
+            assert!(
+                value_is_future_format(raw),
+                "ambiguous metadata must never be overwrite-safe"
+            );
+        }
+        assert!(
+            !value_is_future_format("[null,2]"),
+            "arrays are not envelope metadata objects"
+        );
+    }
+
+    #[test]
+    fn bounded_resolver_rejects_declared_overflow_before_fetching() {
+        let root_key = "app_config";
+        let envelope = serde_json::to_string(&BlobEnvelope::new(
+            serde_json::json!({ "pad": "x".repeat(9_000) }),
+            "2026-01-01T00:00:00Z".to_owned(),
+        ))
+        .expect("envelope");
+        let mut entries = prepare_fastly_config_entries(root_key, &envelope).expect("entries");
+        let (_, pointer) = entries.pop().expect("pointer");
+        let pointer_bytes = u64::try_from(pointer.len()).expect("pointer bytes");
+        let envelope_bytes = u64::try_from(envelope.len()).expect("envelope bytes");
+        for (backend_limit, value_limit) in [
+            (u64::MAX, envelope_bytes - 1),
+            (pointer_bytes + envelope_bytes - 1, envelope_bytes),
+        ] {
+            let mut calls = 0_u32;
+            let error = resolve_fastly_config_value_typed_bounded(
+                root_key,
+                pointer.clone(),
+                pointer_bytes,
+                &MonotonicClock::default(),
+                Deadline::after(Duration::from_secs(1)),
+                backend_limit,
+                value_limit,
+                |_key, _remaining| {
+                    calls += 1;
+                    Ok(BoundedStoreRead {
+                        backend_bytes: 0,
+                        value: None,
+                    })
+                },
+            )
+            .expect_err("declared overflow");
+            assert!(matches!(error, BoundedResolveFailure::ValueTooLarge));
+            assert_eq!(calls, 0, "reject metadata before fetching or assembling");
+        }
+    }
+
+    #[test]
     fn bounded_resolver_accepts_exact_direct_caps_and_rejects_over_cap() {
         let clock = MonotonicClock::default();
         let exact = resolve_fastly_config_value_typed_bounded(
@@ -1569,6 +1780,35 @@ mod tests {
         )
         .expect_err("a direct value over the value cap must fail");
         assert!(matches!(over_value, BoundedResolveFailure::ValueTooLarge));
+    }
+
+    #[test]
+    fn bounded_resolver_deadline_wins_metadata_preflight_errors() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let start = edgezero_core::MonotonicInstant::now();
+        let end = start.checked_add(Duration::from_secs(1)).expect("deadline");
+        let samples = Arc::new(AtomicUsize::new(0));
+        let clock = MonotonicClock::new(move || {
+            if samples.fetch_add(1, Ordering::SeqCst) == 0 {
+                start
+            } else {
+                end
+            }
+        });
+        let error = resolve_fastly_config_value_typed_bounded(
+            "root",
+            "value".to_owned(),
+            5,
+            &clock,
+            Deadline::at_instant(end),
+            5,
+            4,
+            unexpected_chunk_fetch,
+        )
+        .expect_err("deadline must win a simultaneously observed size failure");
+        assert!(matches!(error, BoundedResolveFailure::DeadlineExceeded));
     }
 
     #[test]
@@ -1642,7 +1882,7 @@ mod tests {
 
         assert_eq!(resolved.backend_bytes, total_backend_bytes);
         assert_eq!(resolved.value.as_deref(), Some(envelope.as_str()));
-        assert_eq!(remaining_allowances.first(), Some(&chunk_bytes));
+        assert_eq!(remaining_allowances.first(), Some(&chunk_bytes.min(7_000)));
         assert!(
             remaining_allowances
                 .windows(2)

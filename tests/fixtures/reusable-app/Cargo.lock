@@ -557,6 +557,7 @@ dependencies = [
  "futures-util",
  "log",
  "serde_json",
+ "wasm-streams",
  "web-sys",
  "worker",
 ]
@@ -796,8 +797,10 @@ name = "fixture-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "edgezero-core",
  "futures",
+ "log",
  "serde_json",
 ]
 

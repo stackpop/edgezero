@@ -725,6 +725,7 @@ dependencies = [
  "toml_edit",
  "walkdir",
  "wasm-bindgen-test",
+ "wasm-streams",
  "web-sys",
  "worker",
 ]

@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 default = []
-cloudflare = ["dep:async-stream", "dep:worker", "dep:serde_json", "dep:web-sys"]
+cloudflare = ["dep:async-stream", "dep:worker", "dep:serde_json", "dep:web-sys", "dep:wasm-streams"]
 cli = [
     "dep:edgezero-adapter",
     "edgezero-adapter/cli",
@@ -43,6 +43,7 @@ serde_json = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 toml_edit = { workspace = true, optional = true }
 worker = { workspace = true, optional = true }
+wasm-streams = { workspace = true, optional = true }
 walkdir = { workspace = true, optional = true }
 web-sys = { version = "0.3", optional = true, features = [
     "AbortSignal",

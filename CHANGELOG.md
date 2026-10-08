@@ -28,6 +28,27 @@ separately from the portable API and must be considered when declaring required 
   recovery. These are local evidence, not hosted provider qualification; broad config
   allocation remains Unsupported and response egress remains BestEffort.
 
+### Bounded Provider Config Reads
+
+- Replace Cloudflare bounded KV text materialization with capped BYOB byte-stream reads,
+  reusable 16 KiB buffers and acquired-reader cancellation on overflow, timeout or drop.
+  Require valid UTF-8 without lossy expansion; raw `get` remains explicitly unbounded.
+  Cancel late-arriving streams after an abandoned acquisition, consume rejected cancellation
+  promises, and yield cooperatively between bounded groups of clock-checked reads.
+  Require runtime GC cleanup support before KV dispatch; demo/generated Workers enable
+  `enable_weak_ref` explicitly. GC retention is still excluded from allocation certification.
+- Replace Fastly SDK auto-growing config reads with one caller-sized host-ABI buffer.
+  Reject over-cap chunk declarations before fetching or allocating reassembly; borrow
+  discriminator tokens rather than building a JSON tree. Bounded storage resolution checks
+  transport integrity; typed envelope verification remains behind the extractor's structural scan.
+- Hard-cut `FastlyConfigStore::try_open` to return `ConfigStoreError` rather than the SDK's
+  error type. Reject duplicate pointer discriminators and preserve future-format overwrite guards.
+- Publish narrow guest allocation charges and the remaining Spin/hosted evidence gaps.
+  Broad config allocation stays Unsupported and config deadlines stay BestEffort.
+- Add opt-in, revision-pinned lifecycle qualification fixtures for all four standard entrypoints,
+  a bounded HTTPS probe runner and a fail-closed correlated ownership-evidence validator.
+  Compilation and local tests are not hosted qualification; no capability is promoted.
+
 ### Outbound HTTP And Batches
 
 - Replace the proxy-client/service API with `HttpClient`, `OutboundHttpClient`, `OutboundRequest`,

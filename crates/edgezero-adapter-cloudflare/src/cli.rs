@@ -1219,6 +1219,7 @@ fn target_manifest(target: &AdapterExecutionTarget) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[cfg(unix)]
     use edgezero_core::test_env::PathPrepend;
 
@@ -1237,6 +1238,32 @@ mod tests {
     const TEST_KV_ID_ALT: &str = "cache";
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
+
+    #[test]
+    fn bounded_config_scaffolds_require_gc_cleanup_support() {
+        for source in [
+            include_str!("templates/wrangler.toml.hbs"),
+            include_str!(
+                "../../../examples/app-demo/crates/app-demo-adapter-cloudflare/wrangler.toml"
+            ),
+            include_str!(
+                "../../../tests/fixtures/reusable-app/crates/fixture-cloudflare/wrangler.toml"
+            ),
+        ] {
+            let document = source
+                .parse::<toml_edit::DocumentMut>()
+                .expect("Wrangler TOML");
+            let flags = document
+                .get("compatibility_flags")
+                .and_then(toml_edit::Item::as_array)
+                .expect("explicit compatibility flags");
+            assert!(
+                flags
+                    .iter()
+                    .any(|value| value.as_str() == Some("enable_weak_ref"))
+            );
+        }
+    }
 
     #[test]
     fn adapter_capability_matrix_matches_contracts() {

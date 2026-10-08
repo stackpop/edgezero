@@ -113,6 +113,7 @@ validator = { version = "0.20", features = ["derive"] }
 walkdir = { version = "2" }
 web-time = "1"
 worker = { version = "=0.8.5", default-features = false, features = ["http"] }
+wasm-streams = "=0.6.0"
 
 [workspace.lints.clippy]
 # Same strict gate as the demo workspace. Allow-list mirrors the demo's

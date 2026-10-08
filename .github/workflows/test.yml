@@ -94,10 +94,22 @@ jobs:
 
       - name: Lifecycle fixture host tests
         run: |
-          cargo test --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-harness -p fixture-core
+          cargo test --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-harness -p fixture-core --features fixture-core/qualification
+          node --test scripts/qualify_response_egress.test.mjs
 
       - name: Check Axum lifecycle fixture
         run: cargo check --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-axum
+
+      - name: Check opt-in lifecycle qualification fixtures
+        # These are compile-only identities, never deployed qualification evidence.
+        env:
+          EDGEZERO_QUALIFICATION_REVISION: "0000000000000000000000000000000000000000"
+          EDGEZERO_QUALIFICATION_ARTIFACT: "0000000000000000000000000000000000000000000000000000000000000000"
+        run: |
+          cargo check --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-axum --features qualification
+          cargo check --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-fastly --features qualification --bin fixture-fastly-qualification --target wasm32-wasip1
+          cargo check --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-cloudflare --features qualification --target wasm32-unknown-unknown
+          cargo check --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-spin --features qualification --target wasm32-wasip2
 
       - name: Run workspace tests
         run: cargo test --workspace --all-targets

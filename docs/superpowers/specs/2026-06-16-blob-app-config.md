@@ -4741,7 +4741,7 @@ The capability ladder therefore gains two config-owned cells:
 
 | Capability | Axum | Cloudflare | Fastly | Spin |
 | --- | --- | --- | --- | --- |
-| `config-read-allocation-bounds` | Unsupported overall; bounded local snapshots do not certify secret/environment/allocator overhead | Unsupported until the SDK exposes/proves a pre-materialization bound | Unsupported until host API documentation and a probe prove it | Unsupported until host API documentation and a probe prove it |
+| `config-read-allocation-bounds` | Unsupported overall; bounded local snapshots do not certify secret/environment/allocator overhead | Unsupported overall; capped guest byte streams do not certify opaque KV/JS retention or secret reads | Unsupported overall; caller-sized ABI buffers do not certify provider storage or secret reads | Unsupported until host API documentation and a probe prove it |
 | `config-read-deadlines` | BestEffort while request-time reads are synchronous shared-handle lookups with pre/post checks | BestEffort: guest timer race returns promptly, but host cancellation is unproved | BestEffort; synchronous host reads are not guest-preemptible | BestEffort: guest timer race returns promptly, but host cancellation is unproved |
 
 Apps that require a strict RSS or elapsed-time guarantee declare the corresponding Native
@@ -5392,13 +5392,25 @@ bulk put <tempfile.json> --namespace-id=<id> --remote`
   `wrangler kv key get --binding <BINDING> <KEY> --remote`
   (Wrangler 4.x's four-segment subcommand path; the older
   three-segment `wrangler kv get` is deprecated).
-- Runtime: `CloudflareConfigStore::get_bounded` returns the same JSON string and races the
-  provider future against a Worker timer under the absolute deadline before applying the
-  guest-visible byte checks from §6.3.2. It verifies each timer wake against the injected clock and
-  re-arms after an early wake. The timer race bounds EdgeZero's return but does not prove host-side
-  cancellation; the host may also materialize the value before guest code can reject it, so
-  deadline support remains BestEffort and allocation support remains Unsupported. The
-  `AppConfig<C>` extractor parses and verifies only after charging the bounded read.
+- Runtime: `CloudflareConfigStore::get_bounded` requests a KV byte stream, not `.text()`
+  or a materialized array buffer. A BYOB reader uses reusable 16 KiB Rust/JS buffers and
+  rejects the first excess byte before append. Accumulator capacity never intentionally
+  exceeds `L = min(max_backend_bytes, max_value_bytes)`; requested payload staging is
+  conservatively `2L + 32 KiB`, covering relocation/shared-string conversion and scratch.
+  Bounded reads require valid UTF-8, without lossy expansion. Failure to acquire a byte
+  reader fails closed; there is no unbounded fallback. An acquired reader is cancelled on
+  overflow, timeout or dropped work. The timer covers acquisition, drain and conversion,
+  rechecking the injected clock after each wake and before/after every pull, with a task-queue
+  yield every 16 chunks for frozen-clock hosts. An acquisition owner cancels late-arriving
+  streams after abandonment; cancellation-promise rejections are consumed without publishing
+  provider diagnostics. The SDK exposes no acquisition-promise
+  cancellation. Transferred wasm-bindgen callbacks require `FinalizationRegistry`; absent
+  runtime support fails before provider dispatch. Demo/generated Workers explicitly set
+  `enable_weak_ref`, without claiming deterministic GC cleanup.
+  KV host buffering, JS wrapper/GC retention and finite host teardown remain
+  unqualified. Deadlines remain BestEffort and broad allocation support Unsupported.
+  `AppConfig<C>` parses/verifies only after charging the bounded read. Raw `get` remains
+  explicitly unbounded.
 - `--local` push: `wrangler kv bulk put <tempfile.json>
 --binding <BINDING> --local` — lands in
   `.wrangler/state`. Local push deliberately addresses by
@@ -5438,8 +5450,19 @@ bulk put <tempfile.json> --namespace-id=<id> --remote`
 - Runtime: `FastlyConfigStore::get_bounded` performs the same direct-or-pointer resolution,
   passes one absolute deadline/remaining allowance to every read, and returns the normal
   envelope JSON value. Its `backend_bytes` includes the pointer and every fetched chunk;
-  the core extractor does not know which physical form Fastly used. The preserved unbounded
-  `get` follows the same resolver for hand-managed callers.
+  the core extractor does not know which physical form Fastly used. Reads use one initialized
+  buffer through `fastly-sys 0.13.1`, never SDK auto-growth on `BUFLEN`. A physical entry has
+  an adapter ceiling of 32,000 bytes; roots are capped by
+  `R = min(max_backend_bytes, max(max_value_bytes, 8000), 32000)`, pointers by 8,000 bytes,
+  and chunks by 7,000 bytes and both remaining allowances. Validated declared totals must
+  fit both aggregate caps before chunk dispatch or exact-size reassembly reservation.
+  Root discriminators borrow raw tokens instead of materializing a JSON `Value` tree.
+  The bounded resolver verifies transport hashes/layout, then delegates inner-envelope
+  materialization and integrity to the extractor's structural preflight, matching direct
+  values. Raw `get`/CLI paths retain their explicit inner-envelope integrity checks and
+  are not allocation-certified. A conservative requested guest-payload charge is
+  `2V + R + 16P + 7000` bytes (`V = max_value_bytes`, `P = 8000`), plus fixed objects and
+  allocator overhead; host memory and synchronous-call interruption remain excluded.
 - Local server: `[local_server.config_stores.<id>]` now has ONE
   active root entry — the blob key. PR #269 F6 already moved local-
   server seeding to `config push --local`. Local seeding must mirror

@@ -419,6 +419,21 @@ cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
 
 ## Decision And Evidence Record
 
+### Hosted Qualification Follow-up
+
+- [x] Add a default-off synthetic qualification application through the four standard adapter
+  entrypoints, with bounded source/terminal/resource counters and compiled build identity.
+- [x] Add allowlisted, finite HTTPS client probes and a fail-closed evidence validator; keep
+  `HostHandoff` distinct from peer delivery and record missing instance identity honestly.
+- [x] Exercise validator corruption cases and compile every qualification target in CI.
+- [ ] Run against designated nonproduction hosted targets and export complete unsampled telemetry
+  pinned to the committed source, SDK/runtime, compatibility and deployed binary identity.
+- [ ] Prove same-instance recovery and actual transport failure/cancellation boundaries where
+  observable; do not infer these from a healthy subsequent invocation or promote capabilities.
+
+No hosted deployment was run for this follow-up. The fixture/validator is qualification
+infrastructure, not evidence that the remaining provider lifetime guarantees have been met.
+
 - **Architecture:** Retained one core lifecycle/framing contract and four private runtime-specific
   pumps. Rejected a shared sink abstraction and every response-object or bounded-buffer fallback.
 - **API migration:** Removed the old Fastly response-returning entrypoint, Spin full-response

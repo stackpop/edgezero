@@ -20,7 +20,14 @@ per-request Axum file-reading assumptions. The current normative contract is spe
 - [x] Preserve failed declared bindings, reject duplicate keys and invalid registry metadata.
 - [x] Stream canonical hashing and drop the extraction-owned raw handle before secrets.
 - [x] Align demo, generator, public guides and CHANGELOG with snapshot/restart semantics.
+- [x] Stream Cloudflare bounded KV reads through capped BYOB buffers; cancel acquired readers on termination.
+- [x] Use caller-sized Fastly ABI buffers without growth/retry, preflight aggregate chunk limits and avoid early envelope DOM allocation.
+- [ ] Establish a bounded Spin host/backend read interface or verified hosted allocation ceiling; stock list-valued reads are not sufficient.
 - [ ] Qualify hosted provider allocation/cancellation evidence; do not promote capability cells without it.
+
+These follow-ups supersede older tasks below that describe Cloudflare text materialization,
+Fastly SDK auto-growing reads or inner-envelope DOM verification in the bounded resolver.
+See spec §9.2/§9.3 and the public capability guide for the current allocation charges.
 
 - **Source of truth:** [`docs/superpowers/specs/2026-06-16-blob-app-config.md`](../specs/2026-06-16-blob-app-config.md). Every task numbered below cites the spec section it implements.
 - **Hard cutoff:** no `#[serde(default)]` compat fallback for missing legacy state, no runtime fallback to the old per-leaf app-config shape, no platform-side bridge for legacy state. Fastly's direct-or-pointer storage is a new v1 physical representation for the same blob envelope, not legacy compatibility. Per spec §1 / §10.1.

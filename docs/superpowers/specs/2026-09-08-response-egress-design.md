@@ -790,6 +790,45 @@ No normalized guest test qualifies raw-ingress parser guarantees. A future hoste
 artifact must identify its source SHA, SDK/runtime revision (or typed unknown),
 compatibility settings, scenario, terminal count, resource recovery and ownership boundary.
 
+### 8.1 Opt-in hosted ownership qualification
+
+The reusable-app fixture workspace has a default-off `qualification` feature. Its synthetic
+application uses the standard entrypoints on all four adapters, including the manual Fastly
+send-owning lifecycle. It emits four bounded, correlated records per valid probe: source drop,
+terminal report, response-owned resource drop and final counters. Build identity is compiled in;
+request headers can select only bounded run/probe tokens and a fixed scenario, never a destination.
+No normal demo or generated application installs these probe routes.
+
+`scripts/qualify_response_egress.mjs --execute-hosted` requires an explicitly allowlisted isolated
+nonproduction HTTPS origin, a finite per-probe time budget, source SHA, SDK and runtime identity
+(a documented unknown is allowed), compatibility settings and independent deployment/binary
+identity. It runs normal, HEAD/204/205/304, slow/non-reading client, disconnect, cancellation,
+pending production, expired deadline, source failure and conversion failure probes. Each is
+followed by a normal recovery request. Redirects and retries are disabled. Fastly pending probes
+additionally require an independently enforced finite execution ceiling and wait for that ceiling
+before recovery. A guest deadline cannot preempt an indefinitely pending synchronous source poll.
+
+The runner caps aggregate observed payload at 64 MiB, plus at most one delivered Node stream chunk
+on a cap crossing; input files are read in 16 KiB chunks and rejected before retaining more than
+4 MiB. Each evidence-input read can additionally hold one 16 KiB chunk and a final concatenation
+copy. These are client-driver budgets, not provider allocation guarantees.
+
+`--validate` requires complete unsampled telemetry and exactly one terminal/source/resource/final
+record for every scheduled probe, with matching build identities and ordered sequence numbers.
+It rejects duplicates, missing records, unexpected scenarios, post-terminal source polls,
+misclassified failures and unsuccessful normal/bodyless/recovery observations. Its successful
+result is only `qualified-ownership` for those scheduled probes, never general delivery or
+resource certification. Transport failures qualify only when independently observed; they are
+not synthesized by a response object. A run terminated before telemetry export remains unverified.
+
+The compiled `artifact` identity is a build-input digest (for example the lockfile SHA-256), not
+the final binary's self-referential hash. `binary_sha256` and deployment identity are recorded
+independently after build. The fixture does not identify provider instances (`unobserved`), so
+successful subsequent requests do not prove same-isolate capacity recovery. Hosted teardown,
+actual transport interruption, provider allocation and raw parser behavior still require their
+own evidence. See the fixture README for build and invocation commands. No hosted run is claimed
+by adding or compiling these tools.
+
 - Axum `tokio::io::duplex` and raw TCP tests for no reader, slow reader, disconnect before
   first byte, disconnect mid-body, blocked-socket deadline, normal EOF, keep-alive,
   pipelining collateral cancellation, and per-response flush association.

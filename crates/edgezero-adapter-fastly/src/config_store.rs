@@ -1,4 +1,4 @@
-//! Fastly adapter config store: wraps `fastly::ConfigStore`.
+//! Fastly config reads use one caller-sized host buffer, without SDK retries.
 
 use std::cell::Cell;
 #[cfg(test)]
@@ -12,8 +12,12 @@ use crate::chunked_config::{
 use async_trait::async_trait;
 use edgezero_core::config_store::{BoundedStoreRead, ConfigStore, ConfigStoreError};
 use edgezero_core::{Deadline, MonotonicClock};
-use fastly::ConfigStore as FastlyConfigStoreInner;
-use fastly::config_store::{LookupError, OpenError};
+use fastly_shared::FastlyStatus;
+use fastly_sys::fastly_config_store;
+
+// A physical entry is at most 8,000 Unicode scalars. This adapter also imposes
+// a finite byte ceiling independently of changes to the provider's quota.
+const MAX_ENTRY_BYTES: u64 = 32_000;
 
 /// Config store backed by a Fastly Config Store resource link.
 pub struct FastlyConfigStore {
@@ -21,7 +25,7 @@ pub struct FastlyConfigStore {
 }
 
 enum FastlyConfigStoreBackend {
-    Fastly(FastlyConfigStoreInner),
+    Fastly(u32),
     #[cfg(test)]
     InMemory(HashMap<String, String>),
 }
@@ -34,16 +38,65 @@ impl FastlyConfigStore {
         }
     }
 
+    #[expect(
+        unsafe_code,
+        reason = "the pinned ABI receives a live initialized slice and cannot resize it"
+    )]
+    fn read_entry(&self, key: &str, limit: u64) -> Result<Option<String>, ConfigStoreError> {
+        let read_limit = limit.min(MAX_ENTRY_BYTES);
+        match &self.inner {
+            FastlyConfigStoreBackend::Fastly(handle) => {
+                read_host_buffer(read_limit, |buffer| {
+                    let mut written = 0;
+                    // SAFETY: host output is confined to this initialized slice;
+                    // reported lengths are validated before indexing or truncation.
+                    let status = unsafe {
+                        fastly_config_store::get(
+                            *handle,
+                            key.as_ptr(),
+                            key.len(),
+                            buffer.as_mut_ptr(),
+                            buffer.len(),
+                            &raw mut written,
+                        )
+                    };
+                    (status, written)
+                })
+            }
+            #[cfg(test)]
+            FastlyConfigStoreBackend::InMemory(data) => match data.get(key) {
+                Some(value)
+                    if u64::try_from(value.len()).map_or(true, |length| length > read_limit) =>
+                {
+                    Err(ConfigStoreError::ValueTooLarge)
+                }
+                value => Ok(value.cloned()),
+            },
+        }
+    }
+
     /// Open a Fastly Config Store by resource link name.
     ///
-    /// Returns an error if the configured store cannot be opened.
-    ///
     /// # Errors
-    /// Returns the underlying [`fastly::config_store::OpenError`] when the named store does not exist or cannot be opened.
+    /// Returns a redacted typed failure if the host cannot open the store.
     #[inline]
-    pub fn try_open(name: &str) -> Result<Self, OpenError> {
-        FastlyConfigStoreInner::try_open(name).map(|inner| Self {
-            inner: FastlyConfigStoreBackend::Fastly(inner),
+    #[expect(
+        unsafe_code,
+        reason = "the pinned host ABI writes only the supplied handle out-parameter"
+    )]
+    pub fn try_open(name: &str) -> Result<Self, ConfigStoreError> {
+        let mut handle = fastly_shared::INVALID_CONFIG_STORE_HANDLE;
+        // SAFETY: the UTF-8 name slice and initialized out-parameter remain live
+        // for this synchronous call. Config Store exposes no close operation.
+        let status =
+            unsafe { fastly_config_store::open(name.as_ptr(), name.len(), &raw mut handle) };
+        if status != FastlyStatus::OK || handle == fastly_shared::INVALID_CONFIG_STORE_HANDLE {
+            return Err(ConfigStoreError::unavailable(
+                "config store could not be opened",
+            ));
+        }
+        Ok(Self {
+            inner: FastlyConfigStoreBackend::Fastly(handle),
         })
     }
 }
@@ -52,13 +105,7 @@ impl FastlyConfigStore {
 impl ConfigStore for FastlyConfigStore {
     #[inline]
     async fn get(&self, key: &str) -> Result<Option<edgezero_core::ConfigValue>, ConfigStoreError> {
-        let root_value = match &self.inner {
-            FastlyConfigStoreBackend::Fastly(inner) => {
-                inner.try_get(key).map_err(|err| map_lookup_error(&err))?
-            }
-            #[cfg(test)]
-            FastlyConfigStoreBackend::InMemory(data) => data.get(key).cloned(),
-        };
+        let root_value = self.read_entry(key, MAX_ENTRY_BYTES)?;
         let Some(value) = root_value else {
             return Ok(None);
         };
@@ -95,20 +142,14 @@ impl ConfigStore for FastlyConfigStore {
         // here, because those ARE our reserved namespace.
         let transient = Cell::new(false);
         let outcome = resolve_fastly_config_value_typed(key, value, |chunk_key| {
-            let got = match &self.inner {
-                FastlyConfigStoreBackend::Fastly(inner) => {
-                    inner.try_get(chunk_key).map_err(|err| {
-                        if is_transient_lookup(&err) {
-                            transient.set(true);
-                        }
-                        // The pointer-controlled chunk key is not echoed (the resolver
-                        // adds a safe position locator); the SDK `err` carries no value.
-                        format!("config store lookup failed: {err}")
-                    })?
-                }
-                #[cfg(test)]
-                FastlyConfigStoreBackend::InMemory(data) => data.get(chunk_key).cloned(),
-            };
+            let got = self
+                .read_entry(chunk_key, MAX_ENTRY_BYTES)
+                .map_err(|error| {
+                    if !matches!(error, ConfigStoreError::InvalidKey { .. }) {
+                        transient.set(true);
+                    }
+                    "config store chunk read failed".to_owned()
+                })?;
             if got.is_none() {
                 // Referenced chunk absent at this POP: treat as propagation lag
                 // (transient) rather than corruption.
@@ -131,16 +172,10 @@ impl ConfigStore for FastlyConfigStore {
         max_backend_bytes: u64,
         max_value_bytes: u64,
     ) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError> {
-        let materialized_root = run_sync_host_call(clock, deadline, || {
-            Ok(match &self.inner {
-                FastlyConfigStoreBackend::Fastly(inner) => {
-                    inner.try_get(key).map_err(|err| map_lookup_error(&err))?
-                }
-                #[cfg(test)]
-                FastlyConfigStoreBackend::InMemory(data) => data.get(key).cloned(),
-            })
-        })
-        .map_err(map_sync_config_error)?;
+        let root_limit = max_backend_bytes.min(max_value_bytes.max(8_000));
+        let materialized_root =
+            run_sync_host_call(clock, deadline, || self.read_entry(key, root_limit))
+                .map_err(map_sync_config_error)?;
         let root_read = exact_fastly_read(materialized_root, max_backend_bytes)
             .map_err(|_size_error| ConfigStoreError::ValueTooLarge)?;
         let Some(root_value) = root_read.value else {
@@ -161,24 +196,7 @@ impl ConfigStore for FastlyConfigStore {
             max_value_bytes,
             |chunk_key, remaining_backend_bytes| {
                 let chunk_value = run_sync_host_call(clock, deadline, || {
-                    Ok(match &self.inner {
-                        FastlyConfigStoreBackend::Fastly(inner) => {
-                            inner.try_get(chunk_key).map_err(|err| {
-                                if is_transient_lookup(&err) {
-                                    transient.set(true);
-                                    ConfigStoreError::unavailable(
-                                        "config store temporarily unavailable",
-                                    )
-                                } else {
-                                    ConfigStoreError::internal(anyhow::anyhow!(
-                                        "config store chunk key is invalid"
-                                    ))
-                                }
-                            })?
-                        }
-                        #[cfg(test)]
-                        FastlyConfigStoreBackend::InMemory(data) => data.get(chunk_key).cloned(),
-                    })
+                    self.read_entry(chunk_key, remaining_backend_bytes)
                 })
                 .map_err(map_sync_config_error)?;
                 if chunk_value.is_none() {
@@ -189,6 +207,9 @@ impl ConfigStore for FastlyConfigStore {
             },
         );
 
+        if deadline.is_expired_at(clock.now()) {
+            return Err(ConfigStoreError::DeadlineExceeded);
+        }
         match outcome {
             Ok(read) => {
                 let value = read.value.map(Into::into);
@@ -207,6 +228,33 @@ impl ConfigStore for FastlyConfigStore {
             }
             Err(BoundedResolveFailure::ValueTooLarge) => Err(ConfigStoreError::ValueTooLarge),
         }
+    }
+}
+
+fn read_host_buffer(
+    limit: u64,
+    read: impl FnOnce(&mut [u8]) -> (FastlyStatus, usize),
+) -> Result<Option<String>, ConfigStoreError> {
+    let length = usize::try_from(limit).map_err(|_error| ConfigStoreError::ValueTooLarge)?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_error| ConfigStoreError::ValueTooLarge)?;
+    buffer.resize(length, 0);
+    let (status, written) = read(&mut buffer);
+    match status {
+        FastlyStatus::OK if written <= buffer.len() => {
+            buffer.truncate(written);
+            String::from_utf8(buffer)
+                .map(Some)
+                .map_err(|_error| ConfigStoreError::unavailable("config value is not UTF-8"))
+        }
+        FastlyStatus::NONE => Ok(None),
+        FastlyStatus::BUFLEN => Err(ConfigStoreError::ValueTooLarge),
+        FastlyStatus::INVAL | FastlyStatus::UNSUPPORTED => {
+            Err(ConfigStoreError::invalid_key("invalid config key"))
+        }
+        _ => Err(ConfigStoreError::unavailable("config store read failed")),
     }
 }
 
@@ -245,38 +293,6 @@ fn map_resolve_failure(key: &str, transient: bool, error: ResolveFailure) -> Con
         ConfigStoreError::internal(anyhow::anyhow!(
             "config store entry is corrupt or incomplete; re-run config push to repair: {message}"
         ))
-    }
-}
-
-/// Is a CHUNK lookup failure environmental (retry) rather than corrupt config
-/// (`config push` to repair)? Only a bad KEY names corrupt state a re-push
-/// rewrites; everything else — an invalid store handle, lookup exhaustion, an
-/// unclassified/future failure, or a value that outgrew the read buffer — is
-/// transient, because re-pushing cannot fix a request-scoped condition.
-fn is_transient_lookup(err: &LookupError) -> bool {
-    // `ValueTooLong` is TRANSIENT, not corruption: the SDK already retried with
-    // the reported buffer size, so a `ValueTooLong` reaching us means the value
-    // GREW between host calls (a concurrent write) — a race a retry resolves, not
-    // a re-push-me corruption.
-    !matches!(err, LookupError::KeyInvalid | LookupError::KeyTooLong)
-}
-
-fn map_lookup_error(err: &LookupError) -> ConfigStoreError {
-    // `LookupError` is from the `fastly` crate; using a wildcard arm guards
-    // against new variants being added in upstream point releases without
-    // forcing us into a breaking match every bump.
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "external enum; new variants must remain unavailable→unavailable"
-    )]
-    match err {
-        LookupError::KeyInvalid | LookupError::KeyTooLong => {
-            ConfigStoreError::invalid_key("invalid config key")
-        }
-        _ => {
-            log::warn!("Fastly config store lookup failed: {err}");
-            ConfigStoreError::unavailable("config store temporarily unavailable")
-        }
     }
 }
 
@@ -362,31 +378,64 @@ mod tests {
     }
 
     #[test]
-    fn key_invalid_maps_to_invalid_key_error() {
-        let err = map_lookup_error(&LookupError::KeyInvalid);
-        assert!(matches!(err, ConfigStoreError::InvalidKey { .. }));
+    fn fixture_matches_physical_entry_byte_ceiling() {
+        let store = FastlyConfigStore::from_entries([("key".to_owned(), "x".repeat(32_001))]);
+        let error = store.read_entry("key", u64::MAX).expect_err("physical cap");
+        assert!(matches!(error, ConfigStoreError::ValueTooLarge));
     }
 
     #[test]
-    fn key_too_long_maps_to_invalid_key_error() {
-        let err = map_lookup_error(&LookupError::KeyTooLong);
-        assert!(matches!(err, ConfigStoreError::InvalidKey { .. }));
+    fn host_buffer_accepts_exact_cap_without_copying_the_string() {
+        let value = read_host_buffer(4, |buffer| {
+            assert_eq!(buffer.len(), 4);
+            buffer.copy_from_slice(b"test");
+            (FastlyStatus::OK, 4)
+        })
+        .expect("exact cap");
+        assert_eq!(value.as_deref(), Some("test"));
     }
 
-    /// A CHUNK lookup that fails transiently (lookup exhaustion, an invalid
-    /// store handle, an unclassified error, or a value that outgrew the read
-    /// buffer) must keep Unavailable semantics — re-pushing cannot repair a
-    /// request-scoped condition. Only a bad KEY is corrupt state a re-push fixes.
     #[test]
-    fn transient_chunk_lookups_are_not_treated_as_corruption() {
-        assert!(is_transient_lookup(&LookupError::TooManyLookups));
-        assert!(is_transient_lookup(&LookupError::ConfigStoreInvalid));
-        assert!(is_transient_lookup(&LookupError::Other));
-        // ValueTooLong is TRANSIENT: the SDK already retried at the reported size,
-        // so it reaching us means the value grew between host calls (a race).
-        assert!(is_transient_lookup(&LookupError::ValueTooLong));
-        assert!(!is_transient_lookup(&LookupError::KeyInvalid));
-        assert!(!is_transient_lookup(&LookupError::KeyTooLong));
+    fn host_buffer_never_retries_or_allocates_the_reported_oversize_length() {
+        for limit in [0, 1, 7_000] {
+            let calls = Cell::new(0_u32);
+            let error = read_host_buffer(limit, |buffer| {
+                calls.set(calls.get() + 1);
+                assert_eq!(u64::try_from(buffer.len()).expect("buffer length"), limit);
+                (FastlyStatus::BUFLEN, usize::MAX)
+            })
+            .expect_err("oversize");
+            assert!(matches!(error, ConfigStoreError::ValueTooLarge));
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn host_buffer_status_and_malformed_results_are_typed_and_redacted() {
+        for status in [FastlyStatus::INVAL, FastlyStatus::UNSUPPORTED] {
+            let error = read_host_buffer(1, |_buffer| (status, 0)).expect_err("key failure");
+            assert!(matches!(error, ConfigStoreError::InvalidKey { .. }));
+        }
+        for status in [
+            FastlyStatus::ERROR,
+            FastlyStatus::BADF,
+            FastlyStatus::LIMITEXCEEDED,
+            FastlyStatus::OK,
+        ] {
+            let error = read_host_buffer(1, |_buffer| (status, 2)).expect_err("bad result");
+            assert!(matches!(error, ConfigStoreError::Unavailable { .. }));
+        }
+        assert!(
+            read_host_buffer(0, |_buffer| (FastlyStatus::NONE, 0))
+                .expect("missing")
+                .is_none()
+        );
+        let error = read_host_buffer(1, |buffer| {
+            buffer.fill(255);
+            (FastlyStatus::OK, 1)
+        })
+        .expect_err("invalid UTF-8");
+        assert!(matches!(error, ConfigStoreError::Unavailable { .. }));
     }
 
     /// A referenced chunk that is ABSENT maps to Unavailable (HTTP 503), not

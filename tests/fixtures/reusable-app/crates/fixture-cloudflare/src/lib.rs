@@ -1,7 +1,11 @@
 #![cfg(target_arch = "wasm32")]
 
 use edgezero_core::app::{App, Hooks};
-use fixture_core::{FixtureApp, MissingBindingApp, OtherApp, retained_app};
+#[cfg(not(feature = "qualification"))]
+use fixture_core::FixtureApp;
+#[cfg(feature = "qualification")]
+use fixture_core::qualification::QualificationApp as FixtureApp;
+use fixture_core::{MissingBindingApp, OtherApp, retained_app};
 use std::sync::OnceLock;
 use worker::{Context, Env, Request, Response, event};
 static APP: OnceLock<App> = OnceLock::new();

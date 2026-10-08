@@ -15,6 +15,81 @@ The driver is the native Rust `fixture-harness` crate. Its HTTP clients, control
 loopback backend, process management, and evidence checks run outside the WASM
 applications. The shell script only launches it through Cargo.
 
+## Opt-in Hosted Response Qualification
+
+The default-off `qualification` feature selects a synthetic application through the standard
+entrypoints. Use only a designated isolated nonproduction service with complete unsampled logging
+at `Info` or above, including the `edgezero_qualification` target. No production stores, traffic,
+credentials or log exports should be reused. Existing smoke profiles remain unchanged by default.
+
+Compile from a clean committed checkout with recorded build identity:
+
+```sh
+export EDGEZERO_QUALIFICATION_REVISION="$(git rev-parse HEAD)"
+export EDGEZERO_QUALIFICATION_ARTIFACT="$(shasum -a 256 tests/fixtures/reusable-app/Cargo.lock | awk '{print $1}')"
+cargo build --locked --release --manifest-path tests/fixtures/reusable-app/Cargo.toml \
+  -p fixture-cloudflare --features qualification --target wasm32-unknown-unknown
+cargo build --locked --release --manifest-path tests/fixtures/reusable-app/Cargo.toml \
+  -p fixture-fastly --features qualification --bin fixture-fastly-qualification --target wasm32-wasip1
+cargo build --locked --release --manifest-path tests/fixtures/reusable-app/Cargo.toml \
+  -p fixture-spin --features qualification --target wasm32-wasip2
+cargo build --locked --release --manifest-path tests/fixtures/reusable-app/Cargo.toml \
+  -p fixture-axum --features qualification
+```
+
+Deploy the selected artifact through the platform's normal isolated-service path. Record the
+actual binary SHA-256 and deployment identity after build. `artifact` below is the compiled
+lockfile/build-input digest, not the binary hash: a binary cannot embed its own hash. Record an
+unavailable runtime revision as a reasoned unknown, not an invented version.
+
+Prepare a target JSON object using actual recorded identities:
+
+```json
+{
+  "origin": "https://isolated-qualification.example.com",
+  "allowed_origin": "https://isolated-qualification.example.com",
+  "isolated_nonproduction": true,
+  "run": "qualification-1",
+  "adapter": "cloudflare",
+  "revision": "<40-character committed source SHA>",
+  "artifact": "<64-character compiled build-input SHA-256>",
+  "binary_sha256": "<64-character deployed artifact SHA-256>",
+  "sdk": "worker 0.8.5",
+  "runtime": { "unknown": "provider-unpublished" },
+  "compatibility": { "date": "<actual deployed date>", "flags": ["enable_request_signal", "enable_weak_ref"] },
+  "deployment": "<independently recorded isolated deployment identity>",
+  "max_probe_ms": 2000
+}
+```
+
+Other adapters use their actual SDK name/version and a compatibility object with a `flags`
+array. Fastly additionally requires `execution_ceiling_ms` (1..60000), enforced independently by
+the host: guest checks cannot wake a permanently pending synchronous source. The runner waits
+for that ceiling before recovery where necessary. The server response budget is 500 ms; the
+client budget must be 1000..10000 ms. Thirteen scenarios plus a healthy request after each run
+sequentially, without redirects/retries, with a 64 MiB observed-transfer cap (plus one Node stream
+chunk on crossing). No outbound backend is contacted.
+
+```sh
+node scripts/qualify_response_egress.mjs --execute-hosted TARGET.json CLIENTS.json
+node scripts/qualify_response_egress.mjs --validate CLIENTS.json EVENTS.json
+```
+
+Client collection intentionally exits 2: it is not qualification by itself. Export the complete
+unsampled events as a JSON array in `EVENTS.json`, preserving all records/sequences and excluding
+other runs; independently confirm completeness before setting the recorded manifest's
+`telemetry_complete` to true. Missing/duplicate/conflicting records remain unverified. Evidence
+files are capped at 4 MiB and output uses private file permissions. The validator does not
+authenticate fabricated telemetry or prove the supplied deployment identity.
+
+Each probe emits source-drop, terminal, resource-drop and final counters for one late-bound
+completion resource. `HostHandoff` remains distinct from delivery. Success qualifies ownership
+only for the scheduled probes, not full Q4: instance identity is `unobserved`, so a healthy next
+request does not prove same-isolate capacity recovery. Actual transport failures, host teardown,
+raw parser behavior and provider memory need separate evidence. No capability is promoted by
+these tools, local tests or successful compilation. The response-egress specification maintains
+the per-target evidence matrix and limitations.
+
 ## Understand the change in five minutes
 
 Think of the app as the route table plus any state you attach to it. A request

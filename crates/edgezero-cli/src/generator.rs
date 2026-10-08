@@ -1465,10 +1465,17 @@ mod tests {
             project_dir.join("crates/demo-app-adapter-cloudflare/wrangler.toml"),
         )
         .expect("read Cloudflare wrangler.toml");
-        assert!(
-            manifest.contains("compatibility_flags = [\"enable_request_signal\"]"),
-            "generated Cloudflare manifest must expose the request abort signal",
-        );
+        let parsed: toml::Value = toml::from_str(&manifest).expect("parse Wrangler manifest");
+        let flags = parsed
+            .get("compatibility_flags")
+            .and_then(toml::Value::as_array)
+            .expect("Cloudflare compatibility flags");
+        for required in ["enable_request_signal", "enable_weak_ref"] {
+            assert!(
+                flags.iter().any(|flag| flag.as_str() == Some(required)),
+                "generated Cloudflare manifest must enable {required}"
+            );
+        }
     }
 
     fn assert_generated_fastly_entrypoint(project_dir: &Path) {

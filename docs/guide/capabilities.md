@@ -140,6 +140,47 @@ shared `ConfigValue` handles without copying payloads. This narrower guarantee d
 certify environment-backed secrets, fixed registry metadata, allocator overhead or all
 concurrent extraction allocations, so the broad capability is not promoted.
 
+Cloudflare bounded config reads request KV byte streams and use reusable 16 KiB Rust/JS
+BYOB buffers. With `L = min(max_backend_bytes, max_value_bytes)`, the requested payload
+storage is bounded conservatively by `2L + 32 KiB`, including accumulator relocation or
+the final shared-string copy. Invalid UTF-8 is rejected, not lossily expanded. There is no
+text/array-buffer fallback. Overflow, timeout and caller cancellation cancel an acquired
+reader; cancellation while waiting for KV acquisition cannot cancel the provider promise.
+An acquisition owner cancels any stream that arrives after abandonment. Cancel-promise
+rejections are consumed without publishing provider diagnostics. Ready reads check the
+application clock before and after each pull and yield to the task queue every 16 chunks.
+Bounded KV reads require `FinalizationRegistry` and fail before provider dispatch without it.
+Generated/demo Workers explicitly enable `enable_weak_ref`; GC timing remains nondeterministic,
+not part of the payload charge. See [Workers compatibility flags](https://developers.cloudflare.com/workers/configuration/compatibility-flags/#enable-finalizationregistry-and-weakref).
+Opaque KV buffering, JS wrapper/GC retention and host teardown remain unqualified.
+
+Fastly bounded config reads use the pinned host ABI with one initialized caller-sized
+buffer, never retrying a `BUFLEN` result with the provider's requested length. Physical
+reads have an adapter ceiling of 32,000 bytes. Root reads allow at most
+`R = min(max_backend_bytes, max(max_value_bytes, 8000), 32000)`; pointer JSON is limited to
+8,000 bytes and chunk reads to 7,000 bytes and both remaining allowances. Validated
+declared totals must fit before any chunk fetch or reassembly allocation. The bounded
+resolver verifies chunk/transport hashes and layout without constructing an envelope
+`Value`; the extractor performs inner-envelope verification after its structural scan.
+A conservative requested guest-payload charge is `2V + R + 16P + 7000` bytes, with
+`V = max_value_bytes`, `P = 8000`, plus fixed objects and allocator overhead. This includes
+pointer/schema/index scratch, one chunk, reassembly and the shared-string copy; provider
+storage and synchronous-call interruption are excluded. Raw `get` and CLI integrity
+operations are not allocation-certified.
+
+Spin's list-valued host get still materializes a complete value. Stock Spin 4.1.0 has no
+configurable read-size cap in its KV interface; Akamai's published 1 MB default value quota
+does not establish an exact read-allocation or overridden-quota contract. Neither is used
+as a guessed allocation guarantee. A bounded host/backend interface or verified hosted
+enforcement is still required.
+
+The response-egress specification's evidence matrix
+(`docs/superpowers/specs/2026-09-08-response-egress-design.md`, section 8)
+distinguishes local ownership proofs from deployed lifecycle qualification. Opt-in fixtures and
+`scripts/qualify_response_egress.mjs` collect correlated terminal/source/resource evidence;
+they cannot certify peer delivery, same-instance recovery or provider allocation. No deployed
+artifact has been supplied for the current hosted adapters, so their guarantees are not promoted.
+
 Config reads use one absolute extraction deadline in the application's monotonic clock domain.
 Core passes that same clock through every root, Fastly chunk, and secret read. Adapters sample it
 before provider dispatch and after readiness, before propagating either success or provider
