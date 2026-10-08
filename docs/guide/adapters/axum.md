@@ -329,6 +329,10 @@ API_KEY=mysecret edgezero serve --adapter axum
 
 For local development, each declared `[stores.config]` id resolves to a
 local-file config store backed by `.edgezero/local-config-<id>.json`.
+The standard runner loads immutable snapshots before binding its listener.
+Missing files create empty declared stores. Malformed files retain typed failing
+bindings, while allocation-limit violations fail startup. Changes made by `config
+push` take effect after restart, not on the next request.
 The portable manifest carries no inline defaults — the
 pre-rewrite `[stores.config.defaults]` table is gone (see
 [the migration guide](../manifest-store-migration.md)).
@@ -372,6 +376,53 @@ Seed the per-id files with `<your-cli> config push --adapter axum` (the typed
 flow — the bundled `edgezero config push` errors), which writes the same
 `.edgezero/local-config-<id>.json` files the runtime reads — no shell-out, no
 server to authenticate against.
+
+### Snapshot Allocation Limits
+
+Set `EDGEZERO__ADAPTER__CONFIG_STORE__<SETTING>` through the normal environment
+configuration/startup path. Absent settings use finite defaults; explicit invalid,
+zero, overflowing or inconsistent settings fail before listener binding.
+
+| Setting              | Default | Supported Range / Scope                                                    |
+| -------------------- | ------- | -------------------------------------------------------------------------- |
+| `MAX_FILE_BYTES`     | 16 MiB  | 1 byte to 256 MiB per file, including JSON syntax and escaping             |
+| `MAX_ENTRIES`        | 1024    | 1 to 65536 entries per file, including duplicate-key attempts              |
+| `MAX_KEY_BYTES`      | 1024    | 1 byte to 64 KiB decoded UTF-8 per key, no larger than the file cap        |
+| `MAX_VALUE_BYTES`    | 8 MiB   | 1 byte to 256 MiB decoded UTF-8 per value, no larger than the file cap     |
+| `MAX_RESIDENT_BYTES` | 32 MiB  | 1 byte to 256 MiB across every config snapshot in the startup registry     |
+| `MAX_STARTUP_BYTES`  | 112 MiB | 1 byte to 1 GiB across resident snapshots plus one file's reserved staging |
+
+These are requested-allocation charges, not an RSS ceiling. Stores load sequentially.
+For wire cap `W`, staging reserves `5 * max(W, 32)` bytes: input growth, escaped-string
+decoder growth (including old/new allocation overlap), and temporary decoded key/value
+strings. A separate 4096-byte read buffer lives on the stack. The startup limit must
+cover staging; every index/payload reservation also checks residency plus staging.
+This decoder allowance is audited against pinned `serde_json 1.0.150` and Rust 1.95.0;
+changing those allocation implementations requires repeating the audit.
+
+The sorted snapshot index reserves `MAX_ENTRIES * size_of::<(String, ConfigValue)>()`
+bytes per store. Each entry additionally charges key UTF-8 bytes, value UTF-8 bytes,
+two `Arc` reference counts and up to `size_of::<usize>() - 1` alignment bytes. Duplicate
+keys are rejected. Keys/values are size-checked before their owned copies; actual reads
+detect file growth and reject the first excess byte without appending it. Non-string
+values are rejected without constructing a JSON tree. Failed loads drop staging and
+partial snapshots. Diagnostics never contain file contents.
+
+`get` and `get_bounded` return `ConfigValue`, an independently owned, shared UTF-8
+payload. Clones allocate no payload and never retain the whole file. Bounded reads
+check both extraction caps and the injected deadline before returning an `Arc` clone;
+there is no request-time file read. Borrow with `as_str()` or `as_ref()`; `to_string()`
+is an explicit allocating boundary. Already-owned `from_map` inputs are caller allocations
+outside these startup-reader charges.
+
+Budget fixed manifest/registry/handle metadata separately, as well as allocator overhead,
+environment-backed secret reads, concurrently parsed config trees, typed outputs and
+application retention of returned handles. Canonical hashing streams into SHA-256 rather
+than staging a second full JSON string. The extractor drops its raw handle before resolving
+secrets. Kernel buffers, filesystem page cache, allocator fragmentation and total RSS are
+not guaranteed. Local file reads are synchronous; no finite startup I/O interruption is
+claimed. The broad `config-read-allocation-bounds` capability remains `Unsupported`;
+this bounded local config-snapshot path does not certify every secret/provider allocation.
 
 ## Container Deployment
 

@@ -69,6 +69,7 @@ http-body-util = "0.1"
 hyper = { version = "=1.12.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 log = "0.4"
+libc = "0.2"
 miniz_oxide = { version = "=0.8.9", default-features = false, features = ["simd", "with-alloc"] }
 log-fastly = "=0.13.1"
 matchit = "0.9"
@@ -84,7 +85,7 @@ simd-adler32 = { version = "=0.3.9", default-features = false }
 rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
 ryu = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = "=1.0.150"
 serde_path_to_error = "0.1"
 serde_urlencoded = "0.7"
 sha2 = "0.10"

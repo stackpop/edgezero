@@ -133,6 +133,13 @@ retains or processes a returned value. That does not bound provider-side materia
 parser allocation, SDK copies, or other work performed before the value reaches guest code, so
 `config-read-allocation-bounds` remains `Unsupported` everywhere.
 
+Axum's local config-store path now has [bounded startup snapshots](/guide/adapters/axum#snapshot-allocation-limits):
+actual file reads, flat-string parsing, per-key/value and entry caps, aggregate snapshot
+residency and startup staging are enforced before listener binding. Request reads clone
+shared `ConfigValue` handles without copying payloads. This narrower guarantee does not
+certify environment-backed secrets, fixed registry metadata, allocator overhead or all
+concurrent extraction allocations, so the broad capability is not promoted.
+
 Config reads use one absolute extraction deadline in the application's monotonic clock domain.
 Core passes that same clock through every root, Fastly chunk, and secret read. Adapters sample it
 before provider dispatch and after readiness, before propagating either success or provider

@@ -80,8 +80,11 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl ConfigStore for FixedConfigStore {
-        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-            Ok(Some(self.0.to_owned()))
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> Result<Option<edgezero_core::ConfigValue>, ConfigStoreError> {
+            Ok(Some(self.0.into()))
         }
 
         async fn get_bounded(
@@ -91,7 +94,7 @@ mod tests {
             deadline: Deadline,
             max_backend_bytes: u64,
             max_value_bytes: u64,
-        ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        ) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError> {
             if deadline.is_expired_at(clock.now()) {
                 return Err(ConfigStoreError::DeadlineExceeded);
             }
@@ -147,7 +150,7 @@ mod tests {
                     .await
                     .ok()
                     .flatten()
-                    .unwrap_or_else(|| "missing".to_owned()),
+                    .map_or_else(|| "missing".to_owned(), |value| value.to_string()),
                 None => "missing".to_owned(),
             };
             let response = response_builder()

@@ -1045,7 +1045,10 @@ mod synthesis_tests {
     struct StubConfig;
     #[async_trait::async_trait(?Send)]
     impl ConfigStore for StubConfig {
-        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> Result<Option<edgezero_core::ConfigValue>, ConfigStoreError> {
             Ok(None)
         }
 
@@ -1056,7 +1059,7 @@ mod synthesis_tests {
             deadline: Deadline,
             max_backend_bytes: u64,
             max_value_bytes: u64,
-        ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        ) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError> {
             if deadline.is_expired_at(clock.now()) {
                 return Err(ConfigStoreError::DeadlineExceeded);
             }

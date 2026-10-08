@@ -9,6 +9,25 @@ implementation and review follow-ups. This is a hard API migration: retired APIs
 are removed rather than retained as compatibility aliases. Provider limitations are published
 separately from the portable API and must be considered when declaring required capabilities.
 
+### Bounded Local Config Snapshots
+
+- Hard-cut `ConfigStore::{get, get_bounded}` and matching handle APIs from owned `String`
+  to shared `ConfigValue` UTF-8 payloads across all adapters and fixtures. Borrow via
+  `as_str()`/`as_ref()`; ownership copies are explicit. Debug output is redacted.
+- Load Axum immutable local snapshots before listener binding, with validated finite
+  `EDGEZERO__ADAPTER__CONFIG_STORE__*` file/entry/key/value/resident/startup budgets.
+  Enforce actual reads and decoder/index/payload staging charges, reject duplicate keys,
+  fail startup on allocation-limit violations, and retain typed failed declared bindings.
+- Make Axum `from_path`, `from_local_file` and `from_map` require `ConfigStoreLimits`;
+  `from_map` is now fallible. Publish `resident_allocation_bytes`; push updates require
+  server restart. Shared reads preserve independent byte caps and the application clock.
+- Pin the decoder allocation audit to `serde_json 1.0.150`; stream canonical hashing
+  without full-output staging and release the extractor's raw handle before secret reads.
+- Add native TCP proofs for suppressed-body completion ownership, stalled producer and
+  non-reading client deadlines, disconnect cleanup, exactly-once release and capacity
+  recovery. These are local evidence, not hosted provider qualification; broad config
+  allocation remains Unsupported and response egress remains BestEffort.
+
 ### Outbound HTTP And Batches
 
 - Replace the proxy-client/service API with `HttpClient`, `OutboundHttpClient`, `OutboundRequest`,

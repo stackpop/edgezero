@@ -768,6 +768,28 @@ Every adapter gets deterministic lifecycle tests before provider integration:
 
 Target evidence adds:
 
+Current local Axum evidence uses Rust 1.95.0 and the locked Hyper dependency.
+`connection::tests::bodyless_tcp_responses_release_the_response_resource_exactly_once`
+covers HEAD/204/304 suppression without source polling and one completion/resource release.
+`dev_server::bounded_ingress_tests::stalled_egress_termination_releases_capacity_and_recovers`
+covers disconnect, a pending producer, and a non-reading client with an always-ready source;
+all settle once, stop polling, release resources and recover a one-connection server.
+It includes a frozen injected clock and an independently waking native deadline timer.
+Existing connection/shutdown tests cover EOF, malformed declared lengths, source/conversion
+errors and cancellation. These are native TCP/guest ownership proofs, not confirmed client
+delivery or hosted-provider evidence; no capability promotion follows from this test expansion.
+
+| Target | Tested SDK / Native Revision | Hosted Runtime Revision / Evidence | Egress Qualification |
+| --- | --- | --- | --- |
+| Axum | Hyper 1.12.0, Rust 1.95.0, local TCP tests | Operator deployment not qualified by local tests | BestEffort; HostHandoff is not peer delivery |
+| Cloudflare | worker 0.8.5; guest/WASM contract tests | Unknown; no deployed lifecycle artifact supplied | BestEffort; hosted disconnect/close boundary remains unproved |
+| Fastly | fastly 0.13.1; scripted guest sink tests | Unknown; Viceroy is not hosted evidence | BestEffort; synchronous operations cannot be guest-preempted |
+| Spin | spin-sdk 7.0.0; scripted guest/WASI tests | Unknown; local Spin is not hosted evidence | BestEffort; finite host teardown remains unproved |
+
+No normalized guest test qualifies raw-ingress parser guarantees. A future hosted
+artifact must identify its source SHA, SDK/runtime revision (or typed unknown),
+compatibility settings, scenario, terminal count, resource recovery and ownership boundary.
+
 - Axum `tokio::io::duplex` and raw TCP tests for no reader, slow reader, disconnect before
   first byte, disconnect mid-body, blocked-socket deadline, normal EOF, keep-alive,
   pipelining collateral cancellation, and per-response flush association.

@@ -132,12 +132,12 @@ framework-resolved:**
   distinguish "deploy is incomplete" from "backend is
   flaky".
 - **§9.1 Axum reader uses `ConfigStore::get` returning
-  `Option<String>`.** Previous draft made the extractor parse
+  `Option<ConfigValue>`.** Previous draft made the extractor parse
   the Axum file-map shape directly, bypassing the
   provider-neutral trait contract. Fixed: the file holds
   per-key envelope JSON STRINGS, the `AxumConfigStore::get`
   impl returns the matching string, and the extractor sees
-  the same `Option<String>` every adapter exposes.
+  the same `Option<ConfigValue>` every adapter exposes.
 - **§3.3.2 secret existence claim dropped.** The earlier
   draft claimed `<app-cli> config validate --strict` could
   verify the named secret exists; the typed validator
@@ -398,7 +398,7 @@ ValidationErrorsKind>`. Rewrote the sketch to call
   example showed envelope OBJECTS as map values; the
   normative text said each value is an escaped JSON
   STRING. Picked the string form (matches
-  `ConfigStore::get -> Option<String>`'s contract across
+  `ConfigStore::get -> Option<ConfigValue>`'s contract across
   all four adapters) and rewrote the §9.1 example to
   show escaped JSON strings only. The object form was
   removed.
@@ -4590,10 +4590,10 @@ pub trait ConfigStore: Send + Sync {
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
-    ) -> Result<BoundedStoreRead<String>, ConfigStoreError>;
+    ) -> Result<BoundedStoreRead<ConfigValue>, ConfigStoreError>;
 
     // Preserved for hand-managed reads; it makes no extraction-bound claim.
-    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;
+    async fn get(&self, key: &str) -> Result<Option<ConfigValue>, ConfigStoreError>;
 }
 
 #[async_trait(?Send)]
@@ -4625,7 +4625,7 @@ impl ConfigStoreHandle {
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
-    ) -> Result<BoundedStoreRead<String>, ConfigStoreError>;
+    ) -> Result<BoundedStoreRead<ConfigValue>, ConfigStoreError>;
 }
 
 impl SecretHandle {
@@ -4652,6 +4652,14 @@ impl BoundSecretStore {
 }
 ```
 
+`ConfigValue` is independently owned shared UTF-8 (`Arc<str>`), never a slice retaining
+the entire store file. Cloning shares the payload; `as_str()`/`as_ref()` borrow it,
+`to_string()` deliberately copies it, and `Debug` is content-redacted. This is a hard
+trait migration across all adapters, fixtures and consumers, not a compatibility layer.
+Provider `String` to shared-payload conversion overlaps both allocations and must be
+accounted separately. Cloudflare/Spin check size before conversion and expiry afterward;
+Fastly preserves cumulative root/chunk accounting through the same terminal check.
+
 The bounded methods add `DeadlineExceeded` and `ValueTooLarge` to both lower-level store
 error enums. Those variants are produced at the adapter boundary without formatting away
 the cause and map directly to the same-named extraction reasons (`ValueTooLarge` maps to
@@ -4664,7 +4672,7 @@ depth 1. A streaming `serde_json` visitor enforces both caps before either full 
 without retaining a `Value` tree. Exact-cap structures are accepted. Depth must be in
 `1..=127` (below the parser's recursion ceiling), and node count must be nonzero.
 These caps bound the parsed tree's structural amplification; they do not bound transient
-string decoding, the provider-owned read buffer, canonical serialization, or total process RSS.
+string decoding, the provider-owned read buffer, sorted-key scratch, or total process RSS. Canonical hashing streams directly into SHA-256 without a full output-string buffer.
 
 `App` owns one config-extraction-limits value, set through the fallible
 `Hooks::configure(&mut App) -> Result<(), EdgeError>` callback; the core-owned
@@ -4733,8 +4741,8 @@ The capability ladder therefore gains two config-owned cells:
 
 | Capability | Axum | Cloudflare | Fastly | Spin |
 | --- | --- | --- | --- | --- |
-| `config-read-allocation-bounds` | Unsupported while startup JSON is preloaded; promote only after the local-file reader caps before allocation | Unsupported until the SDK exposes/proves a pre-materialization bound | Unsupported until host API documentation and a probe prove it | Unsupported until host API documentation and a probe prove it |
-| `config-read-deadlines` | BestEffort while request-time reads are synchronous map clones with pre/post checks | BestEffort: guest timer race returns promptly, but host cancellation is unproved | BestEffort; synchronous host reads are not guest-preemptible | BestEffort: guest timer race returns promptly, but host cancellation is unproved |
+| `config-read-allocation-bounds` | Unsupported overall; bounded local snapshots do not certify secret/environment/allocator overhead | Unsupported until the SDK exposes/proves a pre-materialization bound | Unsupported until host API documentation and a probe prove it | Unsupported until host API documentation and a probe prove it |
+| `config-read-deadlines` | BestEffort while request-time reads are synchronous shared-handle lookups with pre/post checks | BestEffort: guest timer race returns promptly, but host cancellation is unproved | BestEffort; synchronous host reads are not guest-preemptible | BestEffort: guest timer race returns promptly, but host cancellation is unproved |
 
 Apps that require a strict RSS or elapsed-time guarantee declare the corresponding Native
 capability and fail before startup/deploy on weaker targets. Capability documentation must
@@ -5316,8 +5324,8 @@ coexist in one file.
 A flat `{ key: envelope_json_string }` map. Each value is the
 envelope serialised to JSON and stored as an ESCAPED STRING (not
 a nested JSON object), so the file deserialises into
-`BTreeMap<String, String>` and Axum's `ConfigStore::get(key)`
-returns the string directly without any envelope-aware
+a bounded sorted index of independently owned shared `ConfigValue` payloads.
+Axum's `ConfigStore::get(key)` returns the shared UTF-8 value without any envelope-aware
 parsing inside the adapter.
 
 ```json
@@ -5333,14 +5341,18 @@ parsing inside the adapter.
   to `<file>.tmp`, fsync, rename). The entry value is the
   envelope serialised then `serde_json::to_string`-ed and
   inserted as a string value.
-- Runtime: the extractor stays adapter-neutral and calls only `get_bounded`; raw
-  hand-managed callers may still call `get`. Axum's production bounded path reads the
-  selected map entry incrementally under the supplied deadline and refuses the first byte
-  beyond the smaller of the per-value and remaining backend allowances. It must not first
-  deserialize/clone the whole file map. The existing in-memory `from_map` test path checks
-  length before cloning the selected value. The unbounded compatibility `get` method
-  remains for hand-managed callers and delegates to the same selected-entry reader without
-  extraction limits; it is never called by `AppConfig<C>`.
+- Runtime: the standard runner loads immutable bounded flat-string snapshots before
+  listener binding, sequentially across the registry. It caps actual file reads, entry
+  count, decoded key/value bytes, all-store resident allocations and startup staging;
+  duplicate keys fail. No intermediate `Value` tree is created. Size violations fail
+  startup; other failed declarations retain typed failing handles. Missing files remain
+  empty declared stores. Push changes require restart. Request-time `get_bounded` checks
+  both extraction caps and the injected deadline before cloning one shared payload handle;
+  raw `get` also shares that payload but makes no extraction-bound claim.
+  `from_path`, `from_local_file` and fallible `from_map` require `ConfigStoreLimits`.
+  Caller-owned map inputs are outside startup-reader charges. The complete defaults,
+  supported ranges, requested-allocation formula, decoder pin and exclusions are normative
+  in [the Axum snapshot limits guide](../../guide/adapters/axum.md#snapshot-allocation-limits).
 
   The string form keeps the per-adapter `ConfigStore` logical value contract intact across
   all four adapters —
@@ -5540,9 +5552,9 @@ maintenance tax.
 2. The runtime `AppConfig<C>` extractor replaces direct
    `ctx.config_store_default()?.get(key)` calls against the typed
    config's store. Downstream apps with custom `ConfigStore`
-   consumers see a deprecation note in `CHANGELOG.md`; the
-   compile-time surface (the `ConfigStore` trait itself) doesn't
-   change.
+   consumers must hard-migrate `get`/`get_bounded` and matching handle APIs to
+   shared `ConfigValue` instead of `String`, as recorded in `CHANGELOG.md`.
+   No deprecated aliases or dual trait signatures remain.
 3. Pre-blob blobs (the flattened per-leaf state) become
    unreadable. The runtime errors loudly on the first request
    pointing at the migration guide. We do NOT silently treat

@@ -10,6 +10,18 @@
 
 ## Global Constraints
 
+PR #275 follow-up supersedes this plan's older owned-string store signatures and
+per-request Axum file-reading assumptions. The current normative contract is spec
+§6.3 and §9.1 plus the Axum guide's snapshot-allocation limits.
+
+- [x] Hard-cut raw config reads to shared `ConfigValue` across all adapters and fixtures.
+- [x] Validate finite Axum startup/snapshot budgets and load before listener binding.
+- [x] Bound actual reads, flat decoder staging, entry/key/value allocations and all-store residency.
+- [x] Preserve failed declared bindings, reject duplicate keys and invalid registry metadata.
+- [x] Stream canonical hashing and drop the extraction-owned raw handle before secrets.
+- [x] Align demo, generator, public guides and CHANGELOG with snapshot/restart semantics.
+- [ ] Qualify hosted provider allocation/cancellation evidence; do not promote capability cells without it.
+
 - **Source of truth:** [`docs/superpowers/specs/2026-06-16-blob-app-config.md`](../specs/2026-06-16-blob-app-config.md). Every task numbered below cites the spec section it implements.
 - **Hard cutoff:** no `#[serde(default)]` compat fallback for missing legacy state, no runtime fallback to the old per-leaf app-config shape, no platform-side bridge for legacy state. Fastly's direct-or-pointer storage is a new v1 physical representation for the same blob envelope, not legacy compatibility. Per spec §1 / §10.1.
 - **Atomic cutover:** spec §10.1 + §10.2 require runtime extractor + per-adapter writers + app-demo migration + scaffold templates + CI gate to land in ONE commit (Phase C below). Intermediate trees with new runtime / old writer do NOT compile cleanly because the read-trait-driven inline diff and the gate cross-check would fail. **Bisect-safe annotations** appear in each task heading.

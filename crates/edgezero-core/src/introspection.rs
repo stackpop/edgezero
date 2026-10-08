@@ -131,10 +131,10 @@ mod tests {
     // A config store returning a fixed result for `get`, used to drive the
     // config handler's status-code mapping. Mirrors the pattern in
     // extractor.rs::config_extractor_resolves_from_registry.
-    struct StubStore(Result<Option<String>, ConfigStoreError>);
+    struct StubStore(Result<Option<crate::ConfigValue>, ConfigStoreError>);
     #[async_trait(?Send)]
     impl ConfigStore for StubStore {
-        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(&self, _key: &str) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
             match &self.0 {
                 Ok(val) => Ok(val.clone()),
                 Err(ConfigStoreError::Unavailable { .. }) => {
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn config_happy_path_returns_envelope_data_secret_safe() {
         let data = serde_json::json!({ "greeting": "hi", "api_token": "demo_api_token" });
-        let resp = run_config(StubStore(Ok(Some(valid_envelope_json(data)))));
+        let resp = run_config(StubStore(Ok(Some(valid_envelope_json(data).into()))));
         assert_eq!(resp.status(), StatusCode::OK);
         // Raw envelope `data` verbatim: the secret field holds the KEY NAME,
         // never a resolved value.
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn config_malformed_envelope_maps_500() {
-        let resp = run_config(StubStore(Ok(Some("not json".to_owned()))));
+        let resp = run_config(StubStore(Ok(Some("not json".into()))));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -316,7 +316,7 @@ mod tests {
             "version": 1_u32,
         })
         .to_string();
-        let resp = run_config(StubStore(Ok(Some(bad))));
+        let resp = run_config(StubStore(Ok(Some(bad.into()))));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -329,7 +329,7 @@ mod tests {
             "version": 99_u32,
         })
         .to_string();
-        let resp = run_config(StubStore(Ok(Some(bad))));
+        let resp = run_config(StubStore(Ok(Some(bad.into()))));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

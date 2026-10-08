@@ -383,6 +383,13 @@ mod tests {
     }
 
     async fn exchange_with_app(app: App) -> (String, Result<ConnectionExit, hyper::Error>) {
+        exchange_with_method(app, "GET").await
+    }
+
+    async fn exchange_with_method(
+        app: App,
+        method: &str,
+    ) -> (String, Result<ConnectionExit, hyper::Error>) {
         LocalSet::new()
             .run_until(async {
                 let listener = TcpListener::bind("127.0.0.1:0")
@@ -398,7 +405,12 @@ mod tests {
                 });
                 let mut client = TcpStream::connect(address).await.expect("connect client");
                 client
-                    .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .write_all(
+                        format!(
+                            "{method} / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
                     .await
                     .expect("write request");
                 let mut wire = Vec::new();
@@ -410,6 +422,73 @@ mod tests {
                 (String::from_utf8(wire).expect("ASCII response"), exit)
             })
             .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bodyless_tcp_responses_release_the_response_resource_exactly_once() {
+        for (method, status) in [
+            ("HEAD", StatusCode::OK),
+            ("GET", StatusCode::NO_CONTENT),
+            ("GET", StatusCode::NOT_MODIFIED),
+        ] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+            let resources = Arc::new(AtomicUsize::new(0));
+            let source_polls = Arc::clone(&polls);
+            let source_drops = Arc::clone(&drops);
+            let router = RouterService::builder()
+                .route(
+                    "/",
+                    Method::from_bytes(method.as_bytes()).expect("method"),
+                    move |_| {
+                        let observed = Arc::clone(&source_polls);
+                        let guard = SourceDropProbe(Arc::clone(&source_drops));
+                        async move {
+                            let body = poll_fn(move |_cx| {
+                                let _keep_alive = &guard;
+                                observed.fetch_add(1, Ordering::SeqCst);
+                                Poll::<Option<Result<Bytes, EdgeError>>>::Pending
+                            });
+                            Ok::<_, EdgeError>(
+                                response_builder()
+                                    .status(status)
+                                    .body(Body::from_stream(body))
+                                    .expect("response"),
+                            )
+                        }
+                    },
+                )
+                .build();
+            let mut app = App::new(router);
+            let observer = RecordingObserver::default();
+            app.set_response_egress_observer(observer.clone());
+            let terminals = Arc::clone(&completed);
+            let released = Arc::clone(&resources);
+            app.set_ingress_admission_policy(move |head| AdmissionDecision::Admit {
+                completion: ResponseEgressCompletion::new({
+                    let callback = Arc::clone(&terminals);
+                    let resource = SourceDropProbe(Arc::clone(&released));
+                    move |report| {
+                        assert_eq!(report.outcome, ResponseEgressOutcome::HostHandoff);
+                        callback.fetch_add(1, Ordering::SeqCst);
+                        drop(resource);
+                    }
+                }),
+                grant: IngressGrant::empty(),
+                read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            });
+            let (wire, exit) = exchange_with_method(app, method).await;
+            assert_eq!(exit.expect("complete"), ConnectionExit::Completed);
+            assert_eq!(wire.split_once("\r\n\r\n").expect("wire head").1, "");
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(completed.load(Ordering::SeqCst), 1);
+            assert_eq!(resources.load(Ordering::SeqCst), 1);
+            let reports = observer.0.lock().expect("reports");
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports.first().expect("report").bytes_written, 0);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

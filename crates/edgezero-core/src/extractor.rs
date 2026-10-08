@@ -1222,7 +1222,7 @@ where
         .map_err(|store_error| map_config_store_error(&store_error))?;
     budget.accept_read(
         read.backend_bytes,
-        read.value.as_ref().map(String::len),
+        read.value.as_ref().map(|value| value.len()),
         budget.max_blob_bytes(),
     )?;
     let raw = read.value.ok_or_else(|| {
@@ -1272,6 +1272,7 @@ where
     })();
     budget.check_deadline()?;
     let mut data = parsed?;
+    drop(raw);
 
     let resolved = secret_walk::<C>(ctx, &mut budget, &mut data).await;
     budget.check_deadline()?;
@@ -2500,8 +2501,11 @@ mod tests {
         struct FixedStore(&'static str);
         #[async_trait(?Send)]
         impl ConfigStore for FixedStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some(self.0.to_owned()))
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                Ok(Some(self.0.into()))
             }
 
             ready_config_store_bounded_read!();
@@ -2542,7 +2546,7 @@ mod tests {
         let analytics = config.named("analytics").expect("analytics handle");
         assert_eq!(
             block_on(analytics.get("any")).expect("config value"),
-            Some("analytics".to_owned())
+            Some(crate::ConfigValue::from("analytics"))
         );
         assert!(config.named("missing").is_none());
         assert!(config.default().is_some());
@@ -2558,8 +2562,11 @@ mod tests {
         struct AnyStore;
         #[async_trait(?Send)]
         impl ConfigStore for AnyStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some("legacy".to_owned()))
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                Ok(Some("legacy".into()))
             }
 
             ready_config_store_bounded_read!();
@@ -2606,7 +2613,10 @@ mod tests {
         struct AnyStore;
         #[async_trait(?Send)]
         impl ConfigStore for AnyStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 Ok(None)
             }
 
@@ -2657,7 +2667,10 @@ mod tests {
         struct AnyStore;
         #[async_trait(?Send)]
         impl ConfigStore for AnyStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 Ok(None)
             }
 
@@ -2815,8 +2828,11 @@ mod tests {
         struct FixedStore(String);
         #[async_trait(?Send)]
         impl ConfigStore for FixedStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some(self.0.clone()))
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                Ok(Some(self.0.clone().into()))
             }
 
             ready_config_store_bounded_read!();
@@ -2845,7 +2861,10 @@ mod tests {
 
         #[async_trait(?Send)]
         impl ConfigStore for BoundedOnlyStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 panic!("typed extraction must not call the unbounded config-store API");
             }
 
@@ -2856,12 +2875,12 @@ mod tests {
                 deadline: Deadline,
                 max_backend_bytes: u64,
                 max_value_bytes: u64,
-            ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+            ) -> Result<BoundedStoreRead<crate::ConfigValue>, ConfigStoreError> {
                 *self.observed.lock().expect("record bounded read") =
                     Some((deadline, max_backend_bytes, max_value_bytes));
                 Ok(BoundedStoreRead {
                     backend_bytes: u64::try_from(self.blob.len()).expect("fixture length"),
-                    value: Some(self.blob.clone()),
+                    value: Some(self.blob.clone().into()),
                 })
             }
         }
@@ -2892,11 +2911,11 @@ mod tests {
 
     #[test]
     fn app_config_extractor_shares_deadline_and_budget_with_secret_reads() {
-        use std::sync::Mutex;
-
+        use crate::ConfigValue;
         use crate::config_store::BoundedStoreRead;
         use crate::time::{Deadline, MonotonicInstant};
         use bytes::Bytes;
+        use std::sync::Mutex;
 
         type Observation = (MonotonicInstant, u64, u64);
 
@@ -2907,7 +2926,7 @@ mod tests {
 
         #[async_trait(?Send)]
         impl ConfigStore for RecordingConfigStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(&self, _key: &str) -> Result<Option<ConfigValue>, ConfigStoreError> {
                 panic!("typed extraction must not call unbounded config reads");
             }
 
@@ -2918,7 +2937,7 @@ mod tests {
                 deadline: Deadline,
                 max_backend_bytes: u64,
                 max_value_bytes: u64,
-            ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+            ) -> Result<BoundedStoreRead<crate::ConfigValue>, ConfigStoreError> {
                 self.observed.lock().expect("config observation").push((
                     deadline.instant(),
                     max_backend_bytes,
@@ -2926,7 +2945,7 @@ mod tests {
                 ));
                 Ok(BoundedStoreRead {
                     backend_bytes: u64::try_from(self.blob.len()).expect("fixture length"),
-                    value: Some(self.blob.clone()),
+                    value: Some(self.blob.clone().into()),
                 })
             }
         }
@@ -3008,7 +3027,10 @@ mod tests {
         struct EmptyStore;
         #[async_trait(?Send)]
         impl ConfigStore for EmptyStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 Ok(None)
             }
 
@@ -3037,7 +3059,10 @@ mod tests {
         struct DownStore;
         #[async_trait(?Send)]
         impl ConfigStore for DownStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 Err(ConfigStoreError::unavailable("backend offline"))
             }
 
@@ -3058,7 +3083,10 @@ mod tests {
         struct BadKeyStore;
         #[async_trait(?Send)]
         impl ConfigStore for BadKeyStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 Err(ConfigStoreError::invalid_key("key is malformed"))
             }
 
@@ -3079,7 +3107,10 @@ mod tests {
         struct BrokenStore;
         #[async_trait(?Send)]
         impl ConfigStore for BrokenStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 Err(ConfigStoreError::internal(anyhow::anyhow!("disk on fire")))
             }
 
@@ -3101,7 +3132,10 @@ mod tests {
         struct TamperedStore;
         #[async_trait(?Send)]
         impl ConfigStore for TamperedStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 // A valid envelope whose stored sha is a SENTINEL secret. The
                 // stored hash is attacker-influenced (it comes from the config
                 // store), and this error becomes the HTTP 500 body — so the
@@ -3111,7 +3145,7 @@ mod tests {
                     "2026-01-01T00:00:00Z".into(),
                 );
                 env.sha256 = SENTINEL.to_owned();
-                Ok(Some(serde_json::to_string(&env).unwrap()))
+                Ok(Some(serde_json::to_string(&env).unwrap().into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3145,7 +3179,10 @@ mod tests {
         struct FutureVersionStore;
         #[async_trait(?Send)]
         impl ConfigStore for FutureVersionStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 // A v1-shaped envelope with the version bumped to 2.
                 let env = BlobEnvelope::new(
                     serde_json::json!({ "greeting": "hi", "timeout_ms": 100_u32 }),
@@ -3154,7 +3191,7 @@ mod tests {
                 let mut value: serde_json::Value =
                     serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
                 value["version"] = serde_json::json!(2_u32);
-                Ok(Some(value.to_string()))
+                Ok(Some(value.to_string().into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3187,7 +3224,10 @@ mod tests {
         struct KindTaggedStore;
         #[async_trait(?Send)]
         impl ConfigStore for KindTaggedStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 let env = BlobEnvelope::new(
                     serde_json::json!({ "greeting": "hi", "timeout_ms": 100_u32 }),
                     "2026-01-01T00:00:00Z".into(),
@@ -3195,7 +3235,7 @@ mod tests {
                 let mut value: serde_json::Value =
                     serde_json::from_str(&serde_json::to_string(&env).unwrap()).unwrap();
                 value["edgezero_kind"] = serde_json::json!("new_format");
-                Ok(Some(value.to_string()))
+                Ok(Some(value.to_string().into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3218,16 +3258,19 @@ mod tests {
         struct EscapedKindTaggedStore;
         #[async_trait(?Send)]
         impl ConfigStore for EscapedKindTaggedStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 let env = BlobEnvelope::new(
                     serde_json::json!({ "greeting": "hi", "timeout_ms": 100_u32 }),
                     "2026-01-01T00:00:00Z".into(),
                 );
                 let serialized = serde_json::to_string(&env).expect("envelope");
                 let serialized_body = serialized.strip_prefix('{').expect("JSON object");
-                Ok(Some(format!(
-                    "{{\"edgezero_\\u006bind\":\"new_format\",{serialized_body}"
-                )))
+                Ok(Some(
+                    format!("{{\"edgezero_\\u006bind\":\"new_format\",{serialized_body}").into(),
+                ))
             }
 
             ready_config_store_bounded_read!();
@@ -3249,7 +3292,10 @@ mod tests {
         struct TypeErrorStore;
         #[async_trait(?Send)]
         impl ConfigStore for TypeErrorStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 // A VALID envelope (verify passes) whose data has the wrong type
                 // for `timeout_ms` — a string sentinel where u32 is expected.
                 // The deserialize error names that value; it must not reach the
@@ -3258,7 +3304,7 @@ mod tests {
                     serde_json::json!({ "greeting": "hi", "timeout_ms": SENTINEL }),
                     "2026-01-01T00:00:00Z".into(),
                 );
-                Ok(Some(serde_json::to_string(&env).unwrap()))
+                Ok(Some(serde_json::to_string(&env).unwrap().into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3292,8 +3338,11 @@ mod tests {
         struct GarbageStore;
         #[async_trait(?Send)]
         impl ConfigStore for GarbageStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some("not-json-at-all".to_owned()))
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                Ok(Some("not-json-at-all".into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3323,8 +3372,11 @@ mod tests {
         struct FixedStore(String);
         #[async_trait(?Send)]
         impl ConfigStore for FixedStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some(self.0.clone()))
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                Ok(Some(self.0.clone().into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3385,12 +3437,15 @@ mod tests {
         struct BadDataStore;
         #[async_trait(?Send)]
         impl ConfigStore for BadDataStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 let data = serde_json::json!({
                     "greeting": "hi",
                     "timeout_ms": "not-a-number",
                 });
-                Ok(Some(make_envelope(data)))
+                Ok(Some(make_envelope(data).into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3421,9 +3476,12 @@ mod tests {
         struct ZeroTimeoutStore;
         #[async_trait(?Send)]
         impl ConfigStore for ZeroTimeoutStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 let data = serde_json::json!({ "greeting": "hi", "timeout_ms": 0_u32 });
-                Ok(Some(make_envelope(data)))
+                Ok(Some(make_envelope(data).into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3451,8 +3509,11 @@ mod tests {
         struct BlobStore(String);
         #[async_trait(?Send)]
         impl ConfigStore for BlobStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some(self.0.clone()))
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                Ok(Some(self.0.clone().into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3481,8 +3542,11 @@ mod tests {
         struct BlobStore(String);
         #[async_trait(?Send)]
         impl ConfigStore for BlobStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some(self.0.clone()))
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                Ok(Some(self.0.clone().into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3514,8 +3578,11 @@ mod tests {
         struct BlobStore(String);
         #[async_trait(?Send)]
         impl ConfigStore for BlobStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some(self.0.clone()))
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                Ok(Some(self.0.clone().into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3744,10 +3811,10 @@ mod tests {
         struct KeyEchoStore;
         #[async_trait(?Send)]
         impl ConfigStore for KeyEchoStore {
-            async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(&self, key: &str) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 // Return a blob whose `greeting` equals the key being looked up.
                 let data = serde_json::json!({ "greeting": key, "timeout_ms": 200_u32 });
-                Ok(Some(make_envelope(data)))
+                Ok(Some(make_envelope(data).into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3767,9 +3834,12 @@ mod tests {
         struct NamedStore(&'static str);
         #[async_trait(?Send)]
         impl ConfigStore for NamedStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 let data = serde_json::json!({ "greeting": self.0, "timeout_ms": 300_u32 });
-                Ok(Some(make_envelope(data)))
+                Ok(Some(make_envelope(data).into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3857,8 +3927,11 @@ mod tests {
         struct BlobStore(String);
         #[async_trait(?Send)]
         impl ConfigStore for BlobStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some(self.0.clone()))
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                Ok(Some(self.0.clone().into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3903,8 +3976,11 @@ mod tests {
         struct BlobStore(String);
         #[async_trait(?Send)]
         impl ConfigStore for BlobStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some(self.0.clone()))
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                Ok(Some(self.0.clone().into()))
             }
 
             ready_config_store_bounded_read!();
@@ -3956,8 +4032,11 @@ mod tests {
         struct BlobStore(String);
         #[async_trait(?Send)]
         impl ConfigStore for BlobStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some(self.0.clone()))
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                Ok(Some(self.0.clone().into()))
             }
 
             ready_config_store_bounded_read!();

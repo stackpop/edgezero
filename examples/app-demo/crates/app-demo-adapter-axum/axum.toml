@@ -2,3 +2,12 @@
 crate = "app-demo-adapter-axum"
 crate_dir = "."
 port = 8787
+
+# Local config snapshots load before listener bind. Push config before startup;
+# restart after an update. Override allocation budgets with:
+# EDGEZERO__ADAPTER__CONFIG_STORE__MAX_FILE_BYTES=16777216
+# EDGEZERO__ADAPTER__CONFIG_STORE__MAX_ENTRIES=1024
+# EDGEZERO__ADAPTER__CONFIG_STORE__MAX_KEY_BYTES=1024
+# EDGEZERO__ADAPTER__CONFIG_STORE__MAX_VALUE_BYTES=8388608
+# EDGEZERO__ADAPTER__CONFIG_STORE__MAX_RESIDENT_BYTES=33554432
+# EDGEZERO__ADAPTER__CONFIG_STORE__MAX_STARTUP_BYTES=117440512

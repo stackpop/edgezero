@@ -83,8 +83,11 @@ struct BlobStore(String);
 
 #[async_trait(?Send)]
 impl ConfigStore for BlobStore {
-    async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-        Ok(Some(self.0.clone()))
+    async fn get(
+        &self,
+        _key: &str,
+    ) -> Result<Option<edgezero_core::ConfigValue>, ConfigStoreError> {
+        Ok(Some(self.0.clone().into()))
     }
 
     async fn get_bounded(
@@ -94,7 +97,7 @@ impl ConfigStore for BlobStore {
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
-    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+    ) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError> {
         if deadline.is_expired_at(clock.now()) {
             return Err(ConfigStoreError::DeadlineExceeded);
         }

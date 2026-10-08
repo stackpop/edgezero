@@ -253,6 +253,13 @@ handlers can call `ctx.config_store("app_config")` (or
 Treat config-store keys like API surface: validate or allowlist any user-controlled lookup before
 calling `ctx.config_store_default()?.get(...)`.
 
+Raw `ConfigStore::get` and `get_bounded` return shared `ConfigValue` UTF-8 payloads,
+not `String`. Cloning shares one value's allocation; borrow with `as_str()` or
+`as_ref()`, or explicitly allocate with `to_string()` at an ownership boundary.
+`Debug` output is redacted. Typed `AppConfig<C>` fields are unchanged. Axum loads
+[bounded immutable snapshots](/guide/adapters/axum#snapshot-allocation-limits)
+before listener bind; push updated local config before startup or restart afterward.
+
 ## Application config
 
 `edgezero.toml` describes the _shape_ of the app — routes, adapters,

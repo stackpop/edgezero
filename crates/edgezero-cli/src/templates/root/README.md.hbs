@@ -89,6 +89,11 @@ cargo run -p {{proj_cli}} -- config diff --adapter <name> --format json --exit-c
 
 Uncomment `[stores.config]` in `edgezero.toml` (and the matching
 adapter binding in the per-adapter manifest) before running `config push`.
+For Axum, push before starting the server or restart after updating config: the
+runner loads bounded immutable snapshots before listener binding. Configure allocation
+budgets through `EDGEZERO__ADAPTER__CONFIG_STORE__*`; invalid budgets fail startup.
+Raw custom store implementations return shared `edgezero_core::ConfigValue`, while
+the typed config extractor and generated handlers require no manual store reads.
 
 Use `--key <name>` for per-environment overrides (staging / canary):
 the same `{{name}}.toml` can land under multiple keys, and the runtime

@@ -74,12 +74,15 @@ impl CloudflareConfigStore {
             inner: CloudflareConfigBackend::Kv(store),
         })
     }
-}
 
-#[async_trait(?Send)]
-impl ConfigStore for CloudflareConfigStore {
-    #[inline]
-    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+    #[cfg_attr(
+        not(all(feature = "cloudflare", target_arch = "wasm32")),
+        expect(
+            clippy::unused_async,
+            reason = "native fixture is synchronous; the production SDK read is asynchronous"
+        )
+    )]
+    async fn materialized_get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         match &self.inner {
             #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
             CloudflareConfigBackend::Kv(store) => store.get(key).text().await.map_err(|err| {
@@ -88,6 +91,16 @@ impl ConfigStore for CloudflareConfigStore {
             #[cfg(test)]
             CloudflareConfigBackend::InMemory(data) => Ok(data.get(key).cloned()),
         }
+    }
+}
+
+#[async_trait(?Send)]
+impl ConfigStore for CloudflareConfigStore {
+    #[inline]
+    async fn get(&self, key: &str) -> Result<Option<edgezero_core::ConfigValue>, ConfigStoreError> {
+        self.materialized_get(key)
+            .await
+            .map(|value| value.map(Into::into))
     }
 
     #[inline]
@@ -98,9 +111,9 @@ impl ConfigStore for CloudflareConfigStore {
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
-    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+    ) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError> {
         bounded_config_read(
-            self.get(key),
+            self.materialized_get(key),
             clock,
             deadline,
             max_backend_bytes,
@@ -118,7 +131,7 @@ async fn bounded_config_read<F>(
     deadline: Deadline,
     max_backend_bytes: u64,
     max_value_bytes: u64,
-) -> Result<BoundedStoreRead<String>, ConfigStoreError>
+) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError>
 where
     F: Future<Output = Result<Option<String>, ConfigStoreError>>,
 {
@@ -155,7 +168,7 @@ async fn bounded_config_read_with_timer<F, MakeTimer, Timer>(
     max_backend_bytes: u64,
     max_value_bytes: u64,
     mut make_timer: MakeTimer,
-) -> Result<BoundedStoreRead<String>, ConfigStoreError>
+) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError>
 where
     F: Future<Output = Result<Option<String>, ConfigStoreError>>,
     MakeTimer: FnMut(Duration) -> Timer,

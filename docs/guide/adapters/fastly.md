@@ -305,7 +305,9 @@ async fn handler(config: Config) -> Result<Response, EdgeError> {
 ```
 
 If a configured store link is missing, the adapter logs a one-time warning
-and drops that id from the registry. Migrating from `name`/`adapters.*`?
+and retains a typed failing declared binding, rather than reporting intentional absence.
+Raw values are shared `ConfigValue` UTF-8 payloads; use `as_str()` to borrow them.
+Migrating from `name`/`adapters.*`?
 See [the migration guide](../manifest-store-migration.md).
 
 ## Context Access

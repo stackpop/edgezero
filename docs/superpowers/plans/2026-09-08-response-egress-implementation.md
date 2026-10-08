@@ -1,5 +1,11 @@
 # Owned Response Egress Implementation Plan
 
+PR #275 follow-up expands local Axum TCP qualification: suppressed-body completion
+resources, pending producers, non-reading clients, disconnect cleanup, native deadline
+wakeup under a frozen injected clock, stopped source polling and single-connection recovery.
+Hosted Cloudflare/Fastly/Spin evidence remains a separate unfulfilled qualification gate;
+local tests and provider emulators must not be presented as deployed runtime proof.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to
 > implement this plan task by task. Apply `superpowers:test-driven-development` to every
 > behavioral change and `superpowers:verification-before-completion` before claiming success.

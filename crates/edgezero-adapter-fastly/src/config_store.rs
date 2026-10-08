@@ -51,7 +51,7 @@ impl FastlyConfigStore {
 #[async_trait(?Send)]
 impl ConfigStore for FastlyConfigStore {
     #[inline]
-    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+    async fn get(&self, key: &str) -> Result<Option<edgezero_core::ConfigValue>, ConfigStoreError> {
         let root_value = match &self.inner {
             FastlyConfigStoreBackend::Fastly(inner) => {
                 inner.try_get(key).map_err(|err| map_lookup_error(&err))?
@@ -117,6 +117,7 @@ impl ConfigStore for FastlyConfigStore {
             Ok(got)
         });
         outcome
+            .map(edgezero_core::ConfigValue::from)
             .map(Some)
             .map_err(|error| map_resolve_failure(key, transient.get(), error))
     }
@@ -129,7 +130,7 @@ impl ConfigStore for FastlyConfigStore {
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
-    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+    ) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError> {
         let materialized_root = run_sync_host_call(clock, deadline, || {
             Ok(match &self.inner {
                 FastlyConfigStoreBackend::Fastly(inner) => {
@@ -143,7 +144,10 @@ impl ConfigStore for FastlyConfigStore {
         let root_read = exact_fastly_read(materialized_root, max_backend_bytes)
             .map_err(|_size_error| ConfigStoreError::ValueTooLarge)?;
         let Some(root_value) = root_read.value else {
-            return Ok(root_read);
+            return Ok(BoundedStoreRead {
+                backend_bytes: root_read.backend_bytes,
+                value: None,
+            });
         };
 
         let transient = Cell::new(false);
@@ -186,7 +190,16 @@ impl ConfigStore for FastlyConfigStore {
         );
 
         match outcome {
-            Ok(read) => Ok(read),
+            Ok(read) => {
+                let value = read.value.map(Into::into);
+                if deadline.is_expired_at(clock.now()) {
+                    return Err(ConfigStoreError::DeadlineExceeded);
+                }
+                Ok(BoundedStoreRead {
+                    backend_bytes: read.backend_bytes,
+                    value,
+                })
+            }
             Err(BoundedResolveFailure::Backend(error)) => Err(error),
             Err(BoundedResolveFailure::DeadlineExceeded) => Err(ConfigStoreError::DeadlineExceeded),
             Err(BoundedResolveFailure::Resolve(error)) => {

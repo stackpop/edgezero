@@ -786,9 +786,11 @@ dependencies = [
  "http-body",
  "hyper",
  "hyper-util",
+ "libc",
  "log",
  "redb",
  "reqwest",
+ "serde",
  "serde_json",
  "simple_logger 5.2.0",
  "thiserror 2.0.21",
@@ -2382,9 +2384,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "e8014e44b4736ed0538adeecded0fce2a272f22dc9578a7eb6b2d9993c74cfb9"
 dependencies = [
  "itoa",
  "memchr",

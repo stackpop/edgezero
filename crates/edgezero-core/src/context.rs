@@ -1306,8 +1306,11 @@ mod tests {
         struct FixedStore(&'static str);
         #[async_trait(?Send)]
         impl ConfigStore for FixedStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some(self.0.to_owned()))
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
+                Ok(Some(self.0.into()))
             }
 
             ready_config_store_bounded_read!();
@@ -1346,13 +1349,13 @@ mod tests {
         let resolved = ctx.config_store("analytics").expect("analytics handle");
         assert_eq!(
             block_on(resolved.get("key")).expect("config value"),
-            Some("analytics".to_owned())
+            Some(crate::ConfigValue::from("analytics"))
         );
         assert!(ctx.config_store("unknown").is_none());
         let default = ctx.config_store_default().expect("default handle");
         assert_eq!(
             block_on(default.get("key")).expect("default config value"),
-            Some("primary".to_owned())
+            Some(crate::ConfigValue::from("primary"))
         );
     }
 
@@ -1426,7 +1429,10 @@ mod tests {
         struct AnyStore;
         #[async_trait(?Send)]
         impl ConfigStore for AnyStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 Ok(None)
             }
 
@@ -1475,7 +1481,10 @@ mod tests {
         struct AnyStore;
         #[async_trait(?Send)]
         impl ConfigStore for AnyStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            async fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<crate::ConfigValue>, ConfigStoreError> {
                 Ok(None)
             }
 

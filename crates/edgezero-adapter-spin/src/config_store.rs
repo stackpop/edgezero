@@ -61,12 +61,15 @@ impl SpinConfigStore {
             inner: SpinConfigBackend::InMemory(entries.into_iter().collect()),
         }
     }
-}
 
-#[async_trait(?Send)]
-impl ConfigStore for SpinConfigStore {
-    #[inline]
-    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+    #[cfg_attr(
+        not(all(feature = "spin", target_arch = "wasm32")),
+        expect(
+            clippy::unused_async,
+            reason = "native fixture is synchronous; the production SDK read is asynchronous"
+        )
+    )]
+    async fn materialized_get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         match &self.inner {
             #[cfg(test)]
             SpinConfigBackend::InMemory(map) => match map.get(key) {
@@ -106,6 +109,16 @@ impl ConfigStore for SpinConfigStore {
             }
         }
     }
+}
+
+#[async_trait(?Send)]
+impl ConfigStore for SpinConfigStore {
+    #[inline]
+    async fn get(&self, key: &str) -> Result<Option<edgezero_core::ConfigValue>, ConfigStoreError> {
+        self.materialized_get(key)
+            .await
+            .map(|value| value.map(Into::into))
+    }
 
     #[inline]
     async fn get_bounded(
@@ -115,9 +128,9 @@ impl ConfigStore for SpinConfigStore {
         deadline: Deadline,
         max_backend_bytes: u64,
         max_value_bytes: u64,
-    ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+    ) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError> {
         bounded_config_read(
-            self.get(key),
+            self.materialized_get(key),
             clock,
             deadline,
             max_backend_bytes,
@@ -147,7 +160,7 @@ async fn bounded_config_read<F>(
     deadline: Deadline,
     max_backend_bytes: u64,
     max_value_bytes: u64,
-) -> Result<BoundedStoreRead<String>, ConfigStoreError>
+) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError>
 where
     F: Future<Output = Result<Option<String>, ConfigStoreError>>,
 {
@@ -184,7 +197,7 @@ async fn bounded_config_read_with_timer<F, MakeTimer, Timer>(
     max_backend_bytes: u64,
     max_value_bytes: u64,
     mut make_timer: MakeTimer,
-) -> Result<BoundedStoreRead<String>, ConfigStoreError>
+) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError>
 where
     F: Future<Output = Result<Option<String>, ConfigStoreError>>,
     MakeTimer: FnMut(Duration) -> Timer,
@@ -378,11 +391,11 @@ mod tests {
 
         assert_eq!(
             block_on(store.get("feature.new_checkout")).expect("dotted lookup"),
-            Some("false".to_owned()),
+            Some(edgezero_core::ConfigValue::from("false")),
         );
         assert_eq!(
             block_on(store.get("service.timeout_ms")).expect("dotted lookup"),
-            Some("1500".to_owned()),
+            Some(edgezero_core::ConfigValue::from("1500")),
         );
         // Negative: the legacy flat form is NOT a fallback any more.
         assert_eq!(

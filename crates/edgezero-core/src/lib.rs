@@ -57,7 +57,7 @@ pub use compression::{
     decode_brotli_stream, decode_deflate_stream, decode_gzip_stream,
 };
 pub use config_store::{
-    BoundedStoreRead, ConfigExtractionLimits, DEFAULT_CONFIG_BACKEND_BYTES,
+    BoundedStoreRead, ConfigExtractionLimits, ConfigValue, DEFAULT_CONFIG_BACKEND_BYTES,
     DEFAULT_CONFIG_BLOB_BYTES, DEFAULT_CONFIG_EXTRACTION_BYTES, DEFAULT_CONFIG_EXTRACTION_TIMEOUT,
     DEFAULT_CONFIG_JSON_DEPTH, DEFAULT_CONFIG_JSON_NODES, DEFAULT_CONFIG_SECRET_BYTES,
 };
@@ -120,7 +120,7 @@ mod public_config_extraction_contract_tests {
     #[test]
     fn bounded_config_types_and_defaults_are_root_exports() {
         let limits = crate::ConfigExtractionLimits::default();
-        let _: crate::BoundedStoreRead<String> = crate::BoundedStoreRead {
+        let _: crate::BoundedStoreRead<crate::ConfigValue> = crate::BoundedStoreRead {
             backend_bytes: 0,
             value: None,
         };

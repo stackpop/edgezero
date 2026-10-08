@@ -359,7 +359,7 @@ pub async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response,
     };
 
     match store.get(&params.name).await? {
-        Some(value) => text_response(StatusCode::OK, value),
+        Some(value) => text_response(StatusCode::OK, value.as_str()),
         None => text_response(
             StatusCode::NOT_FOUND,
             format!("config key '{}' not found", params.name),
@@ -554,8 +554,11 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl ConfigStore for MapConfigStore {
-        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-            Ok(self.0.get(key).cloned())
+        async fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<edgezero_core::ConfigValue>, ConfigStoreError> {
+            Ok(self.0.get(key).cloned().map(Into::into))
         }
 
         async fn get_bounded(
@@ -565,12 +568,12 @@ mod tests {
             deadline: Deadline,
             max_backend_bytes: u64,
             max_value_bytes: u64,
-        ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        ) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError> {
             if deadline.is_expired_at(clock.now()) {
                 return Err(ConfigStoreError::DeadlineExceeded);
             }
             finish_bounded_config_read(
-                self.get(key).await,
+                Ok(self.0.get(key).cloned()),
                 clock,
                 deadline,
                 max_backend_bytes,
@@ -692,7 +695,10 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl ConfigStore for UnavailableConfigStore {
-        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> Result<Option<edgezero_core::ConfigValue>, ConfigStoreError> {
             Err(ConfigStoreError::unavailable("backend offline"))
         }
 
@@ -703,7 +709,7 @@ mod tests {
             deadline: Deadline,
             max_backend_bytes: u64,
             max_value_bytes: u64,
-        ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        ) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError> {
             if deadline.is_expired_at(clock.now()) {
                 return Err(ConfigStoreError::DeadlineExceeded);
             }
@@ -721,8 +727,11 @@ mod tests {
 
     #[async_trait(?Send)]
     impl ConfigStore for FixedStore {
-        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-            Ok(Some(self.0.clone()))
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> Result<Option<edgezero_core::ConfigValue>, ConfigStoreError> {
+            Ok(Some(self.0.clone().into()))
         }
 
         async fn get_bounded(
@@ -732,7 +741,7 @@ mod tests {
             deadline: Deadline,
             max_backend_bytes: u64,
             max_value_bytes: u64,
-        ) -> Result<BoundedStoreRead<String>, ConfigStoreError> {
+        ) -> Result<BoundedStoreRead<edgezero_core::ConfigValue>, ConfigStoreError> {
             if deadline.is_expired_at(clock.now()) {
                 return Err(ConfigStoreError::DeadlineExceeded);
             }

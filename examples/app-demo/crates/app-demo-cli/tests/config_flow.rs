@@ -12,6 +12,7 @@
 
 use app_demo_core::config::AppDemoConfig;
 use edgezero_adapter::cli_support::validate_spin_outbound_host_contract;
+use edgezero_adapter_axum::config_store_limits::ConfigStoreLimits;
 use edgezero_cli::args::{ConfigPushArgs, ConfigValidateArgs};
 use edgezero_core::manifest::ManifestLoader;
 use edgezero_core::Capability;
@@ -255,7 +256,11 @@ fn config_typed_handler_deserialises_blob_envelope_to_greeting() {
     });
     let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
     let blob_str = serde_json::to_string(&envelope).expect("envelope JSON");
-    let store = AxumConfigStore::from_map([("app_config".to_owned(), blob_str)]);
+    let store = AxumConfigStore::from_map(
+        [("app_config".to_owned(), blob_str)],
+        ConfigStoreLimits::default(),
+    )
+    .expect("bounded snapshot");
 
     let config_registry: ConfigRegistry = StoreRegistry::single_id(
         "app_config".to_owned(),

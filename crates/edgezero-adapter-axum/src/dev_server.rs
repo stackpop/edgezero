@@ -20,7 +20,7 @@ use tokio::task::{LocalSet, spawn_blocking};
 
 use edgezero_core::addr;
 use edgezero_core::app::{App, Hooks, StoreMetadata, StoresMetadata};
-use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::config_store::{ConfigStoreError, ConfigStoreHandle, ConfigStoreOpenFailure};
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::logging::{BOOT_LOG_LEVEL, BOOT_LOG_TARGET, resolve_logging_level};
@@ -33,6 +33,7 @@ use simple_logger::SimpleLogger;
 use std::collections::BTreeMap;
 
 use crate::config_store::AxumConfigStore;
+use crate::config_store_limits::ConfigStoreLimits;
 use crate::connection::{ConnectionExit, serve_http1};
 use crate::ingress_config::AxumIngressConfig;
 use crate::key_value_store::PersistentKvStore;
@@ -473,11 +474,16 @@ where
             .context("failed to initialize application logger")?;
     }
     let ingress = AxumIngressConfig::from_env(&env)?;
+    let config_limits = ConfigStoreLimits::from_env(&env)?;
     log::info!("[edgezero] axum HTTP/1 ingress limits: {ingress:?}");
+    log::info!("[edgezero] axum config snapshot limits: {config_limits:?}");
     preflight()?;
     let app = build_app_for_dispatch::<A>()?;
     let stores = A::stores();
     let kv_init_requirement = kv_init_requirement(stores);
+    let kv_registry = build_kv_registry(stores.kv, &env, kv_init_requirement)?;
+    let config_registry = build_config_registry(stores.config, &env, config_limits)?;
+    let secret_registry = build_secret_registry(stores.secrets, &env);
 
     let resolution = resolve_addr(&env);
     for warning in &resolution.warnings {
@@ -499,10 +505,6 @@ where
             .context("failed to set listener to non-blocking")?;
         let listener = TokioTcpListener::from_std(std_listener)
             .context("failed to adopt std listener into tokio")?;
-
-        let kv_registry = build_kv_registry(stores.kv, &env, kv_init_requirement)?;
-        let config_registry = build_config_registry(stores.config, &env);
-        let secret_registry = build_secret_registry(stores.secrets, &env);
 
         let request_stores = Stores {
             config_registry,
@@ -575,46 +577,69 @@ fn build_kv_registry(
 /// Each declared id reads `.edgezero/local-config-<id>.json`. A missing
 /// file yields an empty store for that id — the dev server stays usable
 /// before any `config push` has populated the file. A malformed file logs a
-/// warning and the id is dropped from the registry rather than failing
-/// startup, matching the cloudflare config-binding behaviour.
+/// warning and preserves a typed failing binding. Allocation violations fail
+/// startup before any listener is bound. Snapshots load sequentially.
 fn build_config_registry(
     config_meta: Option<StoreMetadata>,
     env: &EnvConfig,
-) -> Option<ConfigRegistry> {
-    let meta = config_meta?;
+    limits: ConfigStoreLimits,
+) -> Result<Option<ConfigRegistry>, ConfigStoreError> {
+    build_config_registry_at(config_meta, env, limits, AxumConfigStore::local_path)
+}
+
+fn build_config_registry_at(
+    config_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+    limits: ConfigStoreLimits,
+    path_for: impl Fn(&str) -> PathBuf,
+) -> Result<Option<ConfigRegistry>, ConfigStoreError> {
+    let Some(meta) = config_meta else {
+        return Ok(None);
+    };
+    if meta.ids.is_empty()
+        || !meta.ids.contains(&meta.default)
+        || meta.ids.iter().enumerate().any(|(index, id)| {
+            id.is_empty()
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                || meta.ids.iter().take(index).any(|previous| previous == id)
+        })
+    {
+        return Err(ConfigStoreError::internal(anyhow::anyhow!(
+            "invalid declared config-store metadata"
+        )));
+    }
     let mut by_id: BTreeMap<String, ConfigStoreBinding> = BTreeMap::new();
+    let mut resident = 0_usize;
     for id in meta.ids {
-        let store = match AxumConfigStore::from_local_file(id) {
-            Ok(store) => store,
-            Err(err) => {
+        let handle = match AxumConfigStore::load_at_startup(&path_for(id), limits, resident) {
+            Ok(store) => {
+                resident = resident
+                    .checked_add(store.resident_allocation_bytes())
+                    .ok_or(ConfigStoreError::ValueTooLarge)?;
+                ConfigStoreHandle::new(Arc::new(store))
+            }
+            Err(ConfigStoreError::ValueTooLarge) => return Err(ConfigStoreError::ValueTooLarge),
+            Err(_error) => {
                 log::warn!(
                     target: BOOT_LOG_TARGET,
-                    "config store for id `{}` could not be loaded from {}: {}; \
-                     dropping this id from the registry",
-                    id,
-                    AxumConfigStore::local_path(id).display(),
-                    err
+                    "config snapshot unavailable; retaining a failed declared binding"
                 );
-                continue;
+                ConfigStoreHandle::failed_open(ConfigStoreOpenFailure::Unavailable)
             }
         };
         by_id.insert(
             (*id).to_owned(),
             ConfigStoreBinding {
-                handle: ConfigStoreHandle::new(Arc::new(store)),
+                handle,
                 default_key: env.store_key("config", id),
             },
         );
     }
     let default_id = meta.default.to_owned();
-    if !by_id.contains_key(&default_id) {
-        log::warn!(
-            target: BOOT_LOG_TARGET,
-            "config registry default id `{default_id}` failed to load; dropping the config registry — \
-             handlers will see no config store"
-        );
-    }
-    StoreRegistry::from_parts(by_id, default_id)
+    log::info!("[edgezero] axum config snapshot resident charge: {resident} bytes");
+    Ok(StoreRegistry::from_parts(by_id, default_id))
 }
 
 /// Build the per-request secret registry. Axum is `Single` for secrets — every
@@ -657,6 +682,7 @@ pub(crate) fn resolve_addr(env: &EnvConfig) -> addr::BindAddrResolution {
 mod tests {
     use super::*;
     use edgezero_core::error::EdgeError;
+    use futures::executor::block_on;
     use log::LevelFilter;
     use std::env;
     use std::net::{IpAddr, Ipv4Addr};
@@ -1085,7 +1111,9 @@ mod tests {
             default: "app_config",
             ids: &["app_config"],
         };
-        let registry = build_config_registry(Some(meta), &env).expect("registry built");
+        let registry = build_config_registry(Some(meta), &env, ConfigStoreLimits::default())
+            .expect("load")
+            .expect("registry built");
         let binding = registry.named("app_config").expect("binding registered");
         assert_eq!(binding.default_key, "app_config_staging");
     }
@@ -1098,9 +1126,101 @@ mod tests {
             default: "app_config",
             ids: &["app_config"],
         };
-        let registry = build_config_registry(Some(meta), &env).expect("registry built");
+        let registry = build_config_registry(Some(meta), &env, ConfigStoreLimits::default())
+            .expect("load")
+            .expect("registry built");
         let binding = registry.named("app_config").expect("binding registered");
         assert_eq!(binding.default_key, "app_config");
+    }
+
+    #[test]
+    fn malformed_declared_snapshot_is_not_an_absent_binding() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("config.json");
+        fs::write(&path, "credential=private invalid JSON").expect("fixture");
+        let meta = StoreMetadata {
+            default: "config",
+            ids: &["config"],
+        };
+        let registry = build_config_registry_at(
+            Some(meta),
+            &EnvConfig::default(),
+            ConfigStoreLimits::default(),
+            |_id| path.clone(),
+        )
+        .expect("failed binding")
+        .expect("registry");
+        let binding = registry.named("config").expect("declared binding survives");
+        let error = block_on(binding.handle.get("key")).expect_err("unavailable, not absent");
+        assert!(matches!(error, ConfigStoreError::Unavailable { .. }));
+        assert!(!error.to_string().contains("credential=private"));
+    }
+
+    #[test]
+    fn aggregate_snapshot_overflow_fails_startup_and_retry_recovers() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("config.json");
+        fs::write(&path, serde_json::json!({"k": "v"}).to_string()).expect("fixture");
+        let limits = ConfigStoreLimits::new(128, 1, 1, 1, 4096, 8192).expect("limits");
+        let charge = AxumConfigStore::from_path(&path, limits)
+            .expect("snapshot")
+            .resident_allocation_bytes();
+        let capped = ConfigStoreLimits::new(
+            128,
+            1,
+            1,
+            1,
+            charge.saturating_mul(2).saturating_sub(1),
+            8192,
+        )
+        .expect("limits");
+        let meta = StoreMetadata {
+            default: "first",
+            ids: &["first", "second"],
+        };
+        assert!(matches!(
+            build_config_registry_at(Some(meta), &EnvConfig::default(), capped, |_id| path
+                .clone()),
+            Err(ConfigStoreError::ValueTooLarge)
+        ));
+        let registry = build_config_registry_at(Some(meta), &EnvConfig::default(), limits, |_id| {
+            path.clone()
+        })
+        .expect("retry")
+        .expect("registry");
+        assert!(registry.named("first").is_some());
+        assert!(registry.named("second").is_some());
+    }
+
+    #[test]
+    fn invalid_config_registry_metadata_fails_without_opening_stores() {
+        for meta in [
+            StoreMetadata {
+                default: "first",
+                ids: &[],
+            },
+            StoreMetadata {
+                default: "absent",
+                ids: &["first"],
+            },
+            StoreMetadata {
+                default: "first",
+                ids: &["first", "first"],
+            },
+            StoreMetadata {
+                default: "bad/id",
+                ids: &["bad/id"],
+            },
+        ] {
+            let error = build_config_registry_at(
+                Some(meta),
+                &EnvConfig::default(),
+                ConfigStoreLimits::default(),
+                |_id| panic!("must not open invalid metadata"),
+            )
+            .expect_err("invalid metadata");
+            assert!(matches!(error, ConfigStoreError::Internal { .. }));
+        }
     }
 }
 
@@ -1120,6 +1240,7 @@ mod bounded_ingress_tests {
     use edgezero_core::ingress::{AdmissionDecision, IngressGrant};
     use edgezero_core::response_egress::{ResponseEgressCompletion, ResponseEgressOutcome};
     use edgezero_core::router::RouterService;
+    use edgezero_core::{Deadline, MonotonicClock, MonotonicInstant, ResponseEgressPolicy};
     use futures_util::stream::poll_fn;
     use std::task::Poll;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1138,6 +1259,14 @@ mod bounded_ingress_tests {
     }
 
     struct DropProbe(Arc<AtomicUsize>);
+
+    #[derive(Clone, Default)]
+    struct EgressProbes {
+        completions: Arc<AtomicUsize>,
+        polls: Arc<AtomicUsize>,
+        resources: Arc<AtomicUsize>,
+        sources: Arc<AtomicUsize>,
+    }
 
     impl Drop for DropProbe {
         fn drop(&mut self) {
@@ -1179,6 +1308,151 @@ mod bounded_ingress_tests {
             assert_eq!(&body, b"ok");
         };
         timeout(Duration::from_secs(2), read).await.unwrap();
+    }
+
+    fn stalled_egress_app(
+        ready: bool,
+        expected: ResponseEgressOutcome,
+        probes: &EgressProbes,
+    ) -> App {
+        let sources = Arc::clone(&probes.sources);
+        let polls = Arc::clone(&probes.polls);
+        let chunk = Bytes::from(vec![b'a'; 0x0004_0000]);
+        let router = RouterService::builder()
+            .get("/", |_| async { Ok::<_, EdgeError>("ok") })
+            .get("/slow", move |_| {
+                let source = DropProbe(Arc::clone(&sources));
+                let observed_polls = Arc::clone(&polls);
+                let payload = chunk.clone();
+                async move {
+                    let body = poll_fn(move |_cx| {
+                        let _keep_alive = &source;
+                        let polled = observed_polls.fetch_add(1, Ordering::SeqCst);
+                        if ready || polled == 0 {
+                            Poll::Ready(Some(Ok(payload.clone())))
+                        } else {
+                            Poll::Pending
+                        }
+                    });
+                    Ok::<_, EdgeError>(
+                        response_builder()
+                            .body(Body::from_stream(body))
+                            .expect("response"),
+                    )
+                }
+            })
+            .build();
+        let mut app = App::new(router);
+        let frozen = MonotonicInstant::now();
+        app.set_monotonic_clock(MonotonicClock::new(move || frozen));
+        let budget = if expected == ResponseEgressOutcome::TransportError {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_millis(100)
+        };
+        app.set_response_egress_policy(move |_, started| ResponseEgressPolicy {
+            write_deadline: Deadline::at_instant(started.checked_add(budget).expect("deadline")),
+        });
+        let completions = Arc::clone(&probes.completions);
+        let resources = Arc::clone(&probes.resources);
+        app.set_ingress_admission_policy(move |head| {
+            let completion = if head.target().path() == "/slow" {
+                ResponseEgressCompletion::new({
+                    let callback = Arc::clone(&completions);
+                    let resource = DropProbe(Arc::clone(&resources));
+                    move |report| {
+                        assert_eq!(report.outcome, expected);
+                        callback.fetch_add(1, Ordering::SeqCst);
+                        drop(resource);
+                    }
+                })
+            } else {
+                ResponseEgressCompletion::empty()
+            };
+            AdmissionDecision::Admit {
+                completion,
+                grant: IngressGrant::empty(),
+                read_deadline: head.read_deadline_after(Duration::from_secs(1)),
+            }
+        });
+        app
+    }
+
+    #[tokio::test]
+    async fn stalled_egress_termination_releases_capacity_and_recovers() {
+        for (ready, disconnect) in [(false, true), (false, false), (true, false)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+            let address = listener.local_addr().expect("address");
+            let probes = EgressProbes::default();
+            let expected = if disconnect {
+                ResponseEgressOutcome::TransportError
+            } else {
+                ResponseEgressOutcome::DeadlineExceeded
+            };
+            let app = stalled_egress_app(ready, expected, &probes);
+            let task = tokio::spawn(super::serve_with_stores(
+                app,
+                listener,
+                false,
+                AxumIngressConfig::new(1, 8192, 100, Duration::from_secs(5)).expect("ingress"),
+                super::Stores::default(),
+            ));
+            let mut client = TcpStream::connect(address).await.expect("client");
+            client
+                .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .expect("request");
+            timeout(Duration::from_secs(2), async {
+                while probes.polls.load(Ordering::SeqCst) < 2 {
+                    yield_now().await;
+                }
+            })
+            .await
+            .expect("producer is live");
+            if disconnect {
+                drop(client);
+            }
+            timeout(Duration::from_secs(2), async {
+                while probes.completions.load(Ordering::SeqCst) != 1 {
+                    yield_now().await;
+                }
+            })
+            .await
+            .expect("terminal callback");
+            assert_eq!(probes.resources.load(Ordering::SeqCst), 1);
+            assert_eq!(probes.sources.load(Ordering::SeqCst), 1);
+            let stopped = probes.polls.load(Ordering::SeqCst);
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    let mut recovered = TcpStream::connect(address)
+                        .await
+                        .expect("recovery connection");
+                    if recovered
+                        .write_all(
+                            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        let mut wire = Vec::new();
+                        if recovered.read_to_end(&mut wire).await.is_ok() && wire.ends_with(b"ok") {
+                            break;
+                        }
+                    }
+                    yield_now().await;
+                }
+            })
+            .await
+            .expect("capacity recovery");
+            assert_eq!(
+                probes.polls.load(Ordering::SeqCst),
+                stopped,
+                "terminated sources must stop"
+            );
+            assert_eq!(probes.completions.load(Ordering::SeqCst), 1);
+            task.abort();
+            let _shutdown = task.await;
+        }
     }
 
     async fn start(connections: usize, milliseconds: u64, count: usize) -> Server {
