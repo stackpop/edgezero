@@ -132,7 +132,8 @@ def verify_pulled(layout, inspection, platform, reference):
     return info
 
 
-def scan_policy(report, exceptions, manifest_digest, today=None):
+def scan_policy(report, exceptions, manifest_digest, today=None, *, policy='strict'):
+    require(policy in ('strict', 'report-only'), 'Invalid scan policy')
     today = today or datetime.datetime.now(datetime.timezone.utc).date()
     require(report.get('SchemaVersion') == 2 and isinstance(report.get('Results'), list) and report['Results'], 'Missing Trivy results')
     require(isinstance(exceptions, list), 'Exceptions must be a list')
@@ -146,12 +147,20 @@ def scan_policy(report, exceptions, manifest_digest, today=None):
         key = (entry['manifest_digest'], entry['vulnerability'], entry['package'])
         require(key not in allowed, 'Duplicate scan exception')
         allowed.add(key)
+    counts = {'HIGH': 0, 'CRITICAL': 0}
+    fixable = 0
     for result in report['Results']:
         for finding in result.get('Vulnerabilities') or []:
             require(finding['Severity'] in ('UNKNOWN', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'), 'Invalid vulnerability severity')
-            if finding['Severity'] in ('HIGH', 'CRITICAL'):
+            if finding['Severity'] in counts:
                 key = (manifest_digest, finding['VulnerabilityID'], finding['PkgName'])
-                require(key in allowed, f'Blocked {finding["Severity"]} vulnerability: {finding["VulnerabilityID"]} in {finding["PkgName"]}')
+                counts[finding['Severity']] += 1
+                fixable += bool(finding.get('FixedVersion'))
+                if policy == 'strict':
+                    require(key in allowed, f'Blocked {finding["Severity"]} vulnerability: {finding["VulnerabilityID"]} in {finding["PkgName"]}')
+    if policy == 'report-only':
+        print(f'WARNING: report-only scan: {counts["HIGH"]} HIGH, {counts["CRITICAL"]} CRITICAL package findings, '
+              f'{fixable} with fixes. Packaging evidence only; not approved for release.', file=sys.stderr)
 
 
 def seal(bundle, revision, run_id, platform):
@@ -182,7 +191,7 @@ def check_inputs(inputs, revision, run_id):
             re.fullmatch(r'[^\s@]+@sha256:[0-9a-f]{64}', base) for base in bases), 'Pinned base trace missing')
 
 
-def verify(bundle, revision, run_id, platform, exceptions):
+def verify(bundle, revision, run_id, platform, exceptions, *, policy='strict'):
     receipt = load(bundle / 'receipt.json')
     require(receipt['schema'] == 1 and receipt['checks'] == 'packaging-passed', 'Acceptance missing')
     require(receipt['revision'] == revision and receipt['run_id'] == run_id, 'Unauthorized source/run')
@@ -215,7 +224,7 @@ def verify(bundle, revision, run_id, platform, exceptions):
             'Supported OS scan missing')
     require(all(r.get('Class') in ('os-pkgs', 'lang-pkgs') and r.get('Target') for r in report['Results']),
             'Incomplete supported scan results')
-    scan_policy(report, exceptions, info['manifest_digest'])
+    scan_policy(report, exceptions, info['manifest_digest'], policy=policy)
     sbom = load(bundle / 'sbom.json')
     require(sbom.get('bomFormat') == 'CycloneDX' and sbom.get('components'), 'SBOM missing')
     properties = sbom.get('metadata', {}).get('component', {}).get('properties', [])
@@ -348,11 +357,13 @@ def main():
         child.add_argument('--platform', required=True, choices=sorted(PLATFORMS))
         if command == 'verify':
             child.add_argument('--exceptions', type=pathlib.Path)
+            child.add_argument('--scan-policy', choices=('strict', 'report-only'), default='strict')
     index = sub.add_parser('index')
     index.add_argument('bundles', nargs=2, type=pathlib.Path)
     index.add_argument('--revision', required=True)
     index.add_argument('--run-id', required=True)
     index.add_argument('--exceptions', type=pathlib.Path)
+    index.add_argument('--scan-policy', choices=('strict', 'report-only'), default='strict')
     pulled = sub.add_parser('pulled')
     pulled.add_argument('layout', type=pathlib.Path)
     pulled.add_argument('inspection', type=pathlib.Path)
@@ -395,12 +406,12 @@ def main():
             result = seal(args.bundle, args.revision, args.run_id, args.platform)
         elif args.command == 'verify':
             exceptions = load(args.exceptions) if args.exceptions else []
-            result = verify(args.bundle, args.revision, args.run_id, args.platform, exceptions)
+            result = verify(args.bundle, args.revision, args.run_id, args.platform, exceptions, policy=args.scan_policy)
         elif args.command == 'pulled':
             result = verify_pulled(args.layout, load(args.inspection), args.platform, args.reference)
         else:
             exceptions = load(args.exceptions) if args.exceptions else []
-            result = runtime_index([verify(bundle, args.revision, args.run_id, platform, exceptions)
+            result = runtime_index([verify(bundle, args.revision, args.run_id, platform, exceptions, policy=args.scan_policy)
                                     for bundle, platform in zip(args.bundles, ('linux/amd64', 'linux/arm64'))])
         print(json.dumps(result, indent=2))
     except (ValueError, KeyError, TypeError, IndexError, OSError, tarfile.TarError, subprocess.CalledProcessError) as error:

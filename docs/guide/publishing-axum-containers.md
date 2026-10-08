@@ -10,6 +10,9 @@ production readiness, storage recovery or graceful shutdown.
 The repository's `.github/workflows/axum-container.yml` prepares one generated
 application and one application lockfile. Separate ephemeral Ubuntu amd64 and
 arm64 runners build native GNU images. Neither uses QEMU as acceptance evidence.
+Framework CI validates packaging and artifact integrity, and retains vulnerability
+reports without treating the fixture as an approved application release. The
+application-owned publisher separately enforces its strict vulnerability policy.
 
 ```mermaid
 flowchart TD
@@ -170,13 +173,26 @@ Because selection binds the run attempt, rerun all preparation/native jobs for a
 new attempt. The recipe does not mix a successful old platform with a new retry
 or discover a prior successful run automatically.
 
-## Scanner policy and current blocker
+## Scanner policies
 
 Trivy scans the verified OCI layout, which came directly from the retained
-archive. The verifier requires a nonempty supported report with matching image
-config identity and a manifest-bound scanner record. High and Critical findings
-block acceptance, including findings without a fix. It does not use
-`--ignore-unfixed` or an unreviewed ignore file.
+archive. Both policies require a nonempty supported report with matching image
+config and filesystem identities, plus a manifest-bound scanner record. Scan
+execution errors, malformed reports and artifact-integrity failures still block.
+
+Framework packaging CI sets `SCAN_POLICY=report-only` for its native build and
+credential-free handoff jobs. The helpers retain the complete report and warn
+with High/Critical counts and how many findings have available fixes. Those
+findings do not block packaging validation or the disposable localhost index
+check. A passing framework job does not approve an image for application release.
+The verifier's `verify` and `index` commands accept `--scan-policy report-only`;
+policy comes from the caller, never from a bundle's receipt or scan metadata.
+
+The default is `strict`. The application release workflow and `release-record`
+always use strict verification. High and Critical findings block release,
+including findings without a fix. The publishing helper rejects report-only
+policy for GHCR before any publication; only its disposable loopback destination
+permits it. Neither policy uses `--ignore-unfixed` or an unreviewed ignore file.
 
 Exceptions must come from an independently trusted, owner-reviewed policy file,
 not the artifact. Each entry requires `manifest_digest`, `vulnerability`,
@@ -187,14 +203,19 @@ no automatic waiver path. Review the exact existing candidate bytes and an
 explicit approval path before adapting the workflow for an exception. Do not
 rebuild a waived image and assume the old digest exemption still applies.
 
-The October 7, 2026 local scan of the current Debian recipe reported 55 High and
-4 Critical findings. The strict policy blocks that candidate. No exceptions have
-been authorized. Image remediation or explicit scoped risk decisions are still
-needed. The image scan found no language-specific files; its SBOM is not a claim
+The October 7, 2026 scan before the runtime package update reported 55 High and
+4 Critical package findings across 20 CVEs on each architecture. Eight findings
+had available fixes. The runtime recipe now upgrades inherited Bookworm packages
+as well as installing required libraries. A native amd64 scan after this update
+reported 50 High and 1 Critical finding, none with an available fix. Strict
+verification still rejected that same image. No exceptions have been authorized,
+and report-only packaging results do not waive the release policy. The image
+scan found no language-specific files; its SBOM is not a claim
 that every statically linked Rust dependency was independently analyzed.
 
-Native arm64 runner execution, accepted artifact import/index assembly in hosted
-CI and one separately authorized disposable GHCR publish/attestation verification
-remain execution gates. Keep [#399](https://github.com/stackpop/edgezero/issues/399)
-open until those acceptance checks pass. Production runtime and deployment gates
-are described in [Deploying Axum containers](./deploying-axum-containers.md).
+Both hosted native jobs passed packaging and Compose checks on October 7.
+Hosted artifact import/index assembly under the packaging policy and one separately
+authorized disposable GHCR publish/attestation verification still need execution
+evidence. Keep [#399](https://github.com/stackpop/edgezero/issues/399) open until
+those acceptance checks pass. Production runtime and deployment gates are
+described in [Deploying Axum containers](./deploying-axum-containers.md).

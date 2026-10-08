@@ -1019,6 +1019,14 @@ mod tests {
                 assert!(dockerfile.contains("ARG RUST_VERSION=1.95.0"));
                 assert!(dockerfile.contains("-p my-app-adapter-axum --bin my-app-adapter-axum"));
                 assert!(dockerfile.contains("--release --locked"));
+                let runtime = dockerfile
+                    .split(" AS runtime\n")
+                    .nth(1)
+                    .expect("runtime stage");
+                assert!(runtime.contains("apt-get upgrade -y --no-install-recommends"));
+                assert!(runtime.contains(
+                    "apt-get install -y --no-install-recommends ca-certificates libgcc-s1"
+                ));
                 assert!(dockerfile.contains("USER 10001:10001"));
                 assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/app\"]"));
                 assert!(dockerfile.contains("EDGEZERO__ADAPTER__HOST=0.0.0.0"));

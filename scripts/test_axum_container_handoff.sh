@@ -11,6 +11,9 @@ VERIFY="$ROOT/examples/container-publishing/verify_artifacts.py"
 MODE="${1:?build or import}"; INPUT="${2:?input directory}"; OUTPUT="${3:?new output directory}"
 PLATFORM="${4:?linux/amd64 or linux/arm64}"; REVISION="${5:?source SHA}"; RUN_ID="${6:?run identity}"
 [[ $# -eq 6 && ( "$MODE" == build || "$MODE" == import ) ]] || { echo 'Invalid handoff arguments' >&2; exit 2; }
+# Framework packaging CI may retain scan evidence without approving a release.
+SCAN_POLICY="${SCAN_POLICY:-strict}"
+[[ "$SCAN_POLICY" == strict || "$SCAN_POLICY" == report-only ]] || { echo 'Invalid scan policy' >&2; exit 2; }
 [[ "$PLATFORM" == linux/amd64 || "$PLATFORM" == linux/arm64 ]] || { echo 'Unsupported platform' >&2; exit 2; }
 if [[ "$MODE" == build ]]; then
   case "$(docker info --format '{{.Architecture}}')" in
@@ -20,7 +23,7 @@ if [[ "$MODE" == build ]]; then
   esac
   [[ "$PLATFORM" == "$HOST_PLATFORM" ]] || { echo 'Native build required; emulation is not acceptance' >&2; exit 2; }
 fi
-VERIFY_ARGS=()
+VERIFY_ARGS=(--scan-policy "$SCAN_POLICY")
 if [[ -n "${SCAN_EXCEPTIONS:-}" ]]; then VERIFY_ARGS+=(--exceptions "$SCAN_EXCEPTIONS"); fi
 [[ ! -e "$OUTPUT" ]] || { echo 'Output must not exist' >&2; exit 2; }
 INPUT="$(cd "$INPUT" && pwd)"

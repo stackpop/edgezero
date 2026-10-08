@@ -68,6 +68,9 @@ jobs:
   native:
     needs: prepare
     timeout-minutes: 30
+    # Framework packaging evidence is not application release approval.
+    env:
+      SCAN_POLICY: report-only
     strategy:
       fail-fast: false
       matrix:
@@ -131,6 +134,8 @@ jobs:
     needs: native
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      SCAN_POLICY: report-only
     permissions:
       contents: read
       actions: read

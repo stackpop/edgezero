@@ -1,3 +1,4 @@
+import contextlib
 import gzip
 import hashlib
 import importlib.util
@@ -254,6 +255,15 @@ class Artifacts(unittest.TestCase):
         record = v.release_record(source, bundles, metadata, revision, '123-1', [])
         self.assertEqual(record['source']['lock_sha256'], v.checksum(source / 'Cargo.lock'))
         self.assertEqual(len(record['children']), 2)
+        report = v.load(bundles[0] / 'scan.json')
+        report['Results'][0]['Vulnerabilities'] = [{'Severity': 'HIGH', 'VulnerabilityID': 'CVE-test',
+                                                   'PkgName': 'lib-test', 'FixedVersion': ''}]
+        put_json(bundles[0] / 'scan.json', report)
+        v.seal(bundles[0], revision, '123-1', 'linux/amd64')
+        with self.assertRaisesRegex(ValueError, 'Blocked HIGH'):
+            v.release_record(source, bundles, metadata, revision, '123-1', [])
+        report['Results'][0]['Vulnerabilities'] = []
+        put_json(bundles[0] / 'scan.json', report)
         inputs = v.load(bundles[0] / 'inputs.json')
         inputs['lock_sha256'] = 'f' * 64
         put_json(bundles[0] / 'inputs.json', inputs)
@@ -333,6 +343,91 @@ class Artifacts(unittest.TestCase):
             v.scan_policy(report, [dict(exception, manifest_digest='sha256:' + 'd' * 64)], self.image['digest'])
         with self.assertRaises(ValueError):
             v.scan_policy({}, [], self.image['digest'])
+
+    def test_report_only_scan_does_not_approve_release(self):
+        report = v.load(self.root / 'scan.json')
+        report['Results'][0]['Vulnerabilities'] = [
+            {'Severity': severity, 'VulnerabilityID': 'CVE-' + severity,
+             'PkgName': 'lib-test', 'FixedVersion': fixed}
+            for severity, fixed in [('HIGH', ''), ('CRITICAL', '2.0')]
+        ]
+        put_json(self.root / 'scan.json', report)
+        receipt = self.seal()
+        with contextlib.redirect_stderr(io.StringIO()) as warnings:
+            self.assertEqual(v.verify(self.root, REV, '123-1', 'linux/amd64', [], policy='report-only'), receipt)
+        self.assertIn('not approved for release', warnings.getvalue())
+        with self.assertRaisesRegex(ValueError, 'Blocked HIGH'):
+            self.verify()
+        command = ['python3', str(SPEC.origin), 'verify', str(self.root), '--revision', REV,
+                   '--run-id', '123-1', '--platform', 'linux/amd64']
+        self.assertNotEqual(subprocess.run(command, env=dict(os.environ, SCAN_POLICY='report-only'),
+                                           capture_output=True).returncode, 0)
+        result = subprocess.run(command + ['--scan-policy', 'report-only'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), receipt)
+        arm = self.root / 'arm'
+        arm.mkdir()
+        fixture(arm, 'arm64')
+        v.seal(arm, REV, '123-1', 'linux/arm64')
+        index = ['python3', str(SPEC.origin), 'index', str(self.root), str(arm), '--revision', REV, '--run-id', '123-1']
+        self.assertNotEqual(subprocess.run(index, capture_output=True).returncode, 0)
+        self.assertEqual(subprocess.run(index + ['--scan-policy', 'report-only'], capture_output=True).returncode, 0)
+        release = ['python3', str(SPEC.origin), 'release-record', str(self.root), str(self.root), str(arm),
+                   str(self.root / 'metadata.json'), '--revision', REV, '--run-id', '123-1',
+                   '--scan-policy', 'report-only']
+        self.assertIn('unrecognized arguments', subprocess.run(release, capture_output=True, text=True).stderr)
+
+    def test_report_only_preserves_scan_validation(self):
+        original = v.load(self.root / 'scan.json')
+        for change in ({'Results': []}, {'SchemaVersion': 1},
+                       {'Metadata': dict(original['Metadata'], ImageID='sha256:' + 'f' * 64)},
+                       {'Metadata': dict(original['Metadata'], DiffIDs=[])},
+                       {'Results': [{'Class': 'unsupported', 'Target': 'fixture'}]},
+                       {'Results': [dict(original['Results'][0], Vulnerabilities=[{
+                           'Severity': 'INVALID', 'VulnerabilityID': 'CVE-test', 'PkgName': 'lib-test'}])]}):
+            with self.subTest(change=change):
+                put_json(self.root / 'scan.json', dict(original, **change))
+                self.seal()
+                with self.assertRaises(ValueError):
+                    v.verify(self.root, REV, '123-1', 'linux/amd64', [], policy='report-only')
+        for severity in ('HIGH', 'CRITICAL'):
+            for missing in ('VulnerabilityID', 'PkgName'):
+                finding = {'Severity': severity, 'VulnerabilityID': 'CVE-test', 'PkgName': 'lib-test'}
+                del finding[missing]
+                report = dict(original, Results=[dict(original['Results'][0], Vulnerabilities=[finding])])
+                put_json(self.root / 'scan.json', report)
+                self.seal()
+                with self.subTest(severity=severity, missing=missing), self.assertRaises(KeyError):
+                    v.verify(self.root, REV, '123-1', 'linux/amd64', [], policy='report-only')
+                result = subprocess.run(['python3', str(SPEC.origin), 'verify', str(self.root), '--revision', REV,
+                                         '--run-id', '123-1', '--platform', 'linux/amd64', '--scan-policy', 'report-only'],
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+        with self.assertRaisesRegex(ValueError, 'Invalid scan policy'):
+            v.scan_policy(original, [], self.image['digest'], policy='typo')
+        with self.assertRaisesRegex(ValueError, 'Expired scan exception'):
+            v.scan_policy(original, [{'manifest_digest': self.image['digest'], 'vulnerability': 'CVE-test',
+                                     'package': 'lib-test', 'owner': 'operator', 'reason': 'reviewed risk',
+                                     'expires': '2000-01-01'}], self.image['digest'], policy='report-only')
+
+    def test_ghcr_publication_rejects_report_only_before_side_effects(self):
+        output = self.root / 'published'
+        command = ['bash', str(ROOT / 'examples/container-publishing/publish.sh'), 'ghcr.io/owner/app', 'v1.0.0',
+                   str(self.root), str(self.root), str(output), REV, '123-1']
+        result = subprocess.run(command, env=dict(os.environ, SCAN_POLICY='report-only'), capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('GHCR publication requires strict scan policy', result.stderr)
+        self.assertFalse(output.exists())
+        for script, arguments in (
+                (ROOT / 'examples/container-publishing/publish.sh', command[2:]),
+                (ROOT / 'scripts/test_axum_container_handoff.sh',
+                 ['build', str(self.root), str(output), 'linux/amd64', REV, '123-1'])):
+            result = subprocess.run(['bash', str(script), *arguments], env=dict(os.environ, SCAN_POLICY='typo'),
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Invalid scan policy', result.stderr)
+            self.assertFalse(output.exists())
 
     def test_smoke_borrowed_image_not_built_or_deleted(self):
         app = self.root / 'app'

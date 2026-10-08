@@ -19,22 +19,28 @@ elif [[ ! "$REPO" =~ ^ghcr\.io/[a-z0-9_.-]+/[a-z0-9_.-]+$ ]]; then
 elif [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
   echo 'GHCR publication requires a version tag, not a reserved alias' >&2; exit 2
 fi
+SCAN_POLICY="${SCAN_POLICY:-strict}"
+[[ "$SCAN_POLICY" == strict || "$SCAN_POLICY" == report-only ]] || { echo 'Invalid scan policy' >&2; exit 2; }
+# Report-only evidence may exercise a disposable loopback index, never GHCR.
+if ! "$LOCAL" && [[ "$SCAN_POLICY" != strict ]]; then
+  echo 'GHCR publication requires strict scan policy' >&2; exit 2
+fi
 [[ ! -e "$OUTPUT" ]] || { echo 'Output must not exist' >&2; exit 2; }
 AMD="$(cd "$AMD" && pwd)"; ARM="$(cd "$ARM" && pwd)"
 mkdir -p "$OUTPUT"
 OUTPUT="$(cd "$OUTPUT" && pwd)"
 WORK="$(mktemp -d -t axum-publisher.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
-EXCEPTIONS=()
-if [[ -n "${SCAN_EXCEPTIONS:-}" ]]; then EXCEPTIONS+=(--exceptions "$SCAN_EXCEPTIONS"); fi
+VERIFY_ARGS=(--scan-policy "$SCAN_POLICY")
+if [[ -n "${SCAN_EXCEPTIONS:-}" ]]; then VERIFY_ARGS+=(--exceptions "$SCAN_EXCEPTIONS"); fi
 python3 "$HERE/verify_artifacts.py" verify "$AMD" --revision "$REVISION" --run-id "$RUN_ID" \
-  --platform linux/amd64 "${EXCEPTIONS[@]}" > "$OUTPUT/amd64.json"
+  --platform linux/amd64 "${VERIFY_ARGS[@]}" > "$OUTPUT/amd64.json"
 python3 "$HERE/verify_artifacts.py" verify "$ARM" --revision "$REVISION" --run-id "$RUN_ID" \
-  --platform linux/arm64 "${EXCEPTIONS[@]}" > "$OUTPUT/arm64.json"
+  --platform linux/arm64 "${VERIFY_ARGS[@]}" > "$OUTPUT/arm64.json"
 python3 "$HERE/verify_artifacts.py" extract "$AMD/image.tar" "$WORK/amd64" --platform linux/amd64 >/dev/null
 python3 "$HERE/verify_artifacts.py" extract "$ARM/image.tar" "$WORK/arm64" --platform linux/arm64 >/dev/null
 python3 "$HERE/verify_artifacts.py" index "$AMD" "$ARM" --revision "$REVISION" --run-id "$RUN_ID" \
-  "${EXCEPTIONS[@]}" > "$OUTPUT/index.json"
+  "${VERIFY_ARGS[@]}" > "$OUTPUT/index.json"
 python3 - "$WORK" "$OUTPUT" <<'PY'
 import hashlib, json, pathlib, shutil, sys
 work, output = map(pathlib.Path, sys.argv[1:])
