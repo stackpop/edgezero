@@ -404,6 +404,15 @@ class Artifacts(unittest.TestCase):
                                         capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, '')
+        for severity in ('HIGH', 'CRITICAL'):
+            for field in ('VulnerabilityID', 'PkgName'):
+                for invalid in (None, '', ' ', []):
+                    finding = {'Severity': severity, 'VulnerabilityID': 'CVE-test', 'PkgName': 'lib-test', field: invalid}
+                    report = dict(original, Results=[dict(original['Results'][0], Vulnerabilities=[finding])])
+                    with self.subTest(severity=severity, field=field, invalid=invalid):
+                        for policy in ('strict', 'report-only'):
+                            with self.assertRaisesRegex(ValueError, 'Invalid vulnerability/package identity'):
+                                v.scan_policy(report, [], self.image['digest'], policy=policy)
         with self.assertRaisesRegex(ValueError, 'Invalid scan policy'):
             v.scan_policy(original, [], self.image['digest'], policy='typo')
         with self.assertRaisesRegex(ValueError, 'Expired scan exception'):

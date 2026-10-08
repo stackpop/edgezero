@@ -213,9 +213,12 @@ and report-only packaging results do not waive the release policy. The image
 scan found no language-specific files; its SBOM is not a claim
 that every statically linked Rust dependency was independently analyzed.
 
-Both hosted native jobs passed packaging and Compose checks on October 7.
-Hosted artifact import/index assembly under the packaging policy and one separately
-authorized disposable GHCR publish/attestation verification still need execution
-evidence. Keep [#399](https://github.com/stackpop/edgezero/issues/399) open until
-those acceptance checks pass. Production runtime and deployment gates are
+Both hosted native jobs passed packaging and Compose checks on October 7. The
+[follow-up CI run](https://github.com/stackpop/edgezero/actions/runs/37706921831)
+also passed native amd64/arm64 builds, transferred artifact imports and localhost
+index assembly under the packaging policy. Both scans reported 50 High and
+1 Critical finding, with no available fixes. One separately authorized disposable
+GHCR publish/attestation verification still needs execution evidence. Keep
+[#399](https://github.com/stackpop/edgezero/issues/399) open until that acceptance
+check passes. Production runtime and deployment gates are
 described in [Deploying Axum containers](./deploying-axum-containers.md).

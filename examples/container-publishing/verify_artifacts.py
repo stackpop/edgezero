@@ -153,6 +153,8 @@ def scan_policy(report, exceptions, manifest_digest, today=None, *, policy='stri
         for finding in result.get('Vulnerabilities') or []:
             require(finding['Severity'] in ('UNKNOWN', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'), 'Invalid vulnerability severity')
             if finding['Severity'] in counts:
+                require(all(isinstance(finding[field], str) and finding[field].strip()
+                            for field in ('VulnerabilityID', 'PkgName')), 'Invalid vulnerability/package identity')
                 key = (manifest_digest, finding['VulnerabilityID'], finding['PkgName'])
                 counts[finding['Severity']] += 1
                 fixable += bool(finding.get('FixedVersion'))
