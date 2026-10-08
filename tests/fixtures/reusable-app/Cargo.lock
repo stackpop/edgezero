@@ -523,6 +523,7 @@ dependencies = [
  "axum",
  "bytes",
  "edgezero-core",
+ "edgezero-store-aws",
  "futures",
  "futures-util",
  "http",
@@ -538,6 +539,7 @@ dependencies = [
  "simple_logger",
  "thiserror 2.0.20",
  "tokio",
+ "toml",
  "tower",
  "tracing",
 ]
@@ -661,6 +663,16 @@ dependencies = [
  "syn 3.0.3",
  "toml",
  "validator",
+]
+
+[[package]]
+name = "edgezero-store-aws"
+version = "0.1.0"
+dependencies = [
+ "percent-encoding",
+ "serde",
+ "thiserror 2.0.20",
+ "url",
 ]
 
 [[package]]

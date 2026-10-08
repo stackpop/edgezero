@@ -315,27 +315,37 @@ The database file grows over time and does not shrink after deletions. To reclai
 space, delete the file in `.edgezero/`; the data is lost. See [KV Storage](/guide/kv)
 for the portable API.
 
-## Secret Store
+## Native store providers
 
-A declared `[stores.secrets]` id resolves to an `EnvSecretStore`, which looks up each
-secret name verbatim in the process environment. Axum lists `secrets` in its
-`single_store_kinds`, so only one secrets id may be declared:
+Axum keeps the existing local defaults, but native applications can select a provider
+per logical store ID. The portable manifest still declares IDs and defaults only. A
+separate, strict native bindings file selects supported providers; it does not change
+store metadata or add AWS dependencies to Fastly, Cloudflare, or Spin builds.
 
-```bash
-API_KEY=mysecret edgezero serve --adapter axum
-```
+Without a bindings file, config uses local `.edgezero/local-config-<id>.json`
+snapshots, secrets use environment variables, and KV uses the existing local backend.
+With explicit AWS bindings, the runner fetches mapped values before its initializer
+and before it accepts requests. It does not fall back to a local provider when an AWS
+lookup or preparation fails. See the [native AWS stores guide](../native-aws-stores.md)
+for the schema, feature selection, permissions, and lifecycle limits.
 
-## Config Store
+The native binding file path must be absolute. `EDGEZERO__STORE_BINDINGS_FILE` is
+read only by the environment-loading runner. Explicit `AxumRunOptions` selection
+uses only values supplied in code. Programmatic applications may also inject existing
+handles or deferred setup through `run_app_with_native_stores`; deferred setup is
+polled after source validation, in the current native runtime. Its construction must
+not perform provider work.
 
-For local development, each declared `[stores.config]` id resolves to a
-local-file config store backed by `.edgezero/local-config-<id>.json`.
-The standard runner loads immutable snapshots before binding its listener.
-Missing files create empty declared stores. Malformed files retain typed failing
-bindings, while allocation-limit violations fail startup. Changes made by `config
-push` take effect after restart, not on the next request.
-The portable manifest carries no inline defaults — the
-pre-rewrite `[stores.config.defaults]` table is gone (see
-[the migration guide](../manifest-store-migration.md)).
+A declared `[stores.secrets]` ID still defaults to an environment-backed store when
+not explicitly bound. It is no longer limited to one ID by Axum. Existing
+`EDGEZERO__STORES__SECRETS__<ID>__NAME` and config/KV local overrides retain their
+meaning for implicit local bindings; they cannot override an explicitly bound ID.
+
+`config push --adapter axum` remains a local-file writer. It does not publish to
+AppConfig. If passed an explicit `--store-bindings` file that binds the selected ID
+to AWS, the proposed guard rejects the operation before writing anything. A push
+without that explicit file still only updates the local snapshot file; it does not
+update an AWS-bound deployment.
 
 ```toml
 [stores.config]
@@ -423,6 +433,22 @@ secrets. Kernel buffers, filesystem page cache, allocator fragmentation and tota
 not guaranteed. Local file reads are synchronous; no finite startup I/O interruption is
 claimed. The broad `config-read-allocation-bounds` capability remains `Unsupported`;
 this bounded local config-snapshot path does not certify every secret/provider allocation.
+
+## Optional AWS features
+
+Generated native targets opt into `aws-appconfig-agent` and
+`aws-secrets-manager` independently, or use the `aws-stores` alias for both. These
+features are separate from the CLI binary's own dependencies. A bindings file cannot
+enable a provider that was not compiled into the application. The AWS SDK and service
+clients stay out of default native and WASM target graphs.
+
+The native AWS SDK can emit diagnostic fields at dependency `DEBUG`/`TRACE` levels.
+Those events may include secret ARNs, credential-source metadata, or response details
+when sensitive-body logging is enabled. EdgeZero redacts its own errors and diagnostics,
+but the first version does not suppress dependency events because scoped suppression
+can break an application's tracing-to-log fallback. Do not enable dependency
+`DEBUG`/`TRACE` in production unless the process logging policy has been reviewed.
+This limitation must be disclosed in release and PR review notes.
 
 ## Container Deployment
 

@@ -114,6 +114,16 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --all-targets
 
+      - name: Native store dependency isolation
+        run: bash scripts/check_native_store_dependency_contract.sh
+
+      - name: Native AWS provider and startup contracts (loopback only)
+        run: |
+          cargo test --offline --locked -p edgezero-store-aws --no-default-features --features appconfig-agent --lib
+          cargo test --offline --locked -p edgezero-store-aws --no-default-features --features secrets-manager --lib
+          cargo test --offline --locked -p edgezero-store-aws --all-features --lib
+          scripts/run_test_nonzero.sh production_runner_loads_envelope_and_real_sdk_secret_before_serving_mixed_stores cargo test --offline --locked -p edgezero-adapter-axum --features aws-stores,test-utils --test native_aws_startup
+
       - name: Bundled demo logging contract
         run: scripts/run_test_nonzero.sh demo_respects_off_without_hiding_terminal_errors cargo test --offline --locked -p edgezero-cli --features demo-example --test demo_logging
 
@@ -146,6 +156,11 @@ jobs:
           for adapter in axum cloudflare fastly spin; do
             bash scripts/check_adapter_feature_matrix.sh "${adapter}" native
           done
+
+      - name: Generated native AWS startup (loopback only)
+        env:
+          EDGEZERO_GENERATED_TEST_TARGET_DIR: ${{ github.workspace }}/target
+        run: scripts/run_test_nonzero.sh --ignored generated_cli_build_features_and_native_aws_startup_are_proven_together cargo test --offline --locked -p edgezero-cli --test native_store_generated_proof
 
       - name: Verify a generated project compiles
         run: scripts/run_test_nonzero.sh --ignored generated_workspace_compiles cargo test --offline --locked -p edgezero-cli --test generated_project_builds

@@ -115,6 +115,23 @@ impl AxumConfigStore {
         limits: ConfigStoreLimits,
         existing: usize,
     ) -> Result<Self, ConfigStoreError> {
+        Self::load_snapshot(path, limits, existing, false)
+    }
+
+    pub(crate) fn load_required_at_startup(
+        path: &Path,
+        limits: ConfigStoreLimits,
+        existing: usize,
+    ) -> Result<Self, ConfigStoreError> {
+        Self::load_snapshot(path, limits, existing, true)
+    }
+
+    fn load_snapshot(
+        path: &Path,
+        limits: ConfigStoreLimits,
+        existing: usize,
+        required: bool,
+    ) -> Result<Self, ConfigStoreError> {
         let mut options = fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -137,7 +154,12 @@ impl AxumConfigStore {
                 }
                 Snapshot::load(&mut file, limits, existing)?
             }
-            Err(err) if err.kind() == ErrorKind::NotFound => Snapshot::empty(limits, existing)?,
+            Err(err) if err.kind() == ErrorKind::NotFound && !required => {
+                Snapshot::empty(limits, existing)?
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return Err(ConfigStoreError::unavailable("config file missing"));
+            }
             Err(_io) => {
                 return Err(ConfigStoreError::unavailable("config snapshot open failed"));
             }

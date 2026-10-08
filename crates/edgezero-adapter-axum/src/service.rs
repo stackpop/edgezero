@@ -17,6 +17,7 @@ use edgezero_core::ingress::{
     IngressHeadParts, validate_normalized_ingress_parts,
 };
 use edgezero_core::key_value_store::KvHandle;
+use edgezero_core::probe::{LifecyclePhase, LifecycleReader};
 #[cfg(test)]
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
@@ -26,6 +27,7 @@ use edgezero_core::store_registry::{
 use edgezero_core::time::MonotonicInstant;
 use hyper::body::Incoming;
 use hyper::service::Service as HyperService;
+use tokio::sync::watch;
 #[cfg(test)]
 use tower::Service as TowerService;
 
@@ -33,6 +35,7 @@ use tower::Service as TowerService;
 use crate::connection::{ConnectionExit, serve_http1};
 #[cfg(test)]
 use crate::ingress_config::AxumIngressConfig;
+#[cfg(test)]
 use crate::outbound::AxumOutboundClient;
 use crate::request::into_core_request_parts;
 use crate::response::{AxumEgressBody, EgressConnection, prepare_egress_response};
@@ -51,6 +54,7 @@ pub(crate) struct AxumServiceState {
     kv_handle: Option<KvHandle>,
     kv_registry: Option<KvRegistry>,
     outbound_transport: Option<Arc<reqwest::Client>>,
+    phase: Option<watch::Receiver<LifecyclePhase>>,
     secret_handle: Option<SecretHandle>,
     secret_registry: Option<SecretRegistry>,
 }
@@ -63,14 +67,23 @@ impl AxumServiceState {
     /// Creates a service that preserves all policies configured on `App`.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn from_app(app: App) -> Self {
+        Self::with_transport(
+            app,
+            AxumOutboundClient::try_transport().expect("test transport"),
+        )
+    }
+
+    pub(crate) fn with_transport(app: App, transport: Arc<reqwest::Client>) -> Self {
         Self {
             app: Arc::new(app),
             config_registry: None,
             config_store_handle: None,
             kv_handle: None,
             kv_registry: None,
-            outbound_transport: AxumOutboundClient::try_transport().ok(),
+            outbound_transport: Some(transport),
+            phase: None,
             secret_handle: None,
             secret_registry: None,
         }
@@ -103,6 +116,7 @@ impl AxumServiceState {
     /// directly.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn with_config_store_handle(mut self, handle: ConfigStoreHandle) -> Self {
         self.config_store_handle = Some(handle);
         self
@@ -120,6 +134,7 @@ impl AxumServiceState {
     /// directly.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn with_kv_handle(mut self, handle: KvHandle) -> Self {
         self.kv_handle = Some(handle);
         self
@@ -146,6 +161,7 @@ impl AxumServiceState {
     /// [`Self::with_secret_registry`] directly.
     #[must_use]
     #[inline]
+    #[cfg(test)]
     pub fn with_secret_handle(mut self, handle: SecretHandle) -> Self {
         self.secret_handle = Some(handle);
         self
@@ -156,6 +172,11 @@ impl AxumServiceState {
     #[inline]
     pub fn with_secret_registry(mut self, registry: SecretRegistry) -> Self {
         self.secret_registry = Some(registry);
+        self
+    }
+
+    pub(crate) fn with_phase(mut self, phase: watch::Receiver<LifecyclePhase>) -> Self {
+        self.phase = Some(phase);
         self
     }
 
@@ -207,12 +228,23 @@ impl AxumServiceState {
         (config_registry, kv_registry, secret_registry)
     }
 
+    fn admission_open(&self) -> bool {
+        self.phase
+            .as_ref()
+            .is_none_or(|phase| *phase.borrow() == LifecyclePhase::Ready)
+    }
+
     async fn dispatch_request(
         &self,
         mut request: Request<AxumBody>,
         connection: &EgressConnection,
         remote_addr: Option<SocketAddr>,
     ) -> Result<Response<AxumEgressBody>, AxumIngressAbort> {
+        // This private gate defines dispatched work. Public extensions and app
+        // admission policy cannot admit new work after the owner starts draining.
+        if !self.admission_open() {
+            return Err(AxumIngressAbort);
+        }
         if let Some(peer_addr) = remote_addr {
             request.extensions_mut().insert(ConnectInfo(peer_addr));
         }
@@ -293,6 +325,11 @@ impl AxumServiceState {
             }
         };
 
+        if let Some(phase) = self.phase.clone() {
+            core_request
+                .extensions_mut()
+                .insert(LifecycleReader::new(move || Some(*phase.borrow())));
+        }
         if let Some(registry) = config_registry {
             core_request.extensions_mut().insert(registry);
         }

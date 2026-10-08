@@ -1,0 +1,39 @@
+[package]
+name = "edgezero-store-aws"
+description = "Optional native AWS configuration and secret snapshots for EdgeZero"
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+default = []
+snapshot-stores = ["dep:edgezero-core", "dep:bytes", "dep:async-trait", "dep:tokio"]
+appconfig-agent = ["snapshot-stores", "dep:reqwest", "dep:futures-util"]
+secrets-manager = ["snapshot-stores", "dep:aws-config", "dep:aws-sdk-secretsmanager"]
+
+[dependencies]
+percent-encoding = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+async-trait = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-secretsmanager = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+edgezero-core = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true, features = ["stream"] }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }

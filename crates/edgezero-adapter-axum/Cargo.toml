@@ -13,6 +13,7 @@ workspace = true
 [features]
 default = ["axum"]
 axum = [
+    "native-bindings",
     "dep:async-stream",
     "dep:axum",
     "dep:tokio",
@@ -24,14 +25,18 @@ axum = [
     "dep:reqwest",
     "dep:redb",
 ]
+native-bindings = ["dep:toml", "dep:edgezero-store-aws"]
+aws-appconfig-agent = ["axum", "edgezero-store-aws/appconfig-agent"]
+aws-secrets-manager = ["axum", "edgezero-store-aws/secrets-manager"]
+aws-stores = ["aws-appconfig-agent", "aws-secrets-manager"]
 cli = [
+    "native-bindings",
     "dep:edgezero-adapter",
     "edgezero-adapter/cli",
     "dep:ctor",
-    "dep:toml",
     "dep:walkdir",
 ]
-test-utils = []
+test-utils = ["dep:validator"]
 
 [dependencies]
 edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = [
@@ -55,6 +60,7 @@ redb = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+validator = { workspace = true, optional = true }
 simple_logger = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
@@ -63,8 +69,28 @@ tower = { workspace = true, optional = true }
 tracing = { workspace = true }
 walkdir = { workspace = true, optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+edgezero-store-aws = { workspace = true, optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[[bin]]
+name = "edgezero-hosting-fixture"
+path = "tests/fixtures/production_host.rs"
+required-features = ["axum", "test-utils"]
+test = false
+
+[[bin]]
+name = "edgezero-native-aws-host"
+path = "tests/fixtures/native_aws_host.rs"
+required-features = ["aws-stores", "test-utils"]
+test = false
+
+[[test]]
+name = "native_aws_startup"
+path = "tests/native_aws_startup.rs"
+required-features = ["aws-stores", "test-utils"]
 
 [dev-dependencies]
 async-trait = { workspace = true }

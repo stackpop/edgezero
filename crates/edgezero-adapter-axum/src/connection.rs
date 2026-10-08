@@ -2,6 +2,7 @@ use std::error::Error as StdError;
 use std::future::{self, Future};
 use std::io;
 
+use edgezero_core::probe::LifecyclePhase;
 use http_body::Body as HttpBody;
 use hyper::Request;
 use hyper::body::Incoming;
@@ -9,6 +10,7 @@ use hyper::server::conn::http1::Builder as Http1Builder;
 use hyper::service::Service;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
 use crate::header_deadline::{HeaderDeadline, HeaderDeadlineExceeded, HeaderIo, HeaderService};
@@ -24,15 +26,33 @@ pub(crate) enum ConnectionExit {
     DeadlineExceeded,
 }
 
-/// Owns HTTP/1 parsing, idle/header expiry and the existing response deadline race.
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "tokio::select! expands to internal randomized branch selection arithmetic"
-)]
+#[cfg(test)]
 pub(crate) fn serve_http1<ServiceType, ResponseBody>(
     stream: TcpStream,
     service: ServiceType,
     responses: EgressConnection,
+    limits: AxumIngressConfig,
+) -> impl Future<Output = Result<ConnectionExit, hyper::Error>>
+where
+    ServiceType: Service<Request<Incoming>, Response = hyper::Response<ResponseBody>>,
+    ServiceType::Error: Into<Box<dyn StdError + Send + Sync>>,
+    ServiceType::Future: 'static,
+    ResponseBody: HttpBody + 'static,
+    ResponseBody::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    serve_http1_with_shutdown(stream, service, responses, None, limits)
+}
+
+/// Owns bounded HTTP/1 parsing, response deadlines and graceful lifecycle drain.
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "tokio::select! expands to internal randomized branch selection arithmetic"
+)]
+pub(crate) fn serve_http1_with_shutdown<ServiceType, ResponseBody>(
+    stream: TcpStream,
+    service: ServiceType,
+    responses: EgressConnection,
+    mut phase: Option<watch::Receiver<LifecyclePhase>>,
     limits: AxumIngressConfig,
 ) -> impl Future<Output = Result<ConnectionExit, hyper::Error>>
 where
@@ -59,6 +79,22 @@ where
         let mut connection = Box::pin(connection_future);
 
         loop {
+            if phase.as_ref().is_some_and(|reader| {
+                matches!(
+                    *reader.borrow(),
+                    LifecyclePhase::Draining | LifecyclePhase::Stopped
+                )
+            }) {
+                connection.as_mut().graceful_shutdown();
+                phase = None;
+            }
+            let draining = async {
+                if let Some(reader) = phase.as_mut() {
+                    let _changed = reader.changed().await;
+                } else {
+                    future::pending::<()>().await;
+                }
+            };
             if head
                 .deadline()
                 .is_some_and(|deadline| TokioInstant::now() >= deadline)
@@ -95,6 +131,7 @@ where
                 }
                 () = head.changed() => {}
                 () = responses.changed() => {}
+                () = draining => {}
             }
         }
     }

@@ -575,6 +575,9 @@ pub struct ConfigPushArgs {
     /// `[stores.config].ids` has length 1).
     #[arg(long)]
     pub store: Option<String>,
+    /// Explicit native bindings file. Used only to reject unsupported AWS-bound publication.
+    #[arg(long)]
+    pub store_bindings: Option<PathBuf>,
     /// Skip the inline diff prompt and write unconditionally.
     #[arg(long, short)]
     pub yes: bool,
@@ -596,6 +599,7 @@ impl Default for ConfigPushArgs {
             runtime_config: None,
             staging: false,
             store: None,
+            store_bindings: None,
             yes: false,
         }
     }
@@ -604,7 +608,14 @@ impl Default for ConfigPushArgs {
 /// Arguments for the `config validate` command.
 #[derive(clap::Args, Debug)]
 #[non_exhaustive]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent Clap control; target toggles mirror Cargo feature flags"
+)]
 pub struct ConfigValidateArgs {
+    /// Select bindings-only native validation; must be `axum`.
+    #[arg(long)]
+    pub adapter: Option<String>,
     /// Path to the typed app-config file (default: `<app_name>.toml`
     /// resolved from the manifest's `[app].name`, next to the manifest).
     #[arg(long)]
@@ -614,13 +625,28 @@ pub struct ConfigValidateArgs {
     pub manifest: PathBuf,
     /// Skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the
     /// typed app-config. The default loads the overlay so validation
-    /// sees the same values the runtime would.
+    /// sees the values the runtime would.
     #[arg(long)]
     pub no_env: bool,
+    /// Explicit absolute native bindings file for bindings-only validation.
+    #[arg(long)]
+    pub store_bindings: Option<PathBuf>,
     /// Strict mode: additionally check capability-aware completeness
     /// for the declared adapter set and well-formed handler paths.
     #[arg(long)]
     pub strict: bool,
+    /// Native Cargo target triple used for provider capability resolution.
+    #[arg(long, requires = "store_bindings")]
+    pub target: Option<String>,
+    /// Resolve with all target features enabled.
+    #[arg(long)]
+    pub target_all_features: bool,
+    /// Add native Cargo features for target capability resolution.
+    #[arg(long, value_delimiter = ',')]
+    pub target_features: Vec<String>,
+    /// Suppress target default features.
+    #[arg(long)]
+    pub target_no_default_features: bool,
 }
 
 impl Default for ConfigValidateArgs {
@@ -628,10 +654,16 @@ impl Default for ConfigValidateArgs {
     #[inline]
     fn default() -> Self {
         Self {
+            adapter: None,
             app_config: None,
             manifest: default_manifest_path(),
             no_env: false,
+            store_bindings: None,
             strict: false,
+            target: None,
+            target_all_features: false,
+            target_features: Vec::new(),
+            target_no_default_features: false,
         }
     }
 }
@@ -745,6 +777,7 @@ mod tests {
         assert_eq!(args.manifest, PathBuf::from("edgezero.toml"));
         assert!(args.adapter.is_empty());
         assert!(args.app_config.is_none());
+        assert!(args.store_bindings.is_none());
         assert!(!args.dry_run);
         assert!(args.key.is_none());
         assert!(!args.local);
@@ -760,6 +793,12 @@ mod tests {
         let args = ConfigValidateArgs::default();
         assert_eq!(args.manifest, PathBuf::from("edgezero.toml"));
         assert!(args.app_config.is_none());
+        assert!(args.adapter.is_none());
+        assert!(args.store_bindings.is_none());
+        assert!(args.target.is_none());
+        assert!(args.target_features.is_empty());
+        assert!(!args.target_all_features);
+        assert!(!args.target_no_default_features);
         assert!(!args.no_env);
         assert!(!args.strict);
     }
@@ -846,6 +885,39 @@ mod tests {
         );
         assert!(validate.no_env);
         assert!(!validate.strict);
+    }
+
+    #[test]
+    fn config_validate_parses_native_bindings_target_controls() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "config",
+            "validate",
+            "--adapter",
+            "axum",
+            "--store-bindings",
+            "/tmp/native.toml",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--target-features",
+            "aws-appconfig-agent,aws-secrets-manager",
+            "--target-no-default-features",
+        ])
+        .expect("parse native bindings validation");
+        let Command::Config(ConfigCmd::Validate(validate)) = args.cmd else {
+            panic!("expected config validate");
+        };
+        assert_eq!(validate.adapter.as_deref(), Some("axum"));
+        assert_eq!(
+            validate.store_bindings,
+            Some(PathBuf::from("/tmp/native.toml"))
+        );
+        assert_eq!(validate.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(
+            validate.target_features,
+            ["aws-appconfig-agent", "aws-secrets-manager"]
+        );
+        assert!(validate.target_no_default_features);
     }
 
     #[test]

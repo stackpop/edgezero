@@ -8,6 +8,7 @@ members = [
     "crates/edgezero-cli",
     "crates/edgezero-core",
     "crates/edgezero-macros",
+    "crates/edgezero-store-aws",
 ]
 exclude = ["examples/app-demo"]
 resolver = "2"
@@ -39,6 +40,8 @@ async-compression = { version = "=0.4.43", default-features = false, features = 
 ] }
 async-stream = "0.3"
 async-trait = "0.1"
+aws-config = { version = "=1.12.0", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-secretsmanager = { version = "=1.120.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 axum = { version = "0.8", default-features = true }
 brotli = "=8.0.4"
 brotli-decompressor = "=5.0.1"
@@ -54,6 +57,7 @@ edgezero-adapter-cloudflare = { path = "crates/edgezero-adapter-cloudflare", def
 edgezero-adapter-fastly = { path = "crates/edgezero-adapter-fastly", default-features = false }
 edgezero-adapter-spin = { path = "crates/edgezero-adapter-spin", default-features = false }
 edgezero-core = { path = "crates/edgezero-core", default-features = false }
+edgezero-store-aws = { path = "crates/edgezero-store-aws", default-features = false }
 edgezero-cli = { path = "crates/edgezero-cli", default-features = false }
 fastly = "=0.13.1"
 fastly-shared = "=0.13.1"
@@ -91,6 +95,7 @@ serde_urlencoded = "0.7"
 sha2 = "0.10"
 similar = "2"
 simple_logger = "5"
+percent-encoding = "=2.3.2"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 syn = { version = "3", features = ["full", "extra-traits", "visit"] }

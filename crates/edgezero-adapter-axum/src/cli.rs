@@ -1,3 +1,4 @@
+use crate::native_build::NativeCargoSelection;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -116,6 +117,7 @@ struct AxumProject {
     axum_host: Option<String>,
     axum_manifest: PathBuf,
     axum_port: Option<u16>,
+    build_features: Vec<String>,
     cargo_manifest: PathBuf,
     crate_dir: PathBuf,
     crate_name: String,
@@ -466,7 +468,15 @@ fn deploy(_extra_args: &[String]) -> Result<(), String> {
 fn locate_project() -> Result<AxumProject, String> {
     let cwd = env::current_dir().map_err(|err| err.to_string())?;
     let manifest = find_axum_manifest(&cwd)?;
-    read_axum_project(&manifest)
+    let mut project = read_axum_project(&manifest)?;
+    if let Some(edgezero_manifest) = find_manifest_upwards(&cwd, "edgezero.toml") {
+        let loader = ManifestLoader::from_path(&edgezero_manifest)
+            .map_err(|err| format!("failed to load {}: {err}", edgezero_manifest.display()))?;
+        if let Some((_name, adapter)) = loader.manifest().adapter_entry("axum") {
+            project.build_features.clone_from(&adapter.build.features);
+        }
+    }
+    Ok(project)
 }
 
 fn cargo_command(
@@ -495,7 +505,17 @@ fn cargo_command(
             .to_str()
             .ok_or_else(|| format!("invalid manifest path {}", project.cargo_manifest.display()))?,
     );
-    command.args(extra_args);
+    let selection = NativeCargoSelection::normalize_args(&project.build_features, extra_args)?;
+    command.args(selection.cargo_args());
+    match subcommand {
+        "run" if !selection.run_args.is_empty() => {
+            command.arg("--").args(&selection.run_args);
+        }
+        "build" if !selection.run_args.is_empty() => {
+            return Err("`cargo build` does not accept runtime arguments after `--`".to_owned());
+        }
+        _ => {}
+    }
     command.current_dir(&project.crate_dir);
     // Canonical env vars. The runtime's `EnvConfig` reads only the
     // `EDGEZERO__*` form (see `crates/edgezero-core/src/env_config.rs`);
@@ -776,6 +796,9 @@ fn read_axum_project_with_env(
         axum_host: config_host,
         axum_manifest: manifest.to_path_buf(),
         axum_port: config_port,
+        // Pinned targets use only the feature inputs selected by the caller;
+        // the CLI dispatcher has already forwarded manifest build features.
+        build_features: Vec::new(),
         cargo_manifest,
         crate_dir,
         crate_name,
@@ -799,6 +822,7 @@ mod tests {
             axum_host: None,
             axum_manifest: dir.path().join("axum.toml"),
             axum_port: None,
+            build_features: Vec::new(),
             cargo_manifest: dir.path().join("Cargo.toml"),
             crate_dir: dir.path().to_path_buf(),
             crate_name: "fixture".to_owned(),

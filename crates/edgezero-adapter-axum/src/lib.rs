@@ -16,12 +16,20 @@ mod header_deadline;
 pub mod ingress_config;
 #[cfg(feature = "axum")]
 pub mod key_value_store;
+#[cfg(all(feature = "native-bindings", not(target_arch = "wasm32")))]
+pub mod native_bindings;
+#[cfg(all(feature = "native-bindings", not(target_arch = "wasm32")))]
+pub mod native_build;
+#[cfg(feature = "axum")]
+pub mod native_stores;
 #[cfg(feature = "axum")]
 pub mod outbound;
 #[cfg(feature = "axum")]
 pub mod request;
 #[cfg(feature = "axum")]
 mod response;
+#[cfg(feature = "axum")]
+mod run_options;
 #[cfg(feature = "axum")]
 pub mod secret_store;
 #[cfg(feature = "axum")]
