@@ -540,14 +540,13 @@ impl Adapter for SpinCliAdapter {
             if !is_valid_spin_key(&spin_var) {
                 let reason = spin_key_rule_violation(&spin_var);
                 return Err(format!(
-                    "`#[secret]` field `{field}` value `{value}` translates to Spin variable `{spin_var}`, which is not a valid Spin variable name. {reason}. Pick a `#[secret]` value that conforms.",
+                    "`#[secret]` field `{field}` does not reference a valid Spin variable name. {reason}. Pick a secret reference that conforms; its value is redacted.",
                     field = entry.field_name,
-                    value = entry.key_value,
                 ));
             }
             if let Some(prev_field) = seen.insert(spin_var.clone(), entry.field_name.as_str()) {
                 return Err(format!(
-                    "Spin variable `{spin_var}` would receive values from BOTH `#[secret]` field `{prev_field}` AND `#[secret]` field `{this_field}`; Spin's flat variable namespace cannot disambiguate them. Pick distinct `#[secret]` values whose lowercased forms differ.",
+                    "`#[secret]` fields `{prev_field}` and `{this_field}` reference the same Spin variable after lowercasing; Spin's flat variable namespace cannot disambiguate them. Pick distinct secret references; their values are redacted.",
                     this_field = entry.field_name,
                 ));
             }
@@ -1291,6 +1290,37 @@ mod tests {
     }
 
     #[test]
+    fn secret_validation_errors_redact_original_and_normalized_values() {
+        for entries in [
+            vec![TypedSecretEntry::new(
+                "default",
+                "credential",
+                "Private-Canary",
+            )],
+            vec![
+                TypedSecretEntry::new("default", "first", "Private_Canary"),
+                TypedSecretEntry::new("default", "second", "private_canary"),
+            ],
+        ] {
+            let err = SpinCliAdapter.validate_typed_secrets(&entries).unwrap_err();
+            for entry in &entries {
+                assert!(
+                    !err.contains(entry.key_value),
+                    "raw reference leaked: {err}"
+                );
+                assert!(
+                    !err.contains(&entry.key_value.to_ascii_lowercase()),
+                    "normalized reference leaked: {err}"
+                );
+                assert!(
+                    err.contains(entry.field_name.as_str()),
+                    "missing field: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn validate_typed_secrets_passes_with_no_collision() {
         SpinCliAdapter
             .validate_typed_secrets(&[TypedSecretEntry::new(
@@ -1311,13 +1341,10 @@ mod tests {
             .validate_typed_secrets(&[TypedSecretEntry::new("default", "api_token", "api-token")])
             .expect_err("dashed secret value must error");
         assert!(
-            // The error must name BOTH the field name (`api_token`,
-            // underscore) and the offending value (`api-token`,
-            // dash), plus mark it as a Spin variable issue. The prior
-            // assertion double-checked the value and silently missed
-            // the field-name half.
-            err.contains("api_token") && err.contains("api-token") && err.contains("Spin variable"),
-            "error names the field, the bad value, and the Spin-variable bucket: {err}"
+            err.contains("api_token")
+                && !err.contains("api-token")
+                && err.contains("Spin variable"),
+            "error names the field and rule without its value: {err}"
         );
     }
 
@@ -1333,15 +1360,15 @@ mod tests {
             ])
             .expect_err("two values lowercasing to the same name must collide");
         assert!(
-            err.contains("shared_name") && (err.contains("first") || err.contains("second")),
-            "error names the shared canonical name and at least one field: {err}"
+            !err.contains("shared_name") && err.contains("first") && err.contains("second"),
+            "error names both fields without the shared value: {err}"
         );
     }
 
     // named-store secret adapter validation
 
     #[test]
-    fn collision_error_names_both_field_names_and_lowercased_variable() {
+    fn collision_error_names_both_fields_without_the_lowercased_value() {
         // case (b): KeyInDefault and KeyInNamedStore that
         // collide on the lowercased Spin variable.
         let entries = [
@@ -1351,7 +1378,7 @@ mod tests {
         let err = SpinCliAdapter.validate_typed_secrets(&entries).unwrap_err();
         assert!(err.contains("`one`"), "{err}");
         assert!(err.contains("`two`"), "{err}");
-        assert!(err.contains("demo_token"), "{err}");
+        assert!(!err.contains("demo_token"), "{err}");
     }
 
     #[test]
@@ -1361,9 +1388,9 @@ mod tests {
         let entries = [TypedSecretEntry::new("vault", "api_token", "demo-token")];
         let err = SpinCliAdapter.validate_typed_secrets(&entries).unwrap_err();
         assert!(err.contains("`api_token`"), "{err}");
-        assert!(err.contains("demo-token"), "{err}");
+        assert!(!err.contains("demo-token"), "{err}");
         assert!(
-            err.to_lowercase().contains("hyphen") || err.contains("not a valid"),
+            err.contains("lowercase letters, digits, and underscores"),
             "{err}"
         );
     }

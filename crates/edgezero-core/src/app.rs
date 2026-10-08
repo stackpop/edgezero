@@ -78,8 +78,8 @@ impl App {
 /// Compile-time metadata for one logical store kind, baked by the `app!` macro.
 ///
 /// Carries only the portable facts declared in `[stores.<kind>]`: the logical
-/// store ids and the resolved default. Platform names are resolved at runtime
-/// from `EDGEZERO__STORES__*` environment variables.
+/// store ids and the resolved default. A deployment adapter binds platform
+/// resources to these logical aliases.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoreMetadata {
     /// Resolved default logical store id.
@@ -229,6 +229,12 @@ mod tests {
 
     fn empty_router() -> RouterService {
         RouterService::builder().build()
+    }
+
+    #[test]
+    fn app_can_be_retained_in_a_shared_owner() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<App>();
     }
 
     #[test]

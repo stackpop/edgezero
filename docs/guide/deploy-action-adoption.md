@@ -136,7 +136,7 @@ this order:
    `--older-than` with `--yes` to reclaim the unreferenced chunks.
 
 Custom application CLI entry points also need the
-[Fastly entry-point migration](./adapters/fastly.md#migrating-a-custom-entry-point).
+[Fastly entry-point migration](./adapters/fastly.md#migrating-a-custom-entrypoint).
 
 ## Deployment consumer
 

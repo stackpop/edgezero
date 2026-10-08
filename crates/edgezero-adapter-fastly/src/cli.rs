@@ -661,6 +661,10 @@ fn plan_link_reconciliation(
     existing: &[ExistingResourceLink],
     inventories: &ResourceInventories,
 ) -> Result<LinkReconciliation, String> {
+    // Fastly exposes Config, KV, and Secret Stores through separate typed
+    // runtime APIs, so a resource-link identity is `(kind, alias)`. Reusing an
+    // alias across kinds is valid; two links with the same kind and alias are
+    // ambiguous to EdgeZero and fail closed below.
     let mut desired_identities = BTreeSet::new();
     for link in desired {
         let identity = (link.kind, link.alias.as_str());

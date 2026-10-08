@@ -27,12 +27,12 @@ Adapters also expose `from_core_response` (or equivalent) to transform an `edgez
 
 - **Map HTTP status codes** verbatim
 - **Copy headers**, respecting casing rules enforced by the provider
-- **Preserve streaming bodies** - `Body::Stream` should be written chunk-by-chunk to the provider output without buffering the entire payload. Only Cloudflare does this today, via `Response::from_stream`. Fastly drains the stream into a `fastly::Body`, Spin collects it into a `Vec<u8>` capped at 16 MiB, and Axum buffers as well
+- **Preserve streaming bodies** - `Body::Stream` should be written chunk-by-chunk to the provider output without buffering the entire payload. Cloudflare does this through standard dispatch via `Response::from_stream`. Fastly's standard `run_app`/`serve_app` paths drain the stream into a `fastly::Body`; custom [`lifecycle::serve_custom`](/guide/adapters/fastly#custom-dispatch-and-streaming) callbacks can stream progressively. Spin collects into a `Vec<u8>` capped at 16 MiB, and Axum buffers as well
 - **Handle encoding helpers** (`decode_gzip_stream`, `decode_brotli_stream`) where a provider requires transparent decompression
 
 ## Dispatch Helper
 
-Adapters surface a dispatch entry point, either a free function or a service builder's `dispatch` method, that bridges from the provider event loop into the shared router (`App::router().oneshot(...)`). It should:
+Adapters surface a dispatch entry point, either a free function or a service builder's `dispatch` method, that bridges from the provider event loop into the shared router (`app.router().oneshot(...)`). It should:
 
 1. Convert the incoming provider request with `into_core_request`
 2. Await the router future
@@ -154,3 +154,58 @@ logical id under both is a collision that `config validate` rejects.
 Fastly is the only adapter implementing `gc_config_entries` and the staging lifecycle
 actions (`DeployStaged`, `EmitVersion`, `Healthcheck`, `Rollback`); the others return
 an unsupported error for those.
+
+## Opt-in application retention
+
+Use retention when measurements show that constructing the app is expensive.
+Keep per-request construction when `configure` or `app_state` reads values that
+can change and no refresh policy has been defined.
+
+Application ownership and request scheduling are separate. An `App` can be
+retained by its caller; each adapter still controls how requests arrive:
+
+| Adapter    | Existing default                         | Explicit retention                                                                                                    |
+| ---------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Fastly     | Build for each single-request invocation | `serve_app` with an SDK `Serve`, or [`lifecycle::serve_custom`](/guide/adapters/fastly#custom-dispatch-and-streaming) |
+| Cloudflare | Build on each fetch                      | Concrete application-owned cache and `dispatch_app`                                                                   |
+| Spin       | Build on each invocation                 | Concrete cache and `dispatch_app` on a compatible host                                                                |
+| Axum       | Build once at server startup             | Already retains the router                                                                                            |
+
+Retain owned settings, parsed objects, and bounded caches only when their
+staleness policy is acceptable. Keep native request handles, bodies, store
+registries, pending operations, and response effects request-local. `Send + Sync`
+and cloning do not prove host-resource validity. Shared `Arc` interiors remain
+shared; the framework does not reset them between requests. Registered app state
+continues to overwrite request extensions of the same type.
+
+Applications own refresh, invalidation, key rotation, initialization-failure
+policy, and workload benchmarks. Publish complete snapshots; overlapping requests
+keep the snapshot they acquired. Never put an unkeyed static in a generic cache
+function: that static would be shared between application types. Existing macros,
+manifest settings, and generated entry points retain their lifecycle defaults.
+The Cloudflare response-header correction applies to both default and retained apps.
+
+### Preparing an application for retention
+
+Audit the values captured by handlers, middleware, and registered state before
+opting in. The framework creates fresh request resources but cannot inspect or
+clear application-owned interiors.
+
+| Risk                                       | Application mitigation                                                                                                                                                                                                                             |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Request data survives into another request | Store identity, authorization results, bodies, and correlation IDs in request-local values or extensions. Use distinct types for request data and registered state; registered state wins on a type collision.                                     |
+| Settings or parsed keys become stale       | Keep them request-scoped until a refresh policy is defined. For retained values, build and validate a complete replacement snapshot, then publish it atomically. Decide whether refresh failure keeps the last valid snapshot or rejects requests. |
+| Caches grow without bound                  | Limit entries and retained bytes, expire or evict entries, and bound origin diversity. A sandbox request limit cannot bound allocation within one request.                                                                                         |
+| Concurrent requests mutate shared state    | Synchronize mutations and acquire an immutable snapshot per request. Release locks before awaiting provider work. Rust's `Send + Sync` bounds do not establish application-level isolation.                                                        |
+| Initialization or required bindings fail   | Surface the error and monitor repeated fresh-instance failures. In custom dispatch, convert a recoverable failure into one response only when the application defines that recovery policy. Bound retries, e.g. with Fastly `Serve` limits.        |
+| Logging is installed twice                 | Choose one owner. With the Fastly helper, set `Hooks::owns_logging()` when application code installs the logger. First-snapshot logging is intentionally fixed; use custom dispatch for another policy.                                            |
+| A stream fails after commitment            | Finish or drop the streaming writer and settle request-owned pending work. Log the partial-response failure; do not attempt a replacement response after sending headers.                                                                          |
+
+Exercise cancellation as well as successful requests. The core regression tests
+drop a suspended request, verify its extension resources are released, and serve
+a fresh request through the same router. This does not cancel application-spawned
+background tasks or prove cleanup after a terminating provider trap.
+
+Roll out retention only after the application's isolation, refresh, and bounded
+memory workload checks pass. Provider eviction can force initialization on any
+request, so correctness must not depend on reaching the configured reuse limit.

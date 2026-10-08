@@ -261,6 +261,13 @@ fn dispatch_core_request(
     mut core_request: Request,
     stores: Stores,
 ) -> Result<FastlyResponse, FastlyError> {
+    insert_store_registries(&mut core_request, stores);
+    let response = executor::block_on(app.router().oneshot(core_request))
+        .map_err(|err| map_edge_error(&err))?;
+    from_core_response(response).map_err(|err| map_edge_error(&err))
+}
+
+fn insert_store_registries(core_request: &mut Request, stores: Stores) {
     // Hard-cutoff: legacy bare handles are no longer
     // inserted into request extensions. `with_config_handle`
     // still accepts a `ConfigStoreHandle`, but the dispatcher
@@ -279,9 +286,6 @@ fn dispatch_core_request(
     if let Some(registry) = secret_registry {
         core_request.extensions_mut().insert(registry);
     }
-    let response = executor::block_on(app.router().oneshot(core_request))
-        .map_err(|err| map_edge_error(&err))?;
-    from_core_response(response).map_err(|err| map_edge_error(&err))
 }
 
 /// Run an app-provided closure against a scratch `Extensions` populated from the
@@ -344,20 +348,49 @@ pub fn dispatch_with_registries<F>(
 where
     F: FnOnce(&FastlyRequest, &mut Extensions),
 {
+    let core_request = into_core_request_with_registries(req, stores, extend)?;
+    let response = executor::block_on(app.router().oneshot(core_request))
+        .map_err(|err| map_edge_error(&err))?;
+    from_core_response(response).map_err(|err| map_edge_error(&err))
+}
+
+/// Convert a Fastly request and insert the registries derived from baked store
+/// metadata, without dispatching or converting a response.
+///
+/// The extension callback reads the native request before conversion. The
+/// registries are then built from the logical aliases linked to the deployed
+/// service version. Drive `app.router().oneshot(request)` with
+/// `futures::executor::block_on` when the caller needs response extensions or
+/// progressive streaming.
+///
+/// # Errors
+/// Returns an error if a declared KV store cannot be opened or the request
+/// cannot be converted, including an inbound body read failure.
+#[inline]
+pub fn into_core_request_with_registries<F>(
+    req: FastlyRequest,
+    stores: StoresMetadata,
+    extend: F,
+) -> Result<Request, FastlyError>
+where
+    F: FnOnce(&FastlyRequest, &mut Extensions),
+{
     let kv_registry = build_kv_registry(stores.kv)?;
     let config_registry = build_config_registry(stores.config);
     let secret_registry = build_secret_registry(stores.secrets);
-    dispatch_with_handles(
-        app,
-        req,
+    let scratch = apply_request_extend(&req, extend);
+    let mut core_request = into_core_request(req).map_err(|err| map_edge_error(&err))?;
+    core_request.extensions_mut().extend(scratch);
+    insert_store_registries(
+        &mut core_request,
         Stores {
             config_registry,
             kv_registry,
             secret_registry,
             ..Default::default()
         },
-        extend,
-    )
+    );
+    Ok(core_request)
 }
 
 /// Pure synthesis: collapse a `Stores` (which may carry both a

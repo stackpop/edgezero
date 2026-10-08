@@ -30,6 +30,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
+            tests/fixtures/reusable-app/target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
@@ -50,6 +51,12 @@ jobs:
 
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
+
+      - name: Run cargo fmt (lifecycle fixtures)
+        run: cargo fmt --manifest-path tests/fixtures/reusable-app/Cargo.toml --all -- --check
+
+      - name: Run cargo clippy (native lifecycle fixtures)
+        run: cargo clippy --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-harness -p fixture-core -p fixture-axum --all-targets -- -D warnings
 
       - name: Run cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -112,6 +119,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
+            tests/fixtures/reusable-app/target/
           key: ${{ runner.os }}-cargo-${{ matrix.adapter }}-clippy-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.adapter }}-clippy-
@@ -135,6 +143,10 @@ jobs:
 
       - name: Clippy ${{ matrix.adapter }} (${{ matrix.features }}) on ${{ matrix.target }}
         run: cargo clippy -p edgezero-adapter-${{ matrix.adapter }} --features "${{ matrix.features }}" --target ${{ matrix.target }} --all-targets -- -D warnings
+
+      - name: Clippy ${{ matrix.adapter }} lifecycle fixture
+        if: matrix.features != 'fastly cli'
+        run: cargo clippy --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-${{ matrix.adapter }} --target ${{ matrix.target }} --all-targets -- -D warnings
 
   format-docs:
     runs-on: ubuntu-latest
