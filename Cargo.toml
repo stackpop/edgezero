@@ -47,7 +47,7 @@ edgezero-adapter-fastly = { path = "crates/edgezero-adapter-fastly", default-fea
 edgezero-adapter-spin = { path = "crates/edgezero-adapter-spin", default-features = false }
 edgezero-core = { path = "crates/edgezero-core", default-features = false }
 edgezero-cli = { path = "crates/edgezero-cli", default-features = false }
-fastly = "0.12"
+fastly = "0.13"
 fern = "0.7"
 flate2 = { version = "1", features = ["rust_backend"] }
 futures = { version = "0.3", features = ["std", "executor"] }
