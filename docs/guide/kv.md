@@ -120,7 +120,10 @@ Timing logs are limited to derived metadata such as lengths, counts, booleans, a
 ### Local Development
 
 - **Axum**: Uses a persistent `redb` embedded database under `.edgezero/`. Each distinct resolved store name gets its own file, `.edgezero/kv-<slug>-<hash>.redb`; ids that resolve to the same platform name share it. Data persists across restarts (add `.edgezero/` to your `.gitignore`).
-- **Fastly (Viceroy)**: Requires a `[local_server.kv_stores]` and `[setup.kv_stores]` entry per declared KV id. `edgezero provision --adapter fastly` writes both blocks for you; the example below assumes a `sessions` id.
+- **Fastly (Viceroy)**: Local Viceroy data uses a hand-authored
+  `[local_server.kv_stores]` entry. For a default physical name, `edgezero
+provision --adapter fastly` creates the remote store and writes only the
+  `[setup.kv_stores.<logical-id>]` block; the example below assumes `sessions`.
 
   ```toml
   [[local_server.kv_stores.sessions]]
@@ -131,9 +134,12 @@ Timing logs are limited to derived metadata such as lengths, counts, booleans, a
   description = "Application KV store"
   ```
 
-  Override the platform name per environment via
-  `EDGEZERO__STORES__KV__SESSIONS__NAME=<other-name>`; provision honours
-  the override when it writes the setup blocks.
+  Select a different physical store per environment with
+  `EDGEZERO__STORES__KV__SESSIONS__NAME=<other-name>`. Fastly setup cannot map
+  that resource to the logical `sessions` alias, so provision requires an
+  existing service and prints an explicit resource-link command instead of
+  writing a setup block. Managed deploy performs that link reconciliation on
+  its unpublished target version.
 
 - **Cloudflare (Workerd)**: `edgezero provision --adapter cloudflare` creates the namespace and appends the `[[kv_namespaces]]` binding using the env-resolved platform name (`EDGEZERO__STORES__KV__<ID>__NAME` or the logical id by default). The example below shows what provision writes for a `sessions` id with no override:
 

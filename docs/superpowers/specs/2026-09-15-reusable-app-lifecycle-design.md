@@ -132,16 +132,17 @@ where
 
 1. Capture static `A::stores()` metadata.
 2. Enter the SDK callback before performing host-dependent initialization.
-3. Read runtime configuration for the current request.
-4. On the first callback only, resolve logging policy, honor `A::owns_logging()`, initialize adapter logging if enabled, and call `A::build_app()`.
+3. Resolve the logging policy baked into `A`.
+4. On the first callback only, honor `A::owns_logging()`, initialize adapter logging if enabled, and call `A::build_app()`.
 5. Retain the successfully constructed app for subsequent callbacks.
-6. Use the first runtime configuration read for the first dispatch; do not read it twice.
-7. On every request, use existing `request::dispatch_with_registries` with fresh registries and the current runtime configuration.
-8. Return the SDK summary unchanged. Do not hide handler errors or synthesize a guaranteed request count.
+6. On every request, use `request::dispatch_with_registries` with fresh registries opened through the deployed logical resource-link aliases.
+7. Return the SDK summary unchanged. Do not hide handler errors or synthesize a guaranteed request count.
 
-The logger's enablement, level, endpoint, and stdout policy are a first-initialization snapshot, even if runtime selectors later change. Store selector reads remain per request. Preserve the existing `FastlyLogging::from(&EnvConfig)` mapping: it derives enablement from endpoint presence and currently fixes `echo_stdout` to true rather than applying the corresponding runtime override. This feature does not change that mapping. `owns_logging` retains its existing meaning: skip adapter logger installation. An application adopting retained construction must arrange its own logger installation before construction if construction needs logging.
-
-**Degraded-first-read policy:** preserve the existing optional-store fallback and freeze the resulting logging decision for this sandbox. `runtime_env_config` does not distinguish an absent optional store from another store-open failure; both produce empty configuration. That disables named-endpoint logging for the sandbox even if a later runtime read succeeds. The `echo_stdout` value does not provide a fallback when no logger is installed. Later reads can restore store selectors but must not silently reconfigure the global logger. Test this explicitly. Applications requiring stricter logging availability must use the custom lifecycle with their own configuration-read and initialization policy. Adding a distinguishable read status, deferred logging initialization, or retry policy would require a separately reviewed API/ordering change; it is not implied by these helpers.
+The logger's enablement, level, endpoint, and stdout policy come from the
+application manifest and are immutable for the binary. `owns_logging` retains
+its existing meaning: skip adapter logger installation. An application adopting
+retained construction must arrange its own logger installation before
+construction if construction needs logging.
 
 Capture the mutable extensions callback in the outer serving closure and pass a fresh `&mut extend` reborrow to each `dispatch_with_registries` invocation. Its `FnOnce` parameter can call that borrowed `FnMut`; do not move the callback out of the serving closure on the first request.
 
@@ -167,7 +168,7 @@ A callback receives an owned native request and may mutate it, capture metadata,
 
 Applications may capture retained state in a closure or pass it through `run_with_context`. Host-dependent or fallible initialization belongs inside the callback. A lightweight health response may bypass expensive initialization; retaining state must not require eager construction before every callback can run.
 
-Existing public `runtime_env_config` and `request::dispatch_with_registries` remain the complete prebuilt-app path when standard response translation is appropriate. `into_core_request_with_registries` exposes the request half for custom streaming; bare `into_core_request` injects no stores. Drive router dispatch with `futures::executor::block_on` in a synchronous callback. The immutable extensions callback is not a substitute for mutable raw-request custom dispatch.
+`request::dispatch_with_registries` is the complete prebuilt-app path when standard response translation is appropriate. `into_core_request_with_registries` exposes the request half for custom streaming; bare `into_core_request` injects no stores. Drive router dispatch with `futures::executor::block_on` in a synchronous callback. The immutable extensions callback is not a substitute for mutable raw-request custom dispatch.
 
 The custom lifecycle extension adds `lifecycle::Sandbox<T>`: an application-owned payload in a framework-owned successful-only slot, attempted-callback and initialization counters, and an independent successful setup guard. `initialize` returns errors unchanged and leaves the slot empty so a later call can retry; applications decide whether to respond and continue. `run_custom` creates fresh state for a single received request without entering `Serve`. Both wrappers complete `HandlerResult` exactly once. State decision logic is feature-independent for host tests; SDK wrappers require `fastly`. No teardown hook or response-finalization pipeline is introduced. Default generated entry points remain unchanged.
 
@@ -403,7 +404,7 @@ A sequential request sequence alone does not prove reuse: observe a stable insta
 
 B's logging qualification is mandatory: blindly wrapping the enabled-logger `run_app` would fail on its second installation and confound the comparison. Test that failure separately as a negative control. Keep all other dispatch, configuration, response, and workload choices identical between variants. Test standard dispatch and custom progressive streaming as separate comparable workloads; never compare buffered A against streaming C.
 
-Implement B through the custom path in §4.3: `Serve::run`, a once-only logging initialization decision, per-callback `runtime_env_config` and `A::build_app()`, then `request::dispatch_with_registries`. Do not use retaining `serve_app` for B. Apply the same first-read logging policy in B and C so degraded configuration does not introduce a second experimental variable.
+Implement B through the custom path in §4.3: `Serve::run`, a once-only logging initialization decision from the baked manifest settings, per-callback `A::build_app()`, then `request::dispatch_with_registries`. Do not use retaining `serve_app` for B. Apply the same baked logging policy in B and C.
 
 Collect:
 

@@ -2799,10 +2799,9 @@ mod tests {
         let entries = prepare_fastly_config_entries("app_config", &envelope).unwrap();
         let (_, pointer_json) = entries.last().unwrap();
         let mut pointer: FastlyChunkPointer = serde_json::from_str(pointer_json).unwrap();
-        pointer.chunks[0].key =
-            pointer.chunks[0]
-                .key
-                .replacen("app_config", "app_config_staging", 1);
+        pointer.chunks[0].key = pointer.chunks[0]
+            .key
+            .replacen("app_config", "foreign_config", 1);
         let raw = serde_json::to_string(&pointer).unwrap();
 
         let err = prior_chunk_keys("app_config", &raw).expect_err("foreign chunk should warn");

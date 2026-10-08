@@ -218,16 +218,16 @@ where
     F: FnMut(&fastly::Request, &mut Extensions),
 {
     let stores = A::stores();
+    let logging = FastlyLogging::from(A::logging_for("fastly"));
     let mut retained = RetainedApp::default();
     serve.run(move |req| -> Result<fastly::Response, fastly::Error> {
-        let env = runtime_env_config(stores);
-        let app = retained.get_or_init(&env, A::owns_logging, init_logger, A::build_app)?;
-        request::dispatch_with_registries(app, req, stores, &env, &mut extend)
+        let app = retained.get_or_init(&logging, A::owns_logging, init_logger, A::build_app)?;
+        request::dispatch_with_registries(app, req, stores, &mut extend)
     })
 }
 ```
 
-- [x] **3.2 Add API docs** for ordinary `main`, first-callback initialization, degraded logging snapshot, fresh registries/extensions, `owns_logging`, limits, terminal SDK callback errors, attempted counts, and `.into_result()`. Do not promise progressive streaming on this standard path.
+- [x] **3.2 Add API docs** for ordinary `main`, first-callback initialization, baked logging settings, fresh registries/extensions, `owns_logging`, limits, terminal SDK callback errors, attempted counts, and `.into_result()`. Do not promise progressive streaming on this standard path.
 - [x] **3.3 Verify:**
 
 ```sh
@@ -322,14 +322,14 @@ pub async fn dispatch_app(
 
 - [x] **7.1 Declare explicit binary names.** Use `fixture-fastly-a`, `fixture-fastly-b`, `fixture-fastly-c`, `fixture-fastly-custom-a`, `fixture-fastly-custom-b`, `fixture-fastly-custom-c`, and `fixture-fastly-logger-negative`. Pin SDK 0.12.1 and build on `wasm32-wasip1`.
 - [x] **7.2 Implement standard A with the existing single-request macro entry point.** Call `run_app_with_request_extensions`, adding only fixture observations. Preserve its current logging and construction behavior.
-- [x] **7.3 Implement standard B using raw `Serve::run`.** Read runtime configuration each callback, make the logging decision once from the first snapshot, build the app each callback, and call `dispatch_with_registries`. Use the same logging policy as C, including a degraded first snapshot. Do not call retaining `serve_app` for B.
+- [x] **7.3 Implement standard B using raw `Serve::run`.** Use the baked logging decision once, build the app each callback, and call `dispatch_with_registries`. Use the same logging policy as C. Do not call retaining `serve_app` for B.
 - [x] **7.4 Implement standard C with `serve_app_with_request_extensions`.** Start with a finite request limit of 10 and a bounded idle wait. Record SDK attempted-request summaries separately from client success. Compare A/B/C with identical payloads, dispatch, and instrumentation.
 - [x] **7.5 Implement custom A/B/C around a shared raw dispatch function.** A owns one native request; B builds each callback; C captures an ordinary `Option<App>` and initializes it lazily. Mutate a synthetic native header, record native metadata, convert into core, route, recover response extensions, and apply a fixture finalizer. A health request before C's first application request must leave its build count at zero.
 - [x] **7.5a Verify request correlation independently of sandbox identity.** Capture `Request::get_client_request_id()` on each callback and record `FASTLY_TRACE_ID` only as sandbox metadata. Never use the latter as a unique request ID. When the native ID is unavailable, use the harness-issued unique per-request token as an explicitly labeled fixture fallback; record availability and do not present fallback evidence as native-ID support. Across callbacks in the same observed guest, verify that correlation is derived afresh from each request and does not persist in the global logger or retained app. Keep correlation in request-local extensions or explicit per-event log fields. Exercise the fallback through a supported runtime case or a labeled injected accessor result.
 - [x] **7.6 Implement manual progressive response sending in the custom function.** Append every header value. For a core stream, create the native response, commit using `stream_to_client`, pump chunks, and finish the writable body before callback return. Handle errors after commitment locally with explicit logging/cleanup; do not return an error that causes the SDK to attempt another response. Complete instrumented post-send backend work within the callback and prove the next callback starts afterward.
-- [x] **7.7 Configure local backends and stores.** Derive runtime configuration's service-scoped keys from the guest's actual service ID, following `scripts/smoke_test_config_key_override.sh`. Keep config, KV, and secret fixtures isolated. Capture a named logging endpoint distinctly from echoed stdout; if the selected runtime cannot expose endpoint-specific evidence, report that assertion unavailable.
+- [x] **7.7 Configure local backends and stores.** Keep config, KV, and secret fixtures isolated and use the same logical aliases as the baked store metadata. Capture a named logging endpoint distinctly from echoed stdout; if the selected runtime cannot expose endpoint-specific evidence, report that assertion unavailable.
 - [x] **7.8 Add terminal and continuing cases.** Rendered handler errors should allow later callbacks in the same instance. Required-KV open errors, inbound conversion errors, response collection errors, and error-rendering failure are separate escaping paths. Test controlled reachable failures; label injected/unavailable cases honestly. Add constructor panic, pre-commit failure, post-commit stream failure, and a later fresh-owner initialization case.
-- [x] **7.9 Add the logger negative control.** Naively wrapping enabled-logger `run_app` in `Serve` should expose the second-installation failure. Keep this out of B's performance samples. Add the degraded-first-read/recovered-selector case where runtime controls permit; otherwise retain host injection evidence and mark the provider scenario unverified.
+- [x] **7.9 Add the logger negative control.** Naively wrapping enabled-logger `run_app` in `Serve` should expose the second-installation failure. Keep this out of B's performance samples.
 - [x] **7.10 Build and run the fixtures.** From the fixture workspace run `cargo build --locked --release -p fixture-fastly --bins --target wasm32-wasip1`. Launch the selected executable with `viceroy serve --addr 127.0.0.1:<port> --config <run-config> <absolute-wasm-path>`. Account for readiness callbacks or restart before measuring. Run `./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke`.
 - [x] **7.11 Assert actual reuse before accepting comparisons.** Stable guest marker plus increasing ordinal is required. A builds once per fresh invocation; B builds each reused callback; C builds once per retained owner. Check cookies, buffering versus progressive streaming, request isolation, limit 1/10, idle exit, and restart. Compare standard A/B/C and custom A/B/C separately.
 - [x] **7.12 Run existing Fastly tests on their proper runners.** Run default host `cargo test -p edgezero-adapter-fastly --lib`. With the selected Viceroy on PATH, run `CARGO_TARGET_WASM32_WASIP1_RUNNER="viceroy run" cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --test contract`, and repeat with `--lib`. Native feature-enabled linking is not a required test route. Checkpoint: `test(fastly): verify reusable sandbox lifecycle over HTTP`.

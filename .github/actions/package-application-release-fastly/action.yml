@@ -1,0 +1,149 @@
+name: EdgeZero package Fastly application release
+description: Assemble and publish a verified immutable Fastly application release from prebuilt inputs.
+
+inputs:
+  app-cli-archive:
+    description: Path beneath github.workspace to the build-app-cli tar archive.
+    required: true
+  fastly-package:
+    description: Path beneath github.workspace to the prebuilt Fastly package tarball.
+    required: true
+  application-manifest:
+    description: Path beneath github.workspace to edgezero.toml.
+    required: true
+  adapter-manifest:
+    description: Path beneath github.workspace to the Fastly manifest referenced by edgezero.toml.
+    required: true
+  source-revision:
+    description: Full lowercase 40- or 64-character source revision.
+    required: true
+  artifact-name:
+    description: Name of the uploaded immutable release artifact.
+    required: false
+    default: application-release
+
+outputs:
+  artifact-name:
+    description: Uploaded artifact name.
+    value: ${{ steps.package.outputs.artifact-name }}
+  archive-sha256:
+    description: Lowercase SHA-256 of app-release.tar.gz.
+    value: ${{ steps.package.outputs.archive-sha256 }}
+  package-sha256:
+    description: Lowercase SHA-256 of the bundled Fastly package.
+    value: ${{ steps.package.outputs.package-sha256 }}
+  source-revision:
+    description: Source revision recorded in release.json.
+    value: ${{ steps.package.outputs.source-revision }}
+
+runs:
+  using: composite
+  steps:
+    - name: Package and verify application release
+      id: package
+      shell: bash
+      env:
+        EDGEZERO__RELEASE__APP_CLI_ARCHIVE: ${{ inputs.app-cli-archive }}
+        EDGEZERO__RELEASE__FASTLY_PACKAGE: ${{ inputs.fastly-package }}
+        EDGEZERO__RELEASE__APPLICATION_MANIFEST: ${{ inputs.application-manifest }}
+        EDGEZERO__RELEASE__ADAPTER_MANIFEST: ${{ inputs.adapter-manifest }}
+        EDGEZERO__RELEASE__SOURCE_REVISION: ${{ inputs.source-revision }}
+        EDGEZERO__RELEASE__ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        BASH_ENV: ""
+        ENV: ""
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
+      run: exec "$GITHUB_ACTION_PATH/scripts/package-release.sh"
+
+    - name: Upload immutable application release
+      uses: actions/upload-artifact@v7
+      env:
+        BASH_ENV: ""
+        ENV: ""
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
+      with:
+        name: ${{ steps.package.outputs.artifact-name }}
+        path: ${{ steps.package.outputs.archive-path }}
+        if-no-files-found: error
+        retention-days: 14
+
+    - name: Cleanup release workspace
+      if: ${{ always() }}
+      shell: bash
+      env:
+        EDGEZERO__ACTION__WORKSPACE: ${{ steps.package.outputs.workspace-path }}
+        BASH_ENV: ""
+        ENV: ""
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
+        CLOUDFLARE_API_TOKEN: ""
+        CLOUDFLARE_API_KEY: ""
+        CLOUDFLARE_ACCOUNT_ID: ""
+        CLOUDFLARE_EMAIL: ""
+        CF_API_TOKEN: ""
+        CF_API_KEY: ""
+        CF_ACCOUNT_ID: ""
+        SPIN_AUTH_TOKEN: ""
+        FERMYON_TOKEN: ""
+      run: exec "$GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh"

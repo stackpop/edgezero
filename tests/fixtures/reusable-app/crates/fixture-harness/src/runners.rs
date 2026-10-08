@@ -576,22 +576,9 @@ fn smoke_origin_checks(
     Ok(())
 }
 fn logging(exe: &Path, run: &Path, records: &mut Records) -> Result<()> {
-    let Some(service) = records
-        .values
-        .iter()
-        .find_map(|e| e["service_id"].as_str())
-        .map(str::to_owned)
-    else {
-        return records.push(json!({"status":"unverified","reason":"service ID unavailable for logging configuration"}));
-    };
     let base = fs::read_to_string(root().join("crates/fixture-fastly/fastly.toml"))?;
     let config = run.join("logging.toml");
-    fs::write(
-        &config,
-        format!(
-            "{base}\n[local_server.config_stores.edgezero_runtime_env]\nformat = \"inline-toml\"\n[local_server.config_stores.edgezero_runtime_env.contents]\n\"EDGEZERO__SERVICES__{service}__LOGGING__ENDPOINT\" = \"fixture-logs\"\n"
-        ),
-    )?;
+    fs::write(&config, base)?;
     for variant in ["b", "c", "custom-c", "logger-negative"] {
         let log = run.join(format!("logging-{variant}.log"));
         let outcome = (|| -> Result<()> {

@@ -192,13 +192,13 @@ non-zero on a non-TTY (per spec §8.3's four-branch UX).
    wrangler secret put demo_api_token
 
    # Fastly
-   fastly secret-store-entry create --store-id=<id> --name=demo_api_token --value=<value>
+   printf '%s' '<value>' | fastly secret-store-entry create --store-id=<id> --name=demo_api_token --stdin
 
-   # Spin local
-   echo demo_api_token=<value> >> .env
+   # Spin local (spin.toml must declare the `demo_api_token` variable)
+   echo SPIN_VARIABLE_DEMO_API_TOKEN=<value> >> .env
 
    # Axum local
-   demo_api_token=<value> cargo run -p <app-cli> -- serve --adapter axum
+   EDGEZERO__SECRETS__DEMO_API_TOKEN=<value> cargo run -p <app-cli> -- serve --adapter axum
    ```
 
 3. Push the typed config:
@@ -216,28 +216,10 @@ non-zero on a non-TTY (per spec §8.3's four-branch UX).
 ### Per-environment key override
 
 Spec 5.4 + 12.7: a single `<app-name>.toml` covers dev / staging /
-production. Two mechanisms swap which blob the runtime reads.
-
-For staging, use `--staging`. It writes the config under the
-`<logical-id>_staging` key in the same store, so it never overwrites the
-production key the live service reads:
+production. To swap which blob the runtime reads:
 
 ```sh
-<app-cli> config push --adapter <name> --staging
-<app-cli> config diff --adapter <name> --staging
-```
-
-`--staging` is mutually exclusive with `--key`, because the staging key is
-derived from the store's logical id. On Fastly a staged deploy provisions a
-per-service `edgezero_runtime_env_staging_<service-id>` selector store and
-links it automatically, so a staged version reads staged config without any
-manual key override. Do not hand-set a `_staging` key in the production
-`edgezero_runtime_env` store; that would make production serve staged config.
-
-For any other environment, `--key` is the general per-environment mechanism.
-Each push lands at its own key:
-
-```sh
+# Push BOTH variants. Each lands at its own key.
 <app-cli> config push --adapter <name> --key app_config
 <app-cli> config push --adapter <name> --key app_config_canary
 ```
@@ -253,51 +235,39 @@ mechanism.**
 | **Axum**       | Process env: `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_canary <app-cli> serve --adapter axum`                                                                   |
 | **Cloudflare** | `.dev.vars` (local) or `wrangler.toml` `[vars]` (deployed) -- wrangler surfaces it to `env.var(...)` in the worker                                                          |
 | **Spin**       | `[application.variables]` in `spin.toml` (defaulted) plus `SPIN_VARIABLE_EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_canary spin up` for a per-invocation override |
-| **Fastly**     | A dedicated `edgezero_runtime_env` Config Store (Compute@Edge has no process env). See below.                                                                               |
+| **Fastly**     | Do not set a custom key. Production, staging, and local Viceroy all use the logical key `app_config`; select a different physical store with `__NAME`.                      |
 
 #### Fastly specifically
 
-Compute@Edge has no `std::env`, so EdgeZero reads runtime overrides
-from a Fastly Config Store named `edgezero_runtime_env`. The store is
-created automatically by `edgezero provision --adapter fastly`. After
-provisioning:
+Fastly deployment variables select physical stores, while the application always
+opens the logical Config Store ID. Managed deploy links the selected physical
+store under that logical alias. Production and staging both read key
+`app_config` from the physical store selected by their deployment environment:
 
-```sh
-# Look up the platform store id (matches by name).
-fastly config-store list --json | jq -r '.[] | select(.name=="edgezero_runtime_env") | .id'
+```bash
+# Production environment
+export EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-prod
+<app-cli> config push --adapter fastly --store app_config --yes
 
-# Set the override for one service. Config Store keys are case-sensitive.
-fastly config-store-entry update \
-  --store-id=<STORE-ID> \
-  --key=EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__APP_CONFIG__KEY \
-  --value=app_config_canary \
-  --upsert
+# Staging environment
+export EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=config-stage
+<app-cli> config push --adapter fastly --store app_config --staging --yes
 ```
 
-This store is the one the ACTIVE (production) version reads, so never point
-it at a `_staging` key. Staged config is isolated by the per-service
-`edgezero_runtime_env_staging_<service-id>` store that a staged deploy
-creates and links for you.
+Do not set a custom Fastly `__KEY`: a conflicting value fails before provider
+mutation. Production and staging may select the same physical Config Store or
+different stores. Store selection changes resource links on the target Fastly
+version and does not change the application release or package.
 
-Fastly runtime overrides are service-scoped because the Config Store can be
-linked to multiple services. Legacy unscoped `EDGEZERO__STORES__...` entries are
-not read; migrate manually managed entries by rewriting them under the service
-prefix shown above. Provisioning a non-default store-name mapping requires
-`service_id` in `fastly.toml` or `FASTLY_SERVICE_ID` so the command cannot write
-into an ambiguous namespace. If both are set, they must match.
-
-Locally, Viceroy reports the fixed service ID
-`0000000000000000000000`, regardless of the deployment `service_id` in
-`fastly.toml`. Put local overrides under that namespace:
+For local Viceroy testing, use the logical store name and production key:
 
 ```toml
-[local_server.config_stores.edgezero_runtime_env.contents]
-EDGEZERO__SERVICES__0000000000000000000000__STORES__CONFIG__APP_CONFIG__KEY = "app_config_staging"
-```
+[local_server.config_stores.app_config]
+format = "inline-toml"
 
-If the local `edgezero_runtime_env` store is missing, EdgeZero logs a one-line
-warning and falls back to the binding's default id. The runtime keeps serving,
-but the per-environment override is inactive.
+[local_server.config_stores.app_config.contents]
+app_config = '''{"version":1,"generated_at":"2026-09-17T00:00:00Z","sha256":"<digest>","data":{}}'''
+```
 
 ### Drift detection in CI
 
@@ -334,12 +304,12 @@ entries (`feature.new_checkout`, `service.timeout_ms`, etc.) that
 nothing reads. The blob model leaves them inert — they're not
 referenced — but they consume store quota.
 
-| Adapter    | Cleanup command                                                                                                                                                                                                                              |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Axum       | `rm .edgezero/local-config-*.json` (the blob push writes a fresh file)                                                                                                                                                                       |
-| Cloudflare | `wrangler kv bulk delete <tempfile.json> --namespace-id=<id> --remote` with the orphan keys listed                                                                                                                                           |
-| Fastly     | `fastly config-store-entry delete --store-id=<id> --key=<orphan-key>` per key                                                                                                                                                                |
-| Spin local | `sqlite3 .spin/sqlite_key_value.db "DELETE FROM spin_key_value WHERE store='<id>' AND key NOT IN ('app_config', 'app_config_staging', ...)"` -- preserve every key your runtime might select via `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` |
+| Adapter    | Cleanup command                                                                                                                                                                                                                             |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Axum       | `rm .edgezero/local-config-*.json` (the blob push writes a fresh file)                                                                                                                                                                      |
+| Cloudflare | `wrangler kv bulk delete <tempfile.json> --namespace-id=<id> --remote` with the orphan keys listed                                                                                                                                          |
+| Fastly     | `fastly config-store-entry delete --store-id=<id> --key=<orphan-key>` per key                                                                                                                                                               |
+| Spin local | `sqlite3 .spin/sqlite_key_value.db "DELETE FROM spin_key_value WHERE store='<id>' AND key NOT IN ('app_config', 'app_config_canary', ...)"` -- preserve every key your runtime might select via `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` |
 
 Listing the orphans before deletion:
 

@@ -13,22 +13,23 @@ set -euo pipefail
 # precomputed `…_PRESENT` boolean instead.
 #
 # Reads (env):
-#   EDGEZERO__APP__CLI__ARTIFACT_PRESENT  required  "true" when app-cli-artifact is non-empty
+#   EDGEZERO__APP__RELEASE__ARCHIVE_PRESENT required  release archive presence flag
+#   EDGEZERO__APP__RELEASE__SHA256_PRESENT  required  release digest presence flag
 #   EDGEZERO__FASTLY__API_TOKEN_PRESENT   required  "true" when fastly-api-token is non-empty
 #   EDGEZERO__FASTLY__SERVICE_ID          required  the Fastly service id
 #   (plus the validate-inputs.sh Reads contract, which this delegates to)
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=../../deploy-core/scripts/common.sh
-source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
+# shellcheck source=../../fastly-common/scripts/common.sh
+source "$SCRIPT_DIR/../../fastly-common/scripts/common.sh"
 
 main() {
-  # GitHub does not enforce `required: true` on composite inputs. An empty
-  # artifact name makes actions/download-artifact fetch EVERY artifact in the
-  # run, so the CLI we then execute with credentials would be arbitrary.
-  require_present app-cli-artifact "${EDGEZERO__APP__CLI__ARTIFACT_PRESENT:-}"
+  # GitHub does not enforce `required: true` on composite inputs. Require both
+  # release coordinates before any application CLI or provider command runs.
+  require_present app-release-archive "${EDGEZERO__APP__RELEASE__ARCHIVE_PRESENT:-}"
+  require_present app-release-sha256 "${EDGEZERO__APP__RELEASE__SHA256_PRESENT:-}"
   require_present fastly-api-token "${EDGEZERO__FASTLY__API_TOKEN_PRESENT:-}"
-  require_input_matching fastly-service-id "${EDGEZERO__FASTLY__SERVICE_ID:-}" '^[A-Za-z0-9]+$'
+  require_fastly_service_id "${EDGEZERO__FASTLY__SERVICE_ID:-}"
 
   # Provider-neutral validation (adapter, booleans, JSON-array args, the
   # allowlist). It also rejects a 'deploy-to' that is neither production nor

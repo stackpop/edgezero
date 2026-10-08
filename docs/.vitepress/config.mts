@@ -65,6 +65,10 @@ export default defineConfig({
             link: '/guide/deploy-github-actions',
           },
           {
+            text: 'Adopting Deploy Actions',
+            link: '/guide/deploy-action-adoption',
+          },
+          {
             text: 'Manifest Store Migration',
             link: '/guide/manifest-store-migration',
           },

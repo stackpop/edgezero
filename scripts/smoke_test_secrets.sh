@@ -11,6 +11,10 @@ set -euo pipefail
 #   ./scripts/smoke_test_secrets.sh cloudflare
 #   ./scripts/smoke_test_secrets.sh spin
 #
+# Note (axum): the env-backed secret store reads key K from
+# EDGEZERO__SECRETS__<K uppercased>, so SMOKE_SECRET is passed as
+# EDGEZERO__SECRETS__SMOKE_SECRET.
+#
 # Note (spin): Spin variable names are lowercase.  SpinSecretStore normalises
 # the key to lowercase before lookup, so "SMOKE_SECRET" maps to the Spin
 # variable "smoke_secret".  The secret value is passed at startup via
@@ -89,7 +93,9 @@ start_server() {
       echo "==> Building app-demo (axum)..."
       (cd "$DEMO_DIR" && cargo build -p app-demo-adapter-axum 2>&1)
       echo "==> Starting Axum adapter on port $PORT..."
-      (cd "$DEMO_DIR" && cargo run -p app-demo-adapter-axum 2>&1) &
+      (cd "$DEMO_DIR" && \
+        EDGEZERO__SECRETS__SMOKE_SECRET="$SMOKE_SECRET_VALUE" \
+        cargo run -p app-demo-adapter-axum 2>&1) &
       SERVER_PID=$!
       ;;
     fastly)

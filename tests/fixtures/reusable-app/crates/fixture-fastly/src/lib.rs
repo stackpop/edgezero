@@ -1,7 +1,5 @@
-use edgezero_adapter_fastly::{
-    FastlyLogging, Serve, ServeSummary, init_logger, runtime_env_config,
-};
-use edgezero_core::app::{App, Hooks};
+use edgezero_adapter_fastly::{FastlyLogging, Serve, ServeSummary, init_logger};
+use edgezero_core::app::{App, Hooks, StoreMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::http::Extensions;
 use fastly::{Error, Request, Response};
@@ -87,8 +85,7 @@ pub fn finish(summary: ServeSummary<Error>) -> Result<(), Error> {
     );
     summary.into_result()
 }
-fn install_logger(env: &edgezero_core::env_config::EnvConfig) -> Result<(), Error> {
-    let logging = FastlyLogging::from(env);
+fn install_logger(logging: &FastlyLogging) -> Result<(), Error> {
     if logging.use_fastly_logger {
         init_logger(
             logging.endpoint.as_deref().unwrap(),
@@ -106,15 +103,15 @@ fn post_commit_error(obs: &Observation, token: &str, error: &dyn std::fmt::Displ
 }
 pub fn rebuilt() -> Result<(), Error> {
     let mut logger_installed = false;
+    let logging = FastlyLogging::from(MeasuredApp::logging_for("fastly"));
     finish(serving().run(move |req| -> Result<Response, Error> {
         let stores = MeasuredApp::stores();
-        let env = runtime_env_config(stores);
         if !logger_installed {
-            install_logger(&env)?;
+            install_logger(&logging)?;
             logger_installed = true;
         }
         let app = MeasuredApp::build_app();
-        edgezero_adapter_fastly::request::dispatch_with_registries(&app, req, stores, &env, extend)
+        edgezero_adapter_fastly::request::dispatch_with_registries(&app, req, stores, extend)
     }))
 }
 
@@ -144,8 +141,8 @@ fn custom_dispatch(
         return Ok(());
     }
     let stores = MeasuredApp::stores();
-    let env = runtime_env_config(stores);
-    if let Err(error) = sandbox.setup_once(|| install_logger(&env)) {
+    let logging = FastlyLogging::from(MeasuredApp::logging_for("fastly"));
+    if let Err(error) = sandbox.setup_once(|| install_logger(&logging)) {
         eprintln!("logger setup failed: {error}");
         Response::from_status(503).send_to_client();
         return Ok(());
@@ -182,7 +179,6 @@ fn custom_dispatch(
     let core = edgezero_adapter_fastly::request::into_core_request_with_registries(
         req,
         stores,
-        &env,
         |_, extensions| {
             extensions.insert(obs.clone());
         },
@@ -288,6 +284,17 @@ pub fn custom(reuse_sandbox: bool, reuse_app: bool) -> Result<(), Error> {
 
 pub struct MeasuredApp;
 impl Hooks for MeasuredApp {
+    fn logging_for(adapter: &str) -> edgezero_core::manifest::ResolvedLoggingConfig {
+        if adapter.eq_ignore_ascii_case("fastly") {
+            edgezero_core::manifest::ResolvedLoggingConfig {
+                endpoint: Some("fixture-logs".to_owned()),
+                ..Default::default()
+            }
+        } else {
+            Default::default()
+        }
+    }
+
     fn routes() -> edgezero_core::router::RouterService {
         FixtureApp::routes()
     }
@@ -327,7 +334,6 @@ impl Hooks for MeasuredApp {
 
 /// Controlled fixture inputs exercise real adapter boundaries, not provider outages.
 pub fn faults() -> Result<(), Error> {
-    use edgezero_core::env_config::EnvConfig;
     use edgezero_core::http::response_builder;
     let mut retained = None;
     finish(serving().run(move |mut req: Request| -> Result<Response, Error> {
@@ -354,10 +360,27 @@ pub fn faults() -> Result<(), Error> {
                     .map(|_| Response::from_status(200)).map_err(Error::from)
             }
             _ => {
-                let env = if path == "/recoverable-store-error" || path == "/terminal-store-error" {
-                    EnvConfig::from_vars([("EDGEZERO__STORES__KV__FIXTURE_KV__NAME", "missing_fixture_store")])
-                } else { runtime_env_config(MeasuredApp::stores()) };
-                edgezero_adapter_fastly::request::dispatch_with_registries(app, req, MeasuredApp::stores(), &env, |_, extensions| { extensions.insert(obs.clone()); })
+                let stores = if path == "/recoverable-store-error"
+                    || path == "/terminal-store-error"
+                {
+                    edgezero_core::app::StoresMetadata {
+                        kv: Some(StoreMetadata {
+                            default: "missing_fixture_store",
+                            ids: &["missing_fixture_store"],
+                        }),
+                        ..MeasuredApp::stores()
+                    }
+                } else {
+                    MeasuredApp::stores()
+                };
+                edgezero_adapter_fastly::request::dispatch_with_registries(
+                    app,
+                    req,
+                    stores,
+                    |_, extensions| {
+                        extensions.insert(obs.clone());
+                    },
+                )
             }
         };
         match result {
