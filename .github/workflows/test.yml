@@ -29,6 +29,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
+            tests/fixtures/reusable-app/target/
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
@@ -71,6 +72,13 @@ jobs:
           cargo fmt --manifest-path tests/fixtures/request-fidelity-runner/Cargo.toml --all -- --check
           cargo test --manifest-path tests/fixtures/request-fidelity-runner/Cargo.toml --locked
           cargo clippy --manifest-path tests/fixtures/request-fidelity-runner/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Lifecycle fixture host tests
+        run: |
+          cargo test --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-harness -p fixture-core
+
+      - name: Check Axum lifecycle fixture
+        run: cargo check --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-axum
 
       - name: Run workspace tests
         run: cargo test --workspace --all-targets
@@ -140,6 +148,7 @@ jobs:
             ~/.cargo/git/db/
             ~/.wasmtime/bin/
             target/
+            tests/fixtures/reusable-app/target/
           key: ${{ runner.os }}-cargo-${{ matrix.adapter }}-${{ hashFiles('**/Cargo.lock', '.tool-versions') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.adapter }}-
@@ -318,5 +327,22 @@ jobs:
           fi
           ./scripts/test-request-fidelity.sh ${{ matrix.adapter }}
 
+      - name: Fastly reusable HTTP smoke
+        if: matrix.adapter == 'fastly'
+        run: ./scripts/smoke_test_reusable_app.sh --adapter fastly --suite smoke
+
+      - name: Preserve Fastly lifecycle evidence
+        if: always() && matrix.adapter == 'fastly'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastly-lifecycle-evidence
+          path: tests/fixtures/reusable-app/.runs/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Check ${{ matrix.adapter }} wasm target
         run: cargo check -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }}
+
+      - name: Check ${{ matrix.adapter }} lifecycle fixture
+        run: cargo check --locked --manifest-path tests/fixtures/reusable-app/Cargo.toml -p fixture-${{ matrix.adapter }} --target ${{ matrix.target }} --all-targets

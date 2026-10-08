@@ -1,0 +1,4 @@
+[key_value_store.fixture_config]
+type = "spin"
+[key_value_store.fixture_kv]
+type = "spin"

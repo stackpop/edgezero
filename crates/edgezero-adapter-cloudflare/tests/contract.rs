@@ -20,7 +20,7 @@ mod tests {
     use edgezero_adapter_cloudflare::context::CloudflareRequestContext;
     use edgezero_adapter_cloudflare::request::{CloudflareService, into_core_request};
     use edgezero_adapter_cloudflare::response::from_core_response;
-    use edgezero_core::app::App;
+    use edgezero_core::app::{App, Hooks};
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
@@ -330,6 +330,32 @@ mod tests {
         let env = Object::new().unchecked_into::<Env>();
         let js_context = Object::new().unchecked_into::<WorkerSysContext>();
         (env, Context::new(js_context))
+    }
+
+    #[wasm_bindgen_test]
+    async fn dispatch_app_reuses_router_with_fresh_request_bodies() {
+        struct TestApp;
+        // This fixture deliberately exercises the default Hooks metadata.
+        #[expect(
+            clippy::missing_trait_methods,
+            reason = "exercise default Hooks metadata and construction"
+        )]
+        impl Hooks for TestApp {
+            fn routes() -> RouterService {
+                build_test_app().router().clone()
+            }
+        }
+        let app = TestApp::build_app();
+        for body in [b"first".as_slice(), b"second".as_slice()] {
+            let (env, ctx) = test_env_ctx();
+            let request = cf_request(CfMethod::Post, "/mirror", Some(body));
+            let mut response =
+                edgezero_adapter_cloudflare::dispatch_app::<TestApp>(&app, request, env, ctx)
+                    .await
+                    .expect("prebuilt dispatch response");
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(response.bytes().await.expect("response bytes"), body);
+        }
     }
 
     #[wasm_bindgen_test]

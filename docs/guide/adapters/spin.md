@@ -318,6 +318,41 @@ These contracts execute under Wasmtime. Incoming conversion is additionally exer
 Configure the Spin adapter in `edgezero.toml`. See
 [Configuration](/guide/configuration) for the full manifest reference.
 
+## Retaining an application
+
+Use a concrete application-owned `OnceLock<App>` and call
+`edgezero_adapter_spin::dispatch_app::<MyApp>(app, req).await` on each
+invocation. This resolves fresh request resources from `MyApp::stores()` and does
+not install logging, construct an app, or cache native resources. Initialize any
+application logging before the cache's synchronous app constructor. Do not use a
+generic unkeyed static or hold a lock across an await.
+
+```rust
+use edgezero_core::app::{App, Hooks};
+use spin_sdk::{http::{IntoResponse, Request}, http_service};
+use std::sync::OnceLock;
+
+static APP: OnceLock<App> = OnceLock::new();
+
+#[http_service]
+async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
+    let app = APP.get_or_init(MyApp::build_app);
+    edgezero_adapter_spin::dispatch_app::<MyApp>(app, req).await
+}
+```
+
+The pinned SDK 6 macro exports a P3 HTTP interface. The `wasm32-wasip2` Rust target
+name does not establish the component's HTTP lifecycle. Verify the emitted
+interface and host together. spin-sdk 6 requires Spin 3.7 or later. See Spin's
+[instance-reuse documentation](https://spinframework.dev/v4/http-trigger#controlling-instance-reuse)
+for the reuse and concurrency controls your host version supports.
+
+Test both sequential reuse and overlapping invocations in the same instance.
+Different guest instances are not evidence of concurrent isolation. Keep
+request/response bodies and pending operations invocation-local. Existing
+response buffering and stream collection limits still apply. Restore `run_app`
+and remove the cache to roll back; default generated entry points are unchanged.
+
 ## Next Steps
 
 - [Migration guide](/guide/manifest-store-migration) — moving from the
