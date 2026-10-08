@@ -780,6 +780,7 @@ dependencies = [
  "ctor",
  "edgezero-adapter",
  "edgezero-core",
+ "edgezero-store-aws",
  "futures",
  "futures-util",
  "http",
@@ -959,6 +960,16 @@ dependencies = [
  "syn 3.0.6",
  "toml",
  "validator",
+]
+
+[[package]]
+name = "edgezero-store-aws"
+version = "0.1.0"
+dependencies = [
+ "percent-encoding",
+ "serde",
+ "thiserror 2.0.21",
+ "url",
 ]
 
 [[package]]

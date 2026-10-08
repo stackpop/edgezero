@@ -1,6 +1,6 @@
-use edgezero_adapter_axum::dev_server::run_app;
+use edgezero_adapter_axum::dev_server::run_generated_app;
 
 fn main() -> anyhow::Result<()> {
-    run_app::<{{proj_core_mod}}::App>()?;
+    run_generated_app::<{{proj_core_mod}}::App>()?;
     Ok(())
 }

@@ -27,6 +27,13 @@ use crate::ensure_adapter_defined;
 use edgezero_adapter::registry::{
     self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
 };
+#[cfg(feature = "edgezero-adapter-axum")]
+use edgezero_adapter_axum::native_bindings::{
+    NativeBindingsLimits, NativeConfigBinding, NativeProviderCapabilities, NativeSourceSelection,
+    NativeStoreBindings, NativeStoreDeclarations, NativeSuppliedIds,
+};
+#[cfg(feature = "edgezero-adapter-axum")]
+use edgezero_adapter_axum::native_build::NativeCargoSelection;
 use edgezero_core::app_config::{
     self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretField, SecretKind,
     SecretPathSegment,
@@ -217,6 +224,10 @@ struct ResolvedTomlLeaf<'raw> {
 /// Returns a human-readable error string on any validation failure.
 #[inline]
 pub fn run_config_validate(args: &ConfigValidateArgs) -> Result<(), String> {
+    if args.store_bindings.is_some() || args.adapter.is_some() {
+        return run_native_bindings_validate(args);
+    }
+    reject_target_controls_without_bindings(args)?;
     let ctx = load_validation_context(args)?;
     run_shared_checks(&ctx, None)?;
     log::info!(
@@ -236,6 +247,10 @@ pub fn run_config_validate_typed<C>(args: &ConfigValidateArgs) -> Result<(), Str
 where
     C: DeserializeOwned + Validate + AppConfigMeta,
 {
+    if args.store_bindings.is_some() || args.adapter.is_some() {
+        return run_native_bindings_validate(args);
+    }
+    reject_target_controls_without_bindings(args)?;
     let ctx = load_validation_context(args)?;
     run_shared_checks(&ctx, None)?;
 
@@ -443,6 +458,7 @@ pub fn run_config_push_typed<C>(args: &ConfigPushArgs) -> Result<(), String>
 where
     C: DeserializeOwned + Serialize + Validate + AppConfigMeta,
 {
+    reject_aws_bound_config_push(args)?;
     // Pre-flight: load + validate.
     let ctx = load_push_context(args)?;
     run_shared_checks(&ctx.validation, Some(&args.adapter))?;
@@ -606,6 +622,12 @@ where
     // adapter_typed_checks; no consent gate, no re-fetch).
     let validate_args = ConfigValidateArgs {
         app_config: args.app_config.clone(),
+        adapter: None,
+        store_bindings: None,
+        target: None,
+        target_features: Vec::new(),
+        target_all_features: false,
+        target_no_default_features: false,
         manifest: args.manifest.clone(),
         no_env: args.no_env,
         strict: false,
@@ -1329,6 +1351,12 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
     // alongside the schema and selected-adapter shared checks.
     let validate_args = ConfigValidateArgs {
         app_config: args.app_config.clone(),
+        adapter: None,
+        store_bindings: None,
+        target: None,
+        target_features: Vec::new(),
+        target_all_features: false,
+        target_no_default_features: false,
         manifest: args.manifest.clone(),
         no_env: args.no_env,
         strict: true,
@@ -1462,6 +1490,143 @@ where
 /// `generated_at` is informational only — it is NOT part of the SHA.
 fn generated_at_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn reject_target_controls_without_bindings(args: &ConfigValidateArgs) -> Result<(), String> {
+    if args.target.is_some()
+        || !args.target_features.is_empty()
+        || args.target_all_features
+        || args.target_no_default_features
+    {
+        return Err(
+            "native target controls require `--adapter axum --store-bindings <absolute-path>`"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Validate only a caller-selected native bindings file. This path intentionally
+/// does not load app TOML, ambient overlays, tokens, credentials, or deployment env.
+#[cfg(feature = "edgezero-adapter-axum")]
+fn run_native_bindings_validate(args: &ConfigValidateArgs) -> Result<(), String> {
+    let adapter = args
+        .adapter
+        .as_deref()
+        .ok_or_else(|| "bindings-only validation requires `--adapter axum`".to_owned())?;
+    if !adapter.eq_ignore_ascii_case("axum") {
+        return Err("bindings-only validation is supported only for `--adapter axum`".to_owned());
+    }
+    let path = args.store_bindings.as_deref().ok_or_else(|| {
+        "bindings-only validation requires `--store-bindings <absolute-path>`".to_owned()
+    })?;
+    if args.app_config.is_some() {
+        return Err("`--app-config` cannot be used with bindings-only validation".to_owned());
+    }
+    let manifest = ManifestLoader::from_path(&args.manifest)
+        .map_err(|_error| "failed to load application manifest".to_owned())?;
+    let bindings =
+        NativeStoreBindings::read_with_policy(path, NativeBindingsLimits::default(), None)
+            .map_err(|_error| "invalid native store bindings".to_owned())?;
+    let mut target_args = Vec::new();
+    for feature in &args.target_features {
+        target_args.extend(["--features".to_owned(), feature.clone()]);
+    }
+    if args.target_all_features {
+        target_args.push("--all-features".to_owned());
+    }
+    if args.target_no_default_features {
+        target_args.push("--no-default-features".to_owned());
+    }
+    if let Some(target) = &args.target {
+        target_args.extend(["--target".to_owned(), target.clone()]);
+    }
+    // Normalize and validate target controls, but this first version deliberately
+    // makes no provider-availability claim and runs no Cargo command.
+    let manifest_features = manifest
+        .manifest()
+        .adapter_entry("axum")
+        .map_or_else(Vec::new, |(_name, definition)| {
+            definition.build.features.clone()
+        });
+    let selection = NativeCargoSelection::normalize_args(&manifest_features, &target_args)?;
+    let declarations = NativeStoreDeclarations::try_from(&manifest.manifest().stores)
+        .map_err(|_error| "invalid store declarations for native bindings".to_owned())?;
+    NativeSourceSelection::validate(
+        declarations,
+        &bindings,
+        &NativeSuppliedIds::default(),
+        &EnvConfig::default(),
+        NativeProviderCapabilities {
+            appconfig_agent: true,
+            secrets_manager: true,
+        },
+        NativeBindingsLimits::default(),
+        None,
+    )
+    .map_err(|_error| "native store bindings do not match manifest declarations".to_owned())?;
+    log::info!(
+        "[edgezero] native store bindings structurally valid; target provider availability unknown (target={}, requested_features={}, all_features={}, no_default_features={})",
+        selection.target.as_deref().unwrap_or("host"),
+        selection.requested_features.len(),
+        selection.all_features,
+        selection.no_default_features,
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "edgezero-adapter-axum"))]
+fn run_native_bindings_validate(_args: &ConfigValidateArgs) -> Result<(), String> {
+    Err("bindings-only validation requires the CLI Axum native-bindings feature".to_owned())
+}
+
+#[cfg(feature = "edgezero-adapter-axum")]
+fn reject_aws_bound_config_push(args: &ConfigPushArgs) -> Result<(), String> {
+    let Some(path) = args.store_bindings.as_deref() else {
+        return Ok(());
+    };
+    if !args.adapter.eq_ignore_ascii_case("axum") {
+        return Err("`--store-bindings` push selection requires `--adapter axum`".to_owned());
+    }
+    if !path.is_absolute() {
+        return Err("`--store-bindings` must be an absolute path".to_owned());
+    }
+    let manifest = ManifestLoader::from_path(&args.manifest)
+        .map_err(|_error| "failed to load application manifest".to_owned())?;
+    let logical = resolve_config_store_id(args.store.as_deref(), manifest.manifest())?;
+    let bindings =
+        NativeStoreBindings::read_with_policy(path, NativeBindingsLimits::default(), None)
+            .map_err(|_error| "invalid native store bindings".to_owned())?;
+    let declarations = NativeStoreDeclarations::try_from(&manifest.manifest().stores)
+        .map_err(|_error| "invalid native store declarations".to_owned())?;
+    NativeSourceSelection::validate(
+        declarations,
+        &bindings,
+        &NativeSuppliedIds::default(),
+        &EnvConfig::default(),
+        NativeProviderCapabilities {
+            appconfig_agent: true,
+            secrets_manager: true,
+        },
+        NativeBindingsLimits::default(),
+        None,
+    )
+    .map_err(|_error| "native store bindings do not match manifest declarations".to_owned())?;
+    if matches!(
+        bindings.config().get(&logical),
+        Some(NativeConfigBinding::AppConfigAgent(_))
+    ) {
+        return Err("config push does not publish to AWS-bound native config stores; update the selected binding through its deployment workflow".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "edgezero-adapter-axum"))]
+fn reject_aws_bound_config_push(args: &ConfigPushArgs) -> Result<(), String> {
+    if args.store_bindings.is_some() {
+        return Err("`--store-bindings` requires the CLI Axum native-bindings feature".to_owned());
+    }
+    Ok(())
 }
 
 fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContext, String> {
@@ -2436,6 +2601,12 @@ source = "target/wasm32-wasip2/release/demo.wasm"
     fn args_for(manifest: &Path) -> ConfigValidateArgs {
         ConfigValidateArgs {
             app_config: None,
+            adapter: None,
+            store_bindings: None,
+            target: None,
+            target_features: Vec::new(),
+            target_all_features: false,
+            target_no_default_features: false,
             manifest: manifest.to_path_buf(),
             no_env: true, // tests don't want env leakage
             strict: false,
@@ -2446,6 +2617,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
         ConfigPushArgs {
             adapter: adapter.to_owned(),
             app_config: None,
+            store_bindings: None,
             dry_run: false,
             key: None,
             local: false,
@@ -2460,6 +2632,93 @@ source = "target/wasm32-wasip2/release/demo.wasm"
     }
 
     // ---------- raw flow ----------
+
+    #[cfg(feature = "edgezero-adapter-axum")]
+    const AWS_BINDINGS_FIXTURE: &str = r#"version = 1
+[config.remote]
+provider = "aws-appconfig-agent"
+default_key = "main"
+endpoint = "http://127.0.0.1:2772"
+[config.remote.documents.main]
+application = "demo-app"
+environment = "production"
+profile = "envelope"
+"#;
+
+    #[cfg(feature = "edgezero-adapter-axum")]
+    #[test]
+    fn bindings_only_validation_does_not_require_app_toml() {
+        let manifest_text = r#"
+[app]
+name = "demo-app"
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+[stores.config]
+ids = ["remote"]
+default = "remote"
+"#;
+        let (dir, manifest, app_config) = setup_project(manifest_text, "not used");
+        fs::remove_file(&app_config).expect("remove local config");
+        let bindings_path = dir.path().join("bindings.toml");
+        fs::write(&bindings_path, AWS_BINDINGS_FIXTURE).expect("write native bindings");
+        let args = ConfigValidateArgs {
+            app_config: None,
+            adapter: Some("axum".to_owned()),
+            store_bindings: Some(bindings_path),
+            target: None,
+            target_features: Vec::new(),
+            target_all_features: false,
+            target_no_default_features: false,
+            manifest,
+            no_env: false,
+            strict: false,
+        };
+        run_config_validate(&args).expect("structural validation does not load app TOML");
+    }
+
+    #[cfg(feature = "edgezero-adapter-axum")]
+    #[test]
+    fn push_guard_rejects_only_the_selected_aws_config_id() {
+        let manifest_text = PUSH_MANIFEST.replace(
+            "ids = [\"app_config\"]",
+            "ids = [\"app_config\", \"remote\"]\ndefault = \"app_config\"",
+        );
+        let (dir, manifest, app_config) = setup_project(&manifest_text, VALID_APP_CONFIG);
+        fs::remove_file(app_config).expect("guard must not require local app TOML");
+        let bindings_dir = tempfile::tempdir().expect("bindings directory");
+        let bindings = bindings_dir.path().join("bindings.toml");
+        fs::write(
+            &bindings,
+            AWS_BINDINGS_FIXTURE.replace("remote", "app_config"),
+        )
+        .expect("write bindings");
+        let mut args = push_args(&manifest, "axum");
+        args.store_bindings = Some(bindings.clone());
+        let error = reject_aws_bound_config_push(&args).expect_err("AWS-bound push is refused");
+        assert!(error.contains("does not publish to AWS-bound"));
+        for (local, dry_run) in [(false, false), (true, false), (false, true), (true, true)] {
+            args.local = local;
+            args.dry_run = dry_run;
+            let push_error = run_config_push_typed::<FixtureConfig>(&args)
+                .expect_err("public typed push refuses AWS before loading app TOML");
+            assert!(push_error.contains("does not publish to AWS-bound"));
+            assert!(
+                !dir.path().join(".edgezero").exists(),
+                "refusal performs no local write"
+            );
+        }
+
+        fs::write(&bindings, AWS_BINDINGS_FIXTURE).expect("write unrelated AWS binding");
+        reject_aws_bound_config_push(&args).expect("unrelated declared AWS binding is allowed");
+        fs::write(&bindings, AWS_BINDINGS_FIXTURE.replace("remote", "unknown"))
+            .expect("write typo");
+        reject_aws_bound_config_push(&args)
+            .expect_err("undeclared bindings are not a valid push selection");
+    }
 
     #[test]
     fn raw_validates_a_well_formed_project() {

@@ -22,7 +22,7 @@ required-features = ["nested-app-config-check"]
 [dependencies]
 edgezero-core = { workspace = true }
 edgezero-adapter = { path = "../edgezero-adapter" }
-edgezero-adapter-axum = { workspace = true, features = ["cli", "axum"], optional = true }
+edgezero-adapter-axum = { workspace = true, features = ["cli", "native-bindings"], optional = true }
 edgezero-adapter-cloudflare = { workspace = true, features = ["cli"], optional = true }
 edgezero-adapter-fastly = { workspace = true, features = ["cli"], optional = true }
 edgezero-adapter-spin = { workspace = true, features = ["cli"], optional = true }
@@ -58,6 +58,6 @@ default = [
     "edgezero-adapter-cloudflare",
     "edgezero-adapter-spin",
 ]
-cli = ["dep:clap", "dep:handlebars"]
-demo-example = ["dep:app-demo-core", "edgezero-adapter-axum"]
+cli = ["dep:clap", "dep:handlebars", "edgezero-adapter/cli"]
+demo-example = ["dep:app-demo-core", "edgezero-adapter-axum", "edgezero-adapter-axum/axum"]
 nested-app-config-check = ["dep:proc-macro2", "dep:syn", "dep:walkdir"]

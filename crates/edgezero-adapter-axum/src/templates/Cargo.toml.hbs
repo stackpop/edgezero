@@ -24,3 +24,9 @@ log = { workspace = true }
 simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing = { workspace = true }
+
+[features]
+default = []
+aws-appconfig-agent = ["edgezero-adapter-axum/aws-appconfig-agent"]
+aws-secrets-manager = ["edgezero-adapter-axum/aws-secrets-manager"]
+aws-stores = ["aws-appconfig-agent", "aws-secrets-manager"]

@@ -1,4 +1,6 @@
-use std::env::vars_os;
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::env::{var_os, vars_os};
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
@@ -7,7 +9,12 @@ use std::time::{Duration, Instant};
 use edgezero_core::addr;
 use edgezero_core::app::StoresMetadata;
 use edgezero_core::env_config::EnvConfig;
+use edgezero_store_aws::settings::{AgentAccessToken, AwsPreparationLimits};
 use log::LevelFilter;
+
+use crate::native_bindings::{
+    NativeBindingsLimits, NativeConfigBinding, NativeStoreBindings, NativeStoreBindingsInput,
+};
 
 /// Validated explicit production hosting options. Construction never selects a
 /// policy from build profile, cwd or container detection. Explicit constructors
@@ -15,6 +22,10 @@ use log::LevelFilter;
 #[derive(Clone)]
 pub struct AxumRunOptions {
     addr: SocketAddr,
+    aws_limits: Option<AwsPreparationLimits>,
+    bindings: NativeStoreBindingsInput,
+    bindings_limits: NativeBindingsLimits,
+    bootstrap_values: BTreeMap<String, BootstrapValue>,
     config_dir: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     env: EnvConfig,
@@ -23,9 +34,53 @@ pub struct AxumRunOptions {
     non_unicode_overrides: Vec<Vec<String>>,
 }
 
+#[derive(Clone)]
+enum BootstrapValue {
+    Ambiguous,
+    Value(String),
+}
+
+#[expect(
+    clippy::arbitrary_source_item_ordering,
+    reason = "scalar validation precedes local-root validation; compatibility constructors remain grouped"
+)]
 impl AxumRunOptions {
     pub(crate) fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    pub(crate) fn bindings(&self) -> &NativeStoreBindingsInput {
+        &self.bindings
+    }
+
+    pub(crate) fn bindings_limits(&self) -> NativeBindingsLimits {
+        self.bindings_limits
+    }
+
+    pub(crate) fn aws_limits(&self) -> Option<AwsPreparationLimits> {
+        self.aws_limits
+    }
+
+    pub(crate) fn agent_token(&self, name: &str) -> anyhow::Result<AgentAccessToken> {
+        let value = match self.bootstrap_values.get(name) {
+            Some(BootstrapValue::Value(value)) => value.clone(),
+            Some(BootstrapValue::Ambiguous) => {
+                return Err(failure(
+                    "settings",
+                    "Agent token",
+                    "duplicate configured value",
+                ));
+            }
+            None => {
+                return Err(failure(
+                    "settings",
+                    "Agent token",
+                    "configured value absent",
+                ));
+            }
+        };
+        AgentAccessToken::new(value)
+            .map_err(|_category| failure("settings", "Agent token", "invalid configured value"))
     }
 
     pub(crate) fn config_dir(&self) -> Option<&Path> {
@@ -71,7 +126,43 @@ impl AxumRunOptions {
         }
         let mut options = Self::from_vars(pairs)?;
         options.non_unicode_overrides = non_unicode;
+        // Only this env-loading boundary may resolve named token variables.
+        // Explicit constructors and selection methods never call var_os.
+        options.capture_agent_tokens(|name| var_os(name))?;
         Ok(options)
+    }
+
+    fn capture_agent_tokens<Lookup>(&mut self, mut lookup: Lookup) -> anyhow::Result<()>
+    where
+        Lookup: FnMut(&str) -> Option<OsString>,
+    {
+        let names: BTreeSet<String> = self
+            .bindings
+            .document()
+            .into_iter()
+            .flat_map(|document| document.config().values())
+            .filter_map(|binding| {
+                let NativeConfigBinding::AppConfigAgent(settings) = binding;
+                settings.access_token_env.clone()
+            })
+            .collect();
+        for name in names {
+            let value = lookup(&name)
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| {
+                    failure(
+                        "settings",
+                        "Agent token",
+                        "configured value absent or non-Unicode",
+                    )
+                })?;
+            AgentAccessToken::new(value.clone()).map_err(|_category| {
+                failure("settings", "Agent token", "invalid configured value")
+            })?;
+            self.bootstrap_values
+                .insert(name, BootstrapValue::Value(value));
+        }
+        Ok(())
     }
 
     /// Constructs options using only supplied string pairs and omission defaults.
@@ -86,7 +177,31 @@ impl AxumRunOptions {
         K: AsRef<str>,
         V: Into<String>,
     {
-        let env = EnvConfig::from_vars(vars);
+        let pairs: Vec<(String, String)> = vars
+            .into_iter()
+            .map(|(key, value)| (key.as_ref().to_owned(), value.into()))
+            .collect();
+        let mut seen = BTreeSet::new();
+        for (key, _value) in &pairs {
+            if let Some(rest) = key.strip_prefix("EDGEZERO__") {
+                let path: Vec<String> = rest.split("__").map(str::to_ascii_lowercase).collect();
+                let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+                if (fixed_setting(&path).is_some()
+                    || matches!(
+                        segments.as_slice(),
+                        ["stores", "config" | "kv" | "secrets", _, "name" | "key"]
+                    ))
+                    && !seen.insert(path)
+                {
+                    return Err(failure(
+                        "settings",
+                        "bootstrap",
+                        "duplicate normalized setting",
+                    ));
+                }
+            }
+        }
+        let env = EnvConfig::from_vars(pairs.iter().map(|(key, value)| (key, value.clone())));
         let host = env.adapter_host().map_or(Ok(addr::DEFAULT_HOST), |raw| {
             raw.parse()
                 .map_err(|_error| failure("settings", "HOST", "invalid IP literal"))
@@ -110,6 +225,19 @@ impl AxumRunOptions {
             options = options.with_data_dir(root)?;
         }
         options.env = env;
+        for (key, value) in pairs {
+            match options.bootstrap_values.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(BootstrapValue::Value(value));
+                }
+                Entry::Occupied(mut entry) => {
+                    entry.insert(BootstrapValue::Ambiguous);
+                }
+            }
+        }
+        if let Some(path) = options.env.get(&["store_bindings_file"]).map(str::to_owned) {
+            options = options.with_store_bindings_file(path)?;
+        }
         Ok(options)
     }
 
@@ -127,6 +255,10 @@ impl AxumRunOptions {
             return Err(failure("settings", "PORT", "invalid nonzero port"));
         }
         Ok(Self {
+            bindings: NativeStoreBindingsInput::LocalDefaults,
+            bindings_limits: NativeBindingsLimits::default(),
+            aws_limits: None,
+            bootstrap_values: BTreeMap::new(),
             addr,
             config_dir: None,
             data_dir: None,
@@ -141,7 +273,13 @@ impl AxumRunOptions {
         self.grace
     }
 
-    pub(crate) fn validate_stores(&self, metadata: StoresMetadata) -> anyhow::Result<()> {
+    #[cfg(test)]
+    fn validate_stores(&self, metadata: StoresMetadata) -> anyhow::Result<()> {
+        self.validate_store_overlays(metadata)?;
+        self.validate_local_roots(metadata.config.is_some(), metadata.kv.is_some())
+    }
+
+    pub(crate) fn validate_store_overlays(&self, metadata: StoresMetadata) -> anyhow::Result<()> {
         for (kind, declaration) in [
             ("config", metadata.config),
             ("kv", metadata.kv),
@@ -175,11 +313,15 @@ impl AxumRunOptions {
                 }
             }
         }
-        for (meta, root, label) in [
-            (metadata.config, self.config_dir.as_deref(), "CONFIG_DIR"),
-            (metadata.kv, self.data_dir.as_deref(), "DATA_DIR"),
+        Ok(())
+    }
+
+    pub(crate) fn validate_local_roots(&self, config: bool, kv: bool) -> anyhow::Result<()> {
+        for (required, root, label) in [
+            (config, self.config_dir.as_deref(), "CONFIG_DIR"),
+            (kv, self.data_dir.as_deref(), "DATA_DIR"),
         ] {
-            if meta.is_some() && root.is_none() {
+            if required && root.is_none() {
                 return Err(failure("settings", label, "required for declared stores"));
             }
             if let Some(directory) = root {
@@ -187,6 +329,115 @@ impl AxumRunOptions {
             }
         }
         Ok(())
+    }
+
+    /// Selects typed bindings. A second explicit selection is an error.
+    ///
+    /// # Errors
+    /// Rejects duplicate selection and invalid settings/policy sources.
+    #[inline]
+    pub fn with_store_bindings(mut self, bindings: NativeStoreBindings) -> anyhow::Result<Self> {
+        if !matches!(self.bindings, NativeStoreBindingsInput::LocalDefaults) {
+            return Err(failure("settings", "bindings", "duplicate selection"));
+        }
+        bindings
+            .validate(self.bindings_limits, self.aws_limits)
+            .map_err(|category| failure("settings", "bindings", &category.to_string()))?;
+        self.bindings = NativeStoreBindingsInput::Inline(bindings);
+        Ok(self)
+    }
+
+    /// Captures one absolute bindings file once. Explicit selection does not read environment values.
+    ///
+    /// # Errors
+    /// Rejects duplicate/relative/missing/malformed/oversized selections.
+    #[inline]
+    pub fn with_store_bindings_file<Root: Into<PathBuf>>(
+        mut self,
+        locator: Root,
+    ) -> anyhow::Result<Self> {
+        if !matches!(self.bindings, NativeStoreBindingsInput::LocalDefaults) {
+            return Err(failure("settings", "bindings", "duplicate selection"));
+        }
+        let path = locator.into();
+        let bindings =
+            NativeStoreBindings::read_with_policy(&path, self.bindings_limits, self.aws_limits)
+                .map_err(|category| failure("settings", "bindings", &category.to_string()))?;
+        bindings
+            .validate(self.bindings_limits, self.aws_limits)
+            .map_err(|category| failure("settings", "bindings", &category.to_string()))?;
+        self.bindings = NativeStoreBindingsInput::File { path, bindings };
+        Ok(self)
+    }
+
+    /// Supplies named bootstrap values explicitly, never merging ambient variables.
+    ///
+    /// # Errors
+    /// Rejects duplicate variable inputs rather than selecting precedence.
+    #[inline]
+    pub fn with_bootstrap_values<I, K, V>(mut self, values: I) -> anyhow::Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        for (name, value) in values {
+            if self
+                .bootstrap_values
+                .insert(name.into(), BootstrapValue::Value(value.into()))
+                .is_some()
+            {
+                return Err(failure("settings", "bootstrap", "duplicate variable"));
+            }
+        }
+        Ok(self)
+    }
+
+    /// Selects trusted file/ID bounds before selecting a document.
+    ///
+    /// # Errors
+    /// Rejects invalid bounds or policy changes after a file/inline selection.
+    #[inline]
+    pub fn with_native_bindings_limits(
+        mut self,
+        limits: NativeBindingsLimits,
+    ) -> anyhow::Result<Self> {
+        if !matches!(self.bindings, NativeStoreBindingsInput::LocalDefaults) {
+            return Err(failure(
+                "settings",
+                "bindings",
+                "limits must precede selection",
+            ));
+        }
+        limits
+            .validate()
+            .map_err(|category| failure("settings", "bindings", &category.to_string()))?;
+        self.bindings_limits = limits;
+        Ok(self)
+    }
+
+    /// Selects one explicit remote preparation policy, not an override/merge of file policies.
+    ///
+    /// # Errors
+    /// Rejects duplicate policies, competing document policies and invalid limits.
+    #[inline]
+    pub fn with_aws_preparation_limits(
+        mut self,
+        limits: AwsPreparationLimits,
+    ) -> anyhow::Result<Self> {
+        if self.aws_limits.is_some() {
+            return Err(failure("settings", "AWS limits", "duplicate policy"));
+        }
+        limits
+            .validate()
+            .map_err(|category| failure("settings", "AWS limits", &category.to_string()))?;
+        if let Some(document) = self.bindings.document() {
+            document
+                .validate(self.bindings_limits, Some(limits))
+                .map_err(|category| failure("settings", "AWS limits", &category.to_string()))?;
+        }
+        self.aws_limits = Some(limits);
+        Ok(self)
     }
 
     /// Selects an existing absolute config root; never creates it.
@@ -247,6 +498,7 @@ fn fixed_setting(path: &[String]) -> Option<&'static str> {
         ["adapter", "data_dir"] => Some("DATA_DIR"),
         ["adapter", "shutdown_grace_seconds"] => Some("SHUTDOWN_GRACE_SECONDS"),
         ["logging", "level"] => Some("LOGGING__LEVEL"),
+        ["store_bindings_file"] => Some("STORE_BINDINGS_FILE"),
         _ => None,
     }
 }
@@ -295,8 +547,315 @@ fn validate_root(root: &Path, setting: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use edgezero_core::app::StoreMetadata;
+
+    const BINDINGS: &str = "version = 1\n[config.app]\nprovider = 'aws-appconfig-agent'\ndefault_key = 'settings'\nendpoint = 'http://127.0.0.1:2772'\naccess_token_env = 'AGENT_TOKEN'\n[config.app.documents.settings]\napplication = 'example'\nenvironment = 'production'\nprofile = 'envelope'\n";
+
+    fn explicit() -> AxumRunOptions {
+        AxumRunOptions::new(SocketAddr::from(([127, 0, 0, 1], 1234))).expect("explicit options")
+    }
+
+    #[test]
+    fn file_selection_is_captured_once_and_conflicts_do_not_read_a_second_file() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("bindings.toml");
+        fs::write(&path, BINDINGS).expect("write bindings");
+        let options = explicit()
+            .with_store_bindings_file(&path)
+            .expect("selected file");
+        fs::remove_file(&path).expect("remove file after capture");
+        assert_eq!(
+            options
+                .bindings()
+                .document()
+                .expect("captured")
+                .config()
+                .len(),
+            1
+        );
+        let document = NativeStoreBindings::parse(BINDINGS, NativeBindingsLimits::default())
+            .expect("typed bindings");
+        assert!(
+            options
+                .clone()
+                .with_store_bindings(document)
+                .err()
+                .expect("duplicate")
+                .to_string()
+                .contains("duplicate")
+        );
+        assert!(
+            options
+                .with_store_bindings_file(path)
+                .err()
+                .expect("duplicate file")
+                .to_string()
+                .contains("duplicate")
+        );
+        assert!(
+            explicit()
+                .with_store_bindings_file("relative.toml")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_bootstrap_values_do_not_consult_ambient_variables() {
+        let document = NativeStoreBindings::parse(BINDINGS, NativeBindingsLimits::default())
+            .expect("bindings");
+        let unconfigured = explicit().with_store_bindings(document).expect("inline");
+        let missing = unconfigured
+            .agent_token("AGENT_TOKEN")
+            .expect_err("missing token");
+        assert_eq!(missing.chain().count(), 1);
+        let options = unconfigured
+            .with_bootstrap_values([("AGENT_TOKEN", "TOKEN_SENTINEL")])
+            .expect("supplied token");
+        assert_eq!(
+            options
+                .agent_token("AGENT_TOKEN")
+                .expect("captured")
+                .expose(),
+            "TOKEN_SENTINEL"
+        );
+        assert!(!format!("{:?}", options.agent_token("AGENT_TOKEN")).contains("SENTINEL"));
+        assert!(
+            options
+                .with_bootstrap_values([("AGENT_TOKEN", "OTHER_SENTINEL")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_vars_capture_locator_and_named_values_without_reopening() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("bindings.toml");
+        fs::write(&path, BINDINGS).expect("write bindings");
+        let options = AxumRunOptions::from_vars([
+            (
+                "EDGEZERO__STORE_BINDINGS_FILE",
+                path.to_str().expect("path"),
+            ),
+            ("AGENT_TOKEN", "TOKEN_SENTINEL"),
+        ])
+        .expect("supplied variables");
+        fs::remove_file(path).expect("remove");
+        assert!(options.bindings().document().is_some());
+        assert_eq!(
+            options.agent_token("AGENT_TOKEN").expect("token").expose(),
+            "TOKEN_SENTINEL"
+        );
+        for (first, second) in [
+            (
+                "EDGEZERO__STORE_BINDINGS_FILE",
+                "EDGEZERO__store_bindings_file",
+            ),
+            (
+                "EDGEZERO__STORES__CONFIG__APP__NAME",
+                "EDGEZERO__stores__config__app__name",
+            ),
+            ("EDGEZERO__ADAPTER__PORT", "EDGEZERO__adapter__port"),
+        ] {
+            let error = AxumRunOptions::from_vars([(first, "SENTINEL"), (second, "SENTINEL")])
+                .err()
+                .expect("duplicate normalized path");
+            assert!(error.to_string().contains("duplicate"));
+            assert!(!format!("{error:?}").contains("SENTINEL"));
+        }
+    }
+
+    #[test]
+    fn duplicate_unrelated_vars_keep_existing_env_semantics_but_tokens_fail_closed() {
+        let options = AxumRunOptions::from_vars([
+            ("EDGEZERO__UNRELATED", "first"),
+            ("EDGEZERO__UNRELATED", "second"),
+            ("AGENT_TOKEN", "FIRST_SENTINEL"),
+            ("AGENT_TOKEN", "SECOND_SENTINEL"),
+        ])
+        .expect("unrelated env keys retain existing semantics");
+        assert_eq!(options.env.get(&["unrelated"]), Some("second"));
+        let error = options
+            .agent_token("AGENT_TOKEN")
+            .expect_err("ambiguous token");
+        assert!(error.to_string().contains("duplicate"));
+        assert!(!format!("{error:?}").contains("SENTINEL"));
+    }
+
+    #[test]
+    fn named_token_capture_is_once_per_variable_and_rejects_missing_empty() {
+        let duplicate = format!(
+            "{BINDINGS}\n{}",
+            BINDINGS
+                .replace("version = 1\n", "")
+                .replace("config.app", "config.other")
+        );
+        let document = NativeStoreBindings::parse(&duplicate, NativeBindingsLimits::default())
+            .expect("shared token bindings");
+        let options = explicit().with_store_bindings(document).expect("inline");
+        let mut captured = options.clone();
+        let mut calls = 0_usize;
+        captured
+            .capture_agent_tokens(|name| {
+                assert_eq!(name, "AGENT_TOKEN");
+                calls += 1;
+                Some(OsString::from("TOKEN_SENTINEL"))
+            })
+            .expect("capture");
+        assert_eq!(calls, 1);
+        for value in [None, Some(OsString::new())] {
+            let error = options
+                .clone()
+                .capture_agent_tokens(|_name| value.clone())
+                .expect_err("configured token invalid");
+            assert!(!format!("{error:?}").contains("SENTINEL"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_configured_token_fails_closed() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let document = NativeStoreBindings::parse(BINDINGS, NativeBindingsLimits::default())
+            .expect("bindings");
+        let mut options = explicit().with_store_bindings(document).expect("inline");
+        let error = options
+            .capture_agent_tokens(|_name| Some(OsString::from_vec(vec![0xff])))
+            .expect_err("non-Unicode token");
+        assert_eq!(error.chain().count(), 1);
+        assert!(error.to_string().contains("non-Unicode"));
+    }
+
+    #[test]
+    fn trusted_caps_and_remote_policy_sources_are_explicit() {
+        let document = NativeStoreBindings::parse(BINDINGS, NativeBindingsLimits::default())
+            .expect("bindings");
+        let options = explicit().with_store_bindings(document).expect("inline");
+        assert!(
+            options
+                .with_native_bindings_limits(NativeBindingsLimits::default())
+                .is_err()
+        );
+        let with_policy = NativeStoreBindings::parse(
+            &format!("{BINDINGS}\n[limits.aws]\nmax_snapshot_bytes = 16777216"),
+            NativeBindingsLimits::default(),
+        )
+        .expect("policy");
+        assert!(
+            explicit()
+                .with_aws_preparation_limits(AwsPreparationLimits::default())
+                .expect("explicit policy")
+                .with_store_bindings(with_policy.clone())
+                .is_err()
+        );
+        assert!(
+            explicit()
+                .with_store_bindings(with_policy)
+                .expect("file policy")
+                .with_aws_preparation_limits(AwsPreparationLimits::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn env_bootstrap_child() {
+        use std::env;
+
+        let Some(expected) = env::var_os("EDGEZERO_NATIVE_BOOTSTRAP_TEST") else {
+            return;
+        };
+        if expected == "valid" {
+            let options = AxumRunOptions::from_env().expect("env token capture");
+            assert_eq!(
+                options
+                    .agent_token("AGENT_TOKEN")
+                    .expect("captured token")
+                    .expose(),
+                "TOKEN_SENTINEL"
+            );
+            let path = env::var_os("EDGEZERO__STORE_BINDINGS_FILE").expect("locator");
+            fs::write(
+                PathBuf::from(path),
+                BINDINGS.replace("AGENT_TOKEN", "OTHER_SENTINEL"),
+            )
+            .expect("change file after capture");
+            let NativeConfigBinding::AppConfigAgent(settings) = options
+                .bindings()
+                .document()
+                .expect("captured document")
+                .config()
+                .get("app")
+                .expect("captured binding");
+            assert_eq!(settings.access_token_env.as_deref(), Some("AGENT_TOKEN"));
+            assert_eq!(
+                options
+                    .agent_token("AGENT_TOKEN")
+                    .expect("retained token")
+                    .expose(),
+                "TOKEN_SENTINEL"
+            );
+        } else {
+            let error = AxumRunOptions::from_env()
+                .err()
+                .expect("invalid env bootstrap");
+            assert_eq!(error.chain().count(), 1);
+            assert!(!format!("{error:?}").contains("SENTINEL"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_env_entrypoint_captures_named_tokens_and_rejects_non_unicode_inputs() {
+        use std::env::current_exe;
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::process::Command;
+
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("bindings.toml");
+        for (token, valid) in [
+            (Some(OsString::from("TOKEN_SENTINEL")), true),
+            (None, false),
+            (Some(OsString::new()), false),
+            (Some(OsString::from_vec(vec![0xff])), false),
+        ] {
+            fs::write(&path, BINDINGS).expect("fresh bindings");
+            let mut command = Command::new(current_exe().expect("test binary"));
+            command
+                .env_clear()
+                .arg("--exact")
+                .arg("run_options::tests::env_bootstrap_child")
+                .env(
+                    "EDGEZERO_NATIVE_BOOTSTRAP_TEST",
+                    if valid { "valid" } else { "invalid" },
+                )
+                .env("EDGEZERO__STORE_BINDINGS_FILE", &path);
+            if let Some(value) = token {
+                command.env("AGENT_TOKEN", value);
+            }
+            let output = command.output().expect("isolated env fixture");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("SENTINEL"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("SENTINEL"));
+        }
+        let output = Command::new(current_exe().expect("binary"))
+            .env_clear()
+            .arg("--exact")
+            .arg("run_options::tests::env_bootstrap_child")
+            .env("EDGEZERO_NATIVE_BOOTSTRAP_TEST", "invalid")
+            .env(
+                "EDGEZERO__STORE_BINDINGS_FILE",
+                OsString::from_vec(vec![0xff]),
+            )
+            .output()
+            .expect("non-Unicode locator fixture");
+        assert!(output.status.success());
+    }
 
     #[test]
     fn defaults_and_invalid_supplied_scalars_are_distinct() {

@@ -50,6 +50,7 @@ export default defineConfig({
           { text: 'Cloudflare Workers', link: '/guide/adapters/cloudflare' },
           { text: 'Fermyon Spin', link: '/guide/adapters/spin' },
           { text: 'Axum (Native)', link: '/guide/adapters/axum' },
+          { text: 'Native AWS stores', link: '/guide/native-aws-stores' },
         ],
       },
       {
