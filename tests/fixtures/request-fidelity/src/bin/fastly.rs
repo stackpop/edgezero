@@ -2,7 +2,6 @@ use edgezero_adapter_fastly::request::{
     capture_request_ingress, dispatch_with_registries_and_ingress,
 };
 use edgezero_core::app::{Hooks, StoresMetadata};
-use edgezero_core::env_config::EnvConfig;
 use fastly::{Error, Request, Response};
 use request_fidelity::{Fixture, NativeClient};
 
@@ -25,7 +24,6 @@ fn main(mut req: Request) -> Result<Response, Error> {
         &Fixture::build_app(),
         req,
         StoresMetadata::default(),
-        &EnvConfig::default(),
         ingress,
         |_req, extensions| {
             extensions.insert(NativeClient(client_ip));

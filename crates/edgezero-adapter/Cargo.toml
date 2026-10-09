@@ -12,10 +12,14 @@ workspace = true
 
 [features]
 default = []
-cli = ["dep:toml"]
+cli = ["dep:serde", "dep:serde_json", "dep:sha2", "dep:toml", "dep:walkdir"]
 
 [dependencies]
 toml = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+walkdir = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

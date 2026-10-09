@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Builds and self-verifies one immutable application release. The core knows the
+# release schema and archive-safety rules; the provider wrapper supplies adapter
+# identity, lifecycle capability probes, and the provider package input.
+#
+# Reads (env):
+#   GITHUB_WORKSPACE                           required  confinement root for every packaged input
+#   RUNNER_TEMP                                optional  parent for the action-owned package workspace
+#   EDGEZERO__RELEASE__ADAPTER                 required  lowercase adapter identity recorded in release.json
+#   EDGEZERO__RELEASE__LIFECYCLE_CAPABILITIES  required  provider-owned JSON capability declaration
+#   EDGEZERO__RELEASE__POLICY_ROOT             required  trusted root containing the capability declaration
+#   EDGEZERO__RELEASE__APP_CLI_ARCHIVE         required  build-app-cli archive beneath github.workspace
+#   EDGEZERO__RELEASE__PACKAGE                 required  provider package beneath github.workspace
+#   EDGEZERO__RELEASE__APPLICATION_MANIFEST    required  edgezero.toml beneath github.workspace
+#   EDGEZERO__RELEASE__ADAPTER_MANIFEST        required  selected manifest beneath github.workspace
+#   EDGEZERO__RELEASE__SOURCE_REVISION         required  full lowercase 40- or 64-hex revision
+#   EDGEZERO__RELEASE__ARTIFACT_NAME           optional  uploaded artifact name
+# Writes (outputs):
+#   artifact-name, archive-path, workspace-path, archive-sha256,
+#   package-sha256, source-revision
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../../deploy-core/scripts/common.sh
+source "$SCRIPT_DIR/../../deploy-core/scripts/common.sh"
+
+confined_file() {
+  local raw="$1" label="$2" workspace_real="$3" candidate
+  [[ -n "$raw" ]] || fail "$label is required"
+  case "$raw" in
+    /*) candidate="$raw" ;;
+    *) candidate="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}/$raw" ;;
+  esac
+  [[ -f "$candidate" && ! -L "$candidate" ]] || fail "$label must be a regular file"
+  candidate=$(canonical_path "$candidate")
+  is_under "$workspace_real" "$candidate" || fail "$label must resolve beneath github.workspace"
+  printf '%s\n' "$candidate"
+}
+
+probe_capabilities() {
+  local cli="$1" capabilities="$2" protocol="$3" probe_count index help expected
+  probe_count=$(jq -r '.probes | length' "$capabilities")
+  for ((index = 0; index < probe_count; index++)); do
+    local -a command=()
+    while IFS= read -r token; do command+=("$token"); done < <(jq -r ".probes[$index].command[]" "$capabilities")
+    help=$(env -i PATH="/usr/bin:/bin" HOME="${HOME:-/tmp}" "$cli" "${command[@]}" --help 2>&1) ||
+      fail "application CLI does not support '${command[*]} --help' required by lifecycle protocol $protocol"
+    while IFS= read -r expected; do
+    awk -v flag="$expected" '
+      {
+        for (field = 1; field <= NF; field++) {
+          if ($field == flag || index($field, flag "=") == 1) found = 1
+        }
+      }
+      END { exit !found }
+    ' <<<"$help" ||
+      fail "application CLI '${command[*]} --help' lacks '$expected' required by lifecycle protocol $protocol"
+    done < <(jq -r ".probes[$index].required_flags[]" "$capabilities")
+  done
+}
+
+package_adapter_manifest() {
+  local application_manifest="$1" adapter_manifest="$2" adapter="$3" stage="$4" output="$5"
+  local parsed application_root relative candidate referenced destination digest
+  parsed="$output.application.json"
+  yq -p toml -o json -I=0 '.' "$application_manifest" >"$parsed" 2>/dev/null ||
+    fail "could not parse application-manifest as TOML"
+  jq -e --arg adapter "$adapter" '
+    (.adapters | type == "object")
+    and ([.adapters | keys[] | ascii_downcase] as $names
+      | ($names | length) == ($names | unique | length))
+    and ([.adapters | to_entries[] | select((.key | ascii_downcase) == $adapter)] as $selected
+      | ($selected | length) == 1
+        and ($selected[0].value | type == "object")
+        and ($selected[0].value.adapter | type == "object")
+        and ($selected[0].value.adapter.manifest | type == "string" and length > 0))
+  ' "$parsed" >/dev/null 2>&1 ||
+    fail "application-manifest must declare one valid [adapters.$adapter.adapter] manifest"
+  relative=$(jq -er \
+    --arg adapter "$adapter" \
+    '[.adapters | to_entries[] | select((.key | ascii_downcase) == $adapter)][0].value.adapter.manifest' \
+    "$parsed") || fail "could not resolve the selected adapter manifest from application-manifest"
+
+  application_root=$(canonical_path "$(dirname -- "$application_manifest")")
+  [[ "$relative" =~ ^[A-Za-z0-9._/-]+$ ]] ||
+    fail "application-manifest adapter manifest has an invalid path"
+  case "$relative" in
+    /* | *\\* | */ | ./* | *//* | release.json | edgezero.toml | cli/app-cli.tar | package/app.tar.gz)
+      fail "application-manifest adapter manifest path must be normalized, relative, and distinct from reserved release members"
+      ;;
+  esac
+  local part
+  local -a parts
+  IFS=/ read -r -a parts <<<"$relative"
+  for part in "${parts[@]}"; do
+    [[ -n "$part" && "$part" != . && "$part" != .. ]] ||
+      fail "application-manifest adapter manifest path must be normalized and relative"
+  done
+  candidate="$application_root/$relative"
+  [[ ! -L "$candidate" ]] || fail "adapter manifest must not be a symlink"
+  [[ -f "$candidate" ]] || fail "adapter manifest is not a regular file"
+  referenced=$(canonical_path "$candidate")
+  is_under "$application_root" "$referenced" ||
+    fail "application-manifest adapter manifest must resolve beneath the application root"
+  [[ "$referenced" == "$adapter_manifest" ]] ||
+    fail "adapter-manifest must be the selected file referenced by application-manifest"
+  destination="$stage/$relative"
+  mkdir -p "$(dirname -- "$destination")"
+  cp "$referenced" "$destination"
+  digest=$(sha256_file "$destination")
+  jq -cn --arg path "$relative" --arg sha256 "$digest" \
+    '{path:$path,sha256:$sha256}' >"$output"
+  rm -f "$parsed"
+}
+
+validate_capabilities() {
+  local file="$1"
+  jq -e '.' "$file" >/dev/null 2>&1 || fail "lifecycle capability declaration is not valid JSON"
+  # shellcheck disable=SC2016 # $keys is a yq variable, not a shell variable
+  yq -p yaml -o json -I=0 '
+    [.. | select(tag == "!!map")
+      | (keys as $keys | ($keys | length) == ($keys | unique | length))]
+    | all
+  ' "$file" 2>/dev/null | grep -qx true ||
+    fail "lifecycle capability declaration contains a duplicate field"
+  jq -e '
+    type == "object"
+    and (keys == ["lifecycle_protocol", "probes"])
+    and (.lifecycle_protocol | type == "number" and floor == . and . > 0)
+    and (.probes | type == "array" and length > 0)
+    and ([.probes[] |
+      type == "object"
+      and (keys == ["command", "required_flags"])
+      and (.command | type == "array" and length > 0)
+      and ([.command[] | type == "string" and test("^[ -~]+$") and length > 0 and . != "--help"] | all)
+      and (.required_flags | type == "array")
+      and ([.required_flags[] | type == "string" and test("^-[ -~]*$") and length > 1] | all)
+      and ((.required_flags | length) == (.required_flags | unique | length))
+    ] | all)
+    and (([.probes[].command | tojson] | length) == ([.probes[].command | tojson] | unique | length))
+  ' "$file" >/dev/null 2>&1 || fail "lifecycle capability declaration has an invalid schema"
+}
+
+main() {
+  local workspace_real runner_temp artifact_name revision adapter policy_root capabilities protocol
+  workspace_real=$(canonical_path "${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}")
+  runner_temp="${RUNNER_TEMP:-/tmp}"
+  artifact_name="${EDGEZERO__RELEASE__ARTIFACT_NAME:-application-release}"
+  revision="${EDGEZERO__RELEASE__SOURCE_REVISION:-}"
+  adapter="${EDGEZERO__RELEASE__ADAPTER:-}"
+  policy_root="${EDGEZERO__RELEASE__POLICY_ROOT:-}"
+  capabilities="${EDGEZERO__RELEASE__LIFECYCLE_CAPABILITIES:-}"
+  [[ "$artifact_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] ||
+    fail "artifact-name contains unsupported characters"
+  [[ "$revision" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] ||
+    fail "source-revision must be 40 or 64 lowercase hexadecimal characters"
+  [[ "$adapter" =~ ^[a-z][a-z0-9_-]*$ ]] || fail "release adapter is invalid"
+  for command in jq tar; do require_cmd "$command"; done
+  require_yq_v4
+  [[ -d "$policy_root" ]] || fail "release policy root must be a directory"
+  policy_root=$(canonical_path "$policy_root")
+  [[ -f "$capabilities" && ! -L "$capabilities" ]] ||
+    fail "lifecycle capability declaration must be a regular file"
+  capabilities=$(canonical_path "$capabilities")
+  is_under "$policy_root" "$capabilities" ||
+    fail "lifecycle capability declaration must resolve beneath the policy root"
+  validate_capabilities "$capabilities"
+  protocol=$(jq -r '.lifecycle_protocol' "$capabilities")
+
+  local cli_archive package application_manifest adapter_manifest
+  cli_archive=$(confined_file "${EDGEZERO__RELEASE__APP_CLI_ARCHIVE:-}" app-cli-archive "$workspace_real")
+  package=$(confined_file "${EDGEZERO__RELEASE__PACKAGE:-}" adapter-package "$workspace_real")
+  application_manifest=$(confined_file "${EDGEZERO__RELEASE__APPLICATION_MANIFEST:-}" application-manifest "$workspace_real")
+  adapter_manifest=$(confined_file "${EDGEZERO__RELEASE__ADAPTER_MANIFEST:-}" adapter-manifest "$workspace_real")
+
+  local work cli_outputs cli_path
+  work=$(mktemp -d "$runner_temp/edgezero-package-release.XXXXXX")
+  trap 'rm -rf -- "$work"' EXIT
+  cli_outputs="$work/cli.outputs"
+  : >"$cli_outputs"
+  EDGEZERO__APP__CLI__ARCHIVE="$cli_archive" \
+    EDGEZERO__ACTION__TOOL_ROOT="$work/tool" \
+    GITHUB_OUTPUT="$cli_outputs" \
+    "$SCRIPT_DIR/../../deploy-core/scripts/download-app-cli.sh" >/dev/null
+  cli_path=$(sed -n 's/^app-cli-path=//p' "$cli_outputs")
+  [[ -n "$cli_path" && -x "$cli_path" ]] || fail "application CLI verification emitted no executable path"
+  probe_capabilities "$cli_path" "$capabilities" "$protocol"
+
+  local stage adapter_metadata adapter_path release_archive package_digest archive_digest verify_root
+  stage="$work/stage"
+  mkdir -p "$stage/cli" "$stage/package"
+  cp "$cli_archive" "$stage/cli/app-cli.tar"
+  cp "$package" "$stage/package/app.tar.gz"
+  cp "$application_manifest" "$stage/edgezero.toml"
+  adapter_metadata="$work/adapter-manifest.json"
+  package_adapter_manifest "$application_manifest" "$adapter_manifest" "$adapter" "$stage" "$adapter_metadata" ||
+    fail "could not package the selected adapter manifest referenced by application-manifest"
+  adapter_path=$(jq -er '.path' "$adapter_metadata")
+  package_digest=$(sha256_file "$stage/package/app.tar.gz")
+  jq -n \
+    --arg revision "$revision" \
+    --arg adapter_name "$adapter" \
+    --argjson protocol "$protocol" \
+    --arg cli "$(sha256_file "$stage/cli/app-cli.tar")" \
+    --arg package "$package_digest" \
+    --arg edgezero "$(sha256_file "$stage/edgezero.toml")" \
+    --slurpfile adapter "$adapter_metadata" \
+    '{format:1,lifecycle_protocol:$protocol,source_revision:$revision,adapter:$adapter_name,app_cli:{path:"cli/app-cli.tar",sha256:$cli},package:{path:"package/app.tar.gz",sha256:$package},manifests:{edgezero:{path:"edgezero.toml",sha256:$edgezero},adapter:$adapter[0]}}' \
+    >"$stage/release.json"
+  release_archive="$work/app-release.tar.gz"
+  tar -C "$stage" -czf "$release_archive" \
+    release.json cli/app-cli.tar package/app.tar.gz edgezero.toml "$adapter_path"
+  archive_digest=$(sha256_file "$release_archive")
+
+  verify_root="$work/verified"
+  EDGEZERO__APP__RELEASE__ARCHIVE="$release_archive" \
+    EDGEZERO__APP__RELEASE__SHA256="$archive_digest" \
+    EDGEZERO__APP__RELEASE__EXPECTED_SOURCE_REVISION="$revision" \
+    EDGEZERO__APP__RELEASE__EXPECTED_ADAPTER="$adapter" \
+    EDGEZERO__APP__RELEASE__EXPECTED_LIFECYCLE_PROTOCOL="$protocol" \
+    EDGEZERO__APP__RELEASE__ROOT="$verify_root" \
+    GITHUB_OUTPUT="$work/verify.outputs" \
+    "$SCRIPT_DIR/prepare-release.sh" >/dev/null
+
+  append_output artifact-name "$artifact_name"
+  append_output archive-path "$release_archive"
+  append_output workspace-path "$work"
+  append_output archive-sha256 "$archive_digest"
+  append_output package-sha256 "$package_digest"
+  append_output source-revision "$revision"
+  trap - EXIT
+}
+
+main "$@"
