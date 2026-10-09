@@ -253,6 +253,22 @@
         "transfer_encoding_count": 0
       }
     },
+    "route-backslash": {
+      "status": 200,
+      "verdict": {
+        "ordinary": true,
+        "primary_uri_normalized": true,
+        "raw_target_preserved": true
+      }
+    },
+    "route-unicode": {
+      "status": 200,
+      "verdict": {
+        "ordinary": true,
+        "primary_uri_normalized": true,
+        "raw_target_preserved": true
+      }
+    },
     "slashes": {
       "status": 200,
       "verdict": {

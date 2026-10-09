@@ -17,7 +17,7 @@ uses its own target directory, an ephemeral loopback port, bounded readiness
 and an owned process group that is cleaned up on success, failure or interruption.
 No platform credentials or deployment are required.
 
-The runner sends 54 fixed raw HTTP cases across Fastly, Cloudflare and Spin.
+The runner sends 56 fixed raw HTTP cases across Fastly, Cloudflare and Spin.
 The client and process orchestration use an isolated native Rust harness with exact existing Tokio/serde_json/tempfile/TOML pins. Tokio is confined to this host test helper; it adds no core or WASM runtime dependency. Responses contain fixed booleans/counts rather than unrestricted request values.
 `observations.json` records the pinned local runtimes' observed outcomes, and
 subsequent runs compare them exactly. Inspect changes before updating it.
@@ -27,6 +27,11 @@ Axum's real TCP ingress cases live alongside its request converter tests.
 
 Known gates:
 
+- Two Cloudflare routing regressions send raw UTF-8 `/café` and `/a\b`
+  directly to the pinned workerd, bypassing Wrangler's development proxy,
+  which normalizes these targets before Worker invocation. A no-hook
+  application must match `/caf%C3%A9` and `/a/b` while ingress metadata
+  independently retains the raw runtime URL with unknown wire preservation.
 - Fastly 0.12.1 lacks a safe borrowed original-target getter. Ingress reports
   `NotExposed`; a preceding native path shortcut can see a normalized target.
   Its canonical origin is recovered separately from the client runtime URI

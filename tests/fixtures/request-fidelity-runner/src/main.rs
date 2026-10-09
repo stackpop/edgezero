@@ -413,7 +413,15 @@ fn run(options: Options, cancelled: &Cancelled) -> io::Result<()> {
                 }
                 thread::sleep(POLL_INTERVAL);
             }
-            let observed = probes(platform, port, cancelled)?;
+            let mut observed = probes(platform, port, cancelled)?;
+            if *platform == "cloudflare" {
+                let routing =
+                    cloudflare_routing_probes(&fixture, cancelled, options.readiness_timeout)?;
+                observed
+                    .as_object_mut()
+                    .expect("probe results are objects")
+                    .extend(routing);
+            }
             if !options.record_observations {
                 let expected: Value =
                     serde_json::from_slice(&fs::read(fixture.join("observations.json"))?)
@@ -900,6 +908,86 @@ fn verify_observation(platform: &str, case: &str, status: u16, verdict: &Value) 
     )
 }
 
+fn cloudflare_routing_probes(
+    fixture: &Path,
+    cancelled: &Cancelled,
+    readiness_timeout: Duration,
+) -> io::Result<serde_json::Map<String, Value>> {
+    let scratch = tempfile::tempdir()?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    let address = format!("http=127.0.0.1:{port}");
+    let mut runtime = command(
+        fixture,
+        "node_modules/.bin/workerd",
+        &["serve", "workerd.capnp", "--socket-addr", &address],
+    );
+    let log_path = scratch.path().join("workerd.log");
+    let log = File::create(&log_path)?;
+    runtime.stdout(log.try_clone()?).stderr(log);
+    let mut process = OwnedProcess::spawn(&mut runtime)?;
+    let result = (|| {
+        let deadline = Instant::now() + readiness_timeout;
+        loop {
+            check_cancelled(cancelled)?;
+            if process.child.try_wait()?.is_some() || Instant::now() >= deadline {
+                return Err(io::Error::other("direct workerd readiness failed"));
+            }
+            if exchange(port, &ready_case(), cancelled, deadline)
+                .is_ok_and(|(status, _)| status == 200)
+            {
+                break;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        let mut observed = serde_json::Map::new();
+        let mut failures = Vec::new();
+        for (name, target) in [
+            ("route-unicode", b"/caf\xc3\xa9".as_slice()),
+            ("route-backslash", b"/a\\b".as_slice()),
+        ] {
+            let case = Case {
+                name,
+                target,
+                ..ready_case()
+            };
+            let (status, verdict) = exchange(
+                port,
+                &case,
+                cancelled,
+                Instant::now() + Duration::from_secs(5),
+            )?;
+            if status != 200
+                || verdict
+                    != json!({
+                        "ordinary": true,
+                        "primary_uri_normalized": true,
+                        "raw_target_preserved": true,
+                    })
+            {
+                failures.push(format!("{name}: HTTP {status}, verdict {verdict}"));
+            }
+            observed.insert(
+                name.to_owned(),
+                json!({"status": status, "verdict": verdict}),
+            );
+        }
+        require(
+            failures.is_empty(),
+            "cloudflare",
+            "no-hook routing",
+            &failures.join("; "),
+        )?;
+        Ok(observed)
+    })();
+    drop(process);
+    if result.is_err() {
+        writeln!(io::stderr(), "{}", fs::read_to_string(log_path)?)?;
+    }
+    result
+}
+
 fn probes(platform: &str, port: u16, cancelled: &Cancelled) -> io::Result<Value> {
     let mut observed = json!({});
     let cases = cases();
@@ -974,17 +1062,30 @@ struct Case {
 #[cfg(test)]
 mod tests {
     use super::{
-        Case, HEADER_LIMIT, OwnedProcess, TimedSocket, cases, read_response, request_packet,
-        verify_observation,
+        Case, HEADER_LIMIT, OwnedProcess, TimedSocket, cases, cloudflare_routing_probes,
+        read_response, request_packet, verify_observation,
     };
     use serde_json::json;
     use std::io::{self, BufRead as _, BufReader, Cursor, Write as _};
     use std::net::{TcpListener, TcpStream};
+    use std::path::Path;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    #[ignore = "requires a freshly built Cloudflare fixture and pinned workerd"]
+    fn cloudflare_primary_uri_preserves_no_hook_routing() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("runner has a fixture parent")
+            .join("request-fidelity");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        cloudflare_routing_probes(&fixture, &cancelled, Duration::from_secs(60))
+            .expect("primary URI normalization and raw ingress capture must remain independent");
+    }
 
     #[test]
     fn cancelled_response_reads_do_not_retry_until_deadline() {

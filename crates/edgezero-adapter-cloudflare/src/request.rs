@@ -255,7 +255,11 @@ pub async fn into_core_request(
         TargetSource::RuntimeUrl,
         Preservation::Unknown,
     );
-    let uri: Uri = runtime_url
+    let url = req
+        .url()
+        .map_err(|_error| EdgeError::bad_request("invalid runtime URL"))?;
+    let uri: Uri = url
+        .as_str()
         .parse()
         .map_err(|_error| EdgeError::bad_request("invalid runtime URI"))?;
     let origin = uri
