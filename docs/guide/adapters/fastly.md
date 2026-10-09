@@ -605,3 +605,37 @@ entry point and removing retained state, not merely setting a request limit of o
 
 - Learn about [Cloudflare Workers](/guide/adapters/cloudflare) as an alternative deployment target
 - Explore [Configuration](/guide/configuration) for manifest details
+
+## Early ingress snapshots
+
+Call `request::capture_request_ingress(&req)` immediately after acquiring the
+native request and before URL-based shortcuts or native mutation. It borrows
+the same request without round-tripping handles. With Fastly SDK 0.12.1,
+safe raw-target acquisition is unavailable: the snapshot records `NotExposed`
+first, then uses the SDK runtime URL only to recover the canonical origin.
+This URL access can normalize the path; it never establishes original-target
+preservation. Client requests need one valid Host consistent with the runtime
+authority, including equivalent default ports. Origin provenance is
+`RuntimeUri`; absent TLS metadata does not establish an HTTP scheme. Synthetic
+requests and missing, duplicate, invalid or inconsistent Host have no origin.
+
+Use `into_core_request_with_ingress(req, ingress)`,
+`FastlyService::with_request_ingress(ingress)`, or
+`dispatch_with_registries_and_ingress(app, req, stores, ingress, extend)`
+to retain that snapshot after later native mutations. The registry dispatcher
+preserves manifest store IDs through logical resource-link aliases and uses
+each logical config store ID as its entry key. It inserts
+the snapshot after scratch extensions, so a callback cannot accidentally
+replace it. Ordinary runners and existing converters capture once and delegate.
+Supplied metadata and fidelity are caller assertions; syntax validation does
+not independently establish their provenance.
+
+Viceroy probes retain tested ordinary repeated fields and FF header octets.
+Identical repeated Content-Length fields fold into one; conflicting lengths are
+rejected with 400 before application dispatch. These parser observations do not
+establish preservation for every incoming request. The probes also
+demonstrate that a normalized native shortcut can receive
+`/reserved/../native` as `/native`. The router hook cannot intercept a shortcut
+taken earlier. Original-target support and safe shortcut exclusion remain
+blocked on the SDK accessor; client/TLS preservation must be proved on the
+appropriate ingress. See [the capability matrix](./overview#inbound-request-fidelity).

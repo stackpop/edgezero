@@ -232,3 +232,11 @@ If you already hold an `Arc<dyn Middleware>` (`BoxMiddleware`), register it with
 
 - Learn about [Streaming](/guide/streaming) for progressive responses
 - Explore [Proxying](/guide/proxying) for upstream forwarding
+
+## Work before route lookup
+
+Ordinary middleware runs after route selection and router-owned extension setup.
+For method-independent interception before 404/405, use the
+[pre-dispatch hook](./routing#intercepting-before-dispatch). A terminal hook
+response or error bypasses ordinary middleware and handlers. A continuing hook
+passes its request mutations into the existing middleware chain.

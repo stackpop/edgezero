@@ -13,7 +13,7 @@ Adapters translate provider-specific HTTP primitives into the portable `App` in 
 
 ## Request Conversion
 
-Each adapter exposes an `into_core_request` helper that accepts the provider's request type and returns `edgezero_core::http::Request`. The conversion must:
+Each adapter exposes an `into_core_request` helper that accepts the provider's request type and returns `edgezero_core::http::Request`. The conversion preserves the runtime-visible request subject to the fidelity limits below. It must:
 
 - **Preserve the HTTP method** exactly (`GET`, `POST`, etc.)
 - **Parse the full URI** (path and query string) into an `http::Uri`. Reject invalid URIs with `EdgeError::bad_request`
@@ -110,7 +110,7 @@ Spin's adapter targets `wasm32-wasip2` and its contract suite runs under Wasmtim
 
 ```bash
 rustup target add wasm32-wasip2
-export CARGO_TARGET_WASM32_WASIP2_RUNNER="wasmtime run"
+export CARGO_TARGET_WASM32_WASIP2_RUNNER="wasmtime run -W component-model-async=y -S p3=y,http=y"
 cargo test -p edgezero-adapter-spin --features spin --target wasm32-wasip2 --test contract
 ```
 
@@ -154,6 +154,65 @@ logical id under both is a collision that `config validate` rejects.
 Fastly is the only adapter implementing `gc_config_entries` and the staging lifecycle
 actions (`DeployStaged`, `EmitVersion`, `Healthcheck`, `Rollback`); the others return
 an unsupported error for those.
+
+## Inbound request fidelity
+
+Adapters insert `edgezero_core::request::RequestIngress` into request extensions.
+It records runtime-visible target and trusted origin facts separately from the
+primary URI and headers. Missing metadata means unknown capability.
+
+`CapturedTarget::Complete` holds the whole captured string, its acquisition
+source and preservation status. Capture has a 16 KiB UTF-8 byte bound; oversize
+input becomes `Unavailable(TooLarge)`, without retaining a prefix. Fastly's
+current safe API reports `Unavailable(NotExposed)`. Metadata has borrowed
+getters and intentionally has no value-bearing `Debug`, `Display` or
+serialization implementation. Do not log or serialize captured values.
+
+`InboundOrigin` validates an HTTP(S) scheme and an authority of at most 1 KiB,
+including IPv6 and port syntax. Parsing validates syntax; the adapter still
+establishes provenance. Runtime URI facts use `RuntimeUri`; Axum's plain HTTP
+listener uses `TransportBinding` plus one consistent Host. Origin-form Axum
+conversion without that binding has no trusted origin. Ordinary Origin,
+Forwarded and Spin special headers do not establish ingress origin.
+
+Fastly records target unavailability before reading its SDK runtime URL for
+origin, and requires a client request with one consistent validated Host.
+This recovers canonical origin without claiming an original path.
+
+`HeaderFidelity` has separate octet, field-multiplicity, same-name-order and
+global-order axes, with per-name overrides. They concern original received
+fields, excluding HTTP framing and header-name spelling. Faithful copying from
+a runtime HeaderMap does not establish original-wire preservation. Unproved
+axes remain `Unknown`; global field order is `Unavailable` on all four adapters.
+Cloudflare's common octet and multiplicity guarantees remain `Unknown`: a
+runtime capable of replacement/coalescing does not prove a particular field
+changed. The observed transformations below remain capability limitations.
+
+Local evidence uses locked SDKs and fixed raw HTTP/1.1 fixtures. These results
+describe the tested local runtimes; they do not establish production-edge
+behavior.
+
+| Surface                             | Fastly 0.12.1 / Viceroy 0.17.0                                       | worker 0.8.3 / workerd 1.20260415.1                                                       | Axum / Hyper 1.10.1                                                  | Spin SDK 6.0.0 / Spin 4.0.0                                          |
+| ----------------------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | -------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Pre-dispatch hook                   | Executed                                                             | Executed for supported incoming methods                                                   | Executed                                                             | Executed                                                             |
+| Runtime extension method conversion | Byte method preserved                                                | Web Request converter preserves tokens; local wire parser returns 501 for unknown methods | Preserved in tested TCP fixture                                      | Preserved in tested HTTP fixture                                     |
+| Target metadata                     | Not exposed by safe SDK API                                          | Runtime URL; literal and encoded dot spellings normalize                                  | Runtime URI; tested spelling retained                                | Runtime URI; tested spelling retained                                |
+| High-byte Cookie                    | FF retained in tested fixture                                        | Local wire FF becomes U+FFFD before Rust and is copied as runtime UTF-8 EF BF BD          | FF retained in tested TCP fixture                                    | Runtime returns 500 before component for invalid UTF-8               |
+| Repeated control fields             | Tested ordinary duplicates retained; identical Content-Length folded | Fetch combines fields; original counts cannot be recovered; common fidelity Unknown       | Tested ordinary duplicates retained; identical Content-Length folded | Tested ordinary duplicates retained; identical Content-Length folded |
+| Global wire order                   | Unavailable                                                          | Unavailable                                                                               | Unavailable                                                          | Unavailable                                                          |
+
+Run `./scripts/test-request-fidelity.sh all` for local transport probes. They
+assert pinned observations, including unsupported outcomes; a green regression
+run does not turn an unsupported capability into a preservation guarantee.
+Fastly raw-target support requires a safe borrowed SDK accessor and new ingress
+evidence. Consumers that require original dot spellings or duplicate fields
+must separately resolve Fetch normalization/coalescing and platform rejection
+limits. EdgeZero does not approve a weaker consumer contract.
+
+The [pre-dispatch hook](../routing#intercepting-before-dispatch) runs after
+adapter conversion. Fastly, Cloudflare and Spin still buffer bodies; Axum still
+buffers JSON and streams other bodies. Existing store/capability bootstrap and
+outer finalizers retain their behavior.
 
 ## Opt-in application retention
 

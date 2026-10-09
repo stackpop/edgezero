@@ -306,11 +306,11 @@ Run contract tests for the Spin adapter:
 
 ```bash
 rustup target add wasm32-wasip2
-export CARGO_TARGET_WASM32_WASIP2_RUNNER="wasmtime run"
+export CARGO_TARGET_WASM32_WASIP2_RUNNER="wasmtime run -W component-model-async=y -S p3=y,http=y"
 cargo test -p edgezero-adapter-spin --features spin --target wasm32-wasip2 --test contract
 ```
 
-The tests execute the adapter's real `wasm32-wasip2` request path under Wasmtime. The
+These contracts execute under Wasmtime. Incoming conversion is additionally exercised by the actual Spin HTTP fixture. The
 `wasmtime` version CI uses is pinned in `.tool-versions`.
 
 ## Manifest Configuration
@@ -359,3 +359,24 @@ and remove the cache to roll back; default generated entry points are unchanged.
   pre-rewrite store schema
 - [Adapters overview](/guide/adapters/overview) — cross-adapter contracts
 - [Configuration](/guide/configuration) — full manifest reference
+
+## Runtime ingress metadata
+
+Conversion captures SDK URI parts before rebuilding the core request. Origin
+comes from HTTP(S) URI scheme/authority, with runtime provenance.
+`spin-full-url`, `spin-client-addr`, Origin and forwarding headers do not become
+trusted ingress-origin facts. Existing context fields and store/body behavior
+remain unchanged.
+
+The Spin 4.0 HTTP component fixture verifies methods, tested target spelling,
+duplicates and hook ordering through the actual converter. Spin 4.0's request
+preparation requires UTF-8 header values; a Cookie containing FF returns 500
+before the component starts. This needs an upstream runtime fix and cannot be
+restored inside EdgeZero. Same-name runtime values are copied byte-for-byte,
+while original-wire fidelity remains conservative and global order unavailable.
+
+Pure metadata tests execute on the host. The WASM contract suite runs with
+Wasmtime's explicit async/P3/HTTP flags. The full WASM library test artifact
+also imports Spin-specific host interfaces, so plain Wasmtime cannot execute
+that artifact. The real Spin HTTP fixture supplies runtime conversion evidence.
+See [the capability matrix](./overview#inbound-request-fidelity).

@@ -1,0 +1,6 @@
+name = "request-fidelity"
+main = "build/cloudflare/worker/shim.mjs"
+compatibility_date = "2026-04-01"
+[dev]
+ip = "127.0.0.1"
+local_protocol = "http"

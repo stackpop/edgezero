@@ -186,3 +186,56 @@ Run the app under the Axum dev server before deploying to an edge target.
 
 - Learn about [Handlers & Extractors](/guide/handlers) for processing requests
 - Explore [Middleware](/guide/middleware) for cross-cutting concerns
+
+## Intercepting before dispatch
+
+Use an optional `PreDispatchHook` when handling a request must precede method
+and path lookup, including router-generated 404/405 responses. The hook receives
+the converted request before router state, introspection, request context,
+middleware or handlers. Its future can be non-`Send`.
+
+```rust
+use std::sync::Arc;
+use async_trait::async_trait;
+use edgezero_core::body::Body;
+use edgezero_core::error::EdgeError;
+use edgezero_core::http::{Request, Response, response_builder};
+use edgezero_core::router::{PreDispatchHook, RouterService};
+
+struct ExampleHook;
+
+#[async_trait(?Send)]
+impl PreDispatchHook for ExampleHook {
+    async fn handle(&self, request: &mut Request) -> Result<Option<Response>, EdgeError> {
+        if request.headers().contains_key("x-example-stop") {
+            return Ok(Some(
+                response_builder()
+                    .status(204)
+                    .body(Body::empty())
+                    .map_err(EdgeError::internal)?,
+            ));
+        }
+        Ok(None)
+    }
+}
+
+let router = RouterService::builder()
+    .pre_dispatch_hook(Arc::new(ExampleHook))
+    .build();
+```
+
+`Ok(None)` continues with the mutated request: method, URI, headers, extensions
+and remaining body all participate in normal dispatch. Consuming a stream does
+not restore it. `Ok(Some(response))` returns that response without normal router
+lifecycle work. Return a complete response when exact challenge or hardening
+headers matter. `Err(error)` stops dispatch; direct `Service::call` propagates it,
+while `RouterService::oneshot` renders it through the existing error response
+conversion.
+
+Repeated registration replaces the hook. Router clones share its `Arc`.
+Without a hook, existing routing is unchanged. Adapter buffering, capability
+bootstrap and outer response finalizers can still run before or after this
+router boundary; the hook does not replace those layers.
+
+Consult [adapter ingress capabilities](./adapters/overview#inbound-request-fidelity)
+before classifying a request using its target or duplicate headers.

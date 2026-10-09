@@ -49,6 +49,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          components: clippy, rustfmt
 
       - name: Install wasm targets for generated-project checks
         if: matrix.suite == 'cli'
@@ -72,6 +73,13 @@ jobs:
       - name: Nested AppConfig checker tests
         if: matrix.suite == 'cli'
         run: cargo test -p edgezero-cli --features nested-app-config-check --bin check_no_nested_app_config
+
+      - name: Verify native request ingress harness
+        if: matrix.suite == 'workspace'
+        run: |
+          cargo fmt --manifest-path tests/fixtures/request-fidelity-runner/Cargo.toml --all -- --check
+          cargo test --manifest-path tests/fixtures/request-fidelity-runner/Cargo.toml --locked
+          cargo clippy --manifest-path tests/fixtures/request-fidelity-runner/Cargo.toml --all-targets --locked -- -D warnings
 
       - name: Lifecycle fixture host tests
         if: matrix.suite == 'workspace'
@@ -154,7 +162,7 @@ jobs:
           - adapter: spin
             target: wasm32-wasip2
             runner_env: CARGO_TARGET_WASM32_WASIP2_RUNNER
-            runner_value: wasmtime run
+            runner_value: wasmtime run -W component-model-async=y -S p3=y,http=y
     steps:
       - uses: actions/checkout@v6
         with:
@@ -184,9 +192,34 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          components: clippy, rustfmt
 
       - name: Add wasm target
         run: rustup target add ${{ matrix.target }}
+
+      - name: Set up matching browser and driver
+        if: matrix.adapter == 'cloudflare'
+        id: chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: 154.0.8037.92
+          install-chromedriver: true
+          install-dependencies: true
+
+      - name: Set up Node for local Worker tooling
+        if: matrix.adapter == 'cloudflare'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.12.0
+          cache: npm
+          cache-dependency-path: tests/fixtures/request-fidelity/package-lock.json
+
+      - name: Bind browser tests to pinned Chrome
+        if: matrix.adapter == 'cloudflare'
+        env:
+          CHROME_BINARY: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          node -e 'require("node:fs").writeFileSync(require("node:path").join(process.env.RUNNER_TEMP, "edgezero-webdriver.json"), JSON.stringify({"goog:chromeOptions": {binary: process.env.CHROME_BINARY}}))'
 
       - name: Resolve wasm-bindgen CLI version
         if: matrix.adapter == 'cloudflare'
@@ -278,6 +311,8 @@ jobs:
 
       - name: Run ${{ matrix.adapter }} wasm tests
         env:
+          CHROMEDRIVER: ${{ steps.chrome.outputs.chromedriver-path }}
+          WASM_BINDGEN_TEST_WEBDRIVER_JSON: ${{ runner.temp }}/edgezero-webdriver.json
           ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
         run: cargo test -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }} --test contract
 
@@ -290,6 +325,43 @@ jobs:
         env:
           ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
         run: cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --lib
+
+      # Spin's metadata helper runs on the host; its full lib test artifact
+      # imports Spin-specific interfaces unavailable in plain Wasmtime.
+      # The real Spin HTTP fixture below executes the converter instead.
+      - name: Install lock-matched worker-build
+        if: matrix.adapter == 'cloudflare'
+        run: cargo install worker-build --version 0.8.3 --locked --force
+
+      - name: Install pinned Spin HTTP runtime
+        if: matrix.adapter == 'spin'
+        shell: bash
+        run: |
+          version="$(awk '$1 == "spin-cli" { gsub(/"/, "", $3); print $3; exit }' tests/fixtures/request-fidelity/Cargo.toml)"
+          install_dir="$RUNNER_TEMP/spin"
+          mkdir -p "$install_dir"
+          curl -fL "https://github.com/spinframework/spin/releases/download/v${version}/spin-v${version}-linux-amd64.tar.gz" -o "$RUNNER_TEMP/spin.tar.gz"
+          tar -xzf "$RUNNER_TEMP/spin.tar.gz" -C "$install_dir"
+          echo "$install_dir" >> "$GITHUB_PATH"
+          "$install_dir/spin" --version
+
+      - name: Check isolated fixture formatting
+        run: cargo fmt --manifest-path tests/fixtures/request-fidelity/Cargo.toml --all -- --check
+
+      - name: Lint isolated ingress fixture
+        run: >-
+          cargo clippy --manifest-path tests/fixtures/request-fidelity/Cargo.toml
+          --features ${{ matrix.adapter }} --target ${{ matrix.target }}
+          --all-targets --locked -- -D warnings
+
+      - name: Run local HTTP ingress probes
+        shell: bash
+        run: |
+          if [ "${{ matrix.adapter }}" = "cloudflare" ]; then
+            WASM_BINDGEN_BIN="$(command -v wasm-bindgen)"
+            export WASM_BINDGEN_BIN
+          fi
+          ./scripts/test-request-fidelity.sh ${{ matrix.adapter }}
 
       - name: Fastly reusable HTTP smoke
         if: matrix.adapter == 'fastly'

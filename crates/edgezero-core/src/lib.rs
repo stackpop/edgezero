@@ -33,6 +33,7 @@ pub mod manifest;
 pub mod middleware;
 pub mod params;
 pub mod proxy;
+pub mod request;
 pub mod responder;
 pub mod response;
 pub mod router;

@@ -6,8 +6,11 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 use std::sync::Arc;
 
+use crate::request::HttpTransport;
 use anyhow::Context as _;
 use axum::Router;
+use axum::body::Body as AxumBody;
+use axum::http::Request as AxumRequest;
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
@@ -299,10 +302,12 @@ async fn serve_with_stores(
         }
         service
     };
-    let axum_router = Router::new().fallback_service(service_fn(move |req| {
-        let mut svc = service.clone();
-        async move { svc.call(req).await }
-    }));
+    let axum_router =
+        Router::new().fallback_service(service_fn(move |mut req: AxumRequest<AxumBody>| {
+            req.extensions_mut().insert(HttpTransport);
+            let mut svc = service.clone();
+            async move { svc.call(req).await }
+        }));
     let make_service = axum_router.into_make_service_with_connect_info::<SocketAddr>();
 
     let shutdown = enable_ctrl_c.then_some(async {
@@ -745,6 +750,23 @@ mod integration_tests {
     use tokio::task::{JoinHandle, spawn_blocking};
     use tokio::time::sleep;
 
+    use async_trait::async_trait;
+    use edgezero_core::body::Body;
+    use edgezero_core::http::{HeaderValue, Method, Request, Response, response_builder};
+    use edgezero_core::middleware::{Middleware, Next};
+    use edgezero_core::request::{CapturedTarget, Preservation, RequestIngress};
+    use edgezero_core::router::PreDispatchHook;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct IngressHook {
+        calls: Arc<AtomicUsize>,
+    }
+    struct IngressMiddleware {
+        calls: Arc<AtomicUsize>,
+    }
+
     struct TestServer {
         _temp_dir: tempfile::TempDir,
         base_url: String,
@@ -754,6 +776,145 @@ mod integration_tests {
     struct TestServerWithStore {
         base_url: String,
         handle: JoinHandle<()>,
+    }
+
+    #[async_trait(?Send)]
+    impl Middleware for IngressMiddleware {
+        async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            next.run(ctx).await
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl PreDispatchHook for IngressHook {
+        async fn handle(&self, request: &mut Request) -> Result<Option<Response>, EdgeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let ingress = request
+                .extensions()
+                .get::<RequestIngress>()
+                .expect("should carry adapter metadata");
+            assert_eq!(
+                ingress
+                    .origin()
+                    .expect("should expose HTTP binding")
+                    .scheme(),
+                "http"
+            );
+            let CapturedTarget::Complete(target) = ingress.target() else {
+                panic!("should capture target")
+            };
+            assert_eq!(target.value(), request.uri().to_string());
+            match request.headers()["x-fixture"]
+                .to_str()
+                .expect("should read fixed fixture")
+            {
+                "repeat" => {
+                    assert_eq!(request.method().as_str(), "EXAMPLE-METHOD");
+                    assert_eq!(request.headers().get_all("origin").iter().count(), 2);
+                    assert_eq!(request.headers().get_all("x-control").iter().count(), 2);
+                    let cookies: Vec<_> = request
+                        .headers()
+                        .get_all("cookie")
+                        .iter()
+                        .map(HeaderValue::as_bytes)
+                        .collect();
+                    assert_eq!(cookies, [b"a=\xff".as_slice(), b"b=2".as_slice()]);
+                }
+                "length" => {
+                    assert_eq!(
+                        request.headers().get_all("content-length").iter().count(),
+                        1
+                    );
+                    assert_eq!(
+                        ingress
+                            .header_fidelity(&"content-length".parse().expect("should parse name"))
+                            .field_multiplicity(),
+                        Preservation::Unknown
+                    );
+                }
+                "te-cl" => assert!(!request.headers().contains_key("content-length")),
+                "continue" => {
+                    *request.method_mut() = Method::GET;
+                    *request.uri_mut() = "/ordinary".parse().expect("should parse fixed route");
+                    return Ok(None);
+                }
+                "error" => return Err(EdgeError::bad_request("fixture rejection")),
+                "dot" => assert_eq!(request.uri().path(), "/reserved/%2e/../%2F//"),
+                _ => panic!("should use fixed fixture"),
+            }
+            Ok(Some(
+                response_builder()
+                    .status(204)
+                    .header("x-hook", "yes")
+                    .body(Body::empty())
+                    .map_err(EdgeError::internal)?,
+            ))
+        }
+    }
+
+    #[action]
+    async fn ingress_ordinary() -> &'static str {
+        "continued"
+    }
+
+    fn raw_ingress_response(addr: SocketAddr, fixture: &[u8]) -> Vec<u8> {
+        let mut connection = TcpStream::connect(addr).expect("should connect listener");
+        connection
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("should set timeout");
+        connection
+            .write_all(fixture)
+            .expect("should send exact request");
+        let mut response = Vec::new();
+        connection
+            .read_to_end(&mut response)
+            .expect("should read response");
+        response
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ingress_raw_tcp_distinguishes_parser_and_hook_behaviour() {
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterService::builder()
+            .middleware(IngressMiddleware {
+                calls: Arc::clone(&middleware_calls),
+            })
+            .pre_dispatch_hook(Arc::new(IngressHook {
+                calls: Arc::clone(&hook_calls),
+            }))
+            .get("/ordinary", ingress_ordinary)
+            .build();
+        let server = start_test_server(router).await;
+        let addr: SocketAddr = server
+            .base_url
+            .strip_prefix("http://")
+            .expect("should have HTTP binding")
+            .parse()
+            .expect("should parse listener address");
+        let cases: [(&[u8], &[u8], usize); 7] = [
+            (b"EXAMPLE-METHOD /missing HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nX-Fixture: repeat\r\nCookie: a=\xff\r\nOrigin: https://example.com\r\nX-Control: first\r\nCOOKIE: b=2\r\nOrigin: https://other.example.com\r\nX-Control: second\r\n\r\n", b"HTTP/1.1 204", 1),
+            (b"POST /missing HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nX-Fixture: length\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n", b"HTTP/1.1 204", 1),
+            (b"POST /missing HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nX-Fixture: length\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\n", b"HTTP/1.1 400", 0),
+            (b"GET /reserved/%2e/../%2F// HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nX-Fixture: dot\r\n\r\n", b"HTTP/1.1 204", 1),
+            (b"EXAMPLE-METHOD /missing HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nX-Fixture: continue\r\n\r\n", b"HTTP/1.1 200", 1),
+            (b"GET /missing HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nX-Fixture: error\r\n\r\n", b"HTTP/1.1 400", 1),
+            (b"POST /missing HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nX-Fixture: te-cl\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n0\r\n\r\n", b"HTTP/1.1 204", 1),
+        ];
+        for (fixture, status, calls) in cases {
+            let before = hook_calls.load(Ordering::SeqCst);
+            let response = spawn_blocking(move || raw_ingress_response(addr, fixture))
+                .await
+                .expect("should join socket probe");
+            assert!(
+                response.starts_with(status),
+                "should return expected fixed fixture status"
+            );
+            assert_eq!(hook_calls.load(Ordering::SeqCst) - before, calls);
+        }
+        assert_eq!(middleware_calls.load(Ordering::SeqCst), 1);
+        server.handle.abort();
     }
 
     async fn start_test_server(router: RouterService) -> TestServer {

@@ -7,16 +7,18 @@ use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{Method as CoreMethod, Request, Uri, request_builder};
+use edgezero_core::http::{HeaderValue, Method as CoreMethod, Request, Uri, request_builder};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
+use edgezero_core::request::{
+    CapturedTarget, HeaderFidelity, InboundOrigin, OriginSource, Preservation, RequestIngress,
+    TargetSource,
+};
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
-use worker::{
-    Context, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
-};
+use worker::{Context, Env, Error as WorkerError, Request as CfRequest, Response as CfResponse};
 
 use crate::config_store::CloudflareConfigStore;
 use crate::context::CloudflareRequestContext;
@@ -245,19 +247,41 @@ pub async fn into_core_request(
     env: Env,
     ctx: Context,
 ) -> Result<Request, EdgeError> {
-    let method = into_core_method(&req.method());
+    let method = CoreMethod::from_bytes(req.inner().method().as_bytes())
+        .map_err(|_error| EdgeError::bad_request("invalid runtime method"))?;
+    let runtime_url = req.inner().url();
+    let target = CapturedTarget::capture(
+        &runtime_url,
+        TargetSource::RuntimeUrl,
+        Preservation::Unknown,
+    );
     let url = req
         .url()
-        .map_err(|err| EdgeError::bad_request(format!("invalid URL: {err}")))?;
+        .map_err(|_error| EdgeError::bad_request("invalid runtime URL"))?;
     let uri: Uri = url
         .as_str()
         .parse()
-        .map_err(|err| EdgeError::bad_request(format!("invalid URI: {err}")))?;
+        .map_err(|_error| EdgeError::bad_request("invalid runtime URI"))?;
+    let origin = uri
+        .scheme_str()
+        .zip(uri.authority())
+        .and_then(|(scheme, authority)| {
+            InboundOrigin::parse(scheme, authority.as_str(), OriginSource::RuntimeUri).ok()
+        });
+    let fidelity = HeaderFidelity::new(
+        Preservation::Unknown,
+        Preservation::Unknown,
+        Preservation::Unknown,
+        Preservation::Unavailable,
+    );
+    let ingress = RequestIngress::new(target, origin, fidelity, Vec::new())?;
 
     let mut builder = request_builder().method(method).uri(uri);
     let headers = req.headers();
     for (name, value) in headers.entries() {
-        builder = builder.header(name.as_str(), value);
+        let header_value = HeaderValue::from_bytes(value.as_bytes())
+            .map_err(|_error| EdgeError::bad_request("invalid runtime header value"))?;
+        builder = builder.header(name.as_str(), header_value);
     }
 
     let bytes = req.bytes().await.map_err(EdgeError::internal)?;
@@ -266,6 +290,7 @@ pub async fn into_core_request(
         .body(Body::from(bytes))
         .map_err(EdgeError::internal)?;
 
+    request.extensions_mut().insert(ingress);
     CloudflareRequestContext::insert(&mut request, env, ctx);
     request
         .extensions_mut()
@@ -469,17 +494,6 @@ fn edge_error_to_worker(err: &EdgeError) -> WorkerError {
     WorkerError::RustError(err.to_string())
 }
 
-fn into_core_method(method: &Method) -> CoreMethod {
-    let bytes = method.as_ref().as_bytes();
-    CoreMethod::from_bytes(bytes).unwrap_or_else(|_| {
-        log::warn!(
-            "unknown HTTP method {:?}, defaulting to GET",
-            method.as_ref()
-        );
-        CoreMethod::GET
-    })
-}
-
 fn open_config_or_warn(env: &Env, binding_name: &str) -> Option<ConfigStoreHandle> {
     match CloudflareConfigStore::from_env(env, binding_name) {
         Ok(store) => Some(ConfigStoreHandle::new(Arc::new(store))),
@@ -565,26 +579,6 @@ fn warn_missing_kv_binding_once(kv_binding: &str, error: &impl Display) {
         Err(_) => {
             log::warn!("KV binding '{kv_binding}' not available: {error}");
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use wasm_bindgen_test::wasm_bindgen_test;
-
-    #[wasm_bindgen_test]
-    fn into_http_method_defaults_unknown_to_get() {
-        let method = Method::from("FOO".to_owned());
-        assert_eq!(into_core_method(&method), CoreMethod::GET);
-    }
-
-    #[wasm_bindgen_test]
-    fn into_http_method_maps_known_methods() {
-        assert_eq!(into_core_method(&Method::Get), CoreMethod::GET);
-        assert_eq!(into_core_method(&Method::Post), CoreMethod::POST);
-        assert_eq!(into_core_method(&Method::Put), CoreMethod::PUT);
-        assert_eq!(into_core_method(&Method::Delete), CoreMethod::DELETE);
     }
 }
 

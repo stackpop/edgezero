@@ -151,6 +151,7 @@ where
     A: Hooks,
     F: FnOnce(&fastly::Request, &mut Extensions),
 {
+    let ingress = request::capture_request_ingress(&req);
     let stores = A::stores();
     let logging = FastlyLogging::from(A::logging_for("fastly"));
     if logging.use_fastly_logger && !A::owns_logging() {
@@ -158,7 +159,7 @@ where
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
     let app = A::build_app();
-    request::dispatch_with_registries(&app, req, stores, extend)
+    request::dispatch_with_registries_and_ingress(&app, req, stores, ingress, extend)
 }
 
 /// Dispatch with a config store wired explicitly. Its name and default key are
