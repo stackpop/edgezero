@@ -85,6 +85,7 @@ edgezero build --adapter <name>
 **Arguments:**
 
 - `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `spin`, `axum`)
+- `--format <text|json>` - output format (default `text`). `json` writes one [JSON envelope](#machine-readable-output) to stdout and moves all other output to stderr. Must come before any passthrough argument.
 
 **Examples:**
 
@@ -159,6 +160,7 @@ edgezero deploy --adapter <name>
 **Arguments:**
 
 - `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `spin`)
+- `--format <text|json>` - output format (default `text`). `json` writes one [JSON envelope](#machine-readable-output) to stdout and moves all other output to stderr.
 - `--service-id <id>` - Platform service id the deploy targets (Fastly). Passed
   through to the provider; adapters that don't need one ignore it.
 - `--application-release <path>` - Extracted application release root. The
@@ -254,13 +256,14 @@ infer it afterward. The `deploy-fastly` recovery snippets in the
 [GitHub Actions guide](/guide/deploy-github-actions) invoke it directly.
 
 ```bash
-edgezero active-version --adapter <name> --service-id <id>
+edgezero active-version --adapter <name> --service-id <id> [--format <text|json>]
 ```
 
 **Arguments:**
 
 - `--adapter <name>` — target adapter (required). Fastly implements it; other adapters have no active-version concept.
 - `--service-id <id>` — platform service id whose active version to resolve (required).
+- `--format <text|json>` — output format (default `text`). `json` writes one [JSON envelope](#machine-readable-output) to stdout and moves all other output to stderr.
 
 Reads the Fastly API token from `FASTLY_API_TOKEN` in the environment. Emits
 `version=<N>` on stdout, or an empty `version=` when the service has no active
@@ -275,7 +278,7 @@ when the deployment is not provably healthy** — that non-zero exit is what
 gates a rollback.
 
 ```bash
-edgezero healthcheck --adapter <name> --service-id <id> --version <n> --domain <domain> [--path </>] [--staging] [--retry <n>] [--retry-delay <secs>] [--timeout <secs>]
+edgezero healthcheck --adapter <name> --service-id <id> --version <n> --domain <domain> [--path </>] [--staging] [--retry <n>] [--retry-delay <secs>] [--timeout <secs>] [--format <text|json>]
 ```
 
 **Arguments:**
@@ -289,6 +292,7 @@ edgezero healthcheck --adapter <name> --service-id <id> --version <n> --domain <
 - `--retry <n>` — total number of attempts before declaring the probe unhealthy. Default: `3`.
 - `--retry-delay <secs>` — seconds to wait between attempts. Default: `5`.
 - `--timeout <secs>` — per-attempt connect/read timeout in seconds. Default: `10`.
+- `--format <text|json>` — output format (default `text`). `json` writes one [JSON envelope](#machine-readable-output) to stdout and moves all other output to stderr.
 
 Only a **staging** probe needs `FASTLY_API_TOKEN` (to resolve the staging IP). A
 production probe curls the domain; with the token present it also verifies that
@@ -304,7 +308,7 @@ Roll a service back to a previous version, or deactivate a staged version
 (Fastly staging lifecycle).
 
 ```bash
-edgezero rollback --adapter <name> --service-id <id> --version <n> [--rollback-to <n>] [--staging]
+edgezero rollback --adapter <name> --service-id <id> --version <n> [--rollback-to <n>] [--staging] [--format <text|json>]
 ```
 
 **Arguments:**
@@ -314,6 +318,7 @@ edgezero rollback --adapter <name> --service-id <id> --version <n> [--rollback-t
 - `--version <n>` — the current (bad) version to roll back **from** (required; staging deactivates it).
 - `--rollback-to <n>` — **production only:** the version to re-activate. Fastly cannot tell a previously-live version from a staged draft, so the target **cannot be inferred** — capture it before the superseding deploy (run [`active-version`](#edgezero-active-version), or use `deploy-fastly`'s `previous-version` output) and pass it here. Required for a production rollback; ignored for staging.
 - `--staging` — deactivate the staged version instead of activating `--rollback-to`.
+- `--format <text|json>` — output format (default `text`). `json` writes one [JSON envelope](#machine-readable-output) to stdout and moves all other output to stderr.
 
 Reads the Fastly API token from `FASTLY_API_TOKEN` in the environment. A
 production rollback emits `rolled-back-to=<N>` (the version it activated). Exits
@@ -329,7 +334,7 @@ Validate `edgezero.toml` together with the typed `<name>.toml` app
 config (see [Application config](/guide/configuration#application-config)).
 
 ```bash
-edgezero config validate [--manifest <path>] [--app-config <path>] [--strict] [--no-env]
+edgezero config validate [--manifest <path>] [--app-config <path>] [--strict] [--no-env] [--format <text|json>]
 ```
 
 **Arguments:**
@@ -338,6 +343,7 @@ edgezero config validate [--manifest <path>] [--app-config <path>] [--strict] [-
 - `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
 - `--strict` — additionally check capability-aware completeness for the declared adapter set (spec §6.6) and well-formed Rust handler paths.
 - `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the app config. By default the validator reads the overlay so it sees the same values the runtime would.
+- `--format <text|json>` — output format (default `text`). `json` writes one [JSON envelope](#machine-readable-output) to stdout and moves all other output to stderr.
 
 **Two flavours:**
 
@@ -500,7 +506,7 @@ Local (`fastly.toml`) pushes prune their own prior chunks eagerly and never
 need `gc`.
 
 ```bash
-edgezero config gc --adapter fastly [--manifest <path>] [--store <id>] [--older-than <dur>] [--no-env] [--dry-run] [--yes]
+edgezero config gc --adapter fastly [--manifest <path>] [--store <id>] [--older-than <dur>] [--no-env] [--dry-run] [--yes] [--format <text|json>]
 ```
 
 **Arguments:**
@@ -512,6 +518,7 @@ edgezero config gc --adapter fastly [--manifest <path>] [--store <id>] [--older-
 - `--no-env` — ignore `EDGEZERO__STORES__CONFIG__<ID>__NAME`, so the logical store id `<ID>` is used as the physical store name. This is **not** the app-config overlay that `validate`/`push`/`diff` mean by `--no-env` — `gc` never loads your typed app config. Because that variable is normally what maps a logical id onto the real store, `--no-env` **changes which store is swept**, and this command deletes. Check the store id `gc` reports before passing `--yes`.
 - `--dry-run` — preview only: name every key and age it would delete, and delete nothing. This is already the **default** (a run without `--yes` never deletes); the flag just states that intent explicitly to double-check a sweep. It **conflicts with `--yes`** — a single run cannot both preview and delete.
 - `--yes` — actually delete. **Without it, `config gc` is a dry run** that names every key and age it would delete and deletes nothing.
+- `--format <text|json>` — output format (default `text`). `json` writes one [JSON envelope](#machine-readable-output) to stdout and moves all other output to stderr.
 
 **`--older-than` is an assertion only you can make, and it covers the whole
 store.** Fastly's config store is eventually consistent and offers no
@@ -578,8 +585,15 @@ manifest declares — KV namespaces, config stores, secret stores
 crate owns its own implementation, the CLI is a thin delegate.
 
 ```bash
-edgezero provision --adapter <name> [--manifest <path>] [--dry-run]
+edgezero provision --adapter <name> [--manifest <path>] [--dry-run] [--format <text|json>]
 ```
+
+**Arguments:**
+
+- `--adapter <name>` — target adapter (required).
+- `--manifest <path>` — manifest path (default: `edgezero.toml`).
+- `--dry-run` — describe what would be done without doing it (see below).
+- `--format <text|json>` — output format (default `text`). `json` writes one [JSON envelope](#machine-readable-output) to stdout and moves all other output to stderr.
 
 **Per-adapter behaviour:**
 
@@ -630,8 +644,12 @@ platform CLI, hit an HTTP API, or no-op (spec §11).
 ```bash
 edgezero auth login  --adapter <name>
 edgezero auth logout --adapter <name>
-edgezero auth status --adapter <name>
+edgezero auth status --adapter <name> [--format <text|json>]
 ```
+
+`auth status` accepts `--format <text|json>` (default `text`); `json` writes
+one [JSON envelope](#machine-readable-output) to stdout. `login` and `logout`
+have no machine-readable mode.
 
 Dispatch follows the same path as `build` / `deploy` / `serve`:
 the CLI looks up `[adapters.<name>.commands].auth-login` (or
@@ -665,6 +683,238 @@ install hint. A non-zero exit propagates with its stderr verbatim.
 server reads secrets from process env vars (`EDGEZERO__SECRETS__<KEY>`),
 not from a remote auth provider.
 :::
+
+## Machine-readable output
+
+Nine commands accept `--format json` so that scripts and CI can gate on
+structured results instead of parsing log lines: `active-version`,
+`auth status`, `build`, `config gc`, `config validate`, `deploy`,
+`healthcheck`, `provision`, and `rollback`. `--format text` is the default and
+leaves each command's output exactly as it was.
+
+```bash
+edgezero healthcheck --adapter fastly --service-id "$SID" --version 7 \
+  --domain www.example.com --format json | jq -e '.ok'
+```
+
+`config diff` keeps its own `--format <unified|json|structured>` and its own
+JSON shape (`{ local_sha256, remote_sha256, added, removed, changed }`). It is
+not wrapped in the envelope described here.
+
+### Streams
+
+With `--format json`:
+
+- **stdout** holds exactly one JSON document, the envelope. It is
+  pretty-printed, ends with a newline, and is written once when the command
+  finishes.
+- **stderr** gets everything else: the human-readable output the command
+  prints in `text` mode (including `key=value` lines such as `version=<N>`),
+  progress and warnings, the output of child processes (`cargo`, `fastly`,
+  `wrangler`, `spin`, and manifest `[adapters.<name>.commands]`), and the final
+  error line.
+
+An **empty stdout** with a non-zero exit means no envelope was produced. That
+happens on command-line usage errors (clap reports them before `--format` is
+read), on the bundled binary's `config push` / `config diff` stubs, on a
+`build` that rejects a `--format` among its passthrough arguments (exit `1`,
+see [`build`](#results)), and on a crash. Treat it as a failure.
+
+`--help` is handled by clap before `--format` is read: it prints clap's text to
+stdout and exits `0`, with no envelope.
+
+The routing relies on the EdgeZero logger (`edgezero_cli::init_cli_logger()`).
+A downstream CLI that installs a different logger, such as `simple_logger`,
+which writes every level to stdout, will put log lines on stdout and break the
+one-document rule.
+
+### The envelope
+
+```json
+{
+  "command": "healthcheck",
+  "error": null,
+  "ok": true,
+  "result": { "adapter": "fastly", "healthy": true, "status_code": 200 },
+  "schema_version": 1
+}
+```
+
+The `result` above is shortened; the full shape of each command's result is
+listed under [Results](#results).
+
+| Key              | Type           | Meaning                                                                                                                                                                                                                                      |
+| ---------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `schema_version` | integer        | Version of the JSON surface. Currently `1`.                                                                                                                                                                                                  |
+| `command`        | string         | The command, spelled as typed: `active-version`, `auth status`, `build`, `config gc`, `config validate`, `deploy`, `healthcheck`, `provision`, `rollback`.                                                                                   |
+| `ok`             | boolean        | `true` exactly when the process exits `0`.                                                                                                                                                                                                   |
+| `result`         | object or null | Never null when `ok` is `true`. When `ok` is `false` it holds the partial result if the command still measured something (an unhealthy healthcheck, a partly failed `config gc`, an unauthenticated `auth status`), and is `null` otherwise. |
+| `error`          | object or null | `null` exactly when `ok` is `true`; otherwise `{ "message": string }`, the same message printed to stderr.                                                                                                                                   |
+
+Every key listed for a result is always present: an unknown value is `null`,
+never a missing key, and an empty list is `[]`. Durations are whole seconds in
+keys ending `_secs`. Enum-like values are lowercase `snake_case` strings. Key
+order is not part of the contract.
+
+**Exit codes** are the same in both formats: `0` on success, and non-zero on
+failure (`1` for the bundled `edgezero` binary, `2` for a CLI generated from the
+template). Branch on `ok` rather than on the specific non-zero code. In a
+generated CLI, `2` also means a usage error or an unsupported `config diff`;
+only the envelope tells them apart, and an empty stdout means there is none.
+In the bundled binary, a `1` with an empty stdout usually means a `build` that
+rejected a late `--format`.
+
+### Compatibility
+
+`schema_version` covers the envelope and every command's result.
+
+- **Not breaking, no version bump:** adding a key, adding `error.code`, making
+  a nullable key always non-null, adding a value to a string enum.
+- **Breaking, version bump:** removing or renaming a key, changing a key's type
+  or meaning, making a non-null key nullable, or changing what `ok` / `result`
+  mean.
+
+Consumers should ignore unknown keys, handle unknown enum values, and check
+`schema_version`.
+
+### Results
+
+Each table lists every key of a command's `result`. **Nullable** says whether
+the key can be `null` under schema version `1`; a key marked "no" never is.
+Every result except `config validate`'s also has a non-null `adapter` string.
+
+**`active-version`**
+
+| Key          | Type    | Nullable | Meaning                                             |
+| ------------ | ------- | -------- | --------------------------------------------------- |
+| `service_id` | string  | no       | The service queried.                                |
+| `version`    | integer | yes      | The active version; `null` when none is active yet. |
+
+**`auth status`**
+
+| Key     | Type   | Nullable | Meaning                                                         |
+| ------- | ------ | -------- | --------------------------------------------------------------- |
+| `state` | string | no       | `authenticated`, `unauthenticated`, or `not_applicable` (axum). |
+
+`state` reflects the probe command's exit status only (the probes are listed
+under [Adapter built-ins](#edgezero-auth)): `authenticated` means the probe
+exited `0`, not that a token was checked. Some `wrangler whoami` versions exit
+`0` when logged out, and `fastly profile list` only lists saved profiles.
+`unauthenticated` gives `ok: false` with the result present. A missing native
+CLI gives `result: null`.
+
+**`build`**
+
+| Key        | Type   | Nullable | Meaning                                                                                                              |
+| ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------- |
+| `artifact` | string | yes      | The built file's path; `null` when a manifest `commands.build` override ran or the adapter does not track it (axum). |
+
+`--format` must come before the first passthrough argument. A `--format` (or
+`--format=…`) among the passthrough arguments is rejected with exit `1` rather
+than forwarded to the build command; stdout is empty unless `--format json`
+also came before the passthrough arguments. This includes
+`build --adapter <name> -- --format json`: `build` cannot forward a `--format`.
+
+**`deploy`**
+
+| Key          | Type    | Nullable | Meaning                                                                                                                                       |
+| ------------ | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `service_id` | string  | yes      | The service the adapter resolved (a Fastly `--staging` deploy falls back to `FASTLY_SERVICE_ID`), else `--service-id` as passed, else `null`. |
+| `staging`    | boolean | no       | Whether `--staging` was passed.                                                                                                               |
+| `version`    | integer | yes      | The staged version for `--staging`, the activated version for a Fastly production deploy with `--service-id`, and `null` otherwise.           |
+
+A production deploy reads only `--service-id`, so a Fastly production deploy
+that relies on `FASTLY_SERVICE_ID` reports `service_id: null`.
+
+A Fastly production deploy that went live but whose version could not be
+resolved gives `ok: false` with the result present and `version: null`. Check
+`result`, not only `ok`, before assuming nothing was deployed.
+
+**`healthcheck`**
+
+| Key                | Type    | Nullable | Meaning                                                                                                                                             |
+| ------------------ | ------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `service_id`       | string  | no       | The service probed.                                                                                                                                 |
+| `domain`           | string  | no       | The probed domain.                                                                                                                                  |
+| `path`             | string  | no       | The probed path.                                                                                                                                    |
+| `version`          | integer | no       | The version under test.                                                                                                                             |
+| `staging`          | boolean | no       | Whether the staging IP was probed.                                                                                                                  |
+| `staging_ip`       | string  | yes      | The resolved staging IP; `null` for a production probe.                                                                                             |
+| `healthy`          | boolean | no       | Whether the probe passed.                                                                                                                           |
+| `status_code`      | integer | yes      | The last HTTP status; `null` when no probe got a response.                                                                                          |
+| `attempts`         | integer | no       | The number of probes actually made.                                                                                                                 |
+| `version_verified` | boolean | no       | `true` when the version was confirmed active before and after the probe: a healthy production probe with `FASTLY_API_TOKEN` set. Otherwise `false`. |
+
+An unhealthy probe gives `ok: false` with the result present.
+
+**`rollback`**
+
+| Key              | Type    | Nullable | Meaning                                                          |
+| ---------------- | ------- | -------- | ---------------------------------------------------------------- |
+| `service_id`     | string  | no       | The service rolled back.                                         |
+| `staging`        | boolean | no       | Whether a staged version was deactivated.                        |
+| `version`        | integer | no       | The version rolled back from, or the staged version deactivated. |
+| `rolled_back_to` | integer | yes      | The re-activated version; `null` for `--staging`.                |
+
+**`provision`**
+
+| Key       | Type    | Nullable | Meaning                         |
+| --------- | ------- | -------- | ------------------------------- |
+| `dry_run` | boolean | no       | Whether `--dry-run` was passed. |
+| `entries` | array   | no       | One entry per step, in order.   |
+
+Each entry:
+
+| Key              | Type   | Nullable | Meaning                                                                                               |
+| ---------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------- |
+| `action`         | string | no       | `created`, `already_present`, `would_create`, `updated`, `would_update`, `not_applicable`, or `note`. |
+| `store`          | object | yes      | `{ kind, logical, platform }`; `null` for an adapter-level note.                                      |
+| `store.kind`     | string | no       | `config`, `kv`, or `secrets`.                                                                         |
+| `store.logical`  | string | yes      | The manifest id; `null` for a store EdgeZero owns itself, such as Fastly's `edgezero_runtime_env`.    |
+| `store.platform` | string | no       | The platform name the runtime resolves.                                                               |
+| `message`        | string | no       | The line `text` mode prints. It may span several lines and is meant for people, not parsing.          |
+
+A dry run's `would_create` pairs with a real run's `created` or
+`already_present`, and `would_update` with `updated`. The Fastly and Spin dry
+runs report the plan without checking the current state, so a store that
+already exists still shows `would_create`. Fastly's real run also omits the
+`edgezero_runtime_env` entry when `fastly.toml` already declares it.
+
+**`config gc`**
+
+| Key                 | Type    | Nullable | Meaning                                                                                                                               |
+| ------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `store`             | object  | no       | `{ logical, platform, id }`. `id`, the platform's store id, is nullable.                                                              |
+| `dry_run`           | boolean | no       | `true` unless `--yes` was passed.                                                                                                     |
+| `older_than_secs`   | integer | yes      | The `--older-than` window; `null` without `--older-than`.                                                                             |
+| `summary`           | object  | no       | The counts `entries`, `roots`, `referenced_chunks`, `orphans_planned`, `generations_planned`, `orphans_too_recent`, and `unprovable`. |
+| `kept_roots`        | array   | no       | The retained root keys.                                                                                                               |
+| `planned_deletions` | array   | no       | `{ key, age_secs }` for each planned delete.                                                                                          |
+| `deleted`           | integer | yes      | Entries deleted; `null` on a dry run, and `0` for a real run with nothing to reclaim.                                                 |
+| `failed`            | array   | no       | Keys whose delete failed.                                                                                                             |
+| `stranded`          | array   | no       | Keys left in a generation that lost a sibling to a confirmed delete. Remove these by hand.                                            |
+| `uncertain`         | array   | no       | Keys whose delete outcome is unknown; a re-run may reclaim them.                                                                      |
+| `warnings`          | array   | no       | Warnings about the store's contents.                                                                                                  |
+
+If any delete failed, the command gives `ok: false` with the result present,
+and `error.message` carries the recovery commands.
+
+**`config validate`**
+
+| Key          | Type    | Nullable | Meaning                                                    |
+| ------------ | ------- | -------- | ---------------------------------------------------------- |
+| `mode`       | string  | no       | `raw` for the bundled binary, `typed` for a generated CLI. |
+| `manifest`   | string  | no       | The validated manifest.                                    |
+| `app_config` | string  | no       | The app-config file both modes read and require.           |
+| `app_name`   | string  | no       | The app name from the manifest.                            |
+| `strict`     | boolean | no       | Whether `--strict` was passed.                             |
+
+A validation failure gives `ok: false` and `result: null`, with the first
+failing check in `error.message`.
+
+### Schema changelog
+
+- **1**: initial version.
 
 ## Environment Variables
 

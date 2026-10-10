@@ -3,6 +3,7 @@ use crate::scaffold::{
     ResolvedDependency, ScaffoldError, register_templates, resolve_dep_line, sanitize_crate_name,
     write_tmpl,
 };
+use edgezero_adapter::process;
 use edgezero_adapter::scaffold;
 use edgezero_adapter::scaffold::AdapterBlueprint;
 use handlebars::Handlebars;
@@ -781,12 +782,12 @@ fn render_templates(
 
 fn initialize_git_repo(out_dir: &Path) {
     log::info!("[edgezero] initializing git repository");
-    match Command::new("git")
-        .arg("init")
-        .arg("--quiet")
-        .current_dir(out_dir)
-        .status()
-    {
+    match process::status(
+        Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(out_dir),
+    ) {
         Ok(status) if status.success() => {
             log::info!(
                 "[edgezero] initialized empty Git repository in {}/.git/",
@@ -1135,6 +1136,24 @@ mod tests {
         );
     }
 
+    /// The generated `clippy.toml` exempts tests, and carries the `--format
+    /// json` stdout guard.
+    fn assert_clippy_toml(project_dir: &Path) {
+        let clippy = fs::read_to_string(project_dir.join("clippy.toml")).expect("read clippy.toml");
+        assert!(clippy.contains("allow-expect-in-tests = true"));
+        for path in [
+            "std::process::Command::status",
+            "std::process::Command::spawn",
+            "std::io::stdout",
+            "std::os::unix::process::CommandExt::exec",
+        ] {
+            assert!(
+                clippy.contains(&format!("{{ path = \"{path}\"")),
+                "generated clippy.toml disallows `{path}`"
+            );
+        }
+    }
+
     fn assert_scaffold_workspace(project_dir: &Path) {
         let cargo_toml =
             fs::read_to_string(project_dir.join("Cargo.toml")).expect("read Cargo.toml");
@@ -1177,8 +1196,7 @@ mod tests {
         let gitignore =
             fs::read_to_string(project_dir.join(".gitignore")).expect("read .gitignore");
         assert!(gitignore.contains("target/"));
-        let clippy = fs::read_to_string(project_dir.join("clippy.toml")).expect("read clippy.toml");
-        assert!(clippy.contains("allow-expect-in-tests = true"));
+        assert_clippy_toml(project_dir);
 
         // The generated manifests must keep the package-metadata contract: the
         // root declares the five shared fields once, and EVERY member inherits

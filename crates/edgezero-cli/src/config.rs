@@ -19,10 +19,13 @@
 //! the values the runtime would.
 
 use crate::args::{
-    ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs, ConfigValidateArgs, DiffFormat,
+    ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs, ConfigValidateArgs, DiffFormat, OutputFormat,
     parse_duration_secs,
 };
 use crate::diff::{collect_changes, render_json, render_structured};
+use crate::output::{
+    self, CommandName, Failure, GcResult, Outcome, OutputScope, ValidateMode, ValidateResult,
+};
 use crate::{ensure_adapter_defined, manifest_variable_defaults};
 use edgezero_adapter::registry::{
     self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
@@ -227,6 +230,11 @@ struct ResolvedTomlLeaf<'raw> {
 /// Returns a human-readable error string on any validation failure.
 #[inline]
 pub fn run_config_validate(args: &ConfigValidateArgs) -> Result<(), String> {
+    let _scope = OutputScope::enter(args.format);
+    output::finish(CommandName::ConfigValidate, args.format, validate_raw(args))
+}
+
+fn validate_raw(args: &ConfigValidateArgs) -> Outcome<ValidateResult> {
     let ctx = load_validation_context(args)?;
     run_shared_checks(&ctx, AdapterValidationScope::All)?;
     log::info!(
@@ -234,7 +242,13 @@ pub fn run_config_validate(args: &ConfigValidateArgs) -> Result<(), String> {
         args.manifest.display(),
         if args.strict { " (strict)" } else { "" },
     );
-    Ok(())
+    Ok(ValidateResult::new(
+        &args.manifest,
+        &ctx.app_config_path,
+        &ctx.app_name,
+        args.strict,
+        ValidateMode::Raw,
+    ))
 }
 
 /// Typed flow — adds the checks that need the user's `C` struct.
@@ -243,6 +257,18 @@ pub fn run_config_validate(args: &ConfigValidateArgs) -> Result<(), String> {
 /// Returns a human-readable error string on any validation failure.
 #[inline]
 pub fn run_config_validate_typed<C>(args: &ConfigValidateArgs) -> Result<(), String>
+where
+    C: DeserializeOwned + Validate + AppConfigMeta,
+{
+    let _scope = OutputScope::enter(args.format);
+    output::finish(
+        CommandName::ConfigValidate,
+        args.format,
+        validate_typed::<C>(args),
+    )
+}
+
+fn validate_typed<C>(args: &ConfigValidateArgs) -> Outcome<ValidateResult>
 where
     C: DeserializeOwned + Validate + AppConfigMeta,
 {
@@ -273,7 +299,13 @@ where
         ctx.app_config_path.display(),
         if args.strict { " (strict)" } else { "" },
     );
-    Ok(())
+    Ok(ValidateResult::new(
+        &args.manifest,
+        &ctx.app_config_path,
+        &ctx.app_name,
+        args.strict,
+        ValidateMode::Typed,
+    ))
 }
 
 // -------------------------------------------------------------------
@@ -321,31 +353,26 @@ pub fn run_config_push(_args: &ConfigPushArgs) -> Result<(), String> {
 /// adapter refuses to reclaim (unreadable/unclassifiable state).
 #[inline]
 pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
-    // Reject the contradictory combination clap also forbids, so the PUBLIC API is
-    // safe for a library caller that bypasses clap: a single run cannot both
-    // preview and delete. Checked FIRST so the error is unambiguous, rather than
-    // the threshold validation or the `dry_run || !yes` fallback silently
-    // resolving it. (Passing NEITHER flag is valid -- that is the default dry-run.)
-    if args.dry_run && args.yes {
-        return Err(
-            "`config gc` cannot both preview and delete: `--dry-run` and `--yes` are mutually \
-             exclusive. Pass at most one (omit both for the default dry-run preview)."
+    let _scope = OutputScope::enter(args.format);
+    output::finish(CommandName::ConfigGc, args.format, config_gc(args))
+}
+
+/// The `--older-than` window `config gc` sweeps with, in seconds.
+///
+/// A destructive run must not invent the operator's safety assertion: `--yes`
+/// requires an explicit, non-zero window. A dry-run without one previews every
+/// orphan (a zero window).
+fn gc_older_than_secs(args: &ConfigGcArgs) -> Result<u64, String> {
+    match (args.yes, args.older_than.as_deref()) {
+        (true, None) => Err(
+            "`config gc --yes` requires an explicit `--older-than <dur>`: a destructive run \
+             must not guess it. It asserts that NO root in the selected store changed within \
+             that window and that no writer is targeting the store, so nothing POPs may still \
+             be serving is deleted -- `gc` sweeps the whole physical store, not just the \
+             config you have in mind. Run without `--yes` first to preview every orphan and \
+             its age."
                 .to_owned(),
-        );
-    }
-    // A destructive run must not invent the operator's safety assertion.
-    let older_than_secs = match (args.yes, args.older_than.as_deref()) {
-        (true, None) => {
-            return Err(
-                "`config gc --yes` requires an explicit `--older-than <dur>`: a destructive run \
-                 must not guess it. It asserts that NO root in the selected store changed within \
-                 that window and that no writer is targeting the store, so nothing POPs may still \
-                 be serving is deleted -- `gc` sweeps the whole physical store, not just the \
-                 config you have in mind. Run without `--yes` first to preview every orphan and \
-                 its age."
-                    .to_owned(),
-            );
-        }
+        ),
         (yes, Some(raw)) => {
             let secs = parse_duration_secs(raw)?;
             // `--older-than 0 --yes` asserts nothing: it makes EVERY orphan
@@ -360,12 +387,29 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
                      time and no longer than the time since ANY root in this store last changed."
                 ));
             }
-            secs
+            Ok(secs)
         }
         // Dry-run with no threshold: preview EVERY orphan (age >= 0) with ages,
         // so the operator can choose `--older-than` from real data.
-        (false, None) => 0,
-    };
+        (false, None) => Ok(0),
+    }
+}
+
+fn config_gc(args: &ConfigGcArgs) -> Outcome<GcResult> {
+    // Reject the contradictory combination clap also forbids, so the PUBLIC API is
+    // safe for a library caller that bypasses clap: a single run cannot both
+    // preview and delete. Checked FIRST so the error is unambiguous, rather than
+    // the threshold validation or the `dry_run || !yes` fallback silently
+    // resolving it. (Passing NEITHER flag is valid -- that is the default dry-run.)
+    if args.dry_run && args.yes {
+        return Err(
+            "`config gc` cannot both preview and delete: `--dry-run` and `--yes` are mutually \
+             exclusive. Pass at most one (omit both for the default dry-run preview)."
+                .to_owned()
+                .into(),
+        );
+    }
+    let older_than_secs = gc_older_than_secs(args)?;
 
     // Manifest-only resolution. Unlike `push`/`diff`, `gc` reclaims by
     // inspecting the STORE, so it must NOT require the typed app-config file to
@@ -415,7 +459,7 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
     // `--dry-run` states that intent explicitly (clap makes the two mutually
     // exclusive, so an explicit `--dry-run` always means `--yes` is unset).
     let dry_run = args.dry_run || !args.yes;
-    let lines = adapter.gc_config_entries(
+    let report = adapter.gc_config_entries(
         manifest_root,
         adapter_manifest_path.as_deref(),
         component_selector.as_deref(),
@@ -424,7 +468,20 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
         older_than_secs,
         dry_run,
     )?;
-    for line in lines {
+    let result = GcResult::new(
+        &args.adapter,
+        &store,
+        dry_run,
+        args.older_than.is_some().then_some(older_than_secs),
+        &report,
+    );
+    // A run whose deletes failed reports through its error (the full report
+    // plus recovery commands), exactly as before; its lines are not logged
+    // separately.
+    if let Some(failure) = report.failure {
+        return Err(Failure::with_result(failure.diagnostic, result));
+    }
+    for line in &report.text_lines {
         log::info!("[edgezero] {line}");
     }
     if dry_run {
@@ -437,7 +494,7 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
             ),
         }
     }
-    Ok(())
+    Ok(result)
 }
 
 /// Typed flow — push the user's `C` struct. Runs strict pre-flight
@@ -615,6 +672,7 @@ where
     // adapter_typed_checks; no consent gate, no re-fetch).
     let validate_args = ConfigValidateArgs {
         app_config: args.app_config.clone(),
+        format: OutputFormat::Text,
         manifest: args.manifest.clone(),
         no_env: args.no_env,
         strict: false,
@@ -1327,6 +1385,10 @@ pub(crate) fn print_unified_diff_inline(
     local_sha: &str,
 ) {
     use std::io::stdout;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "`config push` and `config diff` have no `--format json` envelope; this inline diff is text-only output"
+    )]
     let mut stdout = stdout().lock();
     // Silently ignore write errors — stdout may be a closed pipe (e.g.
     // `edgezero config push | head`). The operator already saw the diff
@@ -1351,6 +1413,7 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
     // alongside the schema and per-adapter shared checks.
     let validate_args = ConfigValidateArgs {
         app_config: args.app_config.clone(),
+        format: OutputFormat::Text,
         manifest: args.manifest.clone(),
         no_env: args.no_env,
         strict: true,
@@ -2103,8 +2166,8 @@ mod tests {
             &self,
             _action: adapter_registry::AdapterAction,
             _args: &[String],
-        ) -> Result<(), String> {
-            Ok(())
+        ) -> Result<adapter_registry::ActionOutcome, String> {
+            Ok(adapter_registry::ActionOutcome::Empty)
         }
 
         fn name(&self) -> &'static str {
@@ -2670,6 +2733,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
     fn args_for(manifest: &Path) -> ConfigValidateArgs {
         ConfigValidateArgs {
             app_config: None,
+            format: OutputFormat::Text,
             manifest: manifest.to_path_buf(),
             no_env: true, // tests don't want env leakage
             strict: false,

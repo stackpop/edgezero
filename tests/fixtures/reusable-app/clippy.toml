@@ -1,0 +1,9 @@
+# Clippy configuration for the lifecycle fixture workspace. Without this file
+# clippy would use the EdgeZero root `clippy.toml`, whose `disallowed-methods`
+# guard keeps the EdgeZero CLI's stdout clean for `--format json`. The fixture
+# harness is a test driver that spawns and waits on processes directly, so it
+# keeps only the test exemptions.
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true

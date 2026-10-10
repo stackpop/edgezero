@@ -1,5 +1,7 @@
+use edgezero_adapter::process;
 use edgezero_adapter::registry::{
-    self as adapter_registry, AdapterAction, AdapterDeployContext, DeployOwnership,
+    self as adapter_registry, ActionOutcome, AdapterAction, AdapterDeployContext, AuthState,
+    AuthStatusOutcome, DeployOwnership,
 };
 use edgezero_core::manifest::{Manifest, ManifestLoader, ResolvedEnvironment};
 
@@ -67,6 +69,22 @@ impl From<Action> for AdapterAction {
     }
 }
 
+/// Why [`deploy`] failed.
+#[derive(Debug)]
+pub enum DeployFailure {
+    /// The deploy itself failed; nothing is known to be live.
+    Deploy(String),
+    /// The deploy went live, but finalizing it (e.g. resolving the activated
+    /// version) failed.
+    Finalize(String),
+}
+
+impl From<String> for DeployFailure {
+    fn from(message: String) -> Self {
+        Self::Deploy(message)
+    }
+}
+
 fn apply_environment(
     adapter_name: &str,
     environment: &ResolvedEnvironment,
@@ -114,7 +132,7 @@ pub fn execute(
     action: Action,
     manifest_loader: Option<&ManifestLoader>,
     adapter_args: &[String],
-) -> Result<(), String> {
+) -> Result<ActionOutcome, String> {
     if let Some(loader) = manifest_loader
         && let Some(command) = manifest_command(loader.manifest(), adapter_name, action)
     {
@@ -164,13 +182,17 @@ fn require_adapter(
 /// Select deployment ownership through the registered adapter's preflight.
 /// Manifest-owned and fallback deployments retain the legacy finalizer, while
 /// adapter-managed deployments own the complete lifecycle in `deploy`.
+///
+/// Returns what the deploy produced: the finalizer's outcome when it reports
+/// one, else the adapter deploy's (always [`ActionOutcome::Empty`] for a
+/// manifest command).
 pub fn deploy(
     adapter_name: &str,
     context: &AdapterDeployContext,
     adapter_manifest_path_error: Option<&str>,
     manifest_loader: Option<&ManifestLoader>,
     adapter_args: &[String],
-) -> Result<(), String> {
+) -> Result<ActionOutcome, DeployFailure> {
     let registered_adapter = adapter_registry::get_adapter(adapter_name);
     let ownership = registered_adapter
         .map_or(Ok(DeployOwnership::ManifestCommand), |registered| {
@@ -180,19 +202,21 @@ pub fn deploy(
     if ownership != DeployOwnership::AdapterManaged && context.application_release_root.is_some() {
         return Err(format!(
             "adapter `{adapter_name}` does not support immutable application releases; omit --application-release"
-        ));
+        )
+        .into());
     }
 
     if ownership == DeployOwnership::AdapterManaged {
         if let Some(err) = adapter_manifest_path_error {
-            return Err(err.to_owned());
+            return Err(err.to_owned().into());
         }
         let Some(managed_adapter) = registered_adapter else {
             return Err(format!(
                 "adapter `{adapter_name}` selected managed deployment without being registered"
-            ));
+            )
+            .into());
         };
-        return managed_adapter.deploy(context, adapter_args);
+        return Ok(managed_adapter.deploy(context, adapter_args)?);
     }
 
     if !context.staging
@@ -203,7 +227,7 @@ pub fn deploy(
             && !context.stores.is_empty()
             && let Some(err) = adapter_manifest_path_error
         {
-            return Err(err.to_owned());
+            return Err(err.to_owned().into());
         }
         let root = loader.manifest().root().unwrap_or_else(|| Path::new("."));
         let env = loader.manifest().environment_for(adapter_name);
@@ -222,18 +246,26 @@ pub fn deploy(
             adapter_bind,
             &command_args,
         )?;
-        if let Some(finalizer) = registered_adapter {
-            finalizer.finalize_deploy(context, Some(&output))?;
-        }
-        return Ok(());
+        return registered_adapter.map_or(Ok(ActionOutcome::Empty), |finalizer| {
+            finalizer
+                .finalize_deploy(context, Some(&output))
+                .map_err(DeployFailure::Finalize)
+        });
     }
 
     if let Some(err) = adapter_manifest_path_error {
-        return Err(err.to_owned());
+        return Err(err.to_owned().into());
     }
     let fallback_adapter = require_adapter(adapter_name, manifest_loader.is_some())?;
-    fallback_adapter.deploy(context, adapter_args)?;
-    fallback_adapter.finalize_deploy(context, None)
+    let deployed = fallback_adapter.deploy(context, adapter_args)?;
+    let finalized = fallback_adapter
+        .finalize_deploy(context, None)
+        .map_err(DeployFailure::Finalize)?;
+    Ok(if finalized == ActionOutcome::Empty {
+        deployed
+    } else {
+        finalized
+    })
 }
 
 fn manifest_command<'manifest>(
@@ -336,6 +368,12 @@ fn build_shell_command(
     Ok(cmd)
 }
 
+/// Run a manifest-declared adapter command with inherited stdio (stdout
+/// routed to stderr under `--format json`, see [`process::status`]).
+///
+/// A manifest `auth_status` command is a session probe: its non-zero exit
+/// is an `Unauthenticated` outcome (carrying the usual message), not an
+/// error. Every other command reports no structured outcome.
 fn run_shell(
     command: &str,
     cwd: &Path,
@@ -344,7 +382,7 @@ fn run_shell(
     environment: Option<ResolvedEnvironment>,
     adapter_bind: (Option<String>, Option<u16>),
     adapter_args: &[String],
-) -> Result<(), String> {
+) -> Result<ActionOutcome, String> {
     let mut cmd = build_shell_command(
         command,
         cwd,
@@ -354,16 +392,19 @@ fn run_shell(
         adapter_args,
     )?;
 
-    let status = cmd
-        .status()
+    let status = process::status(&mut cmd)
         .map_err(|err| format!("failed to run {action} command `{command}`: {err}"))?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{action} command `{command}` exited with status {status}"
-        ))
+    let exit_failure = (!status.success())
+        .then(|| format!("{action} command `{command}` exited with status {status}"));
+    match (action, exit_failure) {
+        (Action::AuthStatus, failure) => Ok(ActionOutcome::AuthStatus(AuthStatusOutcome {
+            state: failure.map_or(AuthState::Authenticated, |reason| {
+                AuthState::Unauthenticated { reason }
+            }),
+        })),
+        (_, Some(message)) => Err(message),
+        (_, None) => Ok(ActionOutcome::Empty),
     }
 }
 
@@ -397,8 +438,8 @@ fn tee_stream<R: Read, W: Write>(reader: R, mut writer: W) -> String {
 }
 
 /// Same dispatch as [`run_shell`], but the child's stdout/stderr are
-/// piped, echoed through to our own stdout/stderr as they arrive, AND
-/// captured. Returns the captured `stdout + stderr` text so the caller
+/// piped, echoed through to our own stdout/stderr as they arrive (stdout
+/// is echoed to OUR stderr under `--format json`), AND captured. Returns the captured `stdout + stderr` text so the caller
 /// can parse machine-readable lines (e.g. Fastly's activated
 /// `version=<N>`) out of a command it does not otherwise control.
 fn run_shell_tee(
@@ -420,6 +461,10 @@ fn run_shell_tee(
     )?;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "stdout/stderr are piped above; the echo target below honours the stdout policy"
+    )]
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("failed to run {action} command `{command}`: {err}"))?;
@@ -435,7 +480,16 @@ fn run_shell_tee(
     // stderr is drained on a worker thread so a chatty child cannot
     // deadlock by filling the stderr pipe while we block on stdout.
     let stderr_worker = thread::spawn(move || tee_stream(child_stderr, io::stderr()));
-    let captured_stdout = tee_stream(child_stdout, io::stdout());
+    let captured_stdout = if process::child_stdout_to_stderr() {
+        tee_stream(child_stdout, io::stderr())
+    } else {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "text mode echoes the child's stdout to stdout, exactly as before `--format`"
+        )]
+        let stdout = io::stdout();
+        tee_stream(child_stdout, stdout)
+    };
     let captured_stderr = stderr_worker.join().unwrap_or_default();
 
     let status = child
@@ -473,7 +527,9 @@ fn shell_join(args: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdapterDeployContext, ResolvedEnvironment, apply_environment, deploy};
+    use super::{
+        AdapterDeployContext, DeployFailure, ResolvedEnvironment, apply_environment, deploy,
+    };
     use crate::test_support::manifest_guard;
     use edgezero_core::manifest::ResolvedEnvironmentBinding;
     use edgezero_core::test_env::EnvOverride;
@@ -489,9 +545,13 @@ mod tests {
 
         let error = deploy("unregistered", &context, None, None, &[])
             .expect_err("a manifest-owned adapter must not ignore the release contract");
-        assert_eq!(
-            error,
-            "adapter `unregistered` does not support immutable application releases; omit --application-release"
+        assert!(
+            matches!(
+                &error,
+                DeployFailure::Deploy(message)
+                    if message == "adapter `unregistered` does not support immutable application releases; omit --application-release"
+            ),
+            "unexpected failure: {error:?}"
         );
     }
 

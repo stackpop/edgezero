@@ -6,6 +6,11 @@
 //! reuses any subset of edgezero's built-in commands. The default
 //! `edgezero` binary (`main.rs`) is a thin wrapper over this library.
 //!
+//! Run one command per process. Under `--format json` a `run_*` handler
+//! reroutes process-wide output (the logger and inheriting children) for the
+//! duration of the call, so overlapping runs on separate threads are not
+//! supported.
+//!
 //! `run_demo` is an additional contributor-only handler, available only
 //! under the `demo-example` feature — it runs the in-repo `app-demo`
 //! example and is not meant for downstream CLIs.
@@ -31,6 +36,8 @@ mod demo_server;
 mod diff;
 #[cfg(feature = "cli")]
 mod generator;
+#[cfg(feature = "cli")]
+mod output;
 #[cfg(feature = "cli")]
 mod provision;
 #[cfg(feature = "cli")]
@@ -59,22 +66,36 @@ use args::{
     ActiveVersionArgs, BuildArgs, DeployArgs, HealthcheckArgs, NewArgs, RollbackArgs, ServeArgs,
 };
 #[cfg(feature = "cli")]
-use edgezero_adapter::registry::{AdapterDeployContext, DeployStoreIds};
+use edgezero_adapter::registry::{ActionOutcome, AdapterDeployContext, DeployStoreIds};
 #[cfg(feature = "cli")]
 use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
+#[cfg(feature = "cli")]
+use output::{
+    ActiveVersionResult, BuildResult, CommandName, DeployResult, Failure, HealthcheckResult,
+    Outcome, OutputScope, RollbackResult,
+};
 #[cfg(feature = "cli")]
 use std::collections::BTreeMap;
 #[cfg(feature = "cli")]
 use std::env;
 #[cfg(feature = "cli")]
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind, Write as _};
 #[cfg(feature = "cli")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "cli")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// When set, [`CliLogger`] writes `info` to stderr instead of stdout.
+/// `--format json` sets it (via `output::OutputScope`) so stdout carries only
+/// the JSON envelope.
+#[cfg(feature = "cli")]
+static INFO_TO_STDERR: AtomicBool = AtomicBool::new(false);
 
 /// CLI output logger: prints `record.args()` verbatim with no
 /// timestamps, levels, or module prefixes — the CLI's output IS
-/// the user-facing UX, not a debug log. `info` goes to stdout;
-/// `warn`/`error` go to stderr. `debug` and `trace` are filtered
+/// the user-facing UX, not a debug log. `info` goes to stdout (stderr
+/// under `--format json`, see [`INFO_TO_STDERR`]); `warn`/`error` go to
+/// stderr. `debug` and `trace` are filtered
 /// out by `enabled()` and `LevelFilter::Info`; there is no
 /// verbosity flag yet — adding one is a follow-up that would
 /// route debug/trace alongside info.
@@ -101,15 +122,16 @@ impl log::Log for CliLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        // `writeln!` rather than `eprintln!`: a closed stderr must not panic
+        // the command before `--format json` writes its envelope.
         match record.level() {
+            // warn/error always go to stderr; `--format json` sends info there
+            // too, keeping stdout for the JSON envelope.
             log::Level::Error | log::Level::Warn => {
-                #[expect(
-                    clippy::print_stderr,
-                    reason = "CLI UX output goes to stderr for warn/error"
-                )]
-                {
-                    eprintln!("{}", record.args());
-                }
+                let _ignored = writeln!(io::stderr(), "{}", record.args());
+            }
+            log::Level::Info if INFO_TO_STDERR.load(Ordering::SeqCst) => {
+                let _ignored = writeln!(io::stderr(), "{}", record.args());
             }
             log::Level::Info => {
                 #[expect(clippy::print_stdout, reason = "CLI UX output goes to stdout for info")]
@@ -120,6 +142,13 @@ impl log::Log for CliLogger {
             log::Level::Debug | log::Level::Trace => {}
         }
     }
+}
+
+/// Route [`CliLogger`]'s `info` output to stderr (`true`) or stdout (`false`).
+/// Returns the previous setting so a scope guard can restore it.
+#[cfg(feature = "cli")]
+fn set_info_to_stderr(enabled: bool) -> bool {
+    INFO_TO_STDERR.swap(enabled, Ordering::SeqCst)
 }
 
 /// Initialize a CLI logger that prints messages without timestamps
@@ -142,17 +171,44 @@ pub fn init_cli_logger() {
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_build(args: &BuildArgs) -> Result<(), String> {
+    let _scope = OutputScope::enter(args.format);
+    output::finish(CommandName::Build, args.format, build(args))
+}
+
+#[cfg(feature = "cli")]
+fn build(args: &BuildArgs) -> Outcome<BuildResult> {
+    // `trailing_var_arg` captures everything after the first passthrough token,
+    // so a late `--format json` would be forwarded to the build command and the
+    // run would silently print text. Fail closed instead.
+    if let Some(flag) = args
+        .adapter_args
+        .iter()
+        .find(|arg| *arg == "--format" || arg.starts_with("--format="))
+    {
+        return Err(format!(
+            "`{flag}` after a passthrough argument is forwarded to the build command, not read \
+             as EdgeZero's `--format`. Put `--format` before the first passthrough argument."
+        )
+        .into());
+    }
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
     if let Some(loader) = &manifest {
         log_store_bindings(&args.adapter, loader);
     }
-    adapter::execute(
+    let outcome = adapter::execute(
         &args.adapter,
         adapter::Action::Build,
         manifest.as_ref(),
         &args.adapter_args,
-    )
+    )?;
+    // A manifest `commands.build` override reports no artifact.
+    let artifact = if let ActionOutcome::Build(built) = &outcome {
+        built.artifact.as_deref()
+    } else {
+        None
+    };
+    Ok(BuildResult::new(&args.adapter, artifact))
 }
 
 /// Deploy the project to a target edge adapter.
@@ -164,6 +220,21 @@ pub fn run_build(args: &BuildArgs) -> Result<(), String> {
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
+    let _scope = OutputScope::enter(args.format);
+    output::finish(CommandName::Deploy, args.format, deploy(args))
+}
+
+#[cfg(feature = "cli")]
+fn deploy(args: &DeployArgs) -> Outcome<DeployResult> {
+    // `service_id`: the id the adapter resolved, else `--service-id` as passed.
+    let result = |service_id: Option<String>, version: Option<u64>| {
+        DeployResult::new(
+            &args.adapter,
+            service_id.or_else(|| args.service_id.clone()),
+            args.staging,
+            version,
+        )
+    };
     // Reject reserved staging-lifecycle spellings in the passthrough. `--staging` is
     // a typed flag (before `--`); if it — or the renamed-away `--stage` — appears in
     // the passthrough (after `--`), the operator meant to stage but `args.staging` is
@@ -182,7 +253,8 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
              `deploy --adapter {} --staging` (before any `--`). Refusing to run a \
              production deploy with `{flag}` after `--`.",
             args.adapter
-        ));
+        )
+        .into());
     }
 
     let manifest = load_manifest_optional()?;
@@ -222,13 +294,40 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         variable_defaults,
     };
 
-    adapter::deploy(
+    match adapter::deploy(
         &args.adapter,
         &context,
         adapter_manifest_path_error.as_deref(),
         manifest.as_ref(),
         &args.adapter_args,
-    )
+    ) {
+        Ok(outcome) => {
+            let (service_id, version) = deployed(outcome);
+            Ok(result(service_id, version))
+        }
+        Err(adapter::DeployFailure::Deploy(message)) => Err(message.into()),
+        // The deploy went live; only finalizing it (e.g. resolving the
+        // activated version) failed, so the failure still carries a result.
+        Err(adapter::DeployFailure::Finalize(message)) => {
+            Err(Failure::with_result(message, result(None, None)))
+        }
+    }
+}
+
+/// The service id and version a deploy outcome reports, if any.
+#[cfg(feature = "cli")]
+fn deployed(outcome: ActionOutcome) -> (Option<String>, Option<u64>) {
+    if let ActionOutcome::Deploy(deployed) = outcome {
+        (deployed.service_id, deployed.version)
+    } else {
+        (None, None)
+    }
+}
+
+/// The error for an adapter that answered `action` with the wrong outcome.
+#[cfg(feature = "cli")]
+fn unexpected_outcome(adapter_name: &str, action: adapter::Action) -> String {
+    format!("adapter `{adapter_name}` returned no {action} result")
 }
 
 #[cfg(feature = "cli")]
@@ -376,6 +475,12 @@ fn resolve_adapter_manifest_path(
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_healthcheck(args: &HealthcheckArgs) -> Result<(), String> {
+    let _scope = OutputScope::enter(args.format);
+    output::finish(CommandName::Healthcheck, args.format, healthcheck(args))
+}
+
+#[cfg(feature = "cli")]
+fn healthcheck(args: &HealthcheckArgs) -> Outcome<HealthcheckResult> {
     // Manifest-independent, like `active-version`: a pure API/curl probe keyed on
     // explicit flags, never a manifest-command override. Not loading the manifest
     // keeps it correct regardless of the current directory (monorepo safety).
@@ -400,12 +505,25 @@ pub fn run_healthcheck(args: &HealthcheckArgs) -> Result<(), String> {
         "--timeout".to_owned(),
         args.timeout.to_string(),
     ]);
-    adapter::execute(
+    let ActionOutcome::Healthcheck(outcome) = adapter::execute(
         &args.adapter,
         adapter::Action::Healthcheck,
         None,
         &passthrough,
-    )
+    )?
+    else {
+        return Err(unexpected_outcome(&args.adapter, adapter::Action::Healthcheck).into());
+    };
+    // The line-oriented contract the healthcheck action parses.
+    if let Some(code) = outcome.status_code {
+        log::info!("status-code={code}");
+    }
+    log::info!("healthy={}", outcome.healthy());
+    let result = HealthcheckResult::new(&args.adapter, &outcome);
+    match outcome.failure {
+        Some(failure) => Err(Failure::with_result(failure, result)),
+        None => Ok(result),
+    }
 }
 
 /// Roll a service back (Fastly staging lifecycle):
@@ -420,6 +538,12 @@ pub fn run_healthcheck(args: &HealthcheckArgs) -> Result<(), String> {
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_rollback(args: &RollbackArgs) -> Result<(), String> {
+    let _scope = OutputScope::enter(args.format);
+    output::finish(CommandName::Rollback, args.format, rollback(args))
+}
+
+#[cfg(feature = "cli")]
+fn rollback(args: &RollbackArgs) -> Outcome<RollbackResult> {
     // Manifest-independent, like `active-version` / `healthcheck`: a pure API
     // operation keyed on explicit flags, never a manifest-command override.
     let mut passthrough: Vec<String> = vec![
@@ -444,10 +568,19 @@ pub fn run_rollback(args: &RollbackArgs) -> Result<(), String> {
              or wire the deploy-fastly GitHub action's `previous-version` output. If it was \
              never captured, choose the target from the service's version history -- Fastly \
              cannot identify it for you. Pass --staging to deactivate a staged version instead."
-                .to_owned(),
+                .to_owned()
+                .into(),
         );
     }
-    adapter::execute(&args.adapter, adapter::Action::Rollback, None, &passthrough)
+    let ActionOutcome::Rollback(outcome) =
+        adapter::execute(&args.adapter, adapter::Action::Rollback, None, &passthrough)?
+    else {
+        return Err(unexpected_outcome(&args.adapter, adapter::Action::Rollback).into());
+    };
+    if let Some(target) = outcome.rolled_back_to {
+        log::info!("rolled-back-to={target}");
+    }
+    Ok(RollbackResult::new(&args.adapter, &outcome))
 }
 
 /// Resolve and print the currently-active service version as `version=<N>`.
@@ -463,18 +596,47 @@ pub fn run_rollback(args: &RollbackArgs) -> Result<(), String> {
 #[cfg(feature = "cli")]
 #[inline]
 pub fn run_active_version(args: &ActiveVersionArgs) -> Result<(), String> {
+    let _scope = OutputScope::enter(args.format);
+    output::finish(
+        CommandName::ActiveVersion,
+        args.format,
+        active_version_of(args),
+    )
+}
+
+#[cfg(feature = "cli")]
+fn active_version_of(args: &ActiveVersionArgs) -> Outcome<ActiveVersionResult> {
     // No manifest load: `active-version` is a pure Fastly-API operation keyed on
     // `--adapter` + `--service-id`, and `EmitVersion` can never be a
     // manifest-command override (see `adapter::manifest_command`). Loading the
     // manifest would only couple it to the current directory — breaking it in a
     // monorepo where a stray root `edgezero.toml` shadows the app's. The adapter
     // registry still validates `--adapter`.
-    adapter::execute(
+    let ActionOutcome::ActiveVersion(outcome) = adapter::execute(
         &args.adapter,
         adapter::Action::EmitVersion,
         None,
         &["--service-id".to_owned(), args.service_id.clone()],
-    )
+    )?
+    else {
+        return Err(unexpected_outcome(&args.adapter, adapter::Action::EmitVersion).into());
+    };
+    if let Some(version) = outcome.version {
+        log::info!("version={version}");
+    } else {
+        // Confirmed no active version (first-ever deploy): an explicit empty
+        // line so the caller records an empty rollback target and succeeds.
+        log::info!("version=");
+        log::info!(
+            "service {} has no active version yet; emitting an empty rollback target",
+            outcome.service_id
+        );
+    }
+    Ok(ActiveVersionResult::new(
+        &args.adapter,
+        outcome.service_id,
+        outcome.version,
+    ))
 }
 
 /// Run a local simulation for a target edge adapter.
@@ -494,6 +656,7 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
         manifest.as_ref(),
         &[],
     )
+    .map(|_| ())
 }
 
 /// Create a new `EdgeZero` app skeleton.
@@ -603,6 +766,7 @@ fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
 #[cfg(feature = "cli")]
 mod tests {
     use super::*;
+    use crate::args::OutputFormat;
     use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard};
     use edgezero_adapter::registry::{
         self as adapter_registry, Adapter, AdapterAction, DeployOwnership,
@@ -639,16 +803,24 @@ mod tests {
         reason = "the recording adapter exercises only deploy preflight, deploy dispatch, and finalization"
     )]
     impl Adapter for RecordingDeployAdapter {
-        fn deploy(&self, context: &AdapterDeployContext, _args: &[String]) -> Result<(), String> {
+        fn deploy(
+            &self,
+            context: &AdapterDeployContext,
+            _args: &[String],
+        ) -> Result<ActionOutcome, String> {
             *DEPLOY_CONTEXT
                 .lock()
                 .map_err(|err| format!("deploy context lock poisoned: {err}"))? =
                 Some(context.clone());
             DEPLOY_CALLS.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(ActionOutcome::Empty)
         }
 
-        fn execute(&self, action: AdapterAction, _args: &[String]) -> Result<(), String> {
+        fn execute(
+            &self,
+            action: AdapterAction,
+            _args: &[String],
+        ) -> Result<ActionOutcome, String> {
             if action == AdapterAction::Deploy {
                 return Err("managed deployment must call Adapter::deploy".to_owned());
             }
@@ -659,9 +831,9 @@ mod tests {
             &self,
             _context: &AdapterDeployContext,
             _command_output: Option<&str>,
-        ) -> Result<(), String> {
+        ) -> Result<ActionOutcome, String> {
             DEPLOY_FINALIZE_CALLS.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(ActionOutcome::Empty)
         }
 
         fn name(&self) -> &'static str {
@@ -794,6 +966,7 @@ mod tests {
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
         let args = DeployArgs {
+            format: OutputFormat::Text,
             adapter: "fastly".to_owned(),
             application_release: None,
             adapter_args: vec!["--non-interactive".to_owned()],
@@ -825,6 +998,7 @@ mod tests {
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
         let err = run_deploy(&DeployArgs {
+            format: OutputFormat::Text,
             adapter: "fastly".to_owned(),
             application_release: None,
             adapter_args: Vec::new(),
@@ -864,6 +1038,7 @@ mod tests {
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
         run_deploy(&DeployArgs {
+            format: OutputFormat::Text,
             adapter: "unregistered_test".to_owned(),
             application_release: None,
             adapter_args: Vec::new(),
@@ -933,6 +1108,7 @@ deploy = "touch '{}'"
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
         run_deploy(&DeployArgs {
+            format: OutputFormat::Text,
             adapter: "recording_deploy_test".to_owned(),
             application_release: None,
             adapter_args: Vec::new(),
@@ -1069,6 +1245,7 @@ deploy = "touch '{}'"
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
         let err = run_deploy(&DeployArgs {
+            format: OutputFormat::Text,
             adapter: "recording_deploy_test".to_owned(),
             application_release: None,
             adapter_args: Vec::new(),
@@ -1113,6 +1290,7 @@ deploy = "touch '{}'"
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
         run_deploy(&DeployArgs {
+            format: OutputFormat::Text,
             adapter: "recording_deploy_test".to_owned(),
             application_release: None,
             adapter_args: Vec::new(),
@@ -1152,6 +1330,7 @@ deploy = "touch '{}'"
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
         let err = run_deploy(&DeployArgs {
+            format: OutputFormat::Text,
             adapter: "recording_deploy_test".to_owned(),
             application_release: None,
             adapter_args: Vec::new(),
@@ -1192,6 +1371,7 @@ deploy = "touch '{}'"
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
         let err = run_deploy(&DeployArgs {
+            format: OutputFormat::Text,
             adapter: "recording_deploy_test".to_owned(),
             application_release: None,
             adapter_args: Vec::new(),
@@ -1248,6 +1428,7 @@ deploy = "touch '{}'"
             adapter: "fastly".to_owned(),
             application_release: None,
             adapter_args: vec!["--non-interactive".to_owned()],
+            format: OutputFormat::Text,
             service_id: Some("SVC1".to_owned()),
             staging: false,
         })
@@ -1272,6 +1453,7 @@ deploy = "touch '{}'"
                 adapter: "fastly".to_owned(),
                 application_release: None,
                 adapter_args: vec![flag.to_owned()],
+                format: OutputFormat::Text,
                 service_id: Some("SVC1".to_owned()),
                 staging: false,
             };
@@ -1315,6 +1497,7 @@ deploy = "touch '{}'"
         let args = BuildArgs {
             adapter: "fastly".to_owned(),
             adapter_args: Vec::new(),
+            format: OutputFormat::Text,
         };
         run_build(&args).expect("build command runs");
     }
@@ -1335,6 +1518,7 @@ deploy = "touch '{}'"
             // No service id → the production version-emit step is
             // skipped, so this test exercises only the
             // manifest `deploy` command path.
+            format: OutputFormat::Text,
             service_id: None,
             staging: false,
         };

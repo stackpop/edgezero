@@ -10,9 +10,11 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
+use edgezero_adapter::process;
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
-    TypedSecretEntry, register_adapter,
+    ActionOutcome, Adapter, AdapterAction, AdapterPushContext, AuthState, AuthStatusOutcome,
+    BuildOutcome, ProvisionAction, ProvisionEntry, ProvisionReport, ProvisionStores,
+    ReadConfigEntry, ResolvedStoreId, StoreKind, TypedSecretEntry, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
@@ -135,7 +137,7 @@ struct EdgezeroAxumConfig {
     reason = "axum has no validate_app_config_keys / validate_adapter_manifest requirements; those two trait defaults are intentionally inherited. `validate_typed_secrets` IS overridden below (each `#[secret]` value must map to one `EDGEZERO__SECRETS__<KEY>` env var). `read_config_entry` delegates to `read_config_entry_local` (axum is local-only). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for AxumCliAdapter {
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
+    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<ActionOutcome, String> {
         match action {
             // The axum adapter is the in-process native dev server —
             // there is no remote auth provider to sign in/out of.
@@ -144,11 +146,21 @@ impl Adapter for AxumCliAdapter {
                 log::info!(
                     "[edgezero] axum has no remote auth surface; `auth` is a no-op for this adapter"
                 );
-                Ok(())
+                Ok(if action == AdapterAction::AuthStatus {
+                    ActionOutcome::AuthStatus(AuthStatusOutcome {
+                        state: AuthState::NotApplicable,
+                    })
+                } else {
+                    ActionOutcome::Empty
+                })
             }
-            AdapterAction::Build => build(args),
-            AdapterAction::Deploy => deploy(args),
-            AdapterAction::Serve => serve(args),
+            // `cargo build` picks the artifact path itself; axum does not
+            // track it, so the outcome reports none.
+            AdapterAction::Build => {
+                build(args).map(|()| ActionOutcome::Build(BuildOutcome { artifact: None }))
+            }
+            AdapterAction::Deploy => deploy(args).map(|()| ActionOutcome::Empty),
+            AdapterAction::Serve => serve(args).map(|()| ActionOutcome::Empty),
             // The Fastly staging lifecycle is Fastly-only.
             AdapterAction::DeployStaging
             | AdapterAction::EmitVersion
@@ -171,12 +183,12 @@ impl Adapter for AxumCliAdapter {
         _component_selector: Option<&str>,
         stores: &ProvisionStores<'_>,
         _dry_run: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<ProvisionReport, String> {
         //: axum has no remote resources. Print one note per
         // declared store id so the operator sees the CLI heard
         // them — same shape `dry_run` would have, since there is
         // nothing to actually perform.
-        let mut out = Vec::with_capacity(
+        let mut entries = Vec::with_capacity(
             stores
                 .kv
                 .len()
@@ -185,8 +197,11 @@ impl Adapter for AxumCliAdapter {
         );
         for store in stores.kv {
             let logical = store.logical.as_str();
-            out.push(format!(
-                "axum KV store `{logical}` is in-memory; nothing to provision"
+            entries.push(ProvisionEntry::for_store(
+                ProvisionAction::NotApplicable,
+                StoreKind::Kv,
+                store,
+                format!("axum KV store `{logical}` is in-memory; nothing to provision"),
             ));
         }
         for store in stores.config {
@@ -195,20 +210,30 @@ impl Adapter for AxumCliAdapter {
             // overlay isn't used for local file paths because the
             // path encoding is the canonical form.
             let logical = store.logical.as_str();
-            out.push(format!(
-                "axum config store `{logical}` reads `.edgezero/local-config-{logical}.json`; nothing to provision"
+            entries.push(ProvisionEntry::for_store(
+                ProvisionAction::NotApplicable,
+                StoreKind::Config,
+                store,
+                format!(
+                    "axum config store `{logical}` reads `.edgezero/local-config-{logical}.json`; nothing to provision"
+                ),
             ));
         }
         for store in stores.secrets {
             let logical = store.logical.as_str();
-            out.push(format!(
-                "axum secret store `{logical}` reads env vars; nothing to provision"
+            entries.push(ProvisionEntry::for_store(
+                ProvisionAction::NotApplicable,
+                StoreKind::Secrets,
+                store,
+                format!("axum secret store `{logical}` reads env vars; nothing to provision"),
             ));
         }
-        if out.is_empty() {
-            out.push("axum has no declared stores to provision".to_owned());
+        if entries.is_empty() {
+            entries.push(ProvisionEntry::note(
+                "axum has no declared stores to provision".to_owned(),
+            ));
         }
-        Ok(out)
+        Ok(ProvisionReport { entries })
     }
 
     fn push_config_entries(
@@ -442,8 +467,7 @@ fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> 
     // no-op for the child process.
     command.env("EDGEZERO__ADAPTER__HOST", bind_addr.ip().to_string());
     command.env("EDGEZERO__ADAPTER__PORT", bind_addr.port().to_string());
-    let status = command
-        .status()
+    let status = process::status(&mut command)
         .map_err(|err| format!("failed to run cargo {subcommand}: {err}"))?;
     if status.success() {
         Ok(())
