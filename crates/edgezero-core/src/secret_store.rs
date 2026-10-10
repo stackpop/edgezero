@@ -281,7 +281,9 @@ impl SecretHandle {
 /// Access secrets across multiple named stores.
 ///
 /// Platforms with a single flat namespace implement this differently:
-/// - Env vars and in-memory test stores key values on `"{store_name}/{key}"`.
+/// - In-memory test stores key values on `"{store_name}/{key}"`.
+/// - Axum's env store ignores `store_name` and reads `key` from
+///   `EDGEZERO__SECRETS__<KEY>`, with `key` in ASCII uppercase.
 /// - Cloudflare and Spin ignore `store_name`; each platform exposes one flat
 ///   runtime namespace. Spin reads component variables, which must be declared
 ///   with lowercase variable names in `spin.toml`.

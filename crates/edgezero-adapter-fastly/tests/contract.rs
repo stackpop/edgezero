@@ -147,7 +147,6 @@ mod tests {
     #[test]
     fn registry_conversion_preserves_extensions_without_collecting_a_response() {
         use edgezero_core::app::{StoreMetadata, StoresMetadata};
-        use edgezero_core::env_config::EnvConfig;
         use edgezero_core::store_registry::SecretRegistry;
         let request = fastly_request(FastlyMethod::GET, "/stream", None);
         let core = into_core_request_with_registries(
@@ -159,7 +158,6 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            &EnvConfig::default(),
             |raw, extensions| {
                 extensions.insert(raw.get_url_str().to_owned());
             },

@@ -474,8 +474,9 @@ adapter cannot know the path.
 
 - For a staged deploy, `version` is the staged version.
 - For a production Fastly deploy with a service id, `version` is the active
-  version after the deploy, found the same way as today (captured `version=`
-  output, then falling back to the API).
+  version after the deploy, found the same way as text mode (captured
+  `version=` output verified active through the API, else the API's active
+  version).
 - Otherwise `version` is `null`.
 - `service_id` is the id the adapter resolved (a Fastly staged deploy falls
   back to `FASTLY_SERVICE_ID`), else `--service-id` as passed, else `null`. A
@@ -610,8 +611,8 @@ never on string matches (#383), and text tests assert exact bytes.
    - **healthcheck:** the exact line-contract bytes; an unhealthy probe's full
      partial result; `version_verified` only when both API checks ran.
    - **deploy:** the version read from captured output; a deploy that went live
-     without a version keeps its result; a staged deploy resolving its service
-     from `FASTLY_SERVICE_ID`; exact text bytes.
+     without a version keeps its result; a staged deploy without
+     `--application-release` failing with `result: null`; exact text bytes.
    - **rollback** and **active-version:** production and staged rollback, and
      an active version present or absent, each in text and JSON.
    - the bundled `config diff` stub still absorbs `--format json`.
@@ -739,3 +740,20 @@ result shape.
   workspace and the generated project.
 - **§9** lists the 28 end-to-end tests, including exact text bytes for all nine
   commands.
+
+Revision 5 records the merge with #381, which moved deploy into the
+`Adapter::preflight_deploy` / `deploy` / `finalize_deploy` hooks. No result
+shape changes.
+
+- **`Adapter::deploy` and `Adapter::finalize_deploy`** return `ActionOutcome`,
+  like `execute`. A finalizer's `Deploy` outcome takes precedence over the
+  deploy's.
+- **The CLI's `adapter::deploy`** returns a `DeployFailure` that separates a
+  failed deploy from a live deploy whose finalization failed, so the second
+  keeps its result with `version: null`.
+- **A Fastly staged deploy** is adapter-managed and requires
+  `--application-release`; it reports the service and the staged version
+  from its deploy plan. Without a release it fails before any provider call.
+- **A Fastly production deploy's version** is resolved by `finalize_deploy`:
+  a captured `version=` is verified active through the API, else the API's
+  active version is used.

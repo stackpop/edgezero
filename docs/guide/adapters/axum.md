@@ -160,12 +160,15 @@ for the portable API.
 
 ## Secret Store
 
-A declared `[stores.secrets]` id resolves to an `EnvSecretStore`, which looks up each
-secret name verbatim in the process environment. Axum lists `secrets` in its
-`single_store_kinds`, so only one secrets id may be declared:
+A declared `[stores.secrets]` id resolves to an `EnvSecretStore`, which reads
+secret key `api_key` from the environment variable `EDGEZERO__SECRETS__API_KEY`,
+which is the `EDGEZERO__SECRETS__` prefix plus the key in uppercase. Keys may contain only
+ASCII letters, digits, and `_`. `config validate` rejects other keys, and two keys
+that differ only in case. Axum lists `secrets` in its `single_store_kinds`, so
+only one secrets id may be declared:
 
 ```bash
-API_KEY=mysecret edgezero serve --adapter axum
+EDGEZERO__SECRETS__API_KEY=mysecret edgezero serve --adapter axum
 ```
 
 ## Config Store

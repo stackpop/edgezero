@@ -90,8 +90,8 @@ auth-status = "echo logged-in"
 crate = "crates/demo-cloudflare"
 "#;
 
-    /// The versions API answer: 6 inactive, 7 active.
-    const VERSIONS: &str = r#"[{"number":6,"active":false},{"number":7,"active":true}]"#;
+    /// The versions API answer: 6 inactive, 7 active, 8 staged.
+    const VERSIONS: &str = r#"[{"number":6,"active":false,"locked":true,"staging":false,"deployed":true,"environments":[]},{"number":7,"active":true,"locked":true,"staging":false,"deployed":true,"environments":[]},{"number":8,"active":false,"locked":true,"staging":false,"deployed":false,"environments":[{"active_version":8,"name":"staging","service_id":"SVC1"}]}]"#;
 
     /// `healthcheck` against a fake `curl`: one attempt, no delay.
     const HEALTHCHECK: [&str; 13] = [
@@ -619,7 +619,7 @@ crate = "crates/demo-cloudflare"
         // Overwrite the API answer: no version is active yet.
         let curl = fake_curl_script(
             "case \" $* \" in *\" --config \"*) cat >/dev/null; \
-             printf '%s\\n200' '[{\"number\":1,\"active\":false}]'; exit 0;; esac",
+             printf '%s\\n200' '[{\"number\":1,\"active\":false,\"locked\":false,\"staging\":false,\"deployed\":false,\"environments\":[]}]'; exit 0;; esac",
         );
         let text = edgezero_with_token(dir.path(), &ACTIVE_VERSION, Some(curl.path()), Some("t"));
         assert!(text.status.success(), "stderr: {}", stderr_of(&text));
@@ -663,7 +663,12 @@ crate = "crates/demo-cloudflare"
     #[test]
     fn deploy_reads_the_version_from_the_captured_output() {
         let dir = project_with(FASTLY_MANIFEST);
-        let text = edgezero(dir.path(), &DEPLOY, None);
+        // The version parsed from the output is verified active via the API.
+        let curl = fake_curl_script(
+            "case \" $* \" in *\" --config \"*) cat >/dev/null; \
+             printf '%s\\n200' '[{\"number\":12,\"active\":true,\"locked\":true,\"staging\":false,\"deployed\":true,\"environments\":[]}]'; exit 0;; esac",
+        );
+        let text = edgezero_with_token(dir.path(), &DEPLOY, Some(curl.path()), Some("t"));
         assert!(text.status.success(), "stderr: {}", stderr_of(&text));
         // The manifest command receives `--service-id SVC1` as passthrough. The
         // tee echoes the child live, then the CLI prints the version line.
@@ -680,7 +685,7 @@ crate = "crates/demo-cloudflare"
 
         let mut args = DEPLOY.to_vec();
         args.extend(["--format", "json"]);
-        let output = edgezero(dir.path(), &args, None);
+        let output = edgezero_with_token(dir.path(), &args, Some(curl.path()), Some("t"));
         assert!(output.status.success(), "stderr: {}", stderr_of(&output));
         assert_eq!(
             sole_json_document(&output)["result"],
@@ -932,36 +937,37 @@ crate = "crates/demo-cloudflare"
     }
 
     #[test]
-    fn staged_deploy_text_and_json_resolve_the_service_from_the_env() {
+    fn staged_deploy_without_a_release_fails_with_a_json_envelope() {
         let dir = fastly_project(FASTLY_STAGING_MANIFEST);
         let fastly = fake_fastly_staging();
-        // No `--service-id`: the adapter falls back to `FASTLY_SERVICE_ID`.
-        let run = |format: &[&str]| {
-            let mut args = vec!["deploy", "--adapter", "fastly", "--staging"];
-            args.extend(format);
-            let mut command = command(dir.path(), &args);
-            prepend_path(&mut command, fastly.path());
-            command
-                .env("FASTLY_API_TOKEN", "t")
-                .env("FASTLY_SERVICE_ID", "SVC1")
-                .output()
-                .expect("run edgezero")
-        };
-        let lines = "app declares no config stores, so staged version 8 has no config selector \
-                     to isolate; keeping the inherited runtime-env link\n\
-                     version=8\n";
-
-        let text = run(&[]);
-        assert!(text.status.success(), "stderr: {}", stderr_of(&text));
-        assert_eq!(stdout_of(&text), lines);
-
-        let output = run(&["--format", "json"]);
-        assert!(output.status.success(), "stderr: {}", stderr_of(&output));
-        assert_eq!(
-            sole_json_document(&output)["result"],
-            json!({"adapter": "fastly", "service_id": "SVC1", "staging": true, "version": 8_i32})
+        // A staged deploy is adapter-managed and needs an immutable release;
+        // without one it fails before any provider call, so no result exists.
+        let mut command = command(
+            dir.path(),
+            &[
+                "deploy",
+                "--adapter",
+                "fastly",
+                "--staging",
+                "--format",
+                "json",
+            ],
         );
-        assert_eq!(stderr_of(&output), lines);
+        prepend_path(&mut command, fastly.path());
+        let output = command
+            .env("FASTLY_API_TOKEN", "t")
+            .env("FASTLY_SERVICE_ID", "SVC1")
+            .output()
+            .expect("run edgezero");
+        assert_eq!(output.status.code(), Some(1_i32));
+        let envelope = sole_json_document(&output);
+        assert_eq!(envelope["command"], json!("deploy"));
+        assert_eq!(envelope["ok"], json!(false));
+        assert_eq!(envelope["result"], json!(null));
+        let message = envelope["error"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(message.contains("--application-release"), "{message}");
     }
 
     #[test]
@@ -982,7 +988,8 @@ crate = "crates/demo-cloudflare"
         let text = edgezero_with_token(dir.path(), &args, Some(curl.path()), Some("t"));
         assert!(text.status.success(), "stderr: {}", stderr_of(&text));
         assert_eq!(stdout_of(&text), line);
-        assert_eq!(api_calls(&curl), ["PUT"]);
+        // The staged version is confirmed from the version list before deactivating.
+        assert_eq!(api_calls(&curl), ["GET", "PUT"]);
 
         let mut json_args = args.to_vec();
         json_args.extend(["--format", "json"]);

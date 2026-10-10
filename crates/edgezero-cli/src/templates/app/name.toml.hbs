@@ -25,6 +25,7 @@ timeout_ms = 1500
 # resolves it at extractor time; in handler code,
 # `cfg.api_token` is already the resolved secret value.
 # Uncomment alongside the corresponding `[stores.secrets]`
-# block in `edgezero.toml`.
+# block in `edgezero.toml`. Under the Axum dev server, set
+# the value as `EDGEZERO__SECRETS__DEMO_API_TOKEN`.
 #
 # api_token = "demo_api_token"

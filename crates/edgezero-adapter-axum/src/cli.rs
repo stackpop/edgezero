@@ -14,7 +14,7 @@ use edgezero_adapter::process;
 use edgezero_adapter::registry::{
     ActionOutcome, Adapter, AdapterAction, AdapterPushContext, AuthState, AuthStatusOutcome,
     BuildOutcome, ProvisionAction, ProvisionEntry, ProvisionReport, ProvisionStores,
-    ReadConfigEntry, ResolvedStoreId, StoreKind, register_adapter,
+    ReadConfigEntry, ResolvedStoreId, StoreKind, TypedSecretEntry, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
@@ -24,6 +24,8 @@ use edgezero_core::addr;
 use edgezero_core::manifest::ManifestLoader;
 use toml::Value;
 use walkdir::WalkDir;
+
+use crate::secret_env::secret_env_var;
 
 static AXUM_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
     TemplateRegistration {
@@ -132,7 +134,7 @@ struct EdgezeroAxumConfig {
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` delegates to `read_config_entry_local` (axum is local-only). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
+    reason = "axum has no validate_app_config_keys / validate_adapter_manifest requirements; those two trait defaults are intentionally inherited. `validate_typed_secrets` IS overridden below (each `#[secret]` value must map to one `EDGEZERO__SECRETS__<KEY>` env var). `read_config_entry` delegates to `read_config_entry_local` (axum is local-only). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for AxumCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<ActionOutcome, String> {
@@ -380,6 +382,28 @@ impl Adapter for AxumCliAdapter {
         //: axum is Multi for KV (local file dirs) and Config
         // (local JSON files), Single for Secrets (env vars).
         &["secrets"]
+    }
+
+    fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+        let mut claimed: BTreeMap<String, &TypedSecretEntry<'_>> = BTreeMap::new();
+        for entry in entries {
+            let var = secret_env_var(entry.key_value)
+                .map_err(|err| format!("`#[secret]` field `{}`: {err}", entry.field_name))?;
+            if let Some(prev) = claimed.get(&var) {
+                if prev.key_value != entry.key_value {
+                    return Err(format!(
+                        "`#[secret]` field `{prev_field}` (`{prev_value}`) and `#[secret]` field `{this_field}` (`{this_value}`) both read Axum env var `{var}`, which cannot tell them apart. Pick `#[secret]` values whose uppercased forms differ.",
+                        prev_field = prev.field_name,
+                        prev_value = prev.key_value,
+                        this_field = entry.field_name,
+                        this_value = entry.key_value,
+                    ));
+                }
+                continue;
+            }
+            claimed.insert(var, entry);
+        }
+        Ok(())
     }
 }
 
@@ -1490,5 +1514,47 @@ mod tests {
             Some("{\"envelope\":\"B\"}"),
             "staging key must be present: {raw}"
         );
+    }
+
+    #[test]
+    fn validate_typed_secrets_accepts_keys_that_map_to_env_vars() {
+        let entries = [
+            TypedSecretEntry::new("default", "api_token", "demo_api_token"),
+            TypedSecretEntry::new("default", "partners[0].key", "Partner_Key_2"),
+        ];
+        assert_eq!(AXUM_ADAPTER.validate_typed_secrets(&entries), Ok(()));
+    }
+
+    #[test]
+    fn validate_typed_secrets_rejects_key_outside_charset_naming_field() {
+        let entries = [
+            TypedSecretEntry::new("default", "api_token", "demo_api_token"),
+            TypedSecretEntry::new("default", "partners[0].key", "partner-key"),
+        ];
+        let err = AXUM_ADAPTER.validate_typed_secrets(&entries).unwrap_err();
+        assert!(err.contains("`partners[0].key`"), "{err}");
+        assert!(err.contains("partner-key"), "{err}");
+        assert!(err.contains("ASCII letters, digits, or `_`"), "{err}");
+    }
+
+    #[test]
+    fn validate_typed_secrets_rejects_distinct_keys_that_share_an_env_var() {
+        let entries = [
+            TypedSecretEntry::new("default", "api_token", "upstream_token"),
+            TypedSecretEntry::new("vault", "backup_token", "UPSTREAM_TOKEN"),
+        ];
+        let err = AXUM_ADAPTER.validate_typed_secrets(&entries).unwrap_err();
+        assert!(err.contains("`api_token`"), "{err}");
+        assert!(err.contains("`backup_token`"), "{err}");
+        assert!(err.contains("`EDGEZERO__SECRETS__UPSTREAM_TOKEN`"), "{err}");
+    }
+
+    #[test]
+    fn validate_typed_secrets_accepts_same_key_in_two_fields() {
+        let entries = [
+            TypedSecretEntry::new("default", "api_token", "shared_token"),
+            TypedSecretEntry::new("vault", "backup_token", "shared_token"),
+        ];
+        assert_eq!(AXUM_ADAPTER.validate_typed_secrets(&entries), Ok(()));
     }
 }

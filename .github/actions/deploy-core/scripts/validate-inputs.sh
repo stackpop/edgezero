@@ -107,7 +107,7 @@ main() {
 
   # Well-formedness only: the CLI decides whether the adapter is supported.
   [[ -n "$adapter" ]] || fail "internal parameter 'adapter' is required"
-  [[ "$adapter" =~ ^[a-z][a-z0-9-]*$ ]] || fail "adapter '$adapter' is malformed; expected a lowercase token like 'fastly'"
+  [[ "$adapter" =~ ^[a-z][a-z0-9-]*$ ]] || fail "adapter '$adapter' is malformed; expected a lowercase token like 'provider'"
 
   case "$build_mode" in
     auto | always | never) ;;
@@ -152,9 +152,8 @@ main() {
 
   # Action-owned passthrough args are prepended AFTER the allowlist check,
   # because they are not caller input — the wrapper supplies them to make the
-  # deploy safe in CI (for Fastly: `--non-interactive`, which the built-in
-  # deploy path adds for itself but a manifest `[adapters.fastly.commands]
-  # deploy = "fastly compute deploy"` override would otherwise never get, so the
+  # deploy safe in CI (for example `--non-interactive`, which a built-in deploy
+  # path may add itself but a manifest command override may omit, so the
   # deploy could block on a TTY prompt). They go first so a caller arg can still
   # override them where the provider CLI takes last-wins.
   local prepend_file="$state_dir/deploy-args-prepend.nul"

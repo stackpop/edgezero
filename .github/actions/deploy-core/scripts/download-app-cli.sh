@@ -6,10 +6,11 @@ set -euo pipefail
 # self-describing app-cli-meta.json. A wrapper-supplied EDGEZERO__APP__CLI__BIN
 # overrides the metadata's binary name. The binary's ABSOLUTE path is emitted as
 # `app-cli-path`; the dir is deliberately NOT added to PATH, so an app CLI named
-# after a tool the action shells out to (jq, fastly, …) cannot shadow it.
+# after a tool the action shells out to (jq, provider-cli, …) cannot shadow it.
 #
 # Reads (env):
-#   EDGEZERO__APP__CLI__ARTIFACT_DIR      required  dir containing the downloaded tar
+#   EDGEZERO__APP__CLI__ARCHIVE           preferred exact verified release member
+#   EDGEZERO__APP__CLI__ARTIFACT_DIR      legacy build-action artifact directory
 #   EDGEZERO__APP__CLI__BIN               optional  override for the binary name
 #   EDGEZERO__ACTION__TOOL_ROOT           optional  install dir (default: under RUNNER_TEMP)
 # Writes (outputs):
@@ -45,7 +46,8 @@ find_cli_tarball() {
 }
 
 main() {
-  local artifact_dir="${EDGEZERO__APP__CLI__ARTIFACT_DIR:?EDGEZERO__APP__CLI__ARTIFACT_DIR is required}"
+  local archive="${EDGEZERO__APP__CLI__ARCHIVE:-}"
+  local artifact_dir="${EDGEZERO__APP__CLI__ARTIFACT_DIR:-}"
   local cli_bin_override="${EDGEZERO__APP__CLI__BIN:-}"
   local tool_root="${EDGEZERO__ACTION__TOOL_ROOT:-${RUNNER_TEMP:-/tmp}/edgezero-action-tools}"
 
@@ -58,8 +60,15 @@ main() {
   mkdir -p "$tool_root/bin"
 
   local tarball
-  tarball=$(find_cli_tarball "$artifact_dir")
-  [[ -n "$tarball" ]] || fail "no CLI tar found under the downloaded artifact at '$artifact_dir'"
+  if [[ -n "$archive" ]]; then
+    [[ -f "$archive" && ! -L "$archive" ]] || fail "the release-recorded application CLI archive is not a regular file"
+    [[ -z "$cli_bin_override" ]] || fail "app-cli-bin cannot override the binary recorded by an application release"
+    tarball="$archive"
+  else
+    require_input app-cli-artifact-dir "$artifact_dir"
+    tarball=$(find_cli_tarball "$artifact_dir")
+    [[ -n "$tarball" ]] || fail "no CLI tar found under the downloaded artifact at '$artifact_dir'"
+  fi
 
   assert_safe_tarball "$tarball"
   tar -xf "$tarball" -C "$tool_root/bin"
@@ -76,7 +85,7 @@ main() {
   chmod +x "$cli_path"
 
   # Smoke-check with a scrubbed environment: no inherited provider credential
-  # (FASTLY_KEY, FASTLY_AUTH_TOKEN, ...) may reach the app CLI here.
+  # may reach the app CLI here.
   env -i PATH="/usr/bin:/bin" HOME="${HOME:-/tmp}" "$cli_path" --help >/dev/null 2>&1 ||
     fail "downloaded CLI '$cli_bin' did not run '--help'"
 
@@ -84,7 +93,7 @@ main() {
   # it by the ABSOLUTE `app-cli-path` output below, and an app CLI may legitimately
   # be named after a tool the action itself shells out to (e.g. `jq`) — prepending
   # its dir would then SHADOW that system command and break later steps.
-  notice "using app CLI '$cli_bin' v$cli_version from artifact"
+  notice "using verified app CLI '$cli_bin' v$cli_version"
   append_output app-cli-bin "$cli_bin"
   # The ABSOLUTE path, so callers invoke this exact binary rather than resolving
   # the bare name through PATH (immune to the provider-CLI dir the installer

@@ -1,248 +1,157 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Runs the application CLI (build or deploy) through Bash arrays — never eval.
-#
-# Provider-neutral: it invokes `<cli-bin> <mode> --adapter <adapter>` with the
-# wrapper's typed deploy-flags (before `--`) and the caller's passthrough
-# deploy-args (after `--`).
-#
-# Credential boundary (deploy mode): the wrapper never exports provider tokens
-# onto the step directly. It passes EDGEZERO__PROVIDER__ENV (a JSON object of typed
-# credential name -> value) plus a provider-env-clear name list. This script
-# first UNSETS every clear-listed alias (removing any inherited FASTLY_* value),
-# then exports only the typed values from EDGEZERO__PROVIDER__ENV — and only names
-# that are declared in the clear list. So inherited endpoint/token aliases can
-# never survive into the deploy. Build mode is credential-free and only clears.
+# Invokes an already-verified application CLI from an exact NUL-delimited argv.
+# Provider wrappers own command construction, credential aliases, and any extra
+# public runtime names; this core owns confinement, environment scrubbing,
+# mutation signalling, and exact exit-status propagation.
 #
 # Reads (env):
-#   EDGEZERO__APP__CLI__PATH              optional  absolute path to the app CLI (preferred; avoids PATH shadowing)
-#   EDGEZERO__APP__CLI__BIN               optional  app CLI name, used when __PATH is unset
-#   EDGEZERO__ADAPTER                     required  adapter passed as --adapter
-#   EDGEZERO__PROJECT__WORKING_DIRECTORY  required  directory to run the CLI from
-#   EDGEZERO__PROJECT__MANIFEST_PATH      optional  exported as EDGEZERO_MANIFEST when set
-#   EDGEZERO__BUILD__ARGS_FILE            optional  NUL-delimited build passthrough (build)
-#   EDGEZERO__DEPLOY__FLAGS_FILE          optional  NUL-delimited typed flags (deploy)
-#   EDGEZERO__DEPLOY__ARGS_FILE           optional  NUL-delimited passthrough (deploy)
-#   EDGEZERO__PROVIDER__ENV_CLEAR_FILE    optional  NUL-delimited alias names to clear
-#   EDGEZERO__PROVIDER__ENV               optional  JSON object of typed creds (deploy)
+#   EDGEZERO__ACTION__WORKSPACE             required  trusted root containing the CLI and control files
+#   EDGEZERO__APP__CLI__PATH                required  executable regular file beneath the action workspace
+#   EDGEZERO__APP__CLI__ARGS_FILE           required  NUL-delimited argv beneath the action workspace
+#   EDGEZERO__APP__CLI__MUTATES             required  true | false
+#   EDGEZERO__PROJECT__WORKING_DIRECTORY    optional  invocation directory (default: current directory)
+#   EDGEZERO__PROJECT__MANIFEST_PATH        optional  exported to the CLI as EDGEZERO_MANIFEST
+#   EDGEZERO__PROVIDER__ENV_CLEAR_FILE      optional  NUL-delimited provider aliases allowed for import
+#   EDGEZERO__PROVIDER__ENV                 optional  JSON object containing typed provider values
+#   EDGEZERO__PUBLIC_RUNTIME_ENV_ALLOW_FILE optional  NUL-delimited provider-specific public EDGEZERO__ names
 # Writes (outputs):
-#   mutation-attempted   deploy mode only: 'true', written immediately BEFORE the
-#                        CLI runs (best-effort reconcile signal — see below; a hard
-#                        runner loss can drop it, so absence is not proof of no-op).
-# Otherwise runs the app CLI, which owns stdout/stderr and the exit status.
-#   EDGEZERO_MANIFEST is exported to the CLI; the whole EDGEZERO__* namespace is
-#   scrubbed first (see scrub_action_private_env).
+#   mutation-attempted                      true immediately before a mutating CLI invocation
+# Otherwise preserves the application CLI's stdout, stderr, and exit status.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
-# --- Untrusted-build isolation (build mode only) -----------------------------
-# `build` mode runs `<cli> build` → `cargo build`, which executes the app's AND
-# every transitive dependency's `build.rs` / proc macros — untrusted code. In
-# deploy-fastly this is the `build-mode: always` seed build, and it runs in the
-# SAME job that later receives the provider token. A `build.rs` that appends a shim
-# dir to `$GITHUB_PATH`, or `LD_PRELOAD=…` / `https_proxy=…` to `$GITHUB_ENV`, would
-# have the runner apply that to the token-bearing `Capture rollback target` and
-# `Deploy` steps — token exfiltration. Strip the GitHub file-command channels from
-# the PROCESS IMAGE before any build runs. This must be a re-exec, not an `unset`:
-# `/proc/<pid>/environ` still exposes the pre-unset values to a child otherwise
-# (the same reason build-app-cli re-execs its untrusted build). The sentinel arg —
-# not an env var, which a caller controls — marks "already stripped". `deploy` mode
-# is deliberately unchanged: it runs the app's OWN trusted CLI with the same token
-# and must keep GITHUB_OUTPUT to write `mutation-attempted`.
-readonly BUILD_ISOLATED_SENTINEL="__edgezero_build_isolated__"
-if [[ "${BASH_SOURCE[0]}" == "${0}" && "${1:-}" == build && "${2:-}" != "$BUILD_ISOLATED_SENTINEL" ]]; then
-  exec env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE \
-    -u GITHUB_STEP_SUMMARY -u BASH_ENV -u ENV \
-    "$0" build "$BUILD_ISOLATED_SENTINEL" "${@:2}"
-fi
-
-# Collect a NUL-delimited file into the global COLLECTED array (portable; avoids
-# Bash 4.3 namerefs, which some runners/macOS Bash 3.2 lack).
 COLLECTED=()
+validate_nul_file() {
+  local file="$1" label="$2"
+  [[ -f "$file" && ! -L "$file" ]] || fail "$label must be a regular file"
+  [[ ! -s "$file" ]] ||
+    [[ "$(tail -c 1 "$file" | od -An -tu1 | tr -d ' ')" == 0 ]] ||
+    fail "$label must end in NUL"
+}
+
 collect_nul() {
-  local file="$1"
+  local file="$1" entry
   COLLECTED=()
+  validate_nul_file "$file" "application CLI argument file"
   [[ -s "$file" ]] || return 0
-  local entry
-  while IFS= read -r -d '' entry; do
-    COLLECTED+=("$entry")
-  done <"$file"
+  while IFS= read -r -d '' entry; do COLLECTED+=("$entry"); done <"$file"
 }
 
-# Unset each wrapper-named provider alias listed (NUL-delimited) in a file.
 clear_named_aliases() {
-  local file="$1"
+  local file="$1" name
   [[ -s "$file" ]] || return 0
-  local name
   while IFS= read -r -d '' name; do
-    if [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-      unset "$name" || true
-    fi
+    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "provider clear-list contains an invalid name"
+    unset "$name" || true
   done <"$file"
 }
 
-# Return 0 if <name> appears in the NUL-delimited clear-list file.
-name_in_clear_list() {
+name_in_nul_file() {
   local wanted="$1" file="$2" name
   [[ -s "$file" ]] || return 1
-  while IFS= read -r -d '' name; do
-    [[ "$name" == "$wanted" ]] && return 0
-  done <"$file"
+  while IFS= read -r -d '' name; do [[ "$name" == "$wanted" ]] && return 0; done <"$file"
   return 1
 }
 
-# Clear the provider aliases, then export ONLY the typed values from
-# EDGEZERO__PROVIDER__ENV whose names are declared in the clear list. jq parses the
-# JSON, so values are opaque data (never interpreted by the shell).
 import_provider_env() {
-  local clear_file="$1"
-  local json="${EDGEZERO__PROVIDER__ENV:-}"
+  local clear_file="$1" json="${EDGEZERO__PROVIDER__ENV:-}" name b64 value
   [[ -n "$json" ]] || json='{}'
   clear_named_aliases "$clear_file"
-
   require_cmd jq
   require_cmd base64
-  printf '%s' "$json" | jq -e 'type == "object"' >/dev/null 2>&1 ||
-    fail "EDGEZERO__PROVIDER__ENV must be a JSON object of string values"
-  printf '%s' "$json" | jq -e 'all(.[]; type == "string")' >/dev/null 2>&1 ||
-    fail "every EDGEZERO__PROVIDER__ENV value must be a string"
-  # A NUL cannot survive the Bash boundary: `export NAME=value` truncates at the
-  # first NUL, so a value carrying one would be silently altered — a credential
-  # that is quietly wrong is worse than one that is rejected.
-  printf '%s' "$json" | jq -e 'all(.[]; contains("\u0000") | not)' >/dev/null 2>&1 ||
-    fail "EDGEZERO__PROVIDER__ENV values must not contain NUL bytes"
-  # A trailing CR/LF cannot survive the boundary either: the `$(…)` that decodes each
-  # base64 value below strips trailing newlines, so a value ending in a newline would
-  # be silently truncated. Reject CR/LF outright — a quietly-wrong credential is worse
-  # than one that is rejected.
-  printf '%s' "$json" | jq -e 'all(.[]; (contains("\n") or contains("\r")) | not)' >/dev/null 2>&1 ||
-    fail "EDGEZERO__PROVIDER__ENV values must not contain CR or LF bytes"
-
-  # One "NAME BASE64VALUE" line per entry. Base64 keeps values line-safe
-  # (newlines, spaces, quotes cannot break the read loop) and opaque.
-  local name b64 value
+  printf '%s' "$json" | jq -e 'type == "object" and all(.[]; type == "string" and ((contains("\u0000") or contains("\n") or contains("\r")) | not))' >/dev/null 2>&1 ||
+    fail "EDGEZERO__PROVIDER__ENV must be a JSON object of string values without NUL, CR, or LF"
   while read -r name b64; do
-    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
-      fail "EDGEZERO__PROVIDER__ENV name '$name' is not a valid environment variable name"
-    name_in_clear_list "$name" "$clear_file" ||
-      fail "EDGEZERO__PROVIDER__ENV name '$name' must be declared in provider-env-clear"
+    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "provider environment name is invalid"
+    name_in_nul_file "$name" "$clear_file" || fail "provider environment name must appear in the clear-list"
     value=$(printf '%s' "$b64" | base64 --decode)
     export "$name=$value"
   done < <(printf '%s' "$json" | jq -r 'to_entries[] | "\(.key) \(.value | @base64)"')
 }
 
-# Build the CLI argv for `build` mode into the global ARGV array.
-build_build_argv() {
-  local cli_bin="$1"
-  local adapter="$2"
-  ARGV=("$cli_bin" build --adapter "$adapter")
-  # Credential-free build: defensively drop the wrapper-named aliases.
-  clear_named_aliases "${EDGEZERO__PROVIDER__ENV_CLEAR_FILE:-/dev/null}"
-  collect_nul "${EDGEZERO__BUILD__ARGS_FILE:-/dev/null}"
-  if ((${#COLLECTED[@]})); then
-    ARGV+=(-- "${COLLECTED[@]}")
-  fi
-}
-
-# Build the CLI argv for `deploy` mode into the global ARGV array.
-build_deploy_argv() {
-  local cli_bin="$1"
-  local adapter="$2"
-  ARGV=("$cli_bin" deploy --adapter "$adapter")
-  # Typed adapter flags (before `--`): e.g. --service-id <id>, --staging.
-  collect_nul "${EDGEZERO__DEPLOY__FLAGS_FILE:-/dev/null}"
-  ((${#COLLECTED[@]})) && ARGV+=("${COLLECTED[@]}")
-  # Caller passthrough (after `--`): allowlisted deploy-args, e.g. --comment.
-  collect_nul "${EDGEZERO__DEPLOY__ARGS_FILE:-/dev/null}"
-  if ((${#COLLECTED[@]})); then
-    ARGV+=(-- "${COLLECTED[@]}")
-  fi
-}
-
-# Unset the action's PRIVATE environment namespace before handing control to the
-# application CLI.
-#
-# This is a credential boundary, not tidiness. The wrapper carries the typed
-# token into this script twice: once as `EDGEZERO__<PROVIDER>_API_TOKEN` (so the
-# step's YAML can build the JSON without interpolating a secret into a `run:`
-# block), and once inside `EDGEZERO__PROVIDER__ENV` itself. Both are
-# secret-bearing. Without this scrub they stay exported, so the app CLI — and
-# every subprocess it spawns, including a manifest `[adapters.*.commands]` shell
-# command — inherits the raw token under names we never promised, and any
-# `env`-dumping build script would print it.
-#
-# This is why every action-owned variable lives under the double-underscore
-# `EDGEZERO__` prefix: the boundary is then one rule with no list to keep in sync.
-# `EDGEZERO_MANIFEST` (SINGLE underscore) is deliberately outside it — that is the
-# CLI's own public contract, not ours, and it is the one variable we do pass on.
-#
-# This is `unset`, not a re-exec: it scrubs what the CLI INHERITS, so a token never
-# appears under an unpromised name or in an accidental `env` dump. It is NOT a
-# process-image boundary — on Linux this shell's original environment stays
-# readable via `/proc/<ppid>/environ`. That is acceptable here (unlike the
-# untrusted build in build-app-cli/common.sh, which re-execs with `env -u`): the
-# deploy runs the app's OWN trusted CLI, which already gets the same token as
-# FASTLY_API_TOKEN. Deploying means trusting that CLI with the credential.
-scrub_action_private_env() {
-  local name
+PUBLIC_NAMES=()
+PUBLIC_VALUES=()
+capture_public_env() {
+  local allow_file="$1" name allowed upper_name
   while IFS= read -r name; do
-    case "$name" in
-      EDGEZERO__*) unset "$name" || true ;;
-      *) ;;
-    esac
+    allowed=false
+    upper_name=""
+    if [[ "$name" == "EDGEZERO__ADAPTER__HOST" ]] ||
+      [[ "$name" == "EDGEZERO__ADAPTER__PORT" ]] ||
+      [[ "$name" == "EDGEZERO__LOGGING__ENDPOINT" ]] ||
+      [[ "$name" == "EDGEZERO__LOGGING__LEVEL" ]] ||
+      [[ "$name" =~ ^EDGEZERO__STORES__CONFIG__[A-Z0-9_]+__(NAME|KEY)$ ]] ||
+      [[ "$name" =~ ^EDGEZERO__STORES__(KV|SECRETS)__[A-Z0-9_]+__NAME$ ]] ||
+      name_in_nul_file "$name" "$allow_file"; then
+      allowed=true
+    fi
+    if [[ "$allowed" == true ]]; then
+      PUBLIC_NAMES+=("$name")
+      PUBLIC_VALUES+=("${!name}")
+    else
+      upper_name=$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')
+    fi
+    if [[ "$allowed" != true && "$upper_name" == EDGEZERO__STORES__* ]]; then
+      fail "store selector $name must use the canonical upper-case form"
+    fi
   done < <(compgen -e)
 }
 
-ARGV=()
+scrub_private_env() {
+  local name index
+  while IFS= read -r name; do
+    if [[ "$name" == EDGEZERO__* ]]; then unset "$name" || true; fi
+  done < <(compgen -e)
+  for ((index = 0; index < ${#PUBLIC_NAMES[@]}; index++)); do
+    name="${PUBLIC_NAMES[$index]}"
+    export "$name=${PUBLIC_VALUES[$index]}"
+  done
+}
+
 main() {
-  local mode="${1:-}"
-  case "$mode" in
-    build | deploy) ;;
-    *) fail "usage: run-app-cli.sh build|deploy" ;;
-  esac
-
-  local cli_bin
-  cli_bin=$(resolve_app_cli)
-  local adapter="${EDGEZERO__ADAPTER:?EDGEZERO__ADAPTER is required}"
-  local working_directory="${EDGEZERO__PROJECT__WORKING_DIRECTORY:?EDGEZERO__PROJECT__WORKING_DIRECTORY is required}"
+  local cli="${EDGEZERO__APP__CLI__PATH:-}"
+  local args_file="${EDGEZERO__APP__CLI__ARGS_FILE:-}"
+  local mutates="${EDGEZERO__APP__CLI__MUTATES:-}"
+  local workspace="${EDGEZERO__ACTION__WORKSPACE:-}"
+  local working_directory="${EDGEZERO__PROJECT__WORKING_DIRECTORY:-$PWD}"
   local manifest="${EDGEZERO__PROJECT__MANIFEST_PATH:-}"
-  require_cmd "$cli_bin"
-
-  case "$mode" in
-    build) build_build_argv "$cli_bin" "$adapter" ;;
-    deploy)
-      # Clear inherited provider aliases and export only the typed credentials.
-      import_provider_env "${EDGEZERO__PROVIDER__ENV_CLEAR_FILE:-/dev/null}"
-      build_deploy_argv "$cli_bin" "$adapter"
-      ;;
-  esac
-
-  # Everything the action needed from its own env is now in locals or in ARGV.
-  scrub_action_private_env
-
-  if [[ -n "$manifest" ]]; then
-    export EDGEZERO_MANIFEST="$manifest"
-  else
-    unset EDGEZERO_MANIFEST || true
-  fi
-
+  local clear_file="${EDGEZERO__PROVIDER__ENV_CLEAR_FILE:-/dev/null}"
+  local allow_file="${EDGEZERO__PUBLIC_RUNTIME_ENV_ALLOW_FILE:-/dev/null}"
+  require_input application-cli "$cli"
+  require_input application-cli-args-file "$args_file"
+  [[ -f "$cli" && ! -L "$cli" && -x "$cli" ]] || fail "application CLI must be an executable regular file"
+  [[ -d "$workspace" ]] || fail "action workspace must be a directory"
+  local workspace_real
+  workspace_real=$(canonical_path "$workspace")
+  local cli_real
+  cli_real=$(canonical_path "$cli")
+  is_under "$workspace_real" "$cli_real" ||
+    fail "application CLI must resolve beneath the action workspace"
+  local file real
+  for file in "$args_file" "$clear_file" "$allow_file"; do
+    [[ "$file" == /dev/null ]] && continue
+    [[ -f "$file" && ! -L "$file" ]] || fail "application CLI control file must be a regular file"
+    real=$(canonical_path "$file")
+    is_under "$workspace_real" "$real" || fail "application CLI control file must resolve beneath the action workspace"
+  done
+  [[ "$clear_file" == /dev/null ]] || validate_nul_file "$clear_file" "provider clear-list"
+  [[ "$allow_file" == /dev/null ]] || validate_nul_file "$allow_file" "public runtime allow-list"
+  case "$mutates" in true | false) ;; *) fail "application CLI mutation setting must be true or false" ;; esac
+  [[ -d "$working_directory" ]] || fail "application CLI working directory must exist"
+  collect_nul "$args_file"
+  local -a argv=("$cli" "${COLLECTED[@]}")
+  import_provider_env "$clear_file"
+  capture_public_env "$allow_file"
+  scrub_private_env
+  if [[ -n "$manifest" ]]; then export EDGEZERO_MANIFEST="$manifest"; else unset EDGEZERO_MANIFEST || true; fi
   cd "$working_directory"
-  # Publish the reconcile signal for a MUTATING invocation HERE — after all setup
-  # succeeded (binary resolve, credential import, cd) and immediately before the
-  # CLI runs. Writing it now, from the launcher itself, means a setup failure ABOVE
-  # never falsely claims the CLI ran, and because it lands in GITHUB_OUTPUT before
-  # the mutation starts it CAN survive a cancel/timeout mid-mutation — best-effort,
-  # not guaranteed: a hard runner loss can still drop it, so its absence is not
-  # proof of no mutation (the reconcile contract is in the guide). `build` is
-  # credential-free and mutates nothing, so it is not signalled.
-  if [[ "$mode" == "deploy" ]]; then
-    append_output mutation-attempted true
-  fi
-  echo "[edgezero-action] running $cli_bin $mode for adapter $adapter" >&2
-  "${ARGV[@]}"
+  [[ "$mutates" == false ]] || append_output mutation-attempted true
+  echo "[edgezero-action] running verified application CLI" >&2
+  "${argv[@]}"
 }
 
 main "$@"
